@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <oasr/common/arch_dispatch.h>
 #include <oasr/common/math.h>
 #include <oasr/common/reduction.h>
 #include <oasr/common/utils.h>
@@ -677,7 +678,8 @@ cudaError_t LstmLayerImpl(T* output, T* cells, T* final_h, T* final_c, const T* 
     const dim3 grid(hidden_size, batch_size);
     const int cohort_warps = std::min(32, batch_size);
     const size_t cohort_smem = 4 * static_cast<size_t>(input_size + hidden_size) * sizeof(T);
-    const bool use_cohort = batch_size >= 4 && cohort_smem <= 48 * 1024;
+    const bool use_cohort =
+        batch_size >= 4 && cohort_smem <= static_cast<size_t>(getDeviceMaxSharedMemoryOptin());
     const dim3 cohort_grid(hidden_size, (batch_size + cohort_warps - 1) / cohort_warps);
     // Only cell[t-1] is ever read, so the cell history is a two-slice ring of
     // (batch, hidden) rather than the whole (sequence, batch, hidden) tensor.
@@ -698,6 +700,9 @@ cudaError_t LstmLayerImpl(T* output, T* cells, T* final_h, T* final_c, const T* 
         T* final_h_t = timestep + 1 == sequence_length ? final_h : nullptr;
         T* final_c_t = timestep + 1 == sequence_length ? final_c : nullptr;
         if (use_cohort) {
+            if (cudaError_t err = optInSharedMemory(LstmCohortStepKernel<T, VecSize>, cohort_smem);
+                err != cudaSuccess)
+                return err;
             LstmCohortStepKernel<T, VecSize>
                 <<<cohort_grid, cohort_warps * 32, cohort_smem, stream>>>(
                     output_t, cell_t, final_h_t, final_c_t, input_t, previous_h, previous_c,
@@ -724,7 +729,8 @@ cudaError_t RnnLayerImpl(T* output, T* final_h, const T* input, const T* initial
     const dim3 grid(hidden_size, batch_size);
     const int cohort_warps = std::min(32, batch_size);
     const size_t cohort_smem = static_cast<size_t>(input_size + hidden_size) * sizeof(T);
-    const bool use_cohort = batch_size >= 4 && cohort_smem <= 48 * 1024;
+    const bool use_cohort =
+        batch_size >= 4 && cohort_smem <= static_cast<size_t>(getDeviceMaxSharedMemoryOptin());
     const dim3 cohort_grid(hidden_size, (batch_size + cohort_warps - 1) / cohort_warps);
     for (int timestep = 0; timestep < sequence_length; ++timestep) {
         T* output_t = output + static_cast<int64_t>(timestep) * output_time_stride;
@@ -735,6 +741,10 @@ cudaError_t RnnLayerImpl(T* output, T* final_h, const T* input, const T* initial
         const int64_t previous_batch_stride = timestep == 0 ? hidden_size : output_batch_stride;
         T* final_h_t = timestep + 1 == sequence_length ? final_h : nullptr;
         if (use_cohort) {
+            if (cudaError_t err =
+                    optInSharedMemory(RnnCohortStepKernel<T, VecSize, Activation>, cohort_smem);
+                err != cudaSuccess)
+                return err;
             RnnCohortStepKernel<T, VecSize, Activation>
                 <<<cohort_grid, cohort_warps * 32, cohort_smem, stream>>>(
                     output_t, final_h_t, input_t, previous_h, weight_ih, weight_hh, bias_ih,
@@ -858,16 +868,28 @@ cudaError_t SlotStepImpl(T* output, T* state_h, T* state_c, const T* input,
                          cudaStream_t stream) {
     constexpr int kGates = kLstm ? 4 : 1;
     const size_t smem = kGates * static_cast<size_t>(input_size + hidden_size) * sizeof(T);
-    if (smem > 48 * 1024)
+    // The budget is the *device's*, not the 48 KiB every block gets without
+    // asking.  That constant was the whole limit here, so a unit whose weights
+    // needed 49 KiB was declined on an A30 with 164 KiB available -- and the
+    // decline is a real one: `cudaErrorInvalidValue` is the declared "does not
+    // fit in shared memory" signal the Python caller routes around.
+    if (smem > static_cast<size_t>(getDeviceMaxSharedMemoryOptin()))
         return cudaErrorInvalidValue;
     const int warps = std::min(32, std::max(1, batch_size));
     const dim3 grid(hidden_size, (batch_size + warps - 1) / warps);
     if constexpr (kLstm) {
+        if (cudaError_t err = optInSharedMemory(LstmSlotStepKernel<T, VecSize>, smem);
+            err != cudaSuccess)
+            return err;
         LstmSlotStepKernel<T, VecSize><<<grid, warps * 32, smem, stream>>>(
             output, state_h, state_c, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh,
             batch_size, input_size, hidden_size, slot_count, read_parity, input_batch_stride,
             output_batch_stride);
     } else {
+        if (cudaError_t err =
+                optInSharedMemory(RnnSlotStepKernel<T, VecSize, Activation>, smem);
+            err != cudaSuccess)
+            return err;
         RnnSlotStepKernel<T, VecSize, Activation><<<grid, warps * 32, smem, stream>>>(
             output, state_h, input, state_slots, weight_ih, weight_hh, bias_ih, bias_hh, batch_size,
             input_size, hidden_size, slot_count, read_parity, input_batch_stride,

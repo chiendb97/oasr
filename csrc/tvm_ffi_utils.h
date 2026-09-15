@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <oasr/common/arch_dispatch.h>
 
 #include <tvm/ffi/c_api.h>
 #include <tvm/ffi/container/tensor.h>
@@ -163,6 +164,16 @@ inline cudaStream_t get_stream(DLDevice device) {
     // norm, ...) is left out of the captured graph, the resulting graph is
     // empty (PyTorch warns ``CUDA Graph is empty``), and replays produce
     // wrong / NaN outputs because none of the encoder ops actually run.
+    //
+    // The architecture check lives here, and it looks out of place until you ask
+    // where else it could go.  A module is compiled for one SM family; the
+    // tensor's device is the only thing that says which card the work is
+    // actually for; and every launcher in the package calls this exactly once
+    // with that device.  A ``CHECK_*`` macro would have to be remembered at some
+    // forty call sites and at every new one -- and the failure it guards against
+    // is silent, so forgetting it would not show up.  After the first call per
+    // ordinal it is an array read and an integer compare.
+    oasr::checkDeviceMatchesBuild(device.device_id);
     TVMFFIStreamHandle s = TVMFFIEnvGetStream(device.device_type, device.device_id);
     return static_cast<cudaStream_t>(s);
 }

@@ -132,6 +132,128 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 
 
+class TestTheTargetArchIsNeverGuessedAtCompileTime:
+    """``_get_cuda_arch`` used to answer ``(8, 0)`` when nothing could be detected.
+
+    That is a real architecture, so a box where CUDA was invisible — torch
+    without a runtime, ``nvidia-smi`` absent — compiled
+    ``-gencode arch=compute_80,code=sm_80`` and produced a library that would not
+    run on whatever card eventually appeared. Nothing reported it, and the guess
+    was indistinguishable from an A100.
+
+    The guess still exists, because it has to: the JIT config generators resolve
+    a target SM at *import* time (``jit.gemm``'s ``GEMM_DEFAULT``, ``jit.conv``'s
+    ``CONV2D_DEFAULT``) and the CPU test job imports the package. What changed is
+    that producing a ``.so`` refuses it.
+    """
+
+    def test_detection_returns_none_rather_than_a_plausible_arch(self, monkeypatch):
+        """The heart of it.  ``(8, 0)`` as a failure value is indistinguishable
+        from an A100, so every caller downstream believed it."""
+        import torch
+
+        from oasr.jit import core
+
+        def _no_smi(*args, **kwargs):
+            raise OSError("nvidia-smi not found")
+
+        monkeypatch.setattr(core, "_arch_from_env", lambda: None)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setattr(core.subprocess, "check_output", _no_smi)
+        assert core._detect_cuda_arch() is None
+
+    def test_import_time_resolution_still_answers_without_a_device(self, monkeypatch):
+        """The property that keeps ``import oasr`` working on a CPU box."""
+        from oasr.jit import core
+
+        monkeypatch.setattr(core, "_detect_cuda_arch", lambda: None)
+        assert core._get_cuda_arch() == core._ASSUMED_ARCH
+
+    def test_compiling_refuses_an_undetected_arch(self, monkeypatch):
+        from oasr.jit import core
+
+        monkeypatch.setattr(core, "_detect_cuda_arch", lambda: None)
+        with pytest.raises(RuntimeError, match="no CUDA device was detected"):
+            core.require_known_cuda_arch("module 'probe'")
+
+    def test_the_refusal_names_the_way_out(self, monkeypatch):
+        """A build box with no GPU is a legitimate case, so the error has to say
+        how to proceed rather than only that it will not."""
+        from oasr.jit import core
+
+        monkeypatch.setattr(core, "_detect_cuda_arch", lambda: None)
+        with pytest.raises(RuntimeError) as excinfo:
+            core.require_known_cuda_arch("module 'probe'")
+        assert "OASR_CUDA_ARCH_LIST" in str(excinfo.value)
+
+    def test_a_real_build_reaches_the_guard(self, monkeypatch, tmp_path):
+        """Not just that the function refuses — that ``_compile`` calls it."""
+        from oasr.jit import core
+
+        monkeypatch.setattr(core, "_detect_cuda_arch", lambda: None)
+        spec = core.JitSpec(name="probe", sources=[], extra_cuda_cflags=[])
+        with pytest.raises(RuntimeError, match="no CUDA device was detected"):
+            spec._compile(str(tmp_path / "probe.so"))
+
+    def test_the_detected_arch_is_accepted_here(self):
+        """This box has a GPU, so nothing above may fire in the ordinary case."""
+        from oasr.jit import core
+
+        assert core._detect_cuda_arch() is not None
+        core.require_known_cuda_arch("module 'probe'")
+
+
+class TestTheArchOverride:
+    """``OASR_CUDA_ARCH_LIST`` is documented as the manual override for JIT arch
+    detection and, for the JIT gencode, did nothing at all: ``_default_cuda_cflags``
+    always emits its own ``-gencode``, so ``cpp_ext`` drops the context's arch flags.
+
+    It is now the escape hatch the compile-time refusal needs — under one rule.
+    """
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("9.0", (9, 0)),
+            ("9.0a", (9, 0)),
+            ("10.0f", (10, 0)),
+            ("8.6", (8, 6)),
+            ("  8.0  ", (8, 0)),
+            ("9", (9, 0)),
+        ],
+    )
+    def test_a_single_entry_is_an_unambiguous_target(self, monkeypatch, value, expected):
+        from oasr.jit import core
+
+        monkeypatch.setenv("OASR_CUDA_ARCH_LIST", value)
+        assert core._arch_from_env() == expected
+
+    @pytest.mark.parametrize("value", ["8.0 9.0a", "8.0,9.0", "8.0 9.0 10.0a"])
+    def test_several_entries_are_left_to_the_aot_path(self, monkeypatch, value):
+        """Two or more cannot mean "the JIT target" — the JIT builds one module
+        for one architecture. Picking the first would silently compile for the
+        wrong card on a machine that has the right one."""
+        from oasr.jit import core
+
+        monkeypatch.setenv("OASR_CUDA_ARCH_LIST", value)
+        assert core._arch_from_env() is None
+
+    @pytest.mark.parametrize("value", ["", "   ", "sm_90", "hopper"])
+    def test_junk_is_ignored_rather_than_crashing_the_import(self, monkeypatch, value):
+        from oasr.jit import core
+
+        monkeypatch.setenv("OASR_CUDA_ARCH_LIST", value)
+        assert core._arch_from_env() is None
+
+    def test_the_override_unblocks_a_box_with_no_device(self, monkeypatch):
+        """The case the refusal exists for: a build machine with no GPU."""
+        from oasr.jit import core
+
+        monkeypatch.setattr(core, "_arch_from_env", lambda: (9, 0))
+        monkeypatch.setenv("OASR_CUDA_ARCH_LIST", "9.0")
+        core.require_known_cuda_arch("module 'probe'")
+
+
 class TestCuteRuntimeStream:
     """The shared stream helper (``oasr.jit.cute_runtime``).
 
