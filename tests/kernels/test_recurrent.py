@@ -183,8 +183,6 @@ class TestTorchLayerFormula:
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="recurrent kernels need CUDA")
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="recurrent kernels need CUDA")
 class TestWideUnitsReachTheCohortPath:
     """A unit whose weights need more than 48 KiB of shared memory.
 
@@ -264,6 +262,8 @@ class TestWideUnitsReachTheCohortPath:
         assert torch.isfinite(out).all()
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="recurrent kernels need CUDA")
 class TestRecurrentCuda:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(

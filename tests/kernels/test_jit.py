@@ -195,8 +195,15 @@ class TestTheTargetArchIsNeverGuessedAtCompileTime:
         with pytest.raises(RuntimeError, match="no CUDA device was detected"):
             spec._compile(str(tmp_path / "probe.so"))
 
+    @pytest.mark.cuda
     def test_the_detected_arch_is_accepted_here(self):
-        """This box has a GPU, so nothing above may fire in the ordinary case."""
+        """On a box with a GPU, nothing above may fire in the ordinary case.
+
+        The only test in this class that needs one: the rest drive the
+        no-device path through ``monkeypatch``, which is the point — the
+        behaviour they cover is what happens on a machine like the CPU CI job,
+        so gating them on CUDA would test it nowhere.
+        """
         from oasr.jit import core
 
         assert core._detect_cuda_arch() is not None
