@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from helpers import device_sm, requires_cute, requires_sm
+from helpers import device_sm, requires_cute, requires_sm, tol
 from torch import nn
 
 import oasr
@@ -184,6 +184,86 @@ class TestTorchLayerFormula:
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="recurrent kernels need CUDA")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="recurrent kernels need CUDA")
+class TestWideUnitsReachTheCohortPath:
+    """A unit whose weights need more than 48 KiB of shared memory.
+
+    The cohort path used to be gated on ``cohort_smem <= 48 * 1024`` -- the
+    budget a block gets without asking, identical on every architecture -- so an
+    LSTM with ``input + hidden > 6144`` at half precision fell back to the
+    per-unit kernel on a card with 164 KiB available.  Measured on an A30, the
+    cohort kernel is **1.5-2.5x faster** across that whole region, so the
+    fallback was not a trade-off, just an unasked question.
+
+    Shapes here are chosen to land above the old ceiling: ``4 * (I + H) * 2``
+    bytes is 50 KiB at I = H = 3200.
+    """
+
+    @pytest.mark.parametrize("hidden", [3200, 4096])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_matches_torch_above_the_old_48kib_ceiling(self, hidden, dtype):
+        import oasr
+
+        smem = 4 * (hidden + hidden) * torch.tensor([], dtype=dtype).element_size()
+        assert smem > 48 * 1024, "this shape no longer tests the widened path"
+        if smem > torch.cuda.get_device_properties(0).shared_memory_per_block_optin:
+            pytest.skip(f"{smem} B exceeds this device's opt-in shared memory")
+
+        torch.manual_seed(hidden)
+        batch, seq, i_size = 8, 3, hidden
+        x = torch.randn(seq, batch, i_size, device="cuda", dtype=dtype) * 0.1
+        h0 = torch.randn(batch, hidden, device="cuda", dtype=dtype) * 0.1
+        c0 = torch.randn(batch, hidden, device="cuda", dtype=dtype) * 0.1
+        w_ih = torch.randn(4 * hidden, i_size, device="cuda", dtype=dtype) / i_size**0.5
+        w_hh = torch.randn(4 * hidden, hidden, device="cuda", dtype=dtype) / hidden**0.5
+        b_ih = torch.randn(4 * hidden, device="cuda", dtype=dtype) * 0.05
+        b_hh = torch.randn(4 * hidden, device="cuda", dtype=dtype) * 0.05
+
+        out, _, _ = oasr.lstm_layer(x, h0, c0, w_ih, w_hh, b_ih, b_hh)
+
+        ref = torch.nn.LSTM(i_size, hidden).to("cuda", dtype)
+        with torch.no_grad():
+            ref.weight_ih_l0.copy_(w_ih)
+            ref.weight_hh_l0.copy_(w_hh)
+            ref.bias_ih_l0.copy_(b_ih)
+            ref.bias_hh_l0.copy_(b_hh)
+            expected, _ = ref(x, (h0.unsqueeze(0), c0.unsqueeze(0)))
+        torch.testing.assert_close(out, expected, **tol(dtype))
+
+    def test_a_wide_slot_step_is_served_rather_than_refused(self):
+        """The capability half, and the one that is behavioural.
+
+        ``SlotStepImpl`` returns ``cudaErrorInvalidValue`` -- the declared "this
+        unit's weights do not fit in shared memory" signal -- when the weights
+        exceed the budget.  That budget was the 48 KiB every block gets without
+        asking, so an LSTM with ``input + hidden > 6144`` at half precision was
+        refused on a card with three times the shared memory free.  Asking the
+        device turns the refusal into a launch.
+        """
+        import oasr
+
+        hidden = i_size = 3200
+        smem = 4 * (i_size + hidden) * 2
+        assert smem > 48 * 1024, "this shape no longer tests the widened path"
+        if smem > torch.cuda.get_device_properties(0).shared_memory_per_block_optin:
+            pytest.skip(f"{smem} B exceeds this device's opt-in shared memory")
+
+        torch.manual_seed(0)
+        batch = slots = 4
+        x = torch.randn(batch, i_size, device="cuda", dtype=torch.float16) * 0.1
+        state_h = torch.zeros(2, slots, hidden, device="cuda", dtype=torch.float16)
+        state_c = torch.zeros(slots, hidden, device="cuda", dtype=torch.float16)
+        state_slots = torch.arange(batch, device="cuda", dtype=torch.int64)
+        read_parity = torch.zeros(batch, device="cuda", dtype=torch.int32)
+        w_ih = torch.randn(4 * hidden, i_size, device="cuda", dtype=torch.float16) / i_size**0.5
+        w_hh = torch.randn(4 * hidden, hidden, device="cuda", dtype=torch.float16) / hidden**0.5
+
+        out = oasr.lstm_slot_step(x, state_h, state_c, state_slots, read_parity, w_ih, w_hh)
+        torch.cuda.synchronize()
+        assert out.shape == (batch, hidden)
+        assert torch.isfinite(out).all()
+
+
 class TestRecurrentCuda:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(

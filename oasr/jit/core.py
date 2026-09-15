@@ -10,6 +10,7 @@ Mirrors FlashInfer's JIT architecture:
 
 import hashlib
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,11 +31,55 @@ logger = logging.getLogger("oasr.jit")
 # ---------------------------------------------------------------------------
 
 
-def _get_cuda_arch() -> Tuple[int, int]:
-    """Detect the compute capability of the current CUDA device.
+#: What :func:`_get_cuda_arch` reports when nothing could be detected.
+#:
+#: It exists so ``import oasr`` works on a machine with no GPU: the JIT config
+#: generators resolve a target SM at *import* time (``jit.gemm``'s
+#: ``GEMM_DEFAULT``, ``jit.conv``'s ``CONV2D_DEFAULT``), and the CPU test job
+#: imports the package.  It is **not** a target anything may be compiled for —
+#: see :func:`require_known_cuda_arch`.
+_ASSUMED_ARCH = (8, 0)
 
-    Returns (major, minor), e.g. (8, 0) for SM80.
+
+def _arch_from_env() -> Optional[Tuple[int, int]]:
+    """``OASR_CUDA_ARCH_LIST`` as a single JIT target, or ``None``.
+
+    Only a **single-entry** list is honoured here, and that is the whole rule.
+    The JIT builds one module for one architecture, so a one-entry list is
+    unambiguous cross-compilation intent — the escape hatch for a build box with
+    no GPU.  Two or more entries cannot mean "the JIT target"; that is an AOT
+    concern (``CompilationContext`` reads the same variable for the flags it
+    contributes), so this leaves detection alone rather than silently picking
+    the first and compiling for the wrong card.
     """
+    raw = os.environ.get("OASR_CUDA_ARCH_LIST", "").strip()
+    if not raw:
+        return None
+    tokens = raw.replace(",", " ").split()
+    if len(tokens) != 1:
+        return None
+    token = tokens[0].rstrip("af")  # the 9.0a / 10.0f suffixes are a codegen detail
+    try:
+        major, _, minor = token.partition(".")
+        return (int(major), int(minor or 0))
+    except ValueError:
+        logger.warning("OASR_CUDA_ARCH_LIST=%r is not a compute capability; ignoring.", raw)
+        return None
+
+
+def _detect_cuda_arch() -> Optional[Tuple[int, int]]:
+    """The running device's compute capability, or ``None`` if nothing answered.
+
+    ``None`` is the point.  This used to return ``(8, 0)`` when both probes
+    failed, which is a real architecture — so a box where CUDA was invisible
+    compiled ``-gencode arch=compute_80`` and produced a library that would not
+    run on whatever card eventually appeared.  Nothing reported it: the arch
+    flags are in ``JitSpec._content_hash``, so the cache was not poisoned, and
+    the guess was indistinguishable from an A100.
+    """
+    arch = _arch_from_env()
+    if arch is not None:
+        return arch
     try:
         import torch
 
@@ -56,7 +101,38 @@ def _get_cuda_arch() -> Tuple[int, int]:
         major, minor = out.split(".")
         return (int(major), int(minor))
     except Exception:
-        return (8, 0)  # Safe default: SM80 (Ampere)
+        return None
+
+
+def _get_cuda_arch() -> Tuple[int, int]:
+    """Compute capability of the current CUDA device, or :data:`_ASSUMED_ARCH`.
+
+    Callers that are about to *compile* must not use the assumption; they call
+    :func:`require_known_cuda_arch` first.
+    """
+    return _detect_cuda_arch() or _ASSUMED_ARCH
+
+
+def require_known_cuda_arch(what: str) -> None:
+    """Refuse to build *what* when the target architecture is a guess.
+
+    The guess belongs at probe time and nowhere else.  ``import oasr`` has to
+    work on a CPU box — the JIT config generators resolve a target SM at import
+    — so :func:`_get_cuda_arch` still answers.  Producing a ``.so`` is the point
+    where that stops being harmless: the gencode is baked in, and a library
+    built for an assumed sm_80 either fails to load or runs the wrong kernels on
+    the card that actually turns up.
+    """
+    if _detect_cuda_arch() is not None:
+        return
+    raise RuntimeError(
+        f"cannot compile {what}: no CUDA device was detected (torch reports none "
+        f"and nvidia-smi did not answer), so the target architecture is unknown. "
+        f"OASR will not guess one — a library built for an assumed "
+        f"sm_{_ASSUMED_ARCH[0]}{_ASSUMED_ARCH[1]} would not run on another card. "
+        f"Build on the target machine, or set OASR_CUDA_ARCH_LIST to a single "
+        f'compute capability (e.g. OASR_CUDA_ARCH_LIST="9.0").'
+    )
 
 
 #: Raw compute capability -> the kernel family compiled for it.
@@ -242,6 +318,7 @@ class JitSpec:
 
     def _compile(self, lib_path: str) -> None:
         """Compile sources into a shared library using Ninja."""
+        require_known_cuda_arch(f"module {self.name!r}")
         lib_path = Path(lib_path)
         build_dir = lib_path.parent
         build_dir.mkdir(parents=True, exist_ok=True)
