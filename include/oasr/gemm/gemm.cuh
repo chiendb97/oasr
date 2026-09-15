@@ -39,7 +39,7 @@ static GemmStatus dispatchGemmWithSmVersion(const ElementA* A_ptr, const Element
                                           int K, uint64_t lda, uint64_t ldb, uint64_t ldc,
                                           float alpha, cudaStream_t stream, int split_k_slices = 1) {
     if constexpr (SM_VERSION == 75) {
-        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 75>;
+        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 2, 75>;
         return CutlassGemmKernel<Config, ElementA, ElementB, ElementCD, activation_type>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N, K, lda, ldb, ldc, alpha, stream, split_k_slices);
     } else if constexpr (SM_VERSION == 80) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 80>;

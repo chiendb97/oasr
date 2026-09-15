@@ -638,16 +638,25 @@ def _add_k_decompositions(
 
 
 def _get_sm75_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM75 (Turing): kStages ∈ {2,3}, tiles from _GEMM_TILES.
+    """SM75 (Turing): kStages = 2 only, tiles from _GEMM_TILES.
 
-    The ``[2, 3]`` is a live defect, not a description: Turing's
-    ``kernel::DefaultGemm`` tensor-op specialisation exists at two stages and no
-    other, so every ``_s3`` variant this emits fails to compile and takes the
-    whole module with it (audit A10 — untouched here, a different concern).  The
-    K-decompositions added below are deliberately *not* built at three stages for
-    exactly that reason, so this change adds no new broken TU to Turing.
+    Two is not a preference, it is the whole specialisation: CUTLASS's
+    ``kernel::DefaultGemm`` for ``arch::Sm75`` + ``OpClassTensorOp`` exists at two
+    pipeline stages and no other count, so a three-stage variant does not fail to
+    *run*, it fails to compile --
+
+        cutlass/gemm/device/gemm.h(264): error: incomplete type
+          "cutlass::gemm::kernel::DefaultGemm<... 3, 75 ...>"
+
+    -- and one unbuildable TU fails the whole module, so this list read ``[2, 3]``
+    and took `gemm`, `bmm`, `group_gemm` and `gemm_log_softmax` down together on
+    Turing.  The rest of the tree already knew: ``default_config_for_sm`` returns
+    ``kStages=2`` for sm_75 and says in its comment that this function "emits only
+    ``_s2`` variants", ``RecurrentArch<75>`` sets two for the same reason, and the
+    K-decompositions below are built at two for the same reason again.  Only this
+    one list had never been re-read against the constraint it was describing.
     """
-    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [2, 3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[75])
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [2], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[75])
     return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[75])
 
 

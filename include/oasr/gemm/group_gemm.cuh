@@ -57,7 +57,7 @@ static GemmStatus dispatchGroupGemmWithSmVersion(int problem_count, int K, int N
     GroupedGemmProblemDesc<ElementA, ElementB, ElementCD> problem_desc(problem_count, K, N, A_ptr,
                                                                        B_ptr, D_ptr, offsets_host);
     if constexpr (SM_VERSION == 75) {
-        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 75>;
+        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 2, 75>;
         return CutlassGroupGemmKernel<Config, ElementA, ElementB, ElementCD>::run(problem_desc, problem_count, stream);
     } else if constexpr (SM_VERSION == 80) {
         using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 80>;

@@ -56,7 +56,7 @@ static GemmStatus dispatchGemmLogSoftmax(const ElementA* A_ptr, const ElementB* 
                                          float alpha, cudaStream_t stream, int split_k_slices) {
     GemmStatus status;
     if constexpr (SM_VERSION == 75) {
-        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 3, 75>;
+        using Config = CutlassGemmConfig<16, 128, 64, 16, 32, 64, 2, 75>;
         status = CutlassGemmKernel<Config, ElementA, ElementB, ElementCD,
                                    ActivationType::IDENTITY>::run(A_ptr, B_ptr, C_ptr, D_ptr, M, N,
                                                                   K, lda, ldb, ldc, alpha, stream,
