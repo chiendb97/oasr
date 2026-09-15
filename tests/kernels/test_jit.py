@@ -569,6 +569,111 @@ class TestKDecompositionsAreArchUniform:
         assert len(sk80) >= len(sk86)
 
 
+class TestTuringIsTwoStageOnly:
+    """Nothing in the GEMM family may ask ``arch::Sm75`` for three pipeline stages.
+
+    CUTLASS specialises ``kernel::DefaultGemm`` for ``Sm75`` + ``OpClassTensorOp``
+    at **two** stages and no other count, so a three-stage Turing variant does not
+    run slower, it fails to compile -- and one unbuildable TU fails the whole
+    module.  Four places asked anyway, from two unrelated directions:
+
+    * ``_get_sm75_configs`` emitted ``[2, 3]``, which took `gemm`, `bmm`,
+      `group_gemm` and `gemm_log_softmax` down together;
+    * the BMM **general lane**'s ``kGeneralStages`` was a flat 3 -- a genuine
+      Ampere measurement (the deep-K win *is* the ``cp.async`` overlap, and sm_75
+      has no ``cp.async``) applied to a card where it is not a choice;
+    * and three ``if constexpr (SM_VERSION == 75)`` dispatch tiles hardcoded a 3.
+
+    The rest of the tree already knew — ``default_config_for_sm`` returns
+    ``kStages=2`` for sm_75 and says so in a comment, ``RecurrentArch<75>`` sets
+    two, and A6's K-decomposition table builds Turing at two.  These are the
+    tests that would have noticed the disagreement.
+
+    Pure Python and source-level, so the CPU job holds the line for a card nobody
+    has; the C++ side is gated by compiling every emitted TU
+    (``.artifacts/arch_portability_audit.md`` § A10).
+    """
+
+    def test_the_config_space_emits_only_two_stage_variants(self):
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        offenders = {
+            name: cfg.kStages
+            for name, cfg in get_unique_compile_configs(75).items()
+            if cfg.kStages != 2
+        }
+        assert not offenders, (
+            f"sm_75 emits {len(offenders)} variant(s) CUTLASS cannot build: {offenders}. "
+            f"kernel::DefaultGemm's Sm75 tensor-op specialisation is two-stage only."
+        )
+
+    def test_the_space_is_not_empty(self):
+        """The other way to satisfy the test above: emit nothing at all."""
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        configs = get_unique_compile_configs(75)
+        assert len(configs) >= 12, f"sm_75 emits only {len(configs)} variants"
+
+    def test_the_default_survives_the_narrowing(self):
+        """Dropping the 3-stage half must not drop what the un-tuned path asks for."""
+        from oasr.jit.gemm import default_config_for_sm, get_unique_compile_configs
+
+        default = default_config_for_sm(75)
+        assert default.kStages == 2
+        assert default.compile_name in get_unique_compile_configs(75)
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "include/oasr/gemm/gemm.cuh",
+            "include/oasr/gemm/group_gemm.cuh",
+            "include/oasr/gemm/gemm_log_softmax.cuh",
+        ],
+    )
+    def test_no_gemm_dispatch_tile_asks_turing_for_three_stages(self, header):
+        """``CutlassGemmConfig<..., Stages, 75>`` with Stages != 2 is a build break.
+
+        Two of these three are not currently instantiated — ``csrc/gemm.cu`` and
+        ``csrc/group_gemm.cu`` are in no JIT module — which is exactly why they
+        kept the wrong constant while the third took a module down. A latent copy
+        of a known-broken line is worth the same one token as the live one.
+        """
+        from helpers import REPO_ROOT
+
+        src = (REPO_ROOT / header).read_text()
+        offenders = [
+            ln.strip()
+            for ln in src.splitlines()
+            if "CutlassGemmConfig<" in ln and ln.rstrip().endswith("75>;") and ", 2, 75>" not in ln
+        ]
+        assert not offenders, offenders
+
+    def test_the_bmm_general_lane_drops_to_two_on_turing(self):
+        """``kGeneralStages`` is a measured 3 on Ampere and later, and must be
+        conditional rather than constant — the measurement's own reasoning
+        (``cp.async`` multistage overlap) does not exist on sm_75."""
+        from helpers import REPO_ROOT
+
+        src = (REPO_ROOT / "include/oasr/gemm/bmm.cuh").read_text()
+        block = src[src.index("constexpr int kGeneralStages") - 200 :]
+        block = block[: block.index("#endif") + 6]
+        assert "OASR_TARGET_SM < 80" in block, block
+        assert "kGeneralStages = 2" in block and "kGeneralStages = 3" in block, block
+
+    def test_conv_keeps_its_three_stage_turing_tile(self):
+        """The one 3-stage sm_75 config that is *correct*, and must not be "fixed".
+
+        CUTLASS's conv is not its GEMM: ``DefaultConv2dFprop`` does have an Sm75
+        multistage specialisation, and the conv2d module builds all 12 of its
+        sm_75 TUs with this tile. A reader arriving with the audit note in hand
+        would change it to match the others; this says why not.
+        """
+        from helpers import REPO_ROOT
+
+        src = (REPO_ROOT / "include/oasr/conv/conv2d.cuh").read_text()
+        assert "CutlassConv2dConfig<16, 128, 64, 16, 32, 64, 3, 75>" in src
+
+
 class TestCutlass2xArchTagIsInstantiable:
     """A JIT target must name a CUTLASS tag that CUTLASS can build for half.
 

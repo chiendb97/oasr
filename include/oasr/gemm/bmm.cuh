@@ -224,7 +224,19 @@ constexpr int kThinNThreshold = ThinNTile::ThreadblockShape::kN;
 /// on the deep-K ones, where the ``cp.async`` multistage overlap is the whole
 /// point.  Keying stages on K as well would double the instantiation grid for
 /// ~2% geomean, so K wins and the shallow products keep the deeper pipeline.
+///
+/// On **Turing it is not a choice at all.**  That measurement is an Ampere one
+/// in its own terms -- the deep-K win *is* the ``cp.async`` overlap, and sm_75
+/// has no ``cp.async`` -- and CUTLASS agrees structurally: ``kernel::DefaultGemm``
+/// for ``arch::Sm75`` + ``OpClassTensorOp`` is specialised at two stages and no
+/// other, so three does not run slower there, it fails to compile
+/// (``gemm_batched.h(249): error: incomplete type "…DefaultGemm<…>"``) and takes
+/// the whole bmm module with it.  Two is what Turing runs either way.
+#if defined(OASR_TARGET_SM) && OASR_TARGET_SM < 80
+constexpr int kGeneralStages = 2;
+#else
 constexpr int kGeneralStages = 3;
+#endif
 
 constexpr int ceilDiv(int a, int b) {
     return (a + b - 1) / b;
