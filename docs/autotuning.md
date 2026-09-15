@@ -70,9 +70,10 @@ Autotuning is available for operations backed by CUTLASS tile variants:
 | `conv2d_activation` | Fused Conv2D + activation                     |
 
 In addition to the CUTLASS tile variants, the GEMM ops register a **torch/cuBLAS**
-candidate (`Tactic("torch")`) — cuBLAS wins on some thin shapes — and, on SM120,
-two K-decompositions that fill the GPU on thin/deep-K GEMMs where the
-data-parallel grid leaves SMs idle:
+candidate (`Tactic("torch")`) — cuBLAS wins on some thin shapes — and, on every
+architecture served by the CUTLASS 2.x lane (sm_75 / 80 / 86 / 89 / 120), two
+K-decompositions that fill the GPU on thin/deep-K GEMMs where the data-parallel
+grid leaves SMs idle:
 
 * **Stream-K** (`stream_k=1`; `GemmUniversal` + `ThreadblockSwizzleStreamK`) —
   balances the K-reduction across all SMs with an in-kernel fixup.  Set
@@ -80,6 +81,24 @@ data-parallel grid leaves SMs idle:
 * **Parallel split-K** (`parallel_split_k=1`; `GemmSplitKParallel`) — fp32
   partials + a reduction kernel that applies the (possibly activation-fused)
   epilogue exactly once.  Set `OASR_GEMM_SPLITK_PARALLEL=0` to exclude.
+
+Both were reachable on SM120 alone until 2026-09-14, because the two blocks that
+build them sat inside `_get_sm120_configs`. That made the two environment
+variables above inert everywhere else despite being documented as global build
+knobs, and it mattered most for **`gemm_activation`**: serial split-K applies its
+epilogue per K-partition, so it cannot fuse an activation and the autotuner
+refuses it, leaving parallel split-K as the only valid decomposition — and it was
+not in the space. An A100 therefore had *zero* valid split-K candidates for a
+fused-activation GEMM. They are now built per SM family
+(`jit.gemm._SM_STREAMK_STAGES`, `_SM_SPLITK_PARALLEL_STAGES`), each architecture's
+own shared-memory budget deciding which tiles survive.
+
+Pipeline depth is per family and is not a preference on Turing: `kernel::DefaultGemm`'s
+sm_75 tensor-op specialisation exists at **two** stages and no other, for these
+decompositions exactly as for the plain path, so sm_75 builds them at 2 stages only.
+
+SM90 and SM100 take the CUTLASS 3.x lane, whose collective mainloop pipelines K
+itself; neither decomposition applies there and neither is generated.
 
 Serial split-K (`split_k > 1` on a plain config) runs as a **single kernel
 launch**: the per-tile semaphores live in a persistent pre-zeroed workspace
