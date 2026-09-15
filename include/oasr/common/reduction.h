@@ -88,7 +88,7 @@ __device__ __forceinline__ T warpReduceMax(T val) {
     T max_val = val;
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        max_val = max(max_val, __shfl_xor_sync(0xffffffff, val, offset));
+        max_val = max(max_val, __shfl_xor_sync(0xffffffff, max_val, offset));
     }
     return max_val;
 }
