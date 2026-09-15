@@ -13,6 +13,8 @@ import logging
 import os
 from typing import Optional, Tuple, cast
 
+from .measured import Machine, MeasuredOn, note_extrapolation
+
 logger = logging.getLogger("oasr.jit.mlp")
 
 # ---------------------------------------------------------------------------
@@ -126,6 +128,29 @@ _CANDIDATES: tuple = (
     (64, ((64, 64, 64, 4, 256, 4), (64, 64, 32, 4, 128, 4))),
 )
 
+#: Where the candidate list came from — *not* how one is chosen from it.
+#:
+#: The choice is derived: :func:`select_gated_mlp_tile` scores candidates by wave
+#: count against this machine's ``multi_processor_count`` and real opt-in shared
+#: memory, so it follows the card it runs on.  That is the half of this module
+#: that travels, and it was written that way because a rows-keyed table tuned at
+#: N=18944 picked a one-CTA-per-SM ring that left 172 CTAs on 170 SMs — one wave
+#: plus a tail of two — and read 0.987x end to end.
+#:
+#: What does not travel is which six tiles are in the list at all, and the rank
+#: used to break a wave-count tie.  Both were chosen on one card.  A tile that
+#: would win only on a machine with a different smem budget or SM count is not in
+#: the list to be scored, and no amount of wave arithmetic can find it.
+_MEASURED = MeasuredOn(
+    table="jit.mlp._CANDIDATES",
+    machine=Machine(name="NVIDIA GeForce RTX 5090", sm=120, sms=170),
+    bandwidth="1792 GB/s",
+    source=".artifacts/ (2026-08-25)",
+    moves_with="shared-memory budget and SM count — they decide which rings fit "
+    "and how many CTAs are resident, so a different card may want a tile this "
+    "list does not contain. The choice *among* these is already derived",
+)
+
 #: Inclusive row band the fused kernel owns: **one m-tile**.
 #:
 #: That is the whole rule, and it is mechanical rather than fitted.  With a
@@ -135,7 +160,15 @@ _CANDIDATES: tuple = (
 #: twice, and it is competing with cuBLAS on cuBLAS's own terms -- which it
 #: loses, because the ring carries A *and both* Bs and cannot afford the tiles a
 #: library GEMM picks.
-_BAND_MAX_ROWS = 64
+#:
+#: Derived from the candidate list rather than written down next to it.  The rule
+#: is "one m-tile", so the band *is* the largest m-tile that exists — they were
+#: two numbers that happened to agree, and agreeing is not the same as being
+#: linked (audit A8).  A 128-row candidate added for its own sake would have
+#: widened what the kernel can do and left the band at 64, quietly declining the
+#: very shapes it was added for; now widening the list widens the band, which is
+#: the only relationship the argument above supports.
+_BAND_MAX_ROWS = max(m_max for m_max, _ in _CANDIDATES)
 
 #: Hardware ceiling on resident blocks per SM; the tiles here never approach it,
 #: but leaving it out would let a hypothetical tiny tile claim absurd occupancy.
@@ -198,9 +231,14 @@ def select_gated_mlp_tile(rows: int, n: int) -> Optional[Tuple[int, ...]]:
     ------------------------------------------------
     The kernel is bandwidth bound, so the thing that decides its time is whether
     the *last* wave still has enough CTAs in flight to saturate DRAM.
+
+    The scoring reads this machine, so it travels; the *list* it scores was
+    measured on one card, so it does not.  :data:`_MEASURED` records which, and
+    off that card the fact is counted rather than assumed away (audit A8).
     """
     if rows <= 0 or n <= 0:
         return None
+    note_extrapolation(_MEASURED)
     candidates = _CANDIDATES[-1][1]
     for m_max, tiles in _CANDIDATES:
         if rows <= m_max:

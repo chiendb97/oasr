@@ -64,6 +64,8 @@ import logging
 import os
 from typing import Optional, Tuple, cast
 
+from .measured import Machine, MeasuredOn, note_extrapolation
+
 logger = logging.getLogger("oasr.jit.recurrent_cute")
 
 _ENV = "OASR_RECURRENT_CUTE"
@@ -145,6 +147,35 @@ _LSTM_BANDS: tuple = (
     (768, (1, 256)),
     (1536, (1, 64)),
     (1 << 30, (1, 32)),
+)
+
+#: Where the two tables above came from.
+#:
+#: Both are fixed ``(hidden, batch)`` cut-offs, and a cut-off is the one kind of
+#: routing decision in this package that does *not* travel: the tile choice in
+#: ``jit.mlp`` reads ``multi_processor_count`` and the real opt-in smem and does
+#: wave arithmetic against them, so it follows the machine, whereas a number
+#: somebody timed follows the machine it was timed on.  The supported set here is
+#: sm_80 / 86 / 89 / 120 — an A30 at 56 SMs and 933 GB/s, an A100 at 108 and
+#: 1555, an L40S at 142 and 864, a 5090 at 170 and 1792 — and the band is applied
+#: identically on all four.
+#:
+#: It still applies, because what the band encodes is not arbitrary: at the small
+#: end the step is at the weight-read bandwidth floor (B=16, H=640 is 3.28 MB,
+#: L2 delivers it in ~3.3 us against 3.56 measured) and at the large end a tuned
+#: library GEMM keeps a 7-11% mainloop edge.  Which side wins at each extreme is
+#: a property of the algorithm.  Where the two meet is a property of the machine,
+#: and *that* is what this record is about: off the measured card the boundary is
+#: an extrapolation, and :func:`oasr.jit.measured.note_extrapolation` makes it say
+#: so once instead of never.
+_MEASURED = MeasuredOn(
+    table="jit.recurrent_cute._LSTM_BANDS / _TILES",
+    machine=Machine(name="NVIDIA GeForce RTX 5090", sm=120, sms=170),
+    bandwidth="1792 GB/s",
+    source=".artifacts/recurrent_cute_envelope.md (2026-08-23)",
+    moves_with="SM count and memory bandwidth — both edges of the band are set by "
+    "them, the small one by the weight read and the large one by when a library "
+    "GEMM's mainloop starts to win",
 )
 
 
@@ -230,6 +261,11 @@ def should_use(gate_count: int, hidden: int, batch: int) -> bool:
         return True
     if gate_count != 4:
         return False
+    # Consulting the band on a card it was not measured on is an extrapolation.
+    # Say so once and count it, rather than let a number timed on one GPU look
+    # like a property of the kernel (audit A8).  This is reached once per shape:
+    # ``routed_step`` memoises the whole decision.
+    note_extrapolation(_MEASURED)
     for width, (low, high) in _LSTM_BANDS:
         if hidden <= width:
             return bool(low <= batch <= high)

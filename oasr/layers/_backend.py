@@ -191,9 +191,10 @@ def policy_hits() -> Dict[str, int]:
 def reset_backend_stats() -> None:
     """Clear the counters (per-test isolation, per-benchmark accounting).
 
-    Includes the GEMM rule-miss table and both shape-aware heuristics'
-    untuned-architecture counters, so ``reset`` → run → report stays one call for
-    everything :func:`format_gap_report` prints.
+    Includes the GEMM rule-miss table, both shape-aware heuristics'
+    untuned-architecture counters and the tuned-table extrapolation record, so
+    ``reset`` → run → report stays one call for everything
+    :func:`format_gap_report` prints.
     """
     _GAP_HITS.clear()
     _POLICY_HITS.clear()
@@ -210,13 +211,23 @@ def reset_backend_stats() -> None:
         reset_heuristic_stats()
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from oasr.jit.measured import reset_extrapolations
+
+        reset_extrapolations()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def format_gap_report() -> str:
-    """Human-readable summary of what did not reach a kernel, and why.
+    """Human-readable summary of what did not reach a kernel — or reached an
+    untuned one — and why.
 
-    Deliberately separates the three categories: a gap is debt, a policy hit is
-    a decision, an out-of-scope hit is neither.
+    Deliberately separates the categories, because the action differs for each.
+    A gap is debt; a policy hit is a decision; an out-of-scope hit is neither. A
+    shape with no rule wants that shape tuned and an architecture with no table
+    wants a sweep. And a table measured on another GPU is none of those: it was
+    tuned, carefully, somewhere else.
     """
     lines = [f"oasr.layers backend: {layers_backend()}"]
     if _GAP_HITS:
@@ -271,6 +282,25 @@ def format_gap_report() -> str:
             for sm, calls in sorted(counts.items()):
                 lines.append(f"    {label:<18} sm{sm:<5} x{calls}")
         lines.append("    tune this card with → scripts/tune_asr_gemm.py")
+    # And a fifth: a table that *was* tuned, on somebody else's GPU.  A fixed
+    # (hidden, batch) cut-off encodes a crossover between a weight-streaming
+    # kernel and a library GEMM, and that crossover is a function of SM count and
+    # memory bandwidth -- an A30, an A100, an L40S and a 5090 put it in four
+    # places.  The routing still uses it, because which side wins at each extreme
+    # is a property of the algorithm; what is unknown off the measured card is
+    # where the two meet.  Saying "extrapolated" is the difference between a
+    # number somebody can re-measure and a number nobody knows to question.
+    try:
+        from oasr.jit.measured import extrapolations
+
+        extrapolated = extrapolations()
+    except Exception:  # noqa: BLE001 — diagnostics must never break the caller
+        extrapolated = {}
+    if extrapolated:
+        lines.append("  routing tables measured on another GPU (applied as an extrapolation):")
+        for table, where in sorted(extrapolated.items()):
+            lines.append(f"    {table}")
+            lines.append(f"    {'':<4}{where}")
     return "\n".join(lines)
 
 

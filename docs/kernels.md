@@ -460,6 +460,38 @@ The *tile* inside the band is chosen by `N` rather than by `M` — see
 `select_gated_mlp_tile`, and the ten lines of it that exist because a rows-keyed table lost
 10% at one model width.
 
+### Which routing decisions travel, and which are extrapolations
+
+The routing splits cleanly in two, and only one half follows the card it runs on:
+
+| | reads the machine | example |
+|---|---|---|
+| **derived** | yes | `gated_mlp_ctas_per_sm` takes `multi_processor_count`, the real opt-in shared memory and `max_threads_per_multi_processor`, and `select_gated_mlp_tile` does wave arithmetic against them; `selectBmmTile` takes `getDeviceMultiProcessorCount()` |
+| **measured** | no | `_LSTM_BANDS`'s `(hidden, batch)` cut-offs, the `_TILES` ranking, the gated-MLP candidate list — timed once and written down |
+
+A measured cut-off is neither wrong nor a guess; it is the best available
+estimate. But the crossover it encodes is a function of SM count and memory
+bandwidth, and the supported set — sm_80, sm_86, sm_89, sm_120 — spans an A30
+(56 SMs, 933 GB/s), an A100 (108, 1555), an L40S (142, 864) and an RTX 5090
+(170, 1792). All four got the same numbers, with nothing saying whose they were.
+
+`oasr/jit/measured.py` is where each table now names the GPU it was timed on, the
+note holding the protocol, and what moves the crossover. Off that card the table
+still applies — which side wins at each extreme is a property of the algorithm,
+only the boundary between them is a property of the machine — but the fact is
+logged once and reported by `oasr.layers.format_gap_report()`:
+
+```
+  routing tables measured on another GPU (applied as an extrapolation):
+    jit.recurrent_cute._LSTM_BANDS / _TILES
+        measured on NVIDIA GeForce RTX 5090 (sm_120, 170 SMs), 1792 GB/s; running on NVIDIA A30 (sm_80, 56 SMs)
+```
+
+Identity is `(compute capability, SM count)`, both queried exactly. Bandwidth is
+deliberately *not* computed from `memory_clock_rate × bus_width`: that formula is
+right for HBM and GDDR6 and wrong for GDDR7, so on an RTX 50-series card it would
+report the measured machine as an extrapolation of itself.
+
 ## Utilities
 
 `oasr/utils/`:
