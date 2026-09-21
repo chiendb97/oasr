@@ -35,11 +35,17 @@ logger = logging.getLogger("oasr.jit.attention")
 # ---------------------------------------------------------------------------
 
 _BACKEND_ENV = "OASR_ATTN_BACKEND"
-_VALID_BACKENDS = ("sdpa", "cute", "auto")
+#: ``cute`` keeps meaning the CuTeDSL kernel: it is the spelling in AGENTS.md,
+#: docs/kernels.md and every recorded A/B command in `.artifacts/fmha_tuning.md`,
+#: so repointing it would silently change what those measurements measured.
+#: The C++ CUTLASS/CuTe lane is ``cxx``.
+_VALID_BACKENDS = ("sdpa", "cute", "cxx", "auto")
+_BACKEND_ALIASES = {"cutedsl": "cute", "cpp": "cxx", "cutlass": "cxx"}
 
 
 def _read_backend_mode() -> str:
     mode = os.environ.get(_BACKEND_ENV, "auto").lower()
+    mode = _BACKEND_ALIASES.get(mode, mode)
     if mode not in _VALID_BACKENDS:
         logger.warning(
             "%s=%r is invalid; valid choices are %s. Falling back to 'auto'.",
@@ -60,13 +66,20 @@ _RESOLVED_BACKEND: Optional[str] = None
 
 
 def get_backend_mode() -> str:
-    """Return the currently selected backend mode (``sdpa`` / ``cute`` / ``auto``)."""
+    """Return the backend mode (``sdpa`` / ``cute`` / ``cxx`` / ``auto``)."""
     return _BACKEND_MODE
 
 
 def set_backend_mode(mode: str) -> None:
-    """Override the backend mode for the rest of the process. Mostly useful in tests."""
+    """Override the backend mode for the rest of the process. Mostly useful in tests.
+
+    Note this clears the CuTeDSL compile cache, so flipping modes in a loop
+    re-compiles that kernel every time.  For an in-process A/B -- a parametrised
+    fixture, a differential test, an interleaved benchmark arm -- pass
+    ``backend=`` to :func:`oasr.fmha` instead and leave the global alone.
+    """
     global _BACKEND_MODE, _RESOLVED_BACKEND
+    mode = _BACKEND_ALIASES.get(mode, mode)
     if mode not in _VALID_BACKENDS:
         raise ValueError(f"invalid backend mode {mode!r}; valid: {_VALID_BACKENDS}")
     _BACKEND_MODE = mode
@@ -75,6 +88,14 @@ def set_backend_mode(mode: str) -> None:
     _compiled_fmha.cache_clear()
     _capability_probe.cache_clear()
     fmha_config_supported.cache_clear()
+    fmha_backend_for.cache_clear()
+    fmha_cxx_supports.cache_clear()
+    try:
+        from oasr.jit import fmha as _fmha_cxx
+
+        _fmha_cxx.clear_caches()
+    except ImportError:  # the C++ lane is optional; the arbiter must still import
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +148,14 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
     """Detect (major, minor) compute capability and which backend is usable.
 
     Returns ``((major, minor), backend)`` where ``backend`` is one of
-    ``"cute"`` / ``"sdpa"`` / ``None``. The first element is ``None`` if
-    no CUDA device is visible.
+    ``"cute"`` / ``"cxx"`` / ``"sdpa"``.  The first element is ``None`` if no
+    CUDA device is visible.
+
+    ``auto`` resolution order is ``cute`` then ``sdpa``.  The C++ lane is
+    **not** preferred by ``auto`` yet: it is reachable only by naming it
+    (``OASR_ATTN_BACKEND=cxx``) or per call (``oasr.fmha(..., backend="cxx")``)
+    until an interleaved A/B lands in ``.artifacts/``.  Flipping a default on
+    an unmeasured kernel is what this repo's own routing notes warn about.
     """
     try:
         import torch
@@ -143,6 +170,18 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
         return cap, "sdpa"
 
     sm = cap[0] * 10 + cap[1]
+
+    if _BACKEND_MODE == "cxx":
+        from oasr.jit import fmha as _fmha_cxx
+
+        if sm not in _fmha_cxx.SUPPORTED_SM:
+            raise NotImplementedError(
+                f"OASR_ATTN_BACKEND=cxx but the C++ CuTe attention lane is compiled for "
+                f"{_fmha_cxx.SUPPORTED_SM} only, not sm{sm}. "
+                f"Set OASR_ATTN_BACKEND=auto to fall back."
+            )
+        return cap, "cxx"
+
     cute_supported = sm in (80, 86, 89, 120)
     if cute_supported:
         # Try importing the per-arch backend; if CuteDSL isn't installed or
@@ -418,6 +457,7 @@ def fmha_config_supported(
     num_threads: int = 128,
     bias_aligned: bool = False,
     causal: bool = False,
+    local: bool = False,
 ) -> bool:
     """Would :func:`get_compiled_fmha` accept this configuration?
 
@@ -430,7 +470,29 @@ def fmha_config_supported(
     own ``can_implement``, so it cannot go stale as the kernel gains shapes.
     """
     cap = _capability_probe()[0]
-    if cap is None or select_backend() != "cute":
+    if cap is None:
+        return False
+    backend = select_backend()
+    if backend == "cxx":
+        # Answer for the backend that will actually run.  The waist asks this
+        # *before* building anything, so it has to reflect the lane the call
+        # will take, not whichever lane happens to be older.
+        from oasr.jit import fmha as _fmha_cxx
+
+        return _fmha_cxx.config_supported(
+            sm=cap[0] * 10 + cap[1],
+            dtype_str=dtype_str,
+            head_dim=head_dim,
+            paged=paged,
+            causal=causal,
+            local=local,
+        )
+    if backend != "cute":
+        return False
+    if local:
+        # The CuTeDSL kernel's `local` axis is the per-stream
+        # `[seqstart_k, seqlen_k)` pair, not a per-row sliding window.  There is
+        # no argument to pass one, so it cannot serve this at any shape.
         return False
     try:
         import cutlass
@@ -457,6 +519,82 @@ def fmha_config_supported(
         )
     except Exception:  # CuteDSL missing / probe failed -> SDPA is the answer
         return False
+
+
+@functools.cache
+def fmha_cxx_supports(
+    *,
+    head_dim: int,
+    dtype_str: str,
+    paged: bool = False,
+    causal: bool = False,
+    local: bool = False,
+) -> bool:
+    """Can the **C++** lane serve this shape, whichever lane is preferred?
+
+    :func:`fmha_config_supported` answers for the *selected* backend, which is
+    the right question when routing a call that has already chosen one.  This
+    is the other question -- "is there a lane that can do this at all?" -- and
+    it is what a degrade path needs, because the lane it is degrading *from*
+    is by definition the one that said no.
+    """
+    cap = _capability_probe()[0]
+    if cap is None:
+        return False
+    try:
+        from oasr.jit import fmha as _fmha_cxx
+    except ImportError:  # the C++ lane is optional
+        return False
+    return _fmha_cxx.config_supported(
+        sm=cap[0] * 10 + cap[1],
+        dtype_str=dtype_str,
+        head_dim=head_dim,
+        paged=paged,
+        causal=causal,
+        local=local,
+    )
+
+
+@functools.cache
+def fmha_backend_for(
+    *,
+    head_dim: int,
+    dtype_str: str,
+    paged: bool = False,
+    causal: bool = False,
+    local: bool = False,
+) -> str:
+    """Which backend will actually run this configuration under ``auto``.
+
+    :func:`select_backend` answers "which lane is preferred in this process",
+    which is a *mode* question and cannot see the shape.  This answers the
+    remaining one: whether the preferred lane can serve *this* call, and what
+    to degrade to when it cannot.
+
+    The case that forced it into existence is the sliding window.  It is a
+    capability the C++ lane has and the CuTeDSL one structurally does not, so
+    under ``OASR_ATTN_BACKEND=auto`` -- which still resolves to ``cute`` --
+    a windowed call would otherwise raise on a machine that has a perfectly
+    good kernel for it two lanes over.  Naming a backend explicitly still means
+    requiring it; this function is only consulted when nobody named one.
+    """
+    backend = select_backend()
+    if backend in ("sdpa", "cxx"):
+        return backend
+    if fmha_config_supported(
+        head_dim=head_dim,
+        dtype_str=dtype_str,
+        paged=paged,
+        causal=causal,
+        local=local,
+    ):
+        return backend
+    # The preferred lane declined.  Try the other fused one before SDPA.
+    if fmha_cxx_supports(
+        head_dim=head_dim, dtype_str=dtype_str, paged=paged, causal=causal, local=local
+    ):
+        return "cxx"
+    return "sdpa"
 
 
 def get_compiled_fmha(

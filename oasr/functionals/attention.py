@@ -9,13 +9,19 @@ hot-path callers.
 
 from __future__ import annotations
 
+import functools
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 
 from oasr.api_logging import oasr_api
-from oasr.jit.attention import get_compiled_fmha, select_backend
+from oasr.jit.attention import (
+    fmha_backend_for,
+    fmha_cxx_supports,
+    get_compiled_fmha,
+    select_backend,
+)
 
 __all__ = ["fmha", "fmha_varlen"]
 
@@ -196,6 +202,9 @@ def _sdpa_varlen_reference(
     attn_bias: Optional[torch.Tensor],
     bias_offsets: Optional[torch.Tensor],
     out: torch.Tensor,
+    causal: bool = False,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> torch.Tensor:
     """Varlen (sequence-packed) attention reference via per-segment SDPA.
 
@@ -221,11 +230,58 @@ def _sdpa_varlen_reference(
         vs = v[ka:kb].transpose(0, 1).unsqueeze(0)
         if attn_bias is not None and bo is not None:
             bias_s = attn_bias[bo[s] : bo[s + 1]].view(1, H, qb - qa, kb - ka)
+            # `bias_offsets` is an *element* offset into a flat buffer, so a
+            # segment's block can start on any 2-byte boundary.  Torch's
+            # memory-efficient SDPA backend reads `attn_mask` in 16-byte vectors
+            # and faults outright on a slice that is merely 2-byte aligned --
+            # it does not fall back.  Copying to a fresh allocation is the only
+            # way to give it one it accepts, and this is the reference path, so
+            # the copy costs nothing that matters.
+            if bias_s.data_ptr() % 16 != 0:
+                bias_s = bias_s.clone()
         else:
             bias_s = None
-        out_s = _sdpa_reference(qs, ks, vs, softmax_scale, bias_s, None)
+        out_s = _sdpa_reference(
+            qs,
+            ks,
+            vs,
+            softmax_scale,
+            bias_s,
+            None,
+            causal,
+            None,
+            window_left,
+            window_right,
+        )
         out[qa:qb] = out_s.squeeze(0).transpose(0, 1)
     return out
+
+
+def _window_disallowed(
+    T_q: int,
+    T_kv: int,
+    window_left: int,
+    window_right: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """``(T_q, T_kv)`` bool mask of positions a sliding window forbids.
+
+    Top-left aligned, matching the kernel (`include/oasr/attention/fmha_mask.h`)
+    and torch's ``is_causal``: query row ``r`` may attend to key columns
+    ``[r - window_left, r + window_right]``.  A **negative** bound means
+    unbounded on that side, so ``(-1, 0)`` is plain causal and ``(-1, -1)`` is
+    no window at all.
+    """
+    if window_left < 0 and window_right < 0:
+        return None
+    rows = torch.arange(T_q, device=device).view(T_q, 1)
+    cols = torch.arange(T_kv, device=device).view(1, T_kv)
+    disallowed = torch.zeros(T_q, T_kv, dtype=torch.bool, device=device)
+    if window_right >= 0:
+        disallowed |= cols > rows + window_right
+    if window_left >= 0:
+        disallowed |= cols < rows - window_left
+    return disallowed
 
 
 def _sdpa_reference(
@@ -237,6 +293,8 @@ def _sdpa_reference(
     cache_seqlens: Optional[torch.Tensor],
     causal: bool = False,
     cache_seqstarts: Optional[torch.Tensor] = None,
+    window_left: int = -1,
+    window_right: int = -1,
 ) -> torch.Tensor:
     """Functional SDPA path producing the same result as the cute kernel."""
     B, H, T_q, D = q.shape
@@ -265,6 +323,19 @@ def _sdpa_reference(
         full_mask = _length_to_pad_bias(cache_seqlens, T_kv, q.dtype, cache_seqstarts)
     else:
         full_mask = None
+
+    window = _window_disallowed(T_q, T_kv, window_left, window_right, q.device)
+    if window is not None:
+        # A window subsumes `is_causal` -- `(-1, 0)` *is* the triangle -- so
+        # fold everything into one explicit mask rather than asking SDPA for
+        # both, which it refuses.
+        if causal:
+            window = window | torch.ones(T_q, T_kv, dtype=torch.bool, device=q.device).triu(1)
+            causal = False
+        if full_mask is None:
+            full_mask = torch.zeros(1, 1, T_q, T_kv, dtype=q.dtype, device=q.device)
+        full_mask = full_mask.expand(B, full_mask.size(1), T_q, T_kv).clone()
+        full_mask.masked_fill_(window.view(1, 1, T_q, T_kv), float("-inf"))
 
     if causal and full_mask is not None:
         # SDPA refuses ``is_causal`` alongside an explicit mask, so fold the
@@ -386,8 +457,11 @@ def fmha(
     cache_seqstarts: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     causal: bool = False,
+    window_left: int = -1,
+    window_right: int = -1,
     out: Optional[torch.Tensor] = None,
     validate: bool = True,
+    backend: Optional[str] = None,
 ) -> torch.Tensor:
     """Fused multi-head attention.
 
@@ -432,6 +506,16 @@ def fmha(
         meaningful when ``T_q == T_k``: with a shorter query the top-left
         diagonal is not the "attend everything up to me" a decode step wants.
         Composes with ``cache_seqlens`` (both masks are applied).
+    window_left, window_right : int, default -1
+        Per-row sliding window, also top-left aligned: query row ``r`` attends
+        to key columns ``[r - window_left, r + window_right]``.  ``-1`` is
+        unbounded on that side, so ``(-1, -1)`` is no window and ``(w, 0)`` is
+        a causal window of width ``w``.  Composes with ``cache_seqlens`` /
+        ``cache_seqstarts``, which bound the *stream* rather than the row.
+
+        Served by the ``cxx`` backend and by ``sdpa``.  The CuTeDSL kernel has
+        no argument for it, so naming ``backend="cute"`` with a window raises;
+        under ``auto`` the call is routed to a lane that can serve it.
     out : Tensor, optional
         Pre-allocated ``(B, H, T_q, D)`` output.
     validate : bool, default True
@@ -517,7 +601,64 @@ def fmha(
         )
 
     # ---- Backend dispatch ---------------------------------------------------
-    backend = select_backend()
+    # An explicit `backend=` overrides the process-wide selection *without*
+    # touching it.  `set_backend_mode` clears the CuTeDSL compile cache, so an
+    # in-process A/B driven through the global re-compiles that kernel on every
+    # flip; this argument is what makes a parametrised test fixture or an
+    # interleaved benchmark arm affordable.
+    windowed = window_left >= 0 or window_right >= 0
+
+    if backend is None:
+        # Nobody named one, so the shape gets a say: `fmha_backend_for` degrades
+        # to a lane that can serve the call rather than raising.  A *named*
+        # backend skips this deliberately -- naming one means requiring it.
+        backend = (
+            fmha_backend_for(
+                head_dim=D,
+                dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
+                paged=paged,
+                causal=causal,
+                local=windowed,
+            )
+            if windowed and q.dtype in (torch.float16, torch.bfloat16)
+            else select_backend()
+        )
+    elif backend not in ("sdpa", "cute", "cxx"):
+        raise ValueError(f"fmha: unknown backend {backend!r}")
+
+    if backend == "cxx" and q.dtype in (torch.float16, torch.bfloat16):
+        return _call_cxx(
+            q,
+            k,
+            v,
+            out,
+            B=B,
+            H=H,
+            T_q=T_q,
+            D=D,
+            H_kv=H_kv,
+            T_k=T_k,
+            paged=paged,
+            softmax_scale=softmax_scale,
+            attn_bias=attn_bias,
+            cache_seqlens=cache_seqlens,
+            cache_seqstarts=cache_seqstarts,
+            block_table=block_table,
+            causal=causal,
+            window_left=window_left,
+            window_right=window_right,
+        )
+
+    # The CuTeDSL kernel has no per-row sliding window -- its `local` axis is
+    # the per-stream `[seqstart_k, seqlen_k)` pair, which is a different thing.
+    # Naming a backend means requiring it, so say so rather than quietly
+    # computing something else.
+    if windowed and backend == "cute":
+        raise NotImplementedError(
+            "fmha: the CuTeDSL backend has no sliding window; use backend='cxx' "
+            "(or 'sdpa'), or express the window as an -inf attn_bias"
+        )
+
     if backend == "sdpa" or q.dtype not in (torch.float16, torch.bfloat16):
         if block_table is not None:
             k_dense, v_dense = gather_paged_kv(k, v, block_table)
@@ -533,6 +674,8 @@ def fmha(
                 cache_seqlens,
                 causal,
                 cache_seqstarts,
+                window_left,
+                window_right,
             )
         )
         return out
@@ -610,8 +753,12 @@ def fmha_varlen(
     max_seqlen_k: int,
     attn_bias: Optional[torch.Tensor] = None,
     bias_offsets: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    window_left: int = -1,
+    window_right: int = -1,
     out: Optional[torch.Tensor] = None,
     validate: bool = True,
+    backend: Optional[str] = None,
 ) -> torch.Tensor:
     """Variable-length (sequence-packed) fused multi-head attention.
 
@@ -634,8 +781,19 @@ def fmha_varlen(
         row-major at ``bias_offsets[s]``.
     bias_offsets : Tensor, optional
         ``(S+1,)`` int64 prefix sum of ``H * T_q_s * T_k_s`` block sizes.
+    causal : bool
+        Top-left causal masking *within* each segment.  ``cxx`` only -- the
+        CuTeDSL varlen kernel has no causal path and raises rather than
+        silently returning the unmasked answer.
+    window_left, window_right : int
+        Sliding window within each segment; ``-1`` is unbounded on that side.
+        ``cxx`` only, same reasoning.
     out : Tensor, optional
         Pre-allocated ``(total_q, H, D)`` output.
+    backend : str, optional
+        ``"cxx"``, ``"cute"`` or ``"sdpa"``.  ``None`` takes the process-wide
+        selection.  Naming one **requires** it: an unserviceable request raises
+        instead of falling back, which is what ``fmha`` already does.
 
     Returns
     -------
@@ -668,12 +826,66 @@ def fmha_varlen(
             memory_format=torch.contiguous_format,
         )
 
-    backend = select_backend()
-    if (
-        backend == "cute"
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and _varlen_cute_available()
-    ):
+    # An explicit `backend=` is a requirement, not a preference.  Until now
+    # this function *silently* fell back to SDPA where `fmha` raises, so a
+    # `backend="cute"` varlen call could report success having run no kernel at
+    # all -- which is exactly the shape of failure `KERNEL_GAPS` exists to make
+    # visible.
+    explicit = backend is not None
+    fused_dtype = q.dtype in (torch.float16, torch.bfloat16)
+    windowed = window_left >= 0 or window_right >= 0
+
+    if backend is None:
+        # Nobody named one, so the *shape* gets a say, exactly as in `fmha`:
+        # causal and windowed varlen exist on the C++ lane only, and under
+        # `auto` a caller asking for one should be routed to a lane that can
+        # serve it rather than told no.  A named backend skips this -- naming
+        # one means requiring it.
+        backend = select_backend()
+        if (causal or windowed) and backend != "cxx" and fused_dtype:
+            # `fmha_backend_for` is the dense arbiter and would answer "cute"
+            # here: the CuTeDSL kernel *does* do causal -- just not in its
+            # separate varlen kernel, which has no mask argument at all.  So
+            # ask the C++ lane directly rather than through a question that is
+            # about a different kernel.
+            backend = (
+                "cxx"
+                if fmha_cxx_supports(
+                    head_dim=q.size(2),
+                    dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
+                    causal=causal,
+                    local=windowed,
+                )
+                else "sdpa"
+            )
+    elif backend not in ("sdpa", "cute", "cxx"):
+        raise ValueError(f"fmha_varlen: unknown backend {backend!r}")
+
+    if backend == "cxx" and fused_dtype:
+        return _call_cxx_varlen(
+            q,
+            k,
+            v,
+            out,
+            softmax_scale=softmax_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            attn_bias=attn_bias,
+            bias_offsets=bias_offsets,
+            causal=causal,
+            window_left=window_left,
+            window_right=window_right,
+        )
+
+    if (causal or windowed) and backend != "sdpa":
+        raise NotImplementedError(
+            "fmha_varlen: causal and sliding-window masking are served by the "
+            "C++ backend only; use backend='cxx' or backend='sdpa'"
+        )
+
+    if backend == "cute" and fused_dtype and _varlen_cute_available() and not (causal or windowed):
         return _call_cute_dsl_varlen(
             q,
             k,
@@ -688,6 +900,14 @@ def fmha_varlen(
             bias_offsets=bias_offsets,
         )
 
+    if explicit and backend != "sdpa":
+        raise NotImplementedError(
+            f"fmha_varlen: backend {backend!r} cannot serve dtype {q.dtype} "
+            f"(fused paths are fp16/bf16 only)"
+            if not fused_dtype
+            else f"fmha_varlen: backend {backend!r} is not available in this build"
+        )
+
     return _sdpa_varlen_reference(
         q,
         k,
@@ -698,6 +918,9 @@ def fmha_varlen(
         attn_bias,
         bias_offsets,
         out,
+        causal=causal,
+        window_left=window_left,
+        window_right=window_right,
     )
 
 
@@ -847,6 +1070,256 @@ def _pad_paged_inputs(
         block_table = block_table[:, :max_blocks_needed]
 
     return attn_bias, block_table
+
+
+def _needs_stride_copy(t: torch.Tensor) -> bool:
+    """Does the C++ lane have to copy this tensor?
+
+    Only one condition: the last dimension must be contiguous, because
+    ``StrideQKV``'s innermost mode is a compile-time 1.  Everything else --
+    head-split views, permuted-but-dense layouts, a capacity buffer's stride
+    gap on the *time* axis -- is expressible as runtime strides and is passed
+    through untouched.  That is the whole of lever L1: measured on real
+    call-site strides, the CuTeDSL path's canonical-stride copy costs
+    1.24-2.15x of the call (`.artifacts/fmha_cpp_validation.md` § L1).
+    """
+    return t.stride(-1) != 1
+
+
+@functools.cache
+def _multiprocessor_count() -> int:
+    """SMs on the current device -- the other half of the split decision.
+
+    Cached, and read once: it is a property of the machine, so re-querying it
+    per call would only add a driver round trip to the hot path.
+    """
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
+def _split_count(*, B: int, H: int, T_q: int, T_k: int, D: int, causal: bool, local: bool) -> int:
+    """How many ways to cut the K range, or 1 for the ordinary kernel.
+
+    Mirrors ``oasr::attention::fmhaNumSplits``, and is pinned equal to it by
+    ``tests/kernels/test_fmha_cpp.py``.  Split variants are rendered for
+    unmasked dense and paged attention only, so a causal or windowed call falls
+    through to the single-CTA path whatever its shape -- see the header of
+    ``csrc/templates/fmha_split_template.cu.jinja`` for why that is a
+    property of the mask rather than a gap.
+    """
+    if causal or local:
+        return 1
+    from oasr.jit.fmha import num_splits, resolve_config
+
+    tile = resolve_config(_target_sm(), 16, D)
+    if not tile.valid:
+        return 1
+    m_blocks = -(-T_q // tile.block_m)
+    n_blocks = -(-T_k // tile.block_n)
+    return num_splits(B * H * m_blocks, n_blocks, _multiprocessor_count())
+
+
+@functools.cache
+def _target_sm() -> int:
+    from oasr.jit.core import _get_target_sm
+
+    return _get_target_sm()
+
+
+def _call_cxx(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    B: int,
+    H: int,
+    T_q: int,
+    D: int,
+    H_kv: int,
+    T_k: int,
+    paged: bool,
+    softmax_scale: float,
+    attn_bias: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    cache_seqstarts: Optional[torch.Tensor],
+    block_table: Optional[torch.Tensor],
+    causal: bool,
+    window_left: int = -1,
+    window_right: int = -1,
+) -> torch.Tensor:
+    """Invoke the C++ CUTLASS/CuTe kernel.
+
+    Deliberately shorter than :func:`_call_cute_dsl`: there are no DLPack
+    descriptors to build, no dummy tensors to stand in for absent optionals, no
+    synthesized full-length ``cache_seqlens`` buffer, and no canonical-stride
+    copy.  A TVM-FFI call takes the torch tensors as they are and is
+    CUDA-graph-capturable for the same reason every other OASR launcher is.
+    """
+    from oasr.jit.fmha import get_fmha_fn
+
+    dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
+    local = window_left >= 0 or window_right >= 0
+
+    # The one layout the kernel cannot express.  Rare enough to be worth a copy
+    # rather than a refusal, and named so it shows up in a profile.
+    if _needs_stride_copy(q):
+        q = q.contiguous()
+    if _needs_stride_copy(k):
+        k = k.contiguous()
+    if _needs_stride_copy(v):
+        v = v.contiguous()
+    if attn_bias is not None and _needs_stride_copy(attn_bias):
+        attn_bias = attn_bias.contiguous()
+
+    out_target = out
+    if _needs_stride_copy(out):
+        out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
+
+    # --- split-KV (flash decoding) ---------------------------------------
+    # Worth it exactly when the unsplit grid cannot fill the machine, which at
+    # these shapes means a decode step: `B*H*m_blocks` CTAs against 170 SMs.
+    # `_split_count` is a pure function of shape and SM count -- never of
+    # capture state (rule 11) -- so eager and a replayed graph take the same
+    # path and therefore sum the partials in the same order.
+    splits = _split_count(B=B, H=H, T_q=T_q, T_k=T_k, D=D, causal=causal, local=local)
+    if splits > 1:
+        fn = get_fmha_fn(
+            dtype_str=dtype_str,
+            head_dim=D,
+            has_bias=attn_bias is not None,
+            paged=paged,
+            split=True,
+        )
+        # Allocated here, from torch's caching allocator, and not by the
+        # launcher: `oasr::getCachedWorkspace` branches on
+        # `cudaStreamIsCapturing` and hands back null during capture. Torch's
+        # allocator serves a capture from the graph-private pool, so this is
+        # the graph-safe half of the same job.
+        o_partial = torch.empty((splits, B, H, T_q, D), dtype=torch.float32, device=q.device)
+        lse_partial = torch.empty((splits, B, H, T_q), dtype=torch.float32, device=q.device)
+        fn(
+            out,
+            o_partial,
+            lse_partial,
+            q,
+            k,
+            v,
+            attn_bias,
+            cache_seqlens,
+            cache_seqstarts,
+            block_table,
+            int(splits),
+            float(softmax_scale),
+            int(window_left),
+            int(window_right),
+        )
+        if out_target is not out:
+            out_target.copy_(out)
+        return out_target
+
+    fn = get_fmha_fn(
+        dtype_str=dtype_str,
+        head_dim=D,
+        causal=causal and not local,
+        local=local,
+        has_bias=attn_bias is not None,
+        paged=paged,
+    )
+    fn(
+        out,
+        q,
+        k,
+        v,
+        attn_bias,
+        cache_seqlens,
+        cache_seqstarts,
+        block_table,
+        float(softmax_scale),
+        int(window_left),
+        int(window_right),
+    )
+    if out_target is not out:
+        out_target.copy_(out)
+    return out_target
+
+
+def _call_cxx_varlen(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    softmax_scale: float,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    attn_bias: Optional[torch.Tensor],
+    bias_offsets: Optional[torch.Tensor],
+    causal: bool = False,
+    window_left: int = -1,
+    window_right: int = -1,
+) -> torch.Tensor:
+    """Invoke the C++ kernel on packed inputs.
+
+    The *same* compiled variant the dense path uses: a packed tensor is a dense
+    one with a zero batch stride and a per-segment row offset, so only the
+    arguments differ.  That is why causal, sliding-window and GQA come free here
+    while the CuTeDSL lane needs a second kernel for varlen and still has none
+    of the three.
+    """
+    from oasr.jit.fmha import get_fmha_fn
+
+    dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
+    local = window_left >= 0 or window_right >= 0
+    D = q.size(2)
+
+    if _needs_stride_copy(q):
+        q = q.contiguous()
+    if _needs_stride_copy(k):
+        k = k.contiguous()
+    if _needs_stride_copy(v):
+        v = v.contiguous()
+    if attn_bias is not None and _needs_stride_copy(attn_bias):
+        attn_bias = attn_bias.contiguous()
+    if bias_offsets is not None and bias_offsets.dtype != torch.int32:
+        bias_offsets = bias_offsets.to(torch.int32)
+    if cu_seqlens_q.dtype != torch.int32:
+        cu_seqlens_q = cu_seqlens_q.to(torch.int32)
+    if cu_seqlens_k.dtype != torch.int32:
+        cu_seqlens_k = cu_seqlens_k.to(torch.int32)
+
+    out_target = out
+    if _needs_stride_copy(out):
+        out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
+
+    fn = get_fmha_fn(
+        dtype_str=dtype_str,
+        head_dim=D,
+        causal=causal and not local,
+        local=local,
+        has_bias=attn_bias is not None,
+        paged=False,
+        varlen=True,
+    )
+    fn(
+        out,
+        q,
+        k,
+        v,
+        attn_bias,
+        bias_offsets,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        float(softmax_scale),
+        int(window_left),
+        int(window_right),
+    )
+    if out_target is not out:
+        out_target.copy_(out)
+    return out_target
 
 
 def _call_cute_dsl(

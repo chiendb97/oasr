@@ -17,6 +17,10 @@ def gen_all_modules() -> List:
 
     Each GEMM/Conv2D module already contains ALL tile variants compiled into
     a single ``.so``, so no separate ``gen_all_gemm_variants()`` is needed.
+    Fused attention is the exception to "one module per family": its cells are
+    keyed by ``(dtype, head_dim)`` because those change the shared-memory
+    layouts, so :func:`oasr.jit.fmha.gen_fmha_modules` contributes one spec per
+    cell -- and none at all on an architecture it does not serve.
 
     Returns:
         List of JitSpec objects for all kernel modules.
@@ -31,6 +35,7 @@ def gen_all_modules() -> List:
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
     from oasr.jit.features import gen_features_module
     from oasr.jit.fft import gen_fft_module
+    from oasr.jit.fmha import gen_fmha_modules
     from oasr.jit.gemm import (
         gen_bmm_module,
         gen_gemm_log_softmax_module,
@@ -43,6 +48,11 @@ def gen_all_modules() -> List:
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
 
+    # Fused attention is the one family whose module count depends on the
+    # *shapes* shipped models use, not on the kernel: one `.so` per
+    # (dtype, head_dim) cell, each holding all 12 feature variants.  It returns
+    # an empty list on an architecture the C++ lane is not compiled for, which
+    # is why it splices rather than appends.
     return [
         gen_activation_module(),
         gen_norm_module(),
@@ -61,7 +71,7 @@ def gen_all_modules() -> List:
         gen_topk_module(),
         gen_fft_module(),
         gen_features_module(),
-    ]
+    ] + gen_fmha_modules()
 
 
 def register_default_modules() -> int:

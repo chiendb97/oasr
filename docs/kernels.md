@@ -211,19 +211,43 @@ autotuner.
 | `oasr/jit/templates.py` | Jinja2 rendering (`get_template_env()`, `render_template()`) |
 | `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`), nvcc flags, `cutlass_version_stamp` |
 | `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `pooling`, `recurrent`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
-| `oasr/jit/attention.py` | **Different model** — see below |
+| `oasr/jit/fmha.py` | Fused attention, C++ CUTLASS/CuTe lane — one module per `(sm, dtype, head_dim)` **cell**, holding all 17 feature variants |
+| `oasr/jit/attention.py` | The backend arbiter, **and** the CuTeDSL lane — different model, see below |
 | `oasr/compilation_context.py` | `CompilationContext` detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels |
 
 Compiled modules are cached in `~/.cache/oasr/jit/`, keyed on a hash that covers
 the sources, the `include/` tree, the nvcc flags, **and** the CUTLASS version
 stamp.
 
-`oasr/jit/attention.py` is not a Ninja JIT spec. It is a `functools.cache`-keyed
-wrapper around `cutlass.cute.compile()`, exposing `select_backend()`,
-`get_compiled_fmha(...)`, `warmup_fmha(...)`, `fmha_config_supported(...)` and
-`set_backend_mode()`. `select_backend()` probes the device capability eagerly at
-module load and resolves to `"cute"` on sm_80 / 86 / 89 / 120 when CuteDSL
-imports cleanly, otherwise `"sdpa"`.
+Fused attention has **two** kernel lanes and one arbiter over them.
+
+`oasr/jit/attention.py` is the arbiter: `select_backend()`, `set_backend_mode()`,
+`fmha_config_supported(...)`, `fmha_backend_for(...)`, `warmup_fmha(...)`. It is
+also the CuTeDSL lane — a `functools.cache`-keyed wrapper around
+`cutlass.cute.compile()` rather than a Ninja JIT spec, which is why it sits
+apart from the table above. `select_backend()` probes the device capability
+eagerly at module load and resolves on sm_80 / 86 / 89 / 120, otherwise
+`"sdpa"`.
+
+`oasr/jit/fmha.py` is the C++ lane and *is* an ordinary Ninja spec. Jinja
+renders one translation unit per feature variant and ninja builds them into one
+`.so` per **cell** = `(target_sm, dtype, padded_head_dim)` — the axes that
+change the shared-memory layouts and so cannot share a binary. Inside a cell:
+
+    3 (none / causal / local) × 2 (bias) × 2 (dense / paged)   = 12
+    + 4 split-KV (unmasked only) + 1 static binding             = 17
+
+Everything else is runtime, not a compile axis: head counts, page size, window
+bounds, `cache_seqlens` / `cache_seqstarts`, packed-vs-dense input, and whether
+the bias is vectorisable. nvcc parallelises across translation units but not
+within one, so a cell costs about one variant's wall time on a many-core box and
+then covers every shape that cell will ever be asked for.
+
+`select_backend()` answers a *mode* question and cannot see the shape.
+`fmha_backend_for(...)` answers the rest — whether the preferred lane can serve
+*this* call, and what to degrade to when it cannot. The case that needs it is
+the sliding window, which the C++ lane has and the CuTeDSL one has no argument
+for.
 
 ### CUTLASS
 
@@ -404,7 +428,7 @@ Measurements, including the profile that produced the ladder:
 
 ```python
 oasr.fmha(q, k, v, *, softmax_scale, attn_bias, cache_seqlens, cache_seqstarts,
-          block_table, out)
+          block_table, causal, window_left, window_right, out, backend)
 ```
 
 Three cache modes share one signature:
@@ -415,12 +439,57 @@ Three cache modes share one signature:
 | Dense streaming (caller concatenated old + new K/V) | `None` | set |
 | Paged streaming (K/V are pool views) | set | required |
 
-It dispatches to either `_sdpa_reference` (PyTorch SDPA, fp32-friendly) or the
-CuteDSL kernel (fp16/bf16 only). `oasr.fmha.persistent_inputs(...)` caches the
-CuteDSL DLPack descriptors when the engine reuses the same tensors every call;
-`validate=False` skips checks for proven inputs.
+Three backends share that signature — `cxx` (C++ CUTLASS/CuTe), `cute`
+(CuTeDSL) and `sdpa` (PyTorch, fp32-friendly). `OASR_ATTN_BACKEND` selects
+process-wide; the per-call `backend=` overrides it *without* touching the
+global, which matters because `set_backend_mode()` clears three compile caches
+and an in-process A/B driven through the environment variable recompiles the
+CuTeDSL kernel on every flip. `validate=False` skips checks for proven inputs.
 
-Routing policy and measurements: `.artifacts/fmha_tuning.md`.
+Naming a backend **requires** it: a request it cannot serve raises rather than
+quietly computing something else. `backend=None` (the default) is the only mode
+that may degrade, and it degrades through `fmha_backend_for(...)`, which asks
+whether the preferred lane can serve *this* shape rather than only which lane
+the process prefers.
+
+Two capabilities exist on the `cxx` lane only:
+
+| Capability | Why not on `cute` |
+|---|---|
+| `window_left` / `window_right` — a per-row sliding window, top-left aligned | its `local` axis is the per-*stream* `[seqstart_k, seqlen_k)` pair, a different thing with no argument for this |
+| causal and windowed **varlen**, and varlen at all without a second kernel | packed input there is a separate ~600-line `kernel_varlen`; here it is the same instantiation with a zero batch stride |
+
+The `cxx` lane also splits the K range when the grid cannot fill the machine
+(flash-decoding). `num_splits` is a pure function of `(shape, SM count)` —
+never of CUDA-graph capture state, because splitting changes the order the fp32
+partials are summed (rule 11). The workspace is allocated in Python, from
+torch's caching allocator, deliberately **not** from `oasr::getCachedWorkspace`,
+which branches on `cudaStreamIsCapturing`.
+
+Routing policy and measurements: `.artifacts/fmha_tuning.md` (CuTeDSL) and
+`.artifacts/fmha_cpp_validation.md` (the C++ lane's falsifications and the A/B).
+
+### The C++ attention kernel (`include/oasr/attention/`)
+
+Fifteen headers, structured the way CUTLASS 3.x structures a collective:
+`CollectiveMainloopSm80` + `CollectiveEpilogue` + `SingleTileScheduler`,
+composed by `FmhaKernelSm80` — a shell that names no architecture and
+touches no layout. `fmha_launch_template.h` is the **one** file that names
+one, so a Hopper or Blackwell lane is a second `FmhaArch<SM>`, a second
+collective and one more `conditional_t` arm; the arguments, the FFI signature
+and the whole Python side do not move.
+
+Two rules in that header are load-bearing rather than stylistic:
+
+- **`ArchTag` selects instructions; a separate `kIsSm86Or89` selects tuning.**
+  `cutlass::arch::Sm86` exists, but the collective is the same one sm_80 uses.
+- **Never branch on `ArchTag::kMinComputeCapability >= 90`.** `Sm120`'s *is*
+  120, so FlashAttention's `Use_TMA_O` test is true on a part with no TMA at
+  all. `FmhaArch<SM>::kHasTma` / `::kIsWarpSpecialized` say what they mean.
+
+`fmha_softmax.h`'s header comment carries the numerics contract — twelve
+numbered items, each one a place where FlashAttention's reference is wrong for
+OASR's masking semantics, with the failure each one prevents.
 
 ### CuteDSL kernels (`oasr/kernels/`)
 

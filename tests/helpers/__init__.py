@@ -22,6 +22,12 @@ from pathlib import Path
 #: The repository root, independent of how deep the calling test module sits.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+from helpers.attention import (  # noqa: E402
+    FMHA_TOL,
+    backend_ratio_ok,
+    ref_fmha,
+    window_bias,
+)
 from helpers.audio import (  # noqa: E402
     hiss,
     speech_corpus,
@@ -46,18 +52,22 @@ from helpers.tolerances import tol  # noqa: E402
 __all__ = [
     "ACTIVATIONS",
     "ACTIVATION_IDS",
+    "FMHA_TOL",
     "REPO_ROOT",
     "assert_dest_passing",
     "assert_graph_replay",
+    "backend_ratio_ok",
     "device_sm",
     "engine_config",
     "hiss",
     "speech_corpus",
     "make_engine",
+    "ref_fmha",
     "requires_cute",
     "requires_sm",
     "tol",
     "tone",
+    "window_bias",
     "wav_path",
     "wav_paths",
     "waveform",

@@ -120,7 +120,36 @@ class TestJitInfrastructure:
             "features",
         }
         assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
-        assert len(specs) == len(expected)
+        # Not `len(specs) == len(expected)`: fused attention contributes one
+        # spec per `(dtype, head_dim)` cell rather than one per family, and the
+        # count is a function of which architecture this box is.  Pin the
+        # *extras* by what they are instead of by how many there are.
+        extras = [n for n in names if n not in expected]
+        assert all(
+            n.startswith("fmha_") for n in extras
+        ), f"unexpected AOT modules: {[n for n in extras if not n.startswith('fmha_')]}"
+        assert len(names) == len(set(names)), f"duplicate AOT specs: {names}"
+
+    def test_attention_cells_are_registered_where_the_lane_serves_the_arch(self):
+        """An AOT set that skips attention means every engine JITs it at load.
+
+        The cells are the shapes shipped models reach -- head_dim 64 for
+        Conformer / Zipformer / Whisper, 128 for Paraformer's SANM and the
+        Qwen2-Audio decoder -- so a missing one is a 30 s stall on the first
+        request, not a failure, which is why nothing else would notice.
+        """
+        from oasr.aot import gen_all_modules
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.fmha import SUPPORTED_SM
+
+        names = {s.name for s in gen_all_modules()}
+        cells = {n for n in names if n.startswith("fmha_")}
+        if _get_target_sm() in SUPPORTED_SM:
+            assert cells, "the C++ attention lane serves this arch but registered no cells"
+            assert any("d64" in n for n in cells)
+            assert any("d128" in n for n in cells)
+        else:
+            assert not cells, "cells registered for an arch the lane does not serve"
 
 
 if __name__ == "__main__":
