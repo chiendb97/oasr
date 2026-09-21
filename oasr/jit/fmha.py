@@ -106,11 +106,14 @@ _SPLIT_MASK_MODES = ("none",)
 #: Mirrors ``oasr::attention::kFmhaMaxSplits`` / ``kFmhaMinBlocksPerSplit``.
 MAX_SPLITS = 16
 MIN_BLOCKS_PER_SPLIT = 2
-#: Mirrors ``kFmhaMinBlocksForSplit`` -- a *measured* floor, with the table
-#: that produced it in the C++ header.  Below 32 K tiles the fixed cost of the
-#: combine pass is not repaid on the eager path, and rule 11 forbids deciding
-#: that by asking whether a graph capture is in progress.
-MIN_BLOCKS_FOR_SPLIT = 32
+#: Mirrors ``kFmhaMinBlocksForSplit`` / ``kFmhaSplitMaxUtilPct`` /
+#: ``kFmhaSplitDepthPerCta`` -- all *measured*, with the tables that produced
+#: them in the C++ header.  They were re-derived after the combine pass was
+#: rewritten: the old floor of 32 was measuring a combine that ran at 0.02
+#: waves, not an intrinsic cost of splitting.
+MIN_BLOCKS_FOR_SPLIT = 6
+SPLIT_MAX_UTIL_PCT = 60
+SPLIT_DEPTH_PER_CTA = 30
 
 _ARCH_UNDERSERVED: "Counter[int]" = Counter()
 _REFUSED: "Counter[str]" = Counter()
@@ -207,6 +210,21 @@ def config_supported(
     return True
 
 
+def _ceildiv(a: int, b: int) -> int:
+    """Mirror of ``oasr::attention::fmhaCeilDiv``."""
+    return (a + b - 1) // b
+
+
+def _split_eligible(s: int, n_blocks: int) -> bool:
+    """Mirror of ``oasr::attention::fmhaSplitEligible``.
+
+    With 16 K tiles a 5-way split hands out ``ceil(16/5) = 4`` tiles just as a
+    4-way one does, so the fifth CTA set removes no work from the critical path
+    and is pure combine cost.
+    """
+    return s <= 1 or _ceildiv(n_blocks, s) != _ceildiv(n_blocks, s - 1)
+
+
 def num_splits(cta_count: int, n_blocks: int, num_sms: int) -> int:
     """Mirror of ``oasr::attention::fmhaNumSplits``.
 
@@ -221,12 +239,40 @@ def num_splits(cta_count: int, n_blocks: int, num_sms: int) -> int:
     """
     if cta_count <= 0 or n_blocks <= 0 or num_sms <= 0:
         return 1
-    if cta_count >= num_sms:
-        return 1
     if n_blocks < MIN_BLOCKS_FOR_SPLIT:
         return 1
-    want = min(num_sms // cta_count, MAX_SPLITS, n_blocks // MIN_BLOCKS_PER_SPLIT)
-    return want if want >= 2 else 1
+    # Utilisation of the unsplit grid, ``waves / ceil(waves)``.  Not raw CTA
+    # count: on 170 SMs, 128 CTAs is one 75 %-full wave and splitting loses,
+    # while 192 CTAs is a full wave plus a 13 %-full one and splitting wins.
+    if 100 * cta_count > SPLIT_MAX_UTIL_PCT * num_sms * _ceildiv(cta_count, num_sms):
+        return 1
+    if n_blocks * num_sms < SPLIT_DEPTH_PER_CTA * cta_count:
+        return 1
+    hi = min(MAX_SPLITS, num_sms, n_blocks // MIN_BLOCKS_PER_SPLIT)
+    if hi < 2:
+        return 1
+
+    # Integer arithmetic, matching the C++ original exactly: the efficiency
+    # test is a ratio, and evaluating it in float here and in double there can
+    # land the two on opposite sides of a tie.
+    def _ab(s: int) -> Tuple[int, int]:
+        a = cta_count * s
+        return a, num_sms * _ceildiv(a, num_sms)
+
+    am, bm = _ab(1)
+    for s in range(2, hi + 1):
+        if not _split_eligible(s, n_blocks):
+            continue
+        a, b = _ab(s)
+        if a * bm > am * b:
+            am, bm = a, b
+    for s in range(1, hi + 1):
+        if not _split_eligible(s, n_blocks):
+            continue
+        a, b = _ab(s)
+        if 100 * a * bm >= 85 * am * b:
+            return s
+    return 1
 
 
 def split_range(n_block_min: int, n_block_max: int, split_idx: int, splits: int):

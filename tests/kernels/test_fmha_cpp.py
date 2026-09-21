@@ -777,9 +777,12 @@ class TestSplitCountIsPure:
         """The floor below which the combine pass cannot be repaid.
 
         A *measured* constant, not a guess -- the table is in
-        ``include/oasr/attention/cutlass_fmha_configs.h``.  Eagerly, splitting
-        a 16-tile range runs at 0.64x because the two workspace allocations and
-        the second launch cost more than the occupancy buys back.
+        ``include/oasr/attention/cutlass_fmha_configs.h``.  At four K tiles
+        every measured row loses (0.83-0.87x eager, and one 0.82x that only
+        appears graph-replayed): two tiles per split cannot repay a second
+        launch.  The floor was 32 until the combine pass was rewritten, and
+        that value was measuring the combine rather than the split -- see
+        ``fmha_combine.h``.
         """
         from oasr.jit.fmha import MIN_BLOCKS_FOR_SPLIT, num_splits
 
@@ -833,6 +836,53 @@ class TestSplitCountIsPure:
             f"the split count differed under capture ({captured[0]}) from eager "
             f"({eager}); rule 11"
         )
+
+    def test_utilisation_decides_not_raw_cta_count(self):
+        """The case a rule on CTA count alone gets backwards.
+
+        On 170 SMs, 128 CTAs is one wave 75 % full and splitting it *loses*
+        (0.59-0.86x measured).  192 CTAs is a full wave plus a 13 %-full second
+        one -- more CTAs, but utilisation 0.565 -- and splitting *wins*
+        (1.05-1.38x).  Any threshold on ``cta_count`` puts these two on the
+        same side; ``waves / ceil(waves)`` separates them.
+        """
+        from oasr.jit.fmha import num_splits
+
+        sms = 170
+        assert num_splits(128, 64, sms) == 1, "0.75 waves is already well used"
+        assert num_splits(192, 64, sms) > 1, "1.13 waves wastes most of a second wave"
+
+    def test_no_split_count_leaves_the_longest_chunk_unchanged(self):
+        """A split that removes no work from the critical path is pure cost.
+
+        16 K tiles into 5 splits hands out ``ceil(16/5) == 4`` tiles, exactly
+        as 4 splits does, so the fifth CTA set only adds a combine.  Measured
+        at 32 CTAs: 12.29 us at 4 splits, 14.34 us at 5.
+        """
+        from oasr.jit.fmha import num_splits
+
+        for n_blocks in range(6, 200):
+            for cta in (1, 8, 32, 64):
+                s = num_splits(cta, n_blocks, 170)
+                if s > 1:
+                    assert -(-n_blocks // s) != -(-n_blocks // (s - 1)), (
+                        f"{s} splits of {n_blocks} tiles is {s - 1} splits plus a "
+                        f"combine launch"
+                    )
+
+    def test_the_depth_gate_scales_with_how_full_the_grid_is(self):
+        """More K depth is required the closer the unsplit grid is to a wave.
+
+        Measured break-evens on 170 SMs: 32 CTAs pays from 6 K tiles, 64 CTAs
+        not until 12.  A single flat K-tile floor admits ``(64, 8)``, which
+        measured 0.87x.
+        """
+        from oasr.jit.fmha import num_splits
+
+        assert num_splits(32, 6, 170) > 1
+        assert num_splits(64, 6, 170) == 1
+        assert num_splits(64, 8, 170) == 1, "measured 0.87x -- a flat floor admits it"
+        assert num_splits(64, 12, 170) > 1
 
 
 class TestSplitKV:
@@ -912,6 +962,27 @@ class TestSplitKV:
         got = fmha_cxx(q, k, v, softmax_scale=0.125, cache_seqlens=lens, block_table=table)
         k_d, v_d = gather_paged_kv(k, v, table)
         want = ref_fmha(q, k_d, v_d, 0.125, cache_seqlens=lens)
+        torch.testing.assert_close(got, want, **FMHA_TOL)
+
+    @pytest.mark.parametrize("D", [32, 72, 96, 128, 192, 256])
+    def test_split_matches_sdpa_at_every_head_dim(self, fmha_cxx, D):
+        """The combine walks ``kHeadDim / 32`` columns per lane, predicated.
+
+        ``kHeadDim`` is the *padded* head dim and ``head_dim`` the real one, so
+        ``D = 72`` runs three column groups predicated back to 72.  Getting
+        that predicate wrong writes past each row into the next one, which is
+        invisible at every head dim that happens to be a multiple of 32 -- the
+        reason this sweep exists rather than a single D.
+        """
+        from oasr.functionals.attention import _split_count
+
+        B, H, T_q, T_k = 1, 8, 1, 4096
+        assert (
+            _split_count(B=B, H=H, T_q=T_q, T_k=T_k, D=D, causal=False, local=False) > 1
+        ), "this shape must actually take the split path"
+        q, k, v = _qkv(B, H, T_q, T_k, D, seed=D)
+        got = fmha_cxx(q, k, v, softmax_scale=D**-0.5)
+        want = ref_fmha(q, k, v, D**-0.5)
         torch.testing.assert_close(got, want, **FMHA_TOL)
 
     def test_split_is_deterministic_and_graph_safe(self, fmha_cxx):
