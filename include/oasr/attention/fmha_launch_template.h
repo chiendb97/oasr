@@ -141,19 +141,21 @@ cudaError_t run_fmha(FmhaParams<Element> const& params, cudaStream_t stream) {
     return cudaGetLastError();
 }
 
-/*! \brief The combine pass for a split launch, tiled the same way the attention pass was.
+/*! \brief The combine pass for a split launch.
  *
  * Separate from `run_fmha` rather than chained onto it because the caller
  * owns the workspace and therefore owns the decision to split at all; a
  * launcher that decided for itself would need the SM count and the shape, and
  * that is exactly the decision rule 11 says must be visible and pure.
+ *
+ * `Arch` is not used: the combine is arch-free, and it is deliberately *not*
+ * tiled by `fmhaResolveTile`'s M tile -- see `fmha_combine.h` for the
+ * measurement that made tiling it that way a 2.6x tax on the kernel it
+ * reduces. The parameter stays so the call site reads like `run_fmha`'s.
  */
 template <int Arch, int kHeadDim, class Element>
 cudaError_t run_fmha_combine_for(FmhaParams<Element> const& params, cudaStream_t stream) {
-    static constexpr FmhaTile kTile =
-        fmhaResolveTile(Arch, kHeadDim, kHeadDim, int(sizeof(Element)));
-    static_assert(kTile.valid);
-    return oasr::attention::run_fmha_combine<Element, kTile.block_m, kHeadDim>(
+    return oasr::attention::run_fmha_combine<Element, kHeadDim>(
         params.ptr_o, params.ptr_o_partial, params.ptr_lse_partial, params.num_splits,
         int(cute::get<0>(params.shape_q)), int(cute::get<1>(params.shape_q)),
         int(cute::get<2>(params.shape_q)), int(cute::get<3>(params.shape_q)),

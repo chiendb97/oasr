@@ -47,6 +47,7 @@
 #include <cutlass/arch/mma_sm80.h>
 #include <cutlass/numeric_types.h>
 
+#include <cstdint>
 #include <type_traits>
 
 namespace oasr {
@@ -313,36 +314,80 @@ inline constexpr int kFmhaMaxSplits = 16;
 //! Fewest K tiles a split must own to be worth launching.
 //!
 //! A split that walks one K tile pays the whole prologue -- Q load, cp.async
-//! ring fill, epilogue, plus its share of the combine -- to do one MMA pair.
+//! ring fill, the fp32 partial store -- for a single MMA pass.
 inline constexpr int kFmhaMinBlocksPerSplit = 2;
 
 /*! \brief Fewest K tiles in the whole range before splitting is considered.
  *
- * **Measured, not chosen.**  Splitting costs a fixed amount -- two workspace
- * allocations and a second kernel launch -- that does not shrink with the
- * problem, so below some K extent it cannot be repaid.  On this box
- * (sm_120, 170 SMs, `block_n = 64`), split-over-unsplit at `head_dim 64`:
+ * **Measured, not chosen**, and re-measured after the combine pass was fixed
+ * (`fmha_combine.h`).  The previous value of this constant was 32, derived
+ * against a combine that tiled by the attention pass's M tile and so ran at
+ * 0.02 waves -- 2.6x the cost of the split mainloop it reduced.  That table
+ * was measuring the combine, not an intrinsic cost of splitting: with the
+ * combine decomposed per row instead, the same shapes that read 0.53x at 8 K
+ * tiles now read 1.40x.
  *
- *      K tiles |  eager  | graph-replayed
- *      --------+---------+----------------
- *            4 |  0.53x  |  0.75x
- *            8 |  0.53x  |  1.00-1.22x
- *           16 |  0.64x  |  0.69-1.80x   (worse the fuller the M tile)
- *           32 |  1.22x  |  1.70-3.40x
- *           64 |  2.39x  |  1.83-5.49x
- *
- * The two regimes disagree below 32 and `AGENTS.md` rule 11 forbids resolving
- * that by asking whether a capture is in progress -- the split count changes
- * the order the fp32 partials are summed, so a capture-dependent answer makes
- * a replayed graph produce different numbers than eager.  32 is therefore the
- * floor: at or above it every measured row wins in *both* regimes and at every
- * query extent from 1 to 64, and below it the eager path always loses.
- *
- * The graph-only crossover is nearer 8, so there is real headroom here for
- * whoever cuts the fixed cost -- folding the two workspaces into one
- * allocation, or reaching the combine without a second launch.
+ * At four K tiles every measured row still loses (0.83-0.87x eager, and one
+ * 0.82x that only appears graph-replayed), because two tiles per split cannot
+ * repay a second launch.  At six, every row at or below the utilisation gate
+ * wins or ties in *both* regimes.
  */
-inline constexpr int kFmhaMinBlocksForSplit = 32;
+inline constexpr int kFmhaMinBlocksForSplit = 6;
+
+/*! \brief Utilisation above which the unsplit grid is already good enough.
+ *
+ * As a percentage of `waves / ceil(waves)`, where `waves = cta_count/num_sms`.
+ *
+ * Utilisation rather than raw CTA count, because the two come apart exactly
+ * where it matters.  On 170 SMs, 128 CTAs is 0.75 waves -- one wave, 75 % full
+ * -- and splitting it *loses* (0.59-0.86x).  192 CTAs is 1.13 waves, a full
+ * wave plus a 13 %-full second one, so utilisation is 0.565 and splitting
+ * *wins* (1.05-1.38x).  A rule on CTA count alone gets one of those two
+ * backwards whichever threshold it picks.
+ *
+ * 60 admits 0.565 and refuses 0.753, which is the measured break.
+ */
+inline constexpr int kFmhaSplitMaxUtilPct = 60;
+
+/*! \brief K tiles required per unit of grid fill before splitting pays.
+ *
+ * The gate is `n_blocks * num_sms >= kFmhaSplitDepthPerCta * cta_count`: the
+ * fuller the machine already is, the more K depth a split has to divide before
+ * it repays the combine.  Measured break-evens on 170 SMs at `head_dim 64`:
+ *
+ *      CTAs | waves | break-even K tiles | this rule admits from
+ *      -----+-------+--------------------+----------------------
+ *         8 | 0.05  |         6          |          6
+ *        16 | 0.09  |         6          |          6
+ *        32 | 0.19  |         6          |          6
+ *        48 | 0.28  |        12          |         12
+ *        64 | 0.38  |        12          |         12
+ *        96 | 0.57  |        24          |         17
+ *       192 | 1.13  |        16          |         34
+ *
+ * 30 is the largest value that still admits `(64, 12)` and the smallest that
+ * still refuses `(96, 16)`, which measured 1.13x and 0.85x respectively.  The
+ * cost is the last row: `(192, 24)` and `(192, 32)` measured 1.12x and 1.20x
+ * and are refused.  Nothing that is a function of shape alone separates them
+ * from `(128, 24)` at 0.84x, and the standing rule is that no row regresses.
+ */
+inline constexpr int kFmhaSplitDepthPerCta = 30;
+
+//! `ceil(a / b)` for non-negative `a` and positive `b`.
+constexpr int fmhaCeilDiv(int a, int b) {
+    return (a + b - 1) / b;
+}
+
+/*! \brief Would an `s`-way split actually shorten the longest chunk?
+ *
+ * With 16 K tiles, 5 splits hand out `ceil(16/5) = 4` tiles just as 4 splits
+ * do -- the fifth CTA set exists but removes no work from the critical path,
+ * so it is pure combine cost.  Measured: 16 K tiles at 32 CTAs runs 12.29 us
+ * at 4 splits and 14.34 us at 5.  FlashAttention guards the same case.
+ */
+constexpr bool fmhaSplitEligible(int s, int n_blocks) {
+    return s <= 1 || fmhaCeilDiv(n_blocks, s) != fmhaCeilDiv(n_blocks, s - 1);
+}
 
 /*! \brief How many ways to cut the K range, from shape and SM count alone.
  *
@@ -354,37 +399,71 @@ inline constexpr int kFmhaMinBlocksForSplit = 32;
  * `num_sms` is passed in rather than queried, and the result is asserted equal
  * to the Python mirror by `tests/kernels/test_fmha_cpp.py`.
  *
+ * **Integer arithmetic throughout, deliberately.**  The efficiency comparison
+ * is a ratio, and the obvious spelling is `float`; but the Python mirror would
+ * evaluate the same expression in double and the two can land on opposite
+ * sides of a tie.  Cross-multiplying keeps both exact, which is what makes the
+ * mirror test meaningful rather than approximately true.
+ *
  * \param cta_count  `batch * num_heads * m_blocks` -- the CTAs the unsplit
  *                   grid would launch
  * \param n_blocks   K tiles the *longest* stream walks
  * \param num_sms    multiprocessors on the target device
  *
- * The shape of the decision: splitting buys occupancy and costs a combine
- * pass, so it is worth it exactly when the unsplit grid cannot fill the
- * machine.  At `cta_count >= num_sms` one wave already covers every SM and a
- * split would only add the combine.
+ * Three gates, then a search.  The gates are the measured constants above; the
+ * search picks the smallest split count whose grid utilisation is within 15 %
+ * of the best available, which biases small because the combine's traffic is
+ * linear in the split count while the occupancy it buys saturates.
  */
 constexpr int fmhaNumSplits(int cta_count, int n_blocks, int num_sms) {
     if (cta_count <= 0 || n_blocks <= 0 || num_sms <= 0) {
         return 1;
     }
-    if (cta_count >= num_sms) {
-        return 1;  // already one full wave
-    }
     if (n_blocks < kFmhaMinBlocksForSplit) {
-        return 1;  // too little K work to repay the combine -- see the constant
+        return 1;  // too little K work to divide -- see the constant
     }
-    int want = num_sms / cta_count;  // how many more CTAs would fit
-    if (want > kFmhaMaxSplits) {
-        want = kFmhaMaxSplits;
+    if (int64_t(100) * cta_count >
+        int64_t(kFmhaSplitMaxUtilPct) * num_sms * fmhaCeilDiv(cta_count, num_sms)) {
+        return 1;  // the unsplit grid already uses the machine well enough
     }
-    // Never more splits than there are K tiles to hand out, and never so many
-    // that a split falls below the work floor.
-    int const by_work = n_blocks / kFmhaMinBlocksPerSplit;
-    if (want > by_work) {
-        want = by_work;
+    if (int64_t(n_blocks) * num_sms < int64_t(kFmhaSplitDepthPerCta) * cta_count) {
+        return 1;  // not enough K depth for how full the grid already is
     }
-    return want < 2 ? 1 : want;
+    int hi = kFmhaMaxSplits;
+    if (hi > num_sms) {
+        hi = num_sms;
+    }
+    if (hi > n_blocks / kFmhaMinBlocksPerSplit) {
+        hi = n_blocks / kFmhaMinBlocksPerSplit;
+    }
+    if (hi < 2) {
+        return 1;
+    }
+    // Utilisation of an `s`-way grid as the exact rational `a_s / b_s`.
+    int64_t am = int64_t(cta_count);
+    int64_t bm = int64_t(num_sms) * fmhaCeilDiv(cta_count, num_sms);
+    for (int s = 2; s <= hi; ++s) {
+        if (!fmhaSplitEligible(s, n_blocks)) {
+            continue;
+        }
+        int64_t const a = int64_t(cta_count) * s;
+        int64_t const b = int64_t(num_sms) * fmhaCeilDiv(cta_count * s, num_sms);
+        if (a * bm > am * b) {
+            am = a;
+            bm = b;
+        }
+    }
+    for (int s = 1; s <= hi; ++s) {
+        if (!fmhaSplitEligible(s, n_blocks)) {
+            continue;
+        }
+        int64_t const a = int64_t(cta_count) * s;
+        int64_t const b = int64_t(num_sms) * fmhaCeilDiv(cta_count * s, num_sms);
+        if (int64_t(100) * a * bm >= int64_t(85) * am * b) {
+            return s;
+        }
+    }
+    return 1;
 }
 
 /*! \brief `[lo, hi)` of the K-tile range `[n_block_min, n_block_max)` for one split.
