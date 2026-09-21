@@ -65,7 +65,7 @@ One kernel-side gap is declared:
 
 | Gap | Missing | Reached by |
 |---|---|---|
-| `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem (>256 on a 99 KB arch) | nothing in-tree |
+| `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem: **>384** on sm_86/89/120's 98 KiB budget, **>640** on sm_80's 162 KiB | nothing in-tree |
 
 `conv2d-groups` is closed: grouped and depthwise calls use the direct NHWC
 kernel, dense 1×1 calls use the layout-equivalent GEMM path, and Zipformer's

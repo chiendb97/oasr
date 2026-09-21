@@ -17,18 +17,18 @@ syncthreads(). We reserve ID 1 for the attention pipeline.
 import cutlass.pipeline as pipeline
 
 
-class NamedBarrierFwd:
-    """Named-barrier IDs for the FMHA forward kernel."""
+class NamedBarrierId:
+    """Named-barrier IDs for the FMHA kernel."""
 
     Epilogue = 1  # producer/consumer rendezvous around the Q/K/V loads.
 
 
 def make_cta_sync_barrier(num_threads: int) -> pipeline.NamedBarrier:
-    """Build the single CTA-wide barrier the FMHA forward kernel uses."""
+    """Build the single CTA-wide barrier the FMHA kernel uses."""
     return pipeline.NamedBarrier(
-        barrier_id=NamedBarrierFwd.Epilogue,
+        barrier_id=NamedBarrierId.Epilogue,
         num_threads=num_threads,
     )
 
 
-__all__ = ["NamedBarrierFwd", "make_cta_sync_barrier"]
+__all__ = ["NamedBarrierId", "make_cta_sync_barrier"]

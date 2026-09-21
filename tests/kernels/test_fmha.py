@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional
 
 import pytest
 import torch
 import torch.nn.functional as F
+from helpers import ref_fmha  # noqa: E402  (tests/ is on sys.path via conftest)
 
 from oasr.cache import PagedKVCache
 
@@ -49,60 +49,14 @@ def _require_cute_backend():
 
 
 # ---------------------------------------------------------------------------
-# Reference: a clean SDPA path that mirrors oasr.fmha_forward's contract.
-# Used to compare both backends against a single source of truth.
+# Reference
 # ---------------------------------------------------------------------------
-
-
-def _ref_fmha(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: float,
-    attn_bias: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[torch.Tensor] = None,
-    causal: bool = False,
-    cache_seqstarts: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    B, H, T_q, D = q.shape
-    H_kv = k.size(1)
-    T_k = k.size(2)
-    if H % H_kv != 0:
-        raise ValueError("H % H_kv != 0")
-    if H_kv != H:
-        n_repeat = H // H_kv
-        k = k.repeat_interleave(n_repeat, dim=1)
-        v = v.repeat_interleave(n_repeat, dim=1)
-
-    masks = []
-    if attn_bias is not None:
-        masks.append(attn_bias.to(q.dtype))
-    if cache_seqlens is not None:
-        arange = torch.arange(T_k, device=cache_seqlens.device)
-        keep = arange.unsqueeze(0) < cache_seqlens.unsqueeze(1)
-        if cache_seqstarts is not None:
-            keep = keep & (arange.unsqueeze(0) >= cache_seqstarts.unsqueeze(1))
-        pad = torch.where(keep, 0.0, float("-inf")).to(q.dtype)
-        pad = pad.unsqueeze(1).unsqueeze(1)  # (B,1,1,T_k)
-        masks.append(pad)
-    if causal:
-        upper = torch.ones(T_q, T_k, dtype=torch.bool, device=q.device).triu(1)
-        tri = torch.zeros(1, 1, T_q, T_k, dtype=q.dtype, device=q.device)
-        masks.append(tri.masked_fill_(upper.view(1, 1, T_q, T_k), float("-inf")))
-
-    full_mask = None
-    if masks:
-        full_mask = masks[0]
-        for m in masks[1:]:
-            full_mask = full_mask + m
-
-    return F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=full_mask,
-        scale=softmax_scale,
-    )
+#
+# One oracle, in ``tests/helpers/attention.py``, shared with
+# ``test_fmha_cpp.py``.  It used to live here, which is how the sliding window
+# ended up with no kernel-level test at all: a second file that needed the
+# window would have had to grow its own copy, so nobody added one.
+_ref_fmha = ref_fmha
 
 
 # ---------------------------------------------------------------------------
@@ -1425,13 +1379,20 @@ def test_paged_path_matches_sdpa(attn, device):
 def test_a_paged_config_the_kernel_refuses_still_answers():
     """A declared gap has to *serve* the shape, not raise on it.
 
-    The paged loader skips per-element head-dim predication, so the arch class
-    refuses a head_dim off its 32-element MMA stride.  ``oasr.functionals.attention.fmha``
+    The CuTeDSL paged loader skips per-element head-dim predication, so the arch
+    class refuses a head_dim off its 32-element MMA stride.  ``oasr.functionals.attention.fmha``
     raises there — the right contract for a caller naming the kernel by name —
     which leaves the waist to gather the pages and answer on SDPA, counting the
     gap so the coverage debt stays visible.  A shipped decoder's head_dim is 64
     or 128, so this is the tiny-config path; it is also the only thing standing
     between such a config and a hard failure.
+
+    **The C++ lane closes this gap**: its paged loader predicates the head-dim
+    reads like the dense one, and its page size is a runtime value, so there is
+    no config for it to refuse here.  The *answer* still has to be right, so the
+    reference check below runs on every backend; only the gap-counting half is
+    CuTeDSL's.  `TestKernelGapRegistry` allows the declared set to shrink, which
+    is what this is.
     """
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
@@ -1447,11 +1408,19 @@ def test_a_paged_config_the_kernel_refuses_still_answers():
     lens = torch.tensor([20, 9], dtype=torch.int32, device="cuda")
     q = torch.randn(B, heads, T_q, head_dim, device="cuda", dtype=torch.float16)
 
+    from oasr.jit.attention import select_backend
+
     attn = Attention(heads, head_dim)
     reset_backend_stats()
     with torch.no_grad():
         out = attn(q, k_pool, v_pool, kv_lens=lens, block_table=table)
-    assert gap_hits().get("fmha-paged-config"), "the gap was not counted"
+    if select_backend() == "cute":
+        assert gap_hits().get("fmha-paged-config"), "the gap was not counted"
+    else:
+        assert not gap_hits().get("fmha-paged-config"), (
+            "the C++ lane serves this config, so taking the gap would be "
+            "reporting debt that no longer exists"
+        )
 
     # Reference: gather the addressed pages and mask by length.
     dense = k_pool[table.long()].reshape(B, -1, heads, head_dim).permute(0, 2, 1, 3)

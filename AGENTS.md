@@ -598,7 +598,7 @@ Environment variables:
 |---|---|
 | `CUDA_ARCHITECTURES` | SM targets for the build (e.g. `80` or `80;86`) |
 | `OASR_CUDA_ARCH_LIST` | Manual override for JIT arch detection |
-| `OASR_ATTN_BACKEND` | `auto` (default) / `cute` (require the kernel) / `sdpa` (force fallback) |
+| `OASR_ATTN_BACKEND` | `auto` (default) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one) / `sdpa` (force fallback). Naming one **requires** it: a shape it cannot serve raises rather than falling back. Aliases: `cpp`/`cutlass`→`cxx`, `cutedsl`→`cute` |
 | `OASR_LAYERS_BACKEND` | `oasr` (default) or `torch` (parity oracles, and the "is this the kernels' fault" A/B). There is no `auto`. |
 | `OASR_GEMM_HEURISTIC` | `0` disables shape-aware GEMM selection (A/B, rollback) |
 | `OASR_GEMM_STREAMK`, `OASR_GEMM_SPLITK_PARALLEL` | `0` skips compiling those GEMM variants |
