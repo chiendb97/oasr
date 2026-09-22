@@ -6,6 +6,11 @@
 launch::
 
     activation(x @ w_gateᵀ + b_gate) * (x @ w_upᵀ + b_up)
+
+Two kernels implement it -- a C++ CUTLASS/CuTe one and a CuTeDSL one -- and
+:mod:`oasr.jit.mlp` picks between them.  Which one ran is not observable here
+beyond a few ulps: both accumulate in FP32 and round once, and both are
+compared against the same FP32 oracle by ``tests/kernels/test_gated_mlp.py``.
 """
 
 from typing import Any, Optional, Tuple
@@ -66,6 +71,22 @@ def gated_mlp_available(
     return _route(x, w_gate, activation=activation, has_bias=has_bias)[0] is not None
 
 
+def gated_mlp_backend(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    *,
+    activation: str = "silu",
+    has_bias: bool = False,
+) -> Optional[str]:
+    """Which lane :func:`gated_mlp` would run for these operands (``cxx`` / ``cute``).
+
+    ``None`` when it would decline.  Exists so a benchmark or a test can report
+    the lane without reaching into :mod:`oasr.jit.mlp`.
+    """
+    route = _route(x, w_gate, activation=activation, has_bias=has_bias)[0]
+    return None if route is None else route[0]
+
+
 def _route(
     x: torch.Tensor,
     w_gate: torch.Tensor,
@@ -73,13 +94,17 @@ def _route(
     activation: str,
     has_bias: bool,
 ) -> Tuple[Optional[Any], int, int, int]:
-    """``(kernel_or_None, rows, n, k)``.
+    """``((backend, kernel) or None, rows, n, k)``.
 
     Every precondition the kernel's own contract does not cover lives here, and
     each one is a *silent* failure if it is left out rather than an error:
 
     * ``x`` non-contiguous -- ``reshape`` would copy, and the 2-D kernel would
-      write into the copy.
+      write into the copy.  The C++ lane's kernel would in fact take an
+      arbitrary row stride, but accepting one *here* would make the two lanes
+      serve different sets of calls, and then which lane ran would be
+      observable to a caller.  The stride tolerance is exercised directly
+      against the kernel in ``tests/kernels/test_gated_mlp_cpp.py``.
     * ``w_up`` non-contiguous, or a shape that disagrees with ``w_gate`` --
       ``w_up`` is the operand :func:`gated_mlp_available` cannot see, so the
       check has to be here rather than at the call site.
@@ -98,10 +123,10 @@ def _route(
         return None, 0, 0, 0
     rows, n, k = _shape(x, w_gate)
     dtype_str = "float16" if x.dtype is torch.float16 else "bfloat16"
-    fn = routed_gated_mlp(
+    route = routed_gated_mlp(
         dtype_str=dtype_str, activation=activation, has_bias=has_bias, rows=rows, n=n, k=k
     )
-    return fn, rows, n, k
+    return route, rows, n, k
 
 
 @oasr_api
@@ -146,8 +171,8 @@ def gated_mlp(
     if (bias_gate is None) != (bias_up is None):
         raise ValueError("gated_mlp needs both biases or neither")
     has_bias = bias_gate is not None
-    fn, rows, n, k = _route(x, w_gate, activation=activation, has_bias=has_bias)
-    if fn is None:
+    route, rows, n, k = _route(x, w_gate, activation=activation, has_bias=has_bias)
+    if route is None:
         raise ValueError(
             "oasr.gated_mlp cannot serve this call "
             f"(shape={tuple(x.shape)} w_gate={tuple(w_gate.shape)} dtype={x.dtype} "
@@ -167,19 +192,31 @@ def gated_mlp(
         raise ValueError("gated_mlp needs a contiguous out= (it is written through a view)")
     if out is None:
         out = torch.empty(x.shape[:-1] + (n,), device=x.device, dtype=x.dtype)
-    dummy = None if has_bias else _dummy_bias(x.dtype, x.device)
+    backend, fn = route
     # The kernel is 2-D; a (B, T, K) caller reshapes for free because x is
     # contiguous, and ``out`` is written through the same view.
-    fn(
-        x.reshape(rows, k),
-        w_gate,
-        w_up,
-        bias_gate if has_bias else dummy,
-        bias_up if has_bias else dummy,
-        out.reshape(rows, n),
-        _current_stream(),
-    )
+    if backend == "cxx":
+        # Output first (``AGENTS.md`` rule 4), and the stream comes from the
+        # FFI environment rather than from an argument -- which is also what
+        # makes the call capturable without a per-call handle read.
+        fn(out.reshape(rows, n), x.reshape(rows, k), w_gate, w_up, bias_gate, bias_up)
+    else:
+        dummy = None if has_bias else _dummy_bias(x.dtype, x.device)
+        fn(
+            x.reshape(rows, k),
+            w_gate,
+            w_up,
+            bias_gate if has_bias else dummy,
+            bias_up if has_bias else dummy,
+            out.reshape(rows, n),
+            _current_stream(),
+        )
     return out
 
 
-__all__ = ["gated_mlp", "gated_mlp_available", "GATED_MLP_ACTIVATIONS"]
+__all__ = [
+    "gated_mlp",
+    "gated_mlp_available",
+    "gated_mlp_backend",
+    "GATED_MLP_ACTIVATIONS",
+]

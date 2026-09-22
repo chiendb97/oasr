@@ -1,10 +1,18 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Fused gated MLP (SwiGLU / GeGLU) — the CuTeDSL kernel, the functional and the layer.
+"""Fused gated MLP (SwiGLU / GeGLU) — the kernels, the functional and the layer.
 
-The oracle is an FP32 matmul plus the gate equations in torch, so the kernel is
-checked against the *definition* rather than against another OASR kernel.  Kept
-in its own file because every test here needs CuTeDSL, which is an optional extra.
+The oracle is an FP32 matmul plus the gate equations in torch, so a kernel is
+checked against the *definition* rather than against another OASR kernel.
+
+Two lanes implement this op -- a C++ CUTLASS/CuTe one and a CuTeDSL one -- and
+this file is deliberately **backend-agnostic** from :class:`TestRouting`
+onwards: the functional and the layer run through whichever lane
+:mod:`oasr.jit.mlp` picks, which is what proves the two agree about what they
+compute.  Only :class:`TestKernel` reaches for a specific lane, and it is the
+one class that needs CuTeDSL installed.  The C++ lane's own surface -- its
+tile-table mirror, its K residue, its strides -- is in
+``test_gated_mlp_cpp.py``, which needs no CuTeDSL at all.
 """
 
 from __future__ import annotations
@@ -12,27 +20,44 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from helpers import device_sm
 
-cutlass = pytest.importorskip("cutlass", reason="CuTeDSL (nvidia-cutlass-dsl) not installed")
+import oasr
+from oasr.jit import mlp as jit_mlp
+from oasr.layers import GatedMLP
+from oasr.layers._backend import policy_hits, reset_backend_stats
 
-import oasr  # noqa: E402
-from oasr.jit import mlp as jit_mlp  # noqa: E402
-from oasr.jit.cute_runtime import current_stream  # noqa: E402
-from oasr.layers import GatedMLP  # noqa: E402
-from oasr.layers._backend import policy_hits, reset_backend_stats  # noqa: E402
+try:  # the CuTeDSL lane is an optional extra; the C++ lane is not
+    import cutlass
+
+    from oasr.jit.cute_runtime import current_stream
+except Exception:  # pragma: no cover - exercised on a box without the extra
+    cutlass = None
+    current_stream = None
 
 pytestmark = pytest.mark.cuda
 
 
-def _supported() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor in jit_mlp._SUPPORTED_SM
+def _cutedsl_supported() -> bool:
+    return cutlass is not None and device_sm() in jit_mlp._SUPPORTED_SM
 
 
+def _fused_supported() -> bool:
+    """Can **either** lane serve a plain shape here?"""
+    if _cutedsl_supported():
+        return True
+    from oasr.jit.gated_mlp import SUPPORTED_SM
+
+    return device_sm() in SUPPORTED_SM
+
+
+#: For the tests that name the CuTeDSL lane.
+requires_cutedsl = pytest.mark.skipif(
+    not _cutedsl_supported(), reason="no CuTeDSL gated-MLP kernel for this arch"
+)
+#: For the backend-agnostic ones -- either lane will do.
 requires_cute = pytest.mark.skipif(
-    not _supported(), reason="no CuTeDSL gated-MLP kernel for this arch"
+    not _fused_supported(), reason="no fused gated-MLP kernel for this arch"
 )
 
 _ACT = {
@@ -82,9 +107,14 @@ def _assert_close(out, ref, dtype):
 # ---------------------------------------------------------------------------
 
 
-@requires_cute
+@requires_cutedsl
 class TestKernel:
-    """Direct against :class:`~oasr.kernels.cute.mlp.GatedMlpCute`, tile by tile."""
+    """Direct against :class:`~oasr.kernels.cute.mlp.GatedMlpCute`, tile by tile.
+
+    The one class here that names a lane.  The C++ lane's equivalent -- every
+    tile it compiles, against the same oracle -- is
+    ``test_gated_mlp_cpp.py::TestEveryTile``.
+    """
 
     @staticmethod
     def _run(M, N, K, tile, dtype, activation, bias):
@@ -216,10 +246,32 @@ class TestRouting:
         an N of 129 raised ``misaligned address``."""
         assert jit_mlp.gated_mlp_shape_supported(rows=8, n=n, k=k, k_block=64) is ok
 
-    def test_unsupported_shape_is_not_available(self):
-        x = torch.randn(8, 96, device="cuda", dtype=torch.float16)
-        w = torch.randn(200, 96, device="cuda", dtype=torch.float16)
+    def test_a_shape_neither_lane_can_serve_is_not_available(self):
+        """``K`` off the 128-bit load width is refused by both lanes.
+
+        ``K = 132`` and not ``K = 96``: a K that is merely not a whole number
+        of K tiles is refused by the CuTeDSL lane and **served** by the C++
+        one, which predicates the residue.  Asserting the union here rather
+        than one lane's contract is the point -- see
+        ``test_gated_mlp_cpp.py::TestKResidue``.
+        """
+        x = torch.randn(8, 132, device="cuda", dtype=torch.float16)
+        w = torch.randn(200, 132, device="cuda", dtype=torch.float16)
         assert not oasr.gated_mlp_available(x, w)
+
+    def test_a_partial_k_tile_is_served_by_whichever_lane_can(self):
+        x = torch.randn(8, 96, device="cuda", dtype=torch.float16) * 0.3
+        wg = torch.randn(200, 96, device="cuda", dtype=torch.float16) * 96**-0.5
+        wu = torch.randn(200, 96, device="cuda", dtype=torch.float16) * 96**-0.5
+        from oasr.jit.gated_mlp import SUPPORTED_SM
+
+        if device_sm() not in SUPPORTED_SM:
+            pytest.skip("only the C++ lane serves a partial K tile")
+        assert oasr.gated_mlp_available(x, wg)
+        assert oasr.gated_mlp_backend(x, wg) == "cxx"
+        _assert_close(
+            oasr.gated_mlp(x, wg, wu), _oracle(x, wg, wu, None, None, "silu"), torch.float16
+        )
 
     def test_fp32_and_cpu_are_not_available(self):
         x32 = torch.randn(8, 128, device="cuda", dtype=torch.float32)
@@ -285,9 +337,12 @@ class TestFunctional:
         _assert_close(got, _oracle(x, wg, wu, None, None, "silu"), torch.float16)
 
     def test_refuses_rather_than_falling_back(self):
-        """A silent reroute to torch is what makes a missing kernel invisible."""
-        x = torch.randn(8, 96, device="cuda", dtype=torch.float16)
-        w = torch.randn(200, 96, device="cuda", dtype=torch.float16)
+        """A silent reroute to torch is what makes a missing kernel invisible.
+
+        ``K = 132`` is off the 128-bit load width, which **no** lane serves.
+        """
+        x = torch.randn(8, 132, device="cuda", dtype=torch.float16)
+        w = torch.randn(200, 132, device="cuda", dtype=torch.float16)
         with pytest.raises(ValueError, match="cannot serve"):
             oasr.gated_mlp(x, w, w)
 

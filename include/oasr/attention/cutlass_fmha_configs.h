@@ -39,6 +39,8 @@
 // declarations it pulls in, and including them bare is a parse error.
 #include <cute/tensor.hpp>
 
+#include <oasr/common/arch_facts.h>
+
 #include <cute/arch/copy_sm75.hpp>
 #include <cute/arch/copy_sm80.hpp>
 #include <cute/atom/copy_atom.hpp>
@@ -60,8 +62,11 @@ namespace attention {
  * empty error.  Same constant and same rationale as
  * `oasr/kernels/cute/attention/fmha_sm80.py::_DRIVER_SMEM_RESERVE` and
  * `oasr/kernels/cute/mlp/gated.py`, so the two backends budget alike.
+ *
+ * A property of the *driver*, not of attention, so it is stated once in
+ * `oasr/common/arch_facts.h` and aliased here under this family's name.
  */
-inline constexpr int kFmhaDriverSmemReserve = 1024;
+inline constexpr int kFmhaDriverSmemReserve = kDriverSmemReserve;
 
 /*! \brief Opt-in shared memory an architecture offers a single block, in bytes.
  *
@@ -73,15 +78,7 @@ inline constexpr int kFmhaDriverSmemReserve = 1024;
  * Returns 0 for an architecture this family does not know, which
  * `fmhaResolveTile` turns into "no tile fits" rather than a wrong answer.
  */
-constexpr int fmhaSmemCapacity(int sm) {
-    return sm == 80    ? 166912   // A100, A30
-           : sm == 86  ? 101376   // A10G, A40, RTX 3090
-           : sm == 89  ? 101376   // L4, L40S, RTX 4090
-           : sm == 90  ? 232448   // H100, H200
-           : sm == 100 ? 232448   // B200
-           : sm == 120 ? 101376   // RTX 5090, consumer Blackwell
-                       : 0;
-}
+constexpr int fmhaSmemCapacity(int sm) { return smemCapacityForSm(sm); }
 
 /*! \brief Shared memory a launch on \p sm will actually be granted, in bytes. */
 constexpr int fmhaSmemBudget(int sm) {

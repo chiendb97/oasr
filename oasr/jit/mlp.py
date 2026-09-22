@@ -1,9 +1,27 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""JIT dispatch + compile cache for the OASR fused MLP kernels.
+"""JIT dispatch, routing and compile cache for the OASR fused MLP kernels.
 
 This module is the bridge between the public functional API (``oasr.gated_mlp``)
-and the CuTeDSL backends under ``oasr.kernels.cute.mlp``.
+and the two kernel lanes that implement it:
+
+``cute``
+    the CuTeDSL kernel under :mod:`oasr.kernels.cute.mlp`, compiled here
+    through ``cutlass.cute.compile()``.
+``cxx``
+    the C++ CUTLASS/CuTe kernel under ``include/oasr/mlp/``, compiled by
+    :mod:`oasr.jit.gated_mlp` through the ordinary ninja pipeline.
+
+This module is the **arbiter**; :mod:`oasr.jit.gated_mlp` is one of the answers
+and never imports it back.  Two gates, deliberately separate, because they
+answer different questions:
+
+``OASR_GATED_MLP_CUTE``    -- *fuse or not*: ``auto`` / ``1`` / ``0``.
+``OASR_GATED_MLP_BACKEND`` -- *which lane*: ``auto`` / ``cute`` / ``cxx``.
+
+Collapsing them would make "roll the fusion back" and "A/B the two lanes" the
+same switch, and they are not: the first is an operator decision about a
+shape, the second is a claim about two implementations of the same thing.
 """
 
 from __future__ import annotations
@@ -24,6 +42,14 @@ logger = logging.getLogger("oasr.jit.mlp")
 _GATED_MLP_ENV = "OASR_GATED_MLP_CUTE"
 _VALID_MODES = ("auto", "always", "off")
 
+_BACKEND_ENV = "OASR_GATED_MLP_BACKEND"
+#: ``cute`` keeps meaning the CuTeDSL kernel, as it does for attention: it is
+#: the spelling in every recorded A/B command, so repointing it would silently
+#: change what those measurements measured.  The C++ CUTLASS/CuTe lane is
+#: ``cxx``.  Same names and same aliases as ``OASR_ATTN_BACKEND``.
+_VALID_BACKENDS = ("auto", "cute", "cxx")
+_BACKEND_ALIASES = {"cutedsl": "cute", "cpp": "cxx", "cutlass": "cxx"}
+
 
 def _read_gated_mlp_mode() -> str:
     raw = os.environ.get(_GATED_MLP_ENV, "auto").lower()
@@ -36,7 +62,22 @@ def _read_gated_mlp_mode() -> str:
     return "auto"
 
 
+def _read_gated_mlp_backend() -> str:
+    raw = os.environ.get(_BACKEND_ENV, "auto").lower()
+    raw = _BACKEND_ALIASES.get(raw, raw)
+    if raw not in _VALID_BACKENDS:
+        logger.warning(
+            "%s=%r is not recognised; valid choices are %s. Using 'auto'.",
+            _BACKEND_ENV,
+            raw,
+            _VALID_BACKENDS,
+        )
+        return "auto"
+    return raw
+
+
 _GATED_MLP_MODE = _read_gated_mlp_mode()
+_GATED_MLP_BACKEND = _read_gated_mlp_backend()
 
 
 def get_gated_mlp_mode() -> str:
@@ -50,12 +91,44 @@ def set_gated_mlp_mode(mode: str) -> None:
     if mode not in _VALID_MODES:
         raise ValueError(f"invalid mode {mode!r}; valid: {_VALID_MODES}")
     _GATED_MLP_MODE = mode
+    _clear_all_caches()
+
+
+def get_gated_mlp_backend() -> str:
+    """Return the lane preference (``auto`` / ``cute`` / ``cxx``)."""
+    return _GATED_MLP_BACKEND
+
+
+def set_gated_mlp_backend(backend: str) -> None:
+    """Override the lane preference for the rest of the process.  Tests and A/Bs.
+
+    Note this clears both compile caches, so flipping in a loop recompiles.
+    For an in-process A/B -- a parametrised fixture, a differential test, an
+    interleaved benchmark arm -- ask :func:`routed_gated_mlp` for the lane you
+    want by name and leave the global alone.
+    """
+    global _GATED_MLP_BACKEND
+    backend = _BACKEND_ALIASES.get(backend, backend)
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(f"invalid backend {backend!r}; valid: {_VALID_BACKENDS}")
+    _GATED_MLP_BACKEND = backend
+    _clear_all_caches()
+
+
+def _clear_all_caches() -> None:
     _compiled_gated_mlp.cache_clear()
     _capability_probe.cache_clear()
     _machine.cache_clear()
-    # ``routed_gated_mlp`` memoises the whole decision, gate included, so a mode
-    # change that did not clear it would keep serving the old routing -- which is
-    # exactly what an A/B or a rollback switch is for.
+    _cxx_probe.cache_clear()
+    try:
+        from oasr.jit import gated_mlp as _cxx
+
+        _cxx.clear_caches()
+    except ImportError:  # the C++ lane is optional; the arbiter must still import
+        pass
+    # ``routed_gated_mlp`` memoises the whole decision, gate and lane included,
+    # so a change that did not clear it would keep serving the old routing --
+    # which is exactly what an A/B or a rollback switch is for.
     _ROUTE.clear()
 
 
@@ -343,15 +416,15 @@ def _compiled_gated_mlp(
     return cute.compile(inst, *args, stream, options="--enable-tvm-ffi")
 
 
-def gated_mlp_config_supported(*, rows: int, n: int, k: int) -> bool:
-    """Would :func:`get_compiled_gated_mlp` accept this problem?
+def cute_config_supported(*, rows: int, n: int, k: int) -> bool:
+    """Would the **CuTeDSL** lane accept this problem?
 
     Capability only -- arch, CuTeDSL, a tile for these bounds, and the static
-    shape contract.  It says nothing about whether fusing is *faster* here; that
-    is :func:`should_use_gated_mlp`.  The same split as
-    :func:`oasr.jit.attention.fmha_config_supported`, and for the same reason: a
-    caller that is choosing between two working paths has to be able to ask the
-    capability question without also asking the policy one.
+    shape contract.  It says nothing about whether fusing is *faster* here;
+    that is :func:`should_use_gated_mlp`.  The same split as
+    :func:`oasr.jit.attention.fmha_config_supported`, and for the same reason:
+    a caller that is choosing between two working paths has to be able to ask
+    the capability question without also asking the policy one.
     """
     if _capability_probe() is None:
         return False
@@ -359,6 +432,74 @@ def gated_mlp_config_supported(*, rows: int, n: int, k: int) -> bool:
     if tile is None:
         return False
     return gated_mlp_shape_supported(rows=rows, n=n, k=k, k_block=tile[2])
+
+
+@functools.cache
+def _cxx_probe() -> Optional[int]:
+    """The target SM if the C++ lane is usable here, else ``None``.
+
+    Not resolved at import, for the same reason the CuTeDSL probe is not: the
+    steady-state hot path is a :data:`_ROUTE` dict lookup that never reaches
+    either.
+    """
+    if _GATED_MLP_MODE == "off" or _GATED_MLP_BACKEND == "cute":
+        return None
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.gated_mlp import SUPPORTED_SM
+    except Exception:
+        return None
+    try:
+        sm = _get_target_sm()
+    except Exception:  # an architecture OASR compiles for nothing at all
+        return None
+    return sm if sm in SUPPORTED_SM else None
+
+
+def cxx_config_supported(*, dtype_str: str, activation: str, rows: int, n: int, k: int) -> bool:
+    """Would the **C++** lane accept this problem?
+
+    Its shape contract is strictly wider than the CuTeDSL lane's: ``K`` need
+    not be a whole number of K tiles, because the residue is predicated and the
+    ZFILL cp.async makes the skipped elements zero.
+    """
+    sm = _cxx_probe()
+    if sm is None:
+        return False
+    from oasr.jit import gated_mlp as _cxx
+
+    return _cxx.config_supported(
+        sm=sm, dtype_str=dtype_str, activation=activation, rows=rows, n=n, k=k
+    )
+
+
+def gated_mlp_config_supported(
+    *, rows: int, n: int, k: int, dtype_str: str = "float16", activation: str = "silu"
+) -> bool:
+    """Can **any lane this process is willing to use** serve this problem?
+
+    Asks the lanes in :func:`_lane_order`, so a pinned
+    ``OASR_GATED_MLP_BACKEND`` narrows the answer -- otherwise a shape only the
+    unpinned lane can serve would read as available here and then be declined
+    by :func:`routed_gated_mlp`, and the two would disagree.
+
+    The default arguments keep the pre-two-lane call signature working: every
+    caller that only knew about the CuTeDSL lane was implicitly asking about a
+    configuration both lanes support.
+    """
+    for backend in _lane_order():
+        if backend == "cxx":
+            if cxx_config_supported(
+                dtype_str=dtype_str, activation=activation, rows=rows, n=n, k=k
+            ):
+                return True
+        elif cute_config_supported(rows=rows, n=n, k=k):
+            return True
+    return False
 
 
 def get_compiled_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: int, n: int):
@@ -387,46 +528,127 @@ def get_compiled_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, r
 # Routing
 # ---------------------------------------------------------------------------
 
-#: ``(dtype_str, activation, has_bias, rows, n, k)`` -> the compiled kernel, or
-#: ``None`` when this shape is outside the band or the kernel is unavailable.
-#: Populated by :func:`routed_gated_mlp`; cleared by :func:`set_gated_mlp_mode`.
+
+def get_cxx_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: int, n: int):
+    """Public accessor -- the C++ launcher for this problem's tuned tile.
+
+    Raises rather than declining, for the same reason
+    :func:`get_compiled_gated_mlp` does.  Builds its cell on first use.
+    """
+    sm = _cxx_probe()
+    if sm is None:
+        raise RuntimeError("the C++ gated MLP lane is not available on this device")
+    from oasr.jit import gated_mlp as _cxx
+
+    tile = _cxx.routed_tile(rows=rows, n=n, sm=sm)
+    if tile < 0:
+        raise RuntimeError(f"no tile for rows={rows} n={n} on sm_{sm}")
+    return _cxx.get_gated_mlp_fn(
+        dtype_str=dtype_str,
+        activation=activation,
+        has_bias=has_bias,
+        tile_index=tile,
+        sm=sm,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+#: ``(dtype_str, activation, has_bias, rows, n, k)`` -> ``(backend, callable)``,
+#: or ``None`` when this shape is outside the band or no lane is available.
+#: Populated by :func:`routed_gated_mlp`; cleared by :func:`set_gated_mlp_mode`
+#: and :func:`set_gated_mlp_backend`.
 _ROUTE: dict = {}
 
+#: Lane preference under ``auto``, best first.
+#:
+#: ``cxx`` is first because it measured **1.00x - 1.11x** of the CuTeDSL lane
+#: over four interleaved, graph-replayed sweeps of 13 shapes each (fp16 with
+#: and without bias, bf16, gelu_tanh) with **no row regressing** -- ahead by
+#: most where the weights fit in L2 and the kernel is issue-bound rather than
+#: DRAM-bound.  Its shape contract is also strictly wider (no
+#: ``K % k_block`` constraint), and it is the lane that does not need CuTeDSL
+#: installed at all.  Numbers and protocol:
+#: ``.artifacts/gated_mlp_cpp_validation.md``; re-measure before reordering.
+_AUTO_ORDER: Tuple[str, ...] = ("cxx", "cute")
 
-def should_use_gated_mlp(*, rows: int, n: int, k: int) -> bool:
-    """Is this shape inside the band where the fused kernel measured fastest?"""
-    if not gated_mlp_config_supported(rows=rows, n=n, k=k):
+
+def should_use_gated_mlp(
+    *, rows: int, n: int, k: int, dtype_str: str = "float16", activation: str = "silu"
+) -> bool:
+    """Is this shape inside the band where the fused kernel measured fastest?
+
+    The band is one m-tile, and it is the same for both lanes: with a single
+    m-tile every weight element is read from DRAM exactly once, which is the
+    bandwidth argument the fusion rests on.  With two, each weight tile is
+    loaded by two CTAs and the kernel is an ordinary GEMM competing with cuBLAS
+    on cuBLAS's own terms.  That argument is about the *tiling*, which the two
+    lanes share, so the band does not move with the lane.
+    """
+    if not gated_mlp_config_supported(
+        rows=rows, n=n, k=k, dtype_str=dtype_str, activation=activation
+    ):
         return False
     return _GATED_MLP_MODE == "always" or rows <= _BAND_MAX_ROWS
 
 
-def routed_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: int, n: int, k: int):
-    """The kernel to run for this shape, or ``None`` to leave it on the GEMM path.
+def _lane_order() -> Tuple[str, ...]:
+    return _AUTO_ORDER if _GATED_MLP_BACKEND == "auto" else (_GATED_MLP_BACKEND,)
 
-    ``should_use_gated_mlp()`` followed by ``get_compiled_gated_mlp()`` is the
-    readable spelling, and both are pure functions of the shape, so the whole
-    decision memoises to one dict lookup -- which matters because a 28-layer
-    decoder asks 28 times per step.  Deciding *and* compiling under the same key
-    also means a shape whose tile fails to build is remembered as declined rather
-    than retried per step; a compile failure is a property of the configuration,
-    not of the call.
+
+def routed_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: int, n: int, k: int):
+    """``(backend, callable)`` for this shape, or ``None`` to leave it on the GEMM path.
+
+    The two lanes have **different call signatures** -- the C++ one takes its
+    output first (``AGENTS.md`` rule 4) and reads the stream from the FFI
+    environment, the CuTeDSL one takes the output last and a stream handle --
+    so the backend name comes back with the callable rather than being hidden
+    behind a wrapper.  A wrapper would be one more Python frame on a path a
+    28-layer decoder walks 28 times per step, and the whole point of
+    :data:`_ROUTE` is that the steady state is one dict lookup.
+
+    Deciding *and* compiling under the same key also means a shape whose kernel
+    fails to build is remembered as declined rather than retried per step; a
+    build failure is a property of the configuration, not of the call.
     """
     key = (dtype_str, activation, has_bias, rows, n, k)
     try:
         return _ROUTE[key]
     except KeyError:
         pass
-    fn = None
-    if should_use_gated_mlp(rows=rows, n=n, k=k):
-        try:
-            fn = get_compiled_gated_mlp(
-                dtype_str=dtype_str, activation=activation, has_bias=has_bias, rows=rows, n=n
+    route = None
+    if should_use_gated_mlp(rows=rows, n=n, k=k, dtype_str=dtype_str, activation=activation):
+        for backend in _lane_order():
+            supported = (
+                cxx_config_supported(
+                    dtype_str=dtype_str, activation=activation, rows=rows, n=n, k=k
+                )
+                if backend == "cxx"
+                else cute_config_supported(rows=rows, n=n, k=k)
             )
-        except Exception as exc:  # unsupported arch, missing CuTeDSL, unbuildable tile
-            logger.warning("CuTeDSL gated MLP declined for rows=%d n=%d k=%d: %s", rows, n, k, exc)
-            fn = None
-    _ROUTE[key] = fn
-    return fn
+            if not supported:
+                continue
+            getter = get_cxx_gated_mlp if backend == "cxx" else get_compiled_gated_mlp
+            try:
+                route = (
+                    backend,
+                    getter(
+                        dtype_str=dtype_str,
+                        activation=activation,
+                        has_bias=has_bias,
+                        rows=rows,
+                        n=n,
+                    ),
+                )
+                break
+            except Exception as exc:  # unsupported arch, missing toolchain, bad tile
+                logger.warning(
+                    "the %s gated MLP declined rows=%d n=%d k=%d: %s", backend, rows, n, k, exc
+                )
+    _ROUTE[key] = route
+    return route
 
 
 # ---------------------------------------------------------------------------
