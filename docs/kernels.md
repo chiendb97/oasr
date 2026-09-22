@@ -285,7 +285,7 @@ allocates its output tensor, and calls into the compiled module.
 | `oasr/functionals/softmax.py`, `oasr/functionals/topk.py`, `oasr/functionals/fft.py` | `softmax`, `log_softmax`, `masked_softmax` (one pass over an attention score tensor: an additive bias and two boolean masks, each **broadcast against the scores through its own strides**, so a shifted `as_strided` relative-position window or a `[..., ::ds]` mask slice is consumed where it is), `topk`, `rfft` / `rfft_power` |
 | `oasr/functionals/feature.py` | `stft_frame`, `dct_lifter`, `fbank_preprocess`, `mel_log`, `whisper_logmel`, `lfr_gather` — see [features.md](features.md) |
 | `oasr/functionals/attention.py` | `fmha(...)` and `fmha.persistent_inputs(...)` |
-| `oasr/functionals/mlp.py` | `gated_mlp` — a whole SwiGLU/GeGLU gate+up+activation+multiply in one CuTeDSL dual-B GEMM, plus `gated_mlp_available` (the routing question, so a layer can ask before building anything). Refuses rather than falling back |
+| `oasr/functionals/mlp.py` | `gated_mlp` — a whole SwiGLU/GeGLU gate+up+activation+multiply in one dual-B GEMM, plus `gated_mlp_available` (the routing question, so a layer can ask before building anything) and `gated_mlp_backend` (which of the two lanes answered it). Refuses rather than falling back |
 | `oasr/functionals/ctc_decode.py` | `ctc_beam_search_decode`, `GpuStreamingDecoder` — see [ctc_decoder_gpu.md](ctc_decoder_gpu.md) |
 | `oasr/decode.py` | Thin helpers over the CPU-side `oasr.decoder` decoders |
 
@@ -491,6 +491,42 @@ Two rules in that header are load-bearing rather than stylistic:
 numbered items, each one a place where FlashAttention's reference is wrong for
 OASR's masking semantics, with the failure each one prevents.
 
+### The C++ gated-MLP kernel (`include/oasr/mlp/`)
+
+The same collective decomposition, one family over:
+`CollectiveGatedMlpMainloopSm80` + `CollectiveGatedMlpEpilogue`, composed by
+`GatedMlpKernel`, with `gated_mlp_launch_template.h` the one file that names
+an architecture. `gated_mlp_tiles.h` is deliberately CuTe-free — it holds the
+CTA tiles and the arithmetic that picks one, as plain `constexpr` integers, so
+`csrc/gated_mlp_jit_binding.cu` can export them as a cheap capability oracle
+and `tests/kernels/test_gated_mlp_cpp.py` can hold the Python mirror to them
+over four architectures from one box.
+
+Where it differs from the attention family, and why:
+
+| | attention | gated MLP |
+|---|---|---|
+| tile | **resolved**: `fmhaResolveTile` derives it from the architecture, because the question is "what fits" | **tabled**: the question is a wave count, so it depends on `rows`, `N` *and* the SM count, and all six tiles are compiled as siblings in one module |
+| cell | `(sm, dtype, head_dim)` — the axes that change the smem layouts | `(sm, dtype, activation)` — the activation is the one axis that changes the arithmetic, and a checkpoint means one of them |
+| variants in a cell | 3 masks x 2 bias x 2 paged = 12 | 6 tiles x 2 bias = 12 |
+
+Two things it does that the CuTeDSL lane cannot:
+
+| Capability | Why not on `cute` |
+|---|---|
+| a **K residue** — `K` need not be a whole number of K tiles | there the mainloop predicates only the row axis, so a partial K tile reads the next row of `x`; `gated_mlp_shape_supported` has to refuse it |
+| **arbitrary row strides** on every operand | there the compiled signature marks the tensors compact, so a row-slice of a wider buffer has to be copied first |
+
+One implementation note is worth carrying, because nothing in the C++ says it.
+The K residue is predicated into the ZFILL `cp.async`'s own `src_size` operand
+(`copy_zfill_2d`), not into control flow. Written the obvious way —
+`if (pred) copy(...) else clear(...)` — ptxas has to order a synchronous `STS`
+against an asynchronous `LDGSTS` to the same shared address, and it does that
+by bracketing every copy in `BSSY`/`BSYNC` and padding it with three dead
+`@!PT LDS RZ, [RZ]`. Measured on the 64x64x32 tile: the K loop's load section
+went from ~60 instructions to ~12, the LSU pipe from 2.34M instructions to
+1.2M, and the kernel from 0.89x of the CuTeDSL lane to ahead of it everywhere.
+
 ### CuteDSL kernels (`oasr/kernels/`)
 
 `oasr/kernels/` holds low-level implementations that do **not** use the TVM-FFI /
@@ -521,13 +557,29 @@ directly and be captured into a CUDA graph.
 Each of the three also owns a **routing** module beside its compile cache, because
 a fused kernel that is faster on some shapes and slower on others has to say
 which: `OASR_ATTN_BACKEND`, `OASR_RECURRENT_CUTE`, `OASR_GATED_MLP_CUTE`, each
-`auto` / `1` / `0`, each with the measured band in its module docstring. For the
-gated MLP the band is **one m-tile** (`M <= 64`): with one m-tile every weight
-element is read from DRAM once, which is the bandwidth argument the fusion rests
-on; with two it is an ordinary GEMM reading its operands twice and cuBLAS wins.
-The *tile* inside the band is chosen by `N` rather than by `M` — see
-`select_gated_mlp_tile`, and the ten lines of it that exist because a rows-keyed table lost
-10% at one model width.
+with the measured band in its module docstring. For the gated MLP the band is
+**one m-tile** (`M <= 64`): with one m-tile every weight element is read from
+DRAM once, which is the bandwidth argument the fusion rests on; with two it is
+an ordinary GEMM reading its operands twice and cuBLAS wins. The *tile* inside
+the band is chosen by `N` rather than by `M` — see `select_gated_mlp_tile`, and
+the ten lines of it that exist because a rows-keyed table lost 10% at one model
+width.
+
+Attention and the gated MLP each have **two** fused lanes, `cute` and `cxx`,
+and they spell the choice differently on purpose. Attention folds both
+questions into `OASR_ATTN_BACKEND`, because its fallback (`sdpa`) is itself a
+backend and sits in the same list. The gated MLP cannot: its fallback is *two
+GEMMs*, which is not a lane of this kernel at all, so "fuse or not"
+(`OASR_GATED_MLP_CUTE`) and "which lane" (`OASR_GATED_MLP_BACKEND`, `auto` /
+`cute` / `cxx`) are separate switches. Collapsing them would make a rollback
+and an A/B the same knob, and they are different decisions: the first is an
+operator's call about a shape, the second is a claim about two implementations
+of the same thing.
+
+`auto` resolves to `cxx` for the MLP — 1.00x-1.11x of the CuTeDSL lane over
+four interleaved, graph-replayed sweeps with no row regressing, plus a strictly
+wider shape contract — and to `cute` for attention, where the C++ lane's paged
+mode still reads 0.85-0.94x.
 
 ### Which routing decisions travel, and which are extrapolations
 

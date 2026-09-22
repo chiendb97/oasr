@@ -2,10 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused gated MLP (SwiGLU / GeGLU) against the two-GEMM path it replaces.
 
-Three arms, all computing ``act(x @ w_gate.T) * (x @ w_up.T)``:
+Four arms, all computing ``act(x @ w_gate.T) * (x @ w_up.T)``:
 
+``cxx``
+    the C++ CUTLASS/CuTe kernel -- one dual-B tensor-core GEMM, no
+    intermediate.  This is the lane ``OASR_GATED_MLP_BACKEND=auto`` picks.
 ``cute``
-    :func:`oasr.gated_mlp` -- one dual-B tensor-core GEMM, no intermediate.
+    the CuTeDSL kernel, same shape of algorithm.  Both fused arms are called
+    through their *launchers* rather than through :func:`oasr.gated_mlp`, so
+    the row compares two kernels and not two argument-marshalling paths; they
+    differ there by one Python branch and one stream-handle read.
 ``oasr``
     ``oasr.gemm_activation`` for the gate (activation folded into that
     epilogue), ``oasr.gemm`` for the up, then one elementwise multiply.  This is
@@ -106,11 +112,37 @@ def build_fns(
         )
 
     fns: Dict[str, Callable] = {"torch": torch_fn, "oasr": oasr_fn}
-    # `auto` is what the layer asks, so the benchmark asks it too and simply
-    # reports no `cute` row where the routing declines.  OASR_GATED_MLP_CUTE=1
-    # forces it above the band.
-    if oasr.gated_mlp_available(x, w_gate, activation=activation):
-        fns["cute"] = lambda: oasr.gated_mlp(x, w_gate, w_up, activation=activation, out=out)
+
+    # Each fused lane is asked for **by name**, so a row compares them directly
+    # instead of reporting whichever one the router happens to prefer.  A lane
+    # that cannot serve the shape simply contributes no column.
+    # `OASR_GATED_MLP_CUTE=1` reaches above the measured band.
+    from oasr.jit import mlp as jit_mlp
+    from oasr.jit.cute_runtime import current_stream
+
+    dtype_str = "float16" if dtype is torch.float16 else "bfloat16"
+    in_band = jit_mlp.should_use_gated_mlp(
+        rows=rows, n=n, k=k, dtype_str=dtype_str, activation=activation
+    )
+
+    if in_band and jit_mlp.cxx_config_supported(
+        dtype_str=dtype_str, activation=activation, rows=rows, n=n, k=k
+    ):
+        cxx = jit_mlp.get_cxx_gated_mlp(
+            dtype_str=dtype_str, activation=activation, has_bias=False, rows=rows, n=n
+        )
+        fns["cxx"] = lambda: cxx(out, x, w_gate, w_up, None, None)
+
+    if in_band and jit_mlp.cute_config_supported(rows=rows, n=n, k=k):
+        dsl = jit_mlp.get_compiled_gated_mlp(
+            dtype_str=dtype_str, activation=activation, has_bias=False, rows=rows, n=n
+        )
+        dummy = torch.zeros(jit_mlp.ALIGNMENT, device="cuda", dtype=dtype)
+        # The stream handle is read *inside* the call, never hoisted: one
+        # cached before a capture still points at the non-capturing stream, the
+        # graph records nothing, and replay measures nothing.
+        fns["cute"] = lambda: dsl(x, w_gate, w_up, dummy, dummy, out, current_stream())
+
     return fns
 
 
@@ -129,5 +161,5 @@ def describe(subroutine: str, cfg: dict, dtype: torch.dtype) -> Work:
         params=params_of(cfg),
         flops=2 * 2 * rows * n * k,
         bytes=unfused,
-        bytes_by_backend={"cute": fused},
+        bytes_by_backend={"cute": fused, "cxx": fused},
     )

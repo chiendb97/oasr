@@ -120,14 +120,15 @@ class TestJitInfrastructure:
             "features",
         }
         assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
-        # Not `len(specs) == len(expected)`: fused attention contributes one
-        # spec per `(dtype, head_dim)` cell rather than one per family, and the
-        # count is a function of which architecture this box is.  Pin the
-        # *extras* by what they are instead of by how many there are.
+        # Not `len(specs) == len(expected)`: two families contribute one spec
+        # per *cell* rather than one per family -- fused attention by
+        # `(dtype, head_dim)` and the fused gated MLP by `(dtype, activation)`
+        # -- and the count is a function of which architecture this box is.
+        # Pin the *extras* by what they are instead of by how many there are.
+        per_cell = ("fmha_", "gated_mlp_")
         extras = [n for n in names if n not in expected]
-        assert all(
-            n.startswith("fmha_") for n in extras
-        ), f"unexpected AOT modules: {[n for n in extras if not n.startswith('fmha_')]}"
+        unknown = [n for n in extras if not n.startswith(per_cell)]
+        assert not unknown, f"unexpected AOT modules: {unknown}"
         assert len(names) == len(set(names)), f"duplicate AOT specs: {names}"
 
     def test_attention_cells_are_registered_where_the_lane_serves_the_arch(self):
@@ -148,6 +149,27 @@ class TestJitInfrastructure:
             assert cells, "the C++ attention lane serves this arch but registered no cells"
             assert any("d64" in n for n in cells)
             assert any("d128" in n for n in cells)
+        else:
+            assert not cells, "cells registered for an arch the lane does not serve"
+
+    def test_gated_mlp_cells_are_registered_where_the_lane_serves_the_arch(self):
+        """Same argument as attention: a missing cell is a stall, not a failure.
+
+        SwiGLU in both served dtypes is what every gated feed-forward block in
+        scope uses -- Qwen2-Audio's LM and the Nemotron encoder -- and each
+        cell already carries all six tiles in both bias modes, so these two
+        cover the shipped set.
+        """
+        from oasr.aot import gen_all_modules
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.gated_mlp import SUPPORTED_SM
+
+        names = {s.name for s in gen_all_modules()}
+        cells = {n for n in names if n.startswith("gated_mlp_")}
+        if _get_target_sm() in SUPPORTED_SM:
+            assert cells, "the C++ gated-MLP lane serves this arch but registered no cells"
+            assert any("float16_silu" in n for n in cells)
+            assert any("bfloat16_silu" in n for n in cells)
         else:
             assert not cells, "cells registered for an arch the lane does not serve"
 

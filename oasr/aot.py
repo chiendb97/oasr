@@ -20,7 +20,8 @@ def gen_all_modules() -> List:
     Fused attention is the exception to "one module per family": its cells are
     keyed by ``(dtype, head_dim)`` because those change the shared-memory
     layouts, so :func:`oasr.jit.fmha.gen_fmha_modules` contributes one spec per
-    cell -- and none at all on an architecture it does not serve.
+    cell -- and none at all on an architecture it does not serve.  The fused
+    gated MLP is keyed the same way, by ``(dtype, activation)``.
 
     Returns:
         List of JitSpec objects for all kernel modules.
@@ -36,6 +37,7 @@ def gen_all_modules() -> List:
     from oasr.jit.features import gen_features_module
     from oasr.jit.fft import gen_fft_module
     from oasr.jit.fmha import gen_fmha_modules
+    from oasr.jit.gated_mlp import gen_gated_mlp_modules
     from oasr.jit.gemm import (
         gen_bmm_module,
         gen_gemm_log_softmax_module,
@@ -48,12 +50,13 @@ def gen_all_modules() -> List:
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
 
-    # Fused attention is the one family whose module count depends on the
-    # *shapes* shipped models use, not on the kernel: one `.so` per
-    # (dtype, head_dim) cell, each holding all 12 feature variants.  It returns
-    # an empty list on an architecture the C++ lane is not compiled for, which
-    # is why it splices rather than appends.
-    return [
+    # Fused attention and the fused gated MLP are the two families whose module
+    # count depends on what shipped models *use*, not on the kernel: one `.so`
+    # per (dtype, head_dim) attention cell holding all 12 feature variants, and
+    # one per (dtype, activation) MLP cell holding all six tiles in both bias
+    # modes.  Both return an empty list on an architecture their C++ lane is not
+    # compiled for, which is why they extend rather than append.
+    modules = [
         gen_activation_module(),
         gen_norm_module(),
         gen_pooling_module(),
@@ -71,7 +74,10 @@ def gen_all_modules() -> List:
         gen_topk_module(),
         gen_fft_module(),
         gen_features_module(),
-    ] + gen_fmha_modules()
+    ]
+    modules += gen_fmha_modules()
+    modules += gen_gated_mlp_modules()
+    return modules
 
 
 def register_default_modules() -> int:

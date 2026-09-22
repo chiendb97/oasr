@@ -262,6 +262,7 @@ extension cookbook for each axis.
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
+| `include/oasr/mlp/`, `oasr/jit/gated_mlp.py` | The C++ CUTLASS/CuTe fused gated MLP and its lane; `oasr/jit/mlp.py` is the arbiter between it and the CuTeDSL one |
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
 | `csrc/alignment/` | The post-decode alignment pass and the beam read-back, in C++ (`_C.alignment`) |
 | `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |
@@ -605,6 +606,7 @@ Environment variables:
 | `OASR_GEMM_WS_CACHE` | `0` disables the persistent split-K/Stream-K workspace cache |
 | `OASR_CTC_FUSED` | `0` forces the legacy multi-kernel CTC beam-search step (A/B, rollback) |
 | `OASR_GATED_MLP_CUTE` | `auto` (default) / `1` (take the fused gated MLP wherever it fits) / `0` (never) |
+| `OASR_GATED_MLP_BACKEND` | Which fused gated-MLP lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
 | `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the CuTeDSL fused recurrent step |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
