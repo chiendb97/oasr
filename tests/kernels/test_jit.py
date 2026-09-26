@@ -120,12 +120,13 @@ class TestJitInfrastructure:
             "features",
         }
         assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
-        # Not `len(specs) == len(expected)`: two families contribute one spec
+        # Not `len(specs) == len(expected)`: three families contribute one spec
         # per *cell* rather than one per family -- fused attention by
-        # `(dtype, head_dim)` and the fused gated MLP by `(dtype, activation)`
-        # -- and the count is a function of which architecture this box is.
+        # `(dtype, head_dim)`, the fused gated MLP by `(dtype, activation)` and
+        # the fused recurrent step by `(dtype, kind)` -- and the count is a
+        # function of which architecture this box is.
         # Pin the *extras* by what they are instead of by how many there are.
-        per_cell = ("fmha_", "gated_mlp_")
+        per_cell = ("fmha_", "gated_mlp_", "recurrent_step_")
         extras = [n for n in names if n not in expected]
         unknown = [n for n in extras if not n.startswith(per_cell)]
         assert not unknown, f"unexpected AOT modules: {unknown}"
@@ -170,6 +171,27 @@ class TestJitInfrastructure:
             assert cells, "the C++ gated-MLP lane serves this arch but registered no cells"
             assert any("float16_silu" in n for n in cells)
             assert any("bfloat16_silu" in n for n in cells)
+        else:
+            assert not cells, "cells registered for an arch the lane does not serve"
+
+    def test_recurrent_step_cells_are_registered_where_the_lane_serves_the_arch(self):
+        """Same argument again: a missing cell is a stall, not a failure.
+
+        An LSTM in both served dtypes is what every shipped recurrent layer in
+        scope uses -- a transducer predictor, Nemotron's prediction network --
+        and each cell already carries all eight tiles, so these two cover the
+        shipped set.  A vanilla RNN compiles its own cell on first use.
+        """
+        from oasr.aot import gen_all_modules
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.recurrent_step import SUPPORTED_SM
+
+        names = {s.name for s in gen_all_modules()}
+        cells = {n for n in names if n.startswith("recurrent_step_")}
+        if _get_target_sm() in SUPPORTED_SM:
+            assert cells, "the C++ recurrent-step lane serves this arch but registered no cells"
+            assert any("float16_lstm" in n for n in cells)
+            assert any("bfloat16_lstm" in n for n in cells)
         else:
             assert not cells, "cells registered for an arch the lane does not serve"
 

@@ -121,7 +121,7 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | Format Python | `black oasr/ tests/ benchmarks/ scripts/ ci/` then `isort` the same paths |
 | Lint Python | `ruff check oasr/ tests/ benchmarks/ scripts/ ci/` |
 | Type check (ratchet) | `python scripts/mypy_ratchet.py` |
-| Format C++/CUDA | `clang-format -i csrc/**/*.cu csrc/**/*.h csrc/**/*.cpp` |
+| Format C++/CUDA | `clang-format -i csrc/**/*.cu csrc/**/*.h csrc/**/*.cpp` — **`csrc/` only**, never `include/` (see below) |
 | Rust build / test / lint | `cd rust && cargo build --release && cargo test && cargo clippy --all-targets -- -D warnings` |
 | Serve a checkpoint | `oasr-server --ckpt-dir <dir> --service-mode offline --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051` |
 | Convert a checkpoint | `oasr-convert <src> <dst>` |
@@ -263,6 +263,7 @@ extension cookbook for each axis.
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
 | `include/oasr/mlp/`, `oasr/jit/gated_mlp.py` | The C++ CUTLASS/CuTe fused gated MLP and its lane; `oasr/jit/mlp.py` is the arbiter between it and the CuTeDSL one |
+| `include/oasr/recurrent/recurrent_step_*.h`, `oasr/jit/recurrent_step.py` | The C++ CUTLASS/CuTe fused recurrent step and its lane; `oasr/jit/recurrent_cute.py` is the arbiter between it and the CuTeDSL one |
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
 | `csrc/alignment/` | The post-decode alignment pass and the beam read-back, in C++ (`_C.alignment`) |
 | `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |
@@ -304,6 +305,15 @@ extension cookbook for each axis.
 - **Changing `[tool.isort]` without `[tool.ruff.lint.isort]`** (or vice versa). Both sort
   imports and mirror `known_first_party` / `combine_as_imports` /
   `force_sort_within_sections`; change them together or the two tools fight and CI flaps.
+
+- **Running `clang-format` over `include/`.** The documented command covers `csrc/`
+  deliberately. `.clang-format` sets `IncludeBlocks: Regroup` with `SortIncludes: true`,
+  and the CuTe families hand-order their includes because `cute/tensor.hpp` must precede
+  any `cute/atom/*` or `cute/arch/*` header — the atoms' free functions are declared
+  against what it pulls in. Sorting them is a parse error, not a style change; it cost 91
+  test failures once. `include/oasr/recurrent/cutlass_recurrent_step_configs.h` guards its
+  block with `// clang-format off`; the attention and gated-MLP equivalents do not, and are
+  safe only because nobody runs the tool there.
 
 ### Testing & measuring
 - **Assuming a green `pytest tests/` means coverage.** Without the external assets the
@@ -607,7 +617,8 @@ Environment variables:
 | `OASR_CTC_FUSED` | `0` forces the legacy multi-kernel CTC beam-search step (A/B, rollback) |
 | `OASR_GATED_MLP_CUTE` | `auto` (default) / `1` (take the fused gated MLP wherever it fits) / `0` (never) |
 | `OASR_GATED_MLP_BACKEND` | Which fused gated-MLP lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
-| `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the CuTeDSL fused recurrent step |
+| `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the fused recurrent step — whether to fuse at all |
+| `OASR_RECURRENT_BACKEND` | Which fused recurrent-step lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
 | `OASR_METRICS` | `0` binds the engine-side metric collector to a no-op (front-end metrics are unaffected) |

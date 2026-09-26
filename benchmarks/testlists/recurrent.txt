@@ -5,3 +5,11 @@
 --family recurrent --subroutine rnn_tanh --backends oasr cudnn --dtype bfloat16 --refcheck --iters 20 --warmup-iters 5
 --family recurrent --subroutine rnn_relu --backends oasr cudnn --dtype float16 --refcheck --iters 20 --warmup-iters 5
 --family recurrent --subroutine rnn_relu --backends oasr cudnn --dtype bfloat16 --refcheck --iters 20 --warmup-iters 5
+
+# The two fused-step lanes against the tensor-core GEMM they replace.  Each arm
+# is a 64-step dependent chain in one CUDA graph, which is the only protocol
+# that resolves a 2-12 us kernel -- a single call costs more than the step.  No
+# --refcheck: the cuBLAS arm is a lower bound, not an equivalent, and the
+# numerics are checked against FP32 equations in tests/kernels/.
+--family recurrent --subroutine lstm_step_cute --backends cute cxx cublas --dtype float16 --iters 20 --warmup-iters 5
+--family recurrent --subroutine lstm_step_cute --backends cute cxx cublas --dtype bfloat16 --iters 20 --warmup-iters 5
