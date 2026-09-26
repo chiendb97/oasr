@@ -1,13 +1,34 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Compile cache and routing for the CuTeDSL fused recurrent step.
+"""Compile cache and routing for the fused recurrent step.
 
-Like :mod:`oasr.jit.attention`, and unlike :mod:`oasr.jit.core`, this is not the
-Ninja C++ pipeline: CuTeDSL kernels are Python and compile through
-``cutlass.cute.compile()``, which hands back a callable.  One callable is cached
-per configuration and reused.
+This module is the **arbiter** between the two lanes that implement the fused
+step, and the compile cache for one of them:
 
-``OASR_RECURRENT_CUTE`` gates it:
+``cute``
+    the CuTeDSL kernel under :mod:`oasr.kernels.cute.recurrent`, compiled here
+    through ``cutlass.cute.compile()``.  Like :mod:`oasr.jit.attention`, and
+    unlike :mod:`oasr.jit.core`, that is not the Ninja C++ pipeline: CuTeDSL
+    kernels are Python and compile to a callable.  One callable is cached per
+    configuration and reused.
+``cxx``
+    the C++ CUTLASS/CuTe kernel under ``include/oasr/recurrent/``, compiled by
+    :mod:`oasr.jit.recurrent_step` through the ordinary ninja pipeline.
+    :mod:`oasr.jit.recurrent_step` is one of the answers and never imports this
+    module back.
+
+Two gates, deliberately separate, because they answer different questions:
+
+``OASR_RECURRENT_CUTE``    -- *fuse or not*: ``auto`` / ``1`` / ``0``.
+``OASR_RECURRENT_BACKEND`` -- *which lane*: ``auto`` / ``cute`` / ``cxx``.
+
+Collapsing them would make "roll the fused step back" and "A/B the two lanes"
+the same switch, and they are not: the first is an operator decision about a
+shape, the second is a claim about two implementations of the same thing.  Same
+split, and the same spellings, as ``OASR_GATED_MLP_CUTE`` /
+``OASR_GATED_MLP_BACKEND`` and ``OASR_ATTN_BACKEND``.
+
+``OASR_RECURRENT_CUTE`` gates the fusion:
 
 * ``auto`` (**default**) -- take it inside the measured band, leave every other
   shape on whichever path wins there.
@@ -69,6 +90,32 @@ from .measured import Machine, MeasuredOn, note_extrapolation
 logger = logging.getLogger("oasr.jit.recurrent_cute")
 
 _ENV = "OASR_RECURRENT_CUTE"
+
+_BACKEND_ENV = "OASR_RECURRENT_BACKEND"
+#: ``cute`` keeps meaning the CuTeDSL kernel, as it does for attention and the
+#: gated MLP: it is the spelling in every recorded A/B command, so repointing it
+#: would silently change what those measurements measured.  The C++
+#: CUTLASS/CuTe lane is ``cxx``.
+_VALID_BACKENDS = ("auto", "cute", "cxx")
+_BACKEND_ALIASES = {"cutedsl": "cute", "cpp": "cxx", "cutlass": "cxx"}
+
+#: Lane preference under ``auto``, best first.
+#:
+#: ``cxx`` is first because it measured **1.05x - 1.31x** of the CuTeDSL lane,
+#: geomean 1.13x, over four interleaved reps of all 32 ``(hidden, batch)``
+#: shapes of the table below, under the 64-step graph-replayed dependent chain
+#: protocol -- with **no row regressing**.  Both lanes run the same tile on
+#: every shape (``kRecurrentStepRoutes`` reproduces ``_TILES``), so that is a
+#: comparison of kernels and not of tile choices.  The mechanism is the load
+#: section: this lane's cp.async is branch-free and zero-filling where the
+#: CuTeDSL one is an ``if`` around the copy, which ncu shows as 19.1 against
+#: 22.6 warp-cycles per issued instruction at H=1024 B=128.
+#:
+#: Its shape contract is also strictly wider -- a hidden width that is not a
+#: whole number of K tiles, and arbitrary row strides -- and it is the lane
+#: that does not need CuTeDSL installed at all.  Numbers and protocol:
+#: ``.artifacts/recurrent_cpp_validation.md``; re-measure before reordering.
+_AUTO_ORDER: Tuple[str, ...] = ("cxx", "cute")
 
 #: Architectures whose CuTeDSL warp-level ``mma.sync`` composition is validated.
 #: SM90 and SM100 would want wgmma / tcgen05 mainloops of their own and are not
@@ -190,17 +237,49 @@ def _read_mode() -> str:
     return "auto"
 
 
+def _read_backend() -> str:
+    raw = os.environ.get(_BACKEND_ENV, "auto").lower()
+    raw = _BACKEND_ALIASES.get(raw, raw)
+    if raw not in _VALID_BACKENDS:
+        logger.warning(
+            "%s=%r is not recognised; valid choices are %s. Using 'auto'.",
+            _BACKEND_ENV,
+            raw,
+            _VALID_BACKENDS,
+        )
+        return "auto"
+    return raw
+
+
 _MODE = _read_mode()
+_BACKEND = _read_backend()
 
 
-#: ``(dtype_str, gate_count, activation, hidden, batch)`` -> the compiled step, or
-#: ``None`` when this shape is outside the band or the kernel is unavailable.
-#: Populated by :func:`routed_step`; cleared by :func:`set_mode`.
+#: ``(dtype_str, gate_count, activation, hidden, batch)`` ->
+#: ``(backend, callable)``, or ``None`` when this shape is outside the band or
+#: no lane is available.  Populated by :func:`routed_step`; cleared by
+#: :func:`set_mode` and :func:`set_backend`.
 _ROUTE: dict = {}
 
 
 def get_mode() -> str:
     return _MODE
+
+
+def _clear_all_caches() -> None:
+    _compiled_step.cache_clear()
+    _probe.cache_clear()
+    _cxx_probe.cache_clear()
+    try:
+        from oasr.jit import recurrent_step as _cxx
+
+        _cxx.clear_caches()
+    except Exception:  # the C++ lane is optional; nothing to clear if absent
+        pass
+    # ``routed_step`` memoises the *whole* decision, gate and lane included, so
+    # a change that did not clear it would keep serving the old routing --
+    # which is exactly what an A/B or a rollback switch is for.
+    _ROUTE.clear()
 
 
 def set_mode(mode: str) -> None:
@@ -209,18 +288,44 @@ def set_mode(mode: str) -> None:
     if mode not in ("auto", "always", "off"):
         raise ValueError(f"invalid mode {mode!r}; valid: auto / always / off")
     _MODE = mode
-    _compiled_step.cache_clear()
-    _probe.cache_clear()
-    # ``routed_step`` memoises the *whole* decision, gate included, so a mode
-    # change that did not clear it would keep serving the old routing -- which is
-    # exactly what an A/B or a rollback switch is for.
-    _ROUTE.clear()
+    _clear_all_caches()
+
+
+def get_backend() -> str:
+    """Return the lane preference (``auto`` / ``cute`` / ``cxx``)."""
+    return _BACKEND
+
+
+def set_backend(backend: str) -> None:
+    """Override the lane preference for the rest of the process.  Tests and A/Bs.
+
+    Note this clears both compile caches, so flipping in a loop recompiles.
+    For an in-process A/B -- a parametrised fixture, a differential test, an
+    interleaved benchmark arm -- ask :func:`get_compiled_step` or
+    :func:`get_cxx_step` for the lane you want by name and leave the global
+    alone.
+    """
+    global _BACKEND
+    backend = _BACKEND_ALIASES.get(backend, backend)
+    if backend not in _VALID_BACKENDS:
+        raise ValueError(f"invalid backend {backend!r}; valid: {_VALID_BACKENDS}")
+    _BACKEND = backend
+    _clear_all_caches()
+
+
+def _lane_order() -> Tuple[str, ...]:
+    return _AUTO_ORDER if _BACKEND == "auto" else (_BACKEND,)
 
 
 @functools.cache
 def _probe() -> Optional[Tuple[int, int]]:
-    """Compute capability if the CuTeDSL step is usable here, else ``None``."""
-    if _MODE == "off":
+    """Compute capability if the CuTeDSL step is usable here, else ``None``.
+
+    Returns ``None`` when the lane is pinned away as well as when it is
+    unusable, so ``OASR_RECURRENT_BACKEND=cxx`` never imports CuTeDSL at all --
+    which is the point of a lane that does not need it installed.
+    """
+    if _MODE == "off" or _BACKEND == "cxx":
         return None
     try:
         import torch
@@ -251,8 +356,15 @@ def select_tile(hidden: int, batch: int) -> Optional[Tuple[int, ...]]:
 
 
 def should_use(gate_count: int, hidden: int, batch: int) -> bool:
-    """Is this shape inside the band where the CuTeDSL step measured fastest?"""
-    if _probe() is None:
+    """Is this shape inside the band where the fused step measured fastest?
+
+    Policy, not capability: it asks whether *fusing* wins here, and the answer
+    does not depend on which lane runs it.  The band is a property of the
+    tiling -- both lanes run the same tile on every shape -- so it does not
+    move with the lane.  :func:`routed_step` asks the capability question per
+    lane afterwards.
+    """
+    if not any(_lane_available(b) for b in _lane_order()):
         return False
     tile = select_tile(hidden, batch)
     if tile is None:
@@ -356,8 +468,119 @@ def _compiled_step(
     return cute.compile(inst, *args, stream, options="--enable-tvm-ffi")
 
 
+# ---------------------------------------------------------------------------
+# The C++ CUTLASS/CuTe lane
+# ---------------------------------------------------------------------------
+
+#: ``(gate_count, activation)`` -- the pair the functional API and the CuTeDSL
+#: lane use -- to the single ``kind`` axis the C++ lane compiles.  Over there
+#: the two halves have to agree and ``can_implement`` has a clause enforcing
+#: it; here the inconsistent combination cannot be spelled.
+_KIND: dict = {(4, "lstm"): "lstm", (1, "tanh"): "rnn_tanh", (1, "relu"): "rnn_relu"}
+
+
+@functools.cache
+def _cxx_probe() -> Optional[int]:
+    """The target SM if the C++ lane is usable here, else ``None``.
+
+    Not resolved at import, for the same reason the CuTeDSL probe is not: the
+    steady-state hot path is a :data:`_ROUTE` dict lookup that never reaches
+    either.
+    """
+    if _MODE == "off" or _BACKEND == "cute":
+        return None
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.recurrent_step import SUPPORTED_SM
+    except Exception:
+        return None
+    try:
+        sm = _get_target_sm()
+    except Exception:  # an architecture OASR compiles for nothing at all
+        return None
+    return sm if sm in SUPPORTED_SM else None
+
+
+def _lane_available(backend: str) -> bool:
+    return (_cxx_probe() is not None) if backend == "cxx" else (_probe() is not None)
+
+
+def cute_config_supported(*, gate_count: int, activation: str, hidden: int, batch: int) -> bool:
+    """Would the **CuTeDSL** lane accept this problem?
+
+    Capability only -- arch, CuTeDSL and a tile for these bounds.  It says
+    nothing about whether fusing is *faster* here; that is :func:`should_use`.
+    """
+    if _probe() is None:
+        return False
+    if (gate_count, activation) not in _KIND:
+        return False
+    # The CuTeDSL kernel loops `ceil_div(K, k_block)` and predicates only the
+    # row axis, so a hidden width that is not a whole number of K tiles would
+    # read past the end of both operands.  It is not a refusal over there --
+    # nothing checks it -- so the check has to live here.
+    tile = select_tile(hidden, batch)
+    if tile is None or hidden % tile[2]:
+        return False
+    return True
+
+
+def cxx_config_supported(
+    *, dtype_str: str, gate_count: int, activation: str, hidden: int, batch: int
+) -> bool:
+    """Would the **C++** lane accept this problem?
+
+    Its shape contract is strictly wider than the CuTeDSL lane's: the hidden
+    width need not be a whole number of K tiles, because the residue is
+    predicated and the ZFILL cp.async makes the skipped elements zero.
+
+    ``k=hidden`` is not an assumption the *kernel* makes -- it reads a ``K``
+    wide state and writes an ``H`` wide one, and the two are independent there.
+    It is a fact about this arbiter's only caller: ``lstm_gemm_layer`` has
+    already required ``weight_hh`` to be ``(4H, H)`` and ``initial_h`` to be
+    ``(B, H)``, so the two coincide by the time the question is asked.  A
+    projected LSTM would reach the kernel through a different entry point and
+    pass its own ``k``.
+    """
+    sm = _cxx_probe()
+    if sm is None:
+        return False
+    kind = _KIND.get((gate_count, activation))
+    if kind is None:
+        return False
+    from oasr.jit import recurrent_step as _cxx
+
+    return _cxx.config_supported(
+        sm=sm, dtype_str=dtype_str, kind=kind, batch=batch, hidden=hidden, k=hidden
+    )
+
+
+def get_cxx_step(*, dtype_str: str, gate_count: int, activation: str, hidden: int, batch: int):
+    """The C++ launcher for this shape's tuned tile, building its cell on first use.
+
+    Raises rather than declining, which is the right contract for a caller that
+    asked for the lane by name; :func:`routed_step` is the one that chooses.
+    """
+    sm = _cxx_probe()
+    if sm is None:
+        raise RuntimeError("the C++ recurrent step lane is not available on this device")
+    kind = _KIND.get((gate_count, activation))
+    if kind is None:
+        raise RuntimeError(f"no C++ recurrent kind for gates={gate_count} {activation!r}")
+    from oasr.jit import recurrent_step as _cxx
+
+    tile = _cxx.routed_tile(kind=kind, hidden=hidden, batch=batch, sm=sm)
+    if tile < 0:
+        raise RuntimeError(f"no tile for hidden={hidden} batch={batch} on sm_{sm}")
+    return _cxx.get_recurrent_step_fn(dtype_str=dtype_str, kind=kind, tile_index=tile, sm=sm)
+
+
 def get_compiled_step(*, dtype_str: str, gate_count: int, activation: str, hidden: int, batch: int):
-    """Compiled callable for this shape's tuned tile, compiling on first use."""
+    """Compiled CuTeDSL callable for this shape's tuned tile, compiling on first use."""
     cap = _probe()
     if cap is None:
         raise RuntimeError("the CuTeDSL recurrent step is not available on this device")
@@ -368,40 +591,75 @@ def get_compiled_step(*, dtype_str: str, gate_count: int, activation: str, hidde
 
 
 def routed_step(*, dtype_str: str, gate_count: int, activation: str, hidden: int, batch: int):
-    """The step to run for this shape, or ``None`` to leave it on the other path.
+    """``(backend, callable)`` for this shape, or ``None`` for the other path.
 
-    ``should_use()`` followed by ``get_compiled_step()`` is the readable spelling
-    and costs 1.18 us per call -- two table scans, an arch probe and a
+    The two lanes have **different call signatures** -- the C++ one takes its
+    outputs first (``AGENTS.md`` rule 4) and reads the stream from the FFI
+    environment, the CuTeDSL one takes them last and a stream handle -- so the
+    backend name comes back with the callable rather than being hidden behind a
+    wrapper.  A wrapper would be one more Python frame on a path a transducer
+    predictor walks twice per emitted label, and the whole point of
+    :data:`_ROUTE` is that the steady state is one dict lookup.
+
+    ``should_use()`` followed by a getter is the readable spelling and costs
+    1.18 us per call -- two table scans, an arch probe and a
     ``functools.cache`` key build, twice per ``LSTM.forward`` because a
-    transducer predictor has two layers.  Both are pure functions of the shape,
-    so the whole decision memoises to one dict lookup.
+    transducer predictor has two layers.  All of it is a pure function of the
+    shape, so the whole decision memoises to one dict lookup.
 
-    Deciding *and* compiling under the same key also means a shape whose tile
+    Deciding *and* compiling under the same key also means a shape whose kernel
     fails to build is remembered as declined rather than retried per step; a
-    compile failure is a property of the configuration, not of the call.
+    build failure is a property of the configuration, not of the call.
     """
     key = (dtype_str, gate_count, activation, hidden, batch)
     try:
         return _ROUTE[key]
     except KeyError:
         pass
-    step = None
+    route = None
     if should_use(gate_count, hidden, batch):
-        try:
-            step = get_compiled_step(
-                dtype_str=dtype_str,
-                gate_count=gate_count,
-                activation=activation,
-                hidden=hidden,
-                batch=batch,
+        for backend in _lane_order():
+            supported = (
+                cxx_config_supported(
+                    dtype_str=dtype_str,
+                    gate_count=gate_count,
+                    activation=activation,
+                    hidden=hidden,
+                    batch=batch,
+                )
+                if backend == "cxx"
+                else cute_config_supported(
+                    gate_count=gate_count,
+                    activation=activation,
+                    hidden=hidden,
+                    batch=batch,
+                )
             )
-        except Exception as exc:  # unsupported arch, missing CuTeDSL, unbuildable tile
-            logger.warning(
-                "CuTeDSL recurrent step declined for hidden=%d batch=%d: %s", hidden, batch, exc
-            )
-            step = None
-    _ROUTE[key] = step
-    return step
+            if not supported:
+                continue
+            getter = get_cxx_step if backend == "cxx" else get_compiled_step
+            try:
+                route = (
+                    backend,
+                    getter(
+                        dtype_str=dtype_str,
+                        gate_count=gate_count,
+                        activation=activation,
+                        hidden=hidden,
+                        batch=batch,
+                    ),
+                )
+                break
+            except Exception as exc:  # unsupported arch, missing toolchain, bad tile
+                logger.warning(
+                    "the %s recurrent step declined hidden=%d batch=%d: %s",
+                    backend,
+                    hidden,
+                    batch,
+                    exc,
+                )
+    _ROUTE[key] = route
+    return route
 
 
 #: The stream handle a compiled CuTeDSL callable needs, cached against the raw

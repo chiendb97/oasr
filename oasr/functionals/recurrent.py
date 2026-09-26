@@ -314,7 +314,7 @@ def rnn_layer(
     return out, final_h
 
 
-def _lstm_step_cute(
+def _lstm_step_fused(
     input_gates: torch.Tensor,
     previous_h: torch.Tensor,
     previous_c: torch.Tensor,
@@ -322,35 +322,51 @@ def _lstm_step_cute(
     out_h: torch.Tensor,
     out_c: torch.Tensor,
 ) -> bool:
-    """Run one timestep on the CuTeDSL fused step.  ``False`` if it declined.
+    """Run one timestep on the fused recurrent step.  ``False`` if it declined.
+
+    ``oasr.jit.recurrent_cute`` arbitrates between the two lanes and hands back
+    ``(backend, callable)``; the two have different signatures, so the name
+    decides how to call it.  The C++ lane takes its **outputs first**
+    (``AGENTS.md`` rule 4) and reads the stream from the FFI environment; the
+    CuTeDSL one takes them last plus a stream handle, which must be resolved
+    *inside* any CUDA-graph capture (see :mod:`oasr.jit.cute_runtime`).
 
     Declining rather than raising is deliberate: the caller has a working path
-    either way, and a compile failure on one shape should cost that shape its
+    either way, and a build failure on one shape should cost that shape its
     speedup, not the request.  A *wrong answer* would still raise -- nothing here
     swallows anything but construction and compilation.
     """
     from oasr.jit import recurrent_cute
 
     dtype_str = "float16" if input_gates.dtype is torch.float16 else "bfloat16"
-    step = recurrent_cute.routed_step(
+    routed = recurrent_cute.routed_step(
         dtype_str=dtype_str,
         gate_count=4,
         activation="lstm",
         hidden=out_h.shape[1],
         batch=out_h.shape[0],
     )
-    if step is None:
+    if routed is None:
         return False
-    step(
-        previous_h,
-        packed_weight_hh,
-        input_gates,
-        previous_c,
-        out_h,
-        out_c,
-        recurrent_cute.current_stream(),
-    )
+    backend, step = routed
+    if backend == "cxx":
+        step(out_h, out_c, previous_h, packed_weight_hh, input_gates, previous_c)
+    else:
+        step(
+            previous_h,
+            packed_weight_hh,
+            input_gates,
+            previous_c,
+            out_h,
+            out_c,
+            recurrent_cute.current_stream(),
+        )
     return True
+
+
+#: The name this was called before there were two lanes.  Kept because it is
+#: what the recorded A/B commands and the benchmark harness reach for.
+_lstm_step_cute = _lstm_step_fused
 
 
 @oasr_api
@@ -399,21 +415,22 @@ def lstm_gemm_layer(
     if final_c is None:
         final_c = input.new_empty(batch_size, hidden_size)
 
-    # A single timestep is exactly the shape the CuTeDSL fused step owns: it does
-    # the recurrent GEMM and the state transition in one launch, where this path
+    # A single timestep is exactly the shape the fused step owns: it does the
+    # recurrent GEMM and the state transition in one launch, where this path
     # otherwise materializes a gate tile and pays a second kernel for the
-    # transition.  Only inside the measured band -- see oasr/jit/recurrent_cute.py.
+    # transition.  Only inside the measured band, and on whichever of the two
+    # lanes wins -- see oasr/jit/recurrent_cute.py, the arbiter.
     #
     # Taken *before* the tensors below are allocated: `output`, `cells` and
     # `workspace` exist only for the decomposed path, and at these sizes three
     # unused allocations plus the cell ring cost about as much host time as the
     # kernel costs GPU time.
     if sequence_length == 1 and _tactic is None:
-        # ``_lstm_step_cute`` owns the whole decision now -- band, arch probe and
-        # compile all memoise behind one dict lookup in
+        # ``_lstm_step_fused`` owns the whole decision now -- band, lane, arch
+        # probe and compile all memoise behind one dict lookup in
         # ``recurrent_cute.routed_step``, so asking ``should_use`` here first only
         # paid for the table scan twice.
-        if _lstm_step_cute(
+        if _lstm_step_fused(
             input_gates[0],
             initial_h,
             initial_c,

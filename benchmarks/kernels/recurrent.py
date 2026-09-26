@@ -27,6 +27,62 @@ SUBROUTINES = ["lstm", "rnn_tanh", "rnn_relu", "lstm_slot_step", "lstm_step_cute
 #: lets the allocator warm for the next one.
 INTERLEAVE = True
 
+#: Steps per timed call for ``lstm_step_cute``.
+#:
+#: The fused step is 2-12 us, and a single Python call through TVM-FFI or
+#: CuTeDSL costs more than that -- so timing one call measures the harness, not
+#: the kernel.  Before this, all three arms of that subroutine reported the
+#: same 0.010 ms at every shape, which is the launch floor.
+#:
+#: Capturing ``_STEP_CHAIN`` launches into one CUDA graph and timing the replay
+#: fixes both halves: the Python cost is amortised 64-fold, and same-stream
+#: capture makes the launches a linear dependency chain, which is what a
+#: recurrence actually is -- step t+1 cannot start until t lands.  A
+#: back-to-back loop of *independent* launches would instead let consecutive
+#: kernels overlap and flatter whichever one leaves the machine emptiest.
+#:
+#: This is the protocol the routing table in ``oasr/jit/recurrent_cute.py`` was
+#: measured under, so the rows here are comparable with it.
+_STEP_CHAIN = 64
+
+
+def _graph_chain(fn: Callable[[], Any], out: torch.Tensor) -> Callable[[], Any]:
+    """Capture ``_STEP_CHAIN`` calls of ``fn`` into one graph; return a replay.
+
+    Falls back to a plain Python loop if capture fails, so a backend that
+    cannot be captured still produces a row rather than taking the family
+    down -- but it says so, because a silently uncaptured arm is being
+    compared against captured ones.
+    """
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    try:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(_STEP_CHAIN):
+                fn()
+    except Exception as exc:  # pragma: no cover - capture is expected to work
+        print(f"  [WARNING] step chain not capturable ({exc}); timing an eager loop")
+
+        def eager():
+            for _ in range(_STEP_CHAIN):
+                fn()
+            return out
+
+        return eager
+
+    def replay():
+        graph.replay()
+        return out
+
+    return replay
+
+
 #: torch.nn.LSTM dispatches to cuDNN on CUDA, so that is what the row should say.
 REF_BACKEND = "cudnn"
 
@@ -101,10 +157,17 @@ def _setup(
     h = torch.randn(num_layers, batch, hidden_size, device="cuda", dtype=dtype)
 
     if subroutine == "lstm_step_cute":
-        # The CuTeDSL fused step against the tensor-core GEMM it replaces.  Both
-        # consume a precomputed input projection, so this is the recurrent step
-        # alone -- which is the only place the fusion shows up undiluted.
-        from oasr.jit import recurrent_cute
+        # The two fused-step lanes against the tensor-core GEMM they replace.
+        # All three consume a precomputed input projection, so this is the
+        # recurrent step alone -- which is the only place the fusion shows up
+        # undiluted.
+        #
+        # Both lanes are asked for **by name** rather than through
+        # ``routed_step``, so an interleaved A/B does not have to flip a global
+        # and recompile between arms.  They run the same tile on every shape
+        # (``kRecurrentStepRoutes`` reproduces ``_TILES``), so what this
+        # compares is the kernels.
+        from oasr.jit import recurrent_cute, recurrent_step as recurrent_cxx
 
         n = 4 * hidden_size
         prev_h = torch.randn(batch, hidden_size, device="cuda", dtype=dtype)
@@ -126,9 +189,22 @@ def _setup(
         except Exception as exc:  # no CuTeDSL, or no tile for this shape
             print(f"  [WARNING] CuTeDSL step unavailable: {exc}")
             step = None
+        try:
+            cxx_step = recurrent_cxx.get_recurrent_step_fn(
+                dtype_str=dtype_str,
+                kind="lstm",
+                tile_index=recurrent_cxx.routed_tile(kind="lstm", hidden=hidden_size, batch=batch),
+            )
+        except Exception as exc:  # unsupported arch, or no toolchain
+            print(f"  [WARNING] C++ step unavailable: {exc}")
+            cxx_step = None
 
         @torch.no_grad()
         def cute_fn():
+            # The stream handle must be read *inside* any CUDA-graph capture:
+            # one cached outside still points at the non-capturing stream, the
+            # graph records nothing, and replay measures nothing.  See
+            # ``oasr.jit.cute_runtime``.
             step(
                 prev_h,
                 weight,
@@ -141,20 +217,34 @@ def _setup(
             return out_h
 
         @torch.no_grad()
+        def cxx_fn():
+            # Outputs first (``AGENTS.md`` rule 4); the stream comes from the
+            # FFI environment, so there is no handle to read.
+            cxx_step(out_h, out_c, prev_h, weight, in_gates, prev_c)
+            return out_h
+
+        @torch.no_grad()
         def gemm_fn():
             """Lower bound on the decomposed path: its GEMM, without the epilogue."""
             return torch.mm(prev_h, weight.t(), out=gate_buf)
 
         # Named "cublas", not "torch": the routine relabels a "torch" backend as
         # "cudnn" on output, and this arm is neither.
-        fns = {"cublas": gemm_fn}
+        # Every arm is timed the same way: one graph, `_STEP_CHAIN` dependent
+        # steps.  Wrapping *all three* matters as much as wrapping any -- a
+        # captured arm against an eager one compares launch paths, not kernels.
+        fns = {"cublas": _graph_chain(gemm_fn, gate_buf)}
         if step is not None:
-            fns["cute"] = cute_fn
+            fns["cute"] = _graph_chain(cute_fn, out_h)
+        if cxx_step is not None:
+            fns["cxx"] = _graph_chain(cxx_fn, out_h)
         # No meaningful benchmark reference: the arms compute different things (the
         # GEMM alone is a lower bound, not an equivalent).  Correctness is checked
-        # against FP32 equations in tests/test_recurrent_cute.py, which is a
-        # stronger oracle than a refcheck against another kernel would be.
-        return fns, (cute_fn if step is not None else gemm_fn)
+        # against FP32 equations in tests/kernels/test_recurrent.py and
+        # tests/kernels/test_recurrent_cpp.py, which is a stronger oracle than a
+        # refcheck against another kernel would be.
+        default = fns.get("cxx") or fns.get("cute") or fns["cublas"]
+        return fns, default
 
     if subroutine == "lstm_slot_step":
         # Slots deliberately exceed the row count so the gather is a real
@@ -392,10 +482,16 @@ def _assert_close(subroutine: str, actual, expected) -> float:
 
 
 def _flops(subroutine: str, config: dict[str, Any]) -> int:
-    gates = 4 if subroutine.startswith("lstm") else 1
     batch = config["batch"]
-    sequence = config["seq"]
     hidden = config["hidden_size"]
+    if subroutine == "lstm_step_cute":
+        # One recurrent affine per step -- `previous_h @ weight_hh^T` -- times
+        # the chain length, because that is what one timed call now runs.  The
+        # input projection is *not* here: these arms consume it precomputed,
+        # which is the whole point of measuring the step alone.
+        return 2 * 4 * batch * hidden * hidden * _STEP_CHAIN
+    gates = 4 if subroutine.startswith("lstm") else 1
+    sequence = config["seq"]
     total = 0
     layer_input = config["input_size"]
     for _ in range(config["num_layers"]):

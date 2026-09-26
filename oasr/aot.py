@@ -47,15 +47,18 @@ def gen_all_modules() -> List:
     from oasr.jit.norm import gen_norm_module
     from oasr.jit.pooling import gen_pooling_module
     from oasr.jit.recurrent import gen_recurrent_module
+    from oasr.jit.recurrent_step import gen_recurrent_step_modules
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
 
-    # Fused attention and the fused gated MLP are the two families whose module
-    # count depends on what shipped models *use*, not on the kernel: one `.so`
-    # per (dtype, head_dim) attention cell holding all 12 feature variants, and
-    # one per (dtype, activation) MLP cell holding all six tiles in both bias
-    # modes.  Both return an empty list on an architecture their C++ lane is not
-    # compiled for, which is why they extend rather than append.
+    # Fused attention, the fused gated MLP and the fused recurrent step are the
+    # three families whose module count depends on what shipped models *use*,
+    # not on the kernel: one `.so` per (dtype, head_dim) attention cell holding
+    # all 12 feature variants, one per (dtype, activation) MLP cell holding all
+    # six tiles in both bias modes, and one per (dtype, kind) recurrent cell
+    # holding all eight tiles.  All three return an empty list on an
+    # architecture their C++ lane is not compiled for, which is why they extend
+    # rather than append.
     modules = [
         gen_activation_module(),
         gen_norm_module(),
@@ -77,6 +80,7 @@ def gen_all_modules() -> List:
     ]
     modules += gen_fmha_modules()
     modules += gen_gated_mlp_modules()
+    modules += gen_recurrent_step_modules()
     return modules
 
 

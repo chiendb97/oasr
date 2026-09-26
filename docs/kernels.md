@@ -527,6 +527,74 @@ by bracketing every copy in `BSSY`/`BSYNC` and padding it with three dead
 went from ~60 instructions to ~12, the LSU pipe from 2.34M instructions to
 1.2M, and the kernel from 0.89x of the CuTeDSL lane to ahead of it everywhere.
 
+### The C++ fused recurrent step (`include/oasr/recurrent/recurrent_step_*.h`)
+
+The same collective decomposition again, and the second lane for the kernel
+`oasr/kernels/cute/recurrent/step.py` already implements in CuTeDSL:
+`CollectiveRecurrentStepMainloopSm80` + `CollectiveRecurrentStepEpilogue`,
+composed by `RecurrentStepKernel`, with `recurrent_step_launch_template.h` the
+one file that names an architecture. `recurrent_step_tiles.h` is CuTe-free, so
+`csrc/recurrent_step_jit_binding.cu` exports it as a capability oracle and
+`tests/kernels/test_recurrent_cpp.py` holds the Python mirror to it over six
+architectures from one box.
+
+One fused timestep, with the gate dimension *interleaved* so column `n` is
+`(hidden n / G, gate n % G)`:
+
+```
+gates[m, n] = sum_k previous_h[m, k] * weight_hh[n, k] + input_gates[m, n]
+c[m, i]     = sigmoid(g1) * previous_c[m, i] + sigmoid(g0) * tanh(g2)
+h[m, i]     = sigmoid(g3) * tanh(c[m, i])
+```
+
+The interleaving is what keeps the epilogue inside one CTA tile — a hidden
+unit's gates are adjacent columns, so no cross-tile reduction is needed, and
+`recurrentStepTileValid` refuses any `block_n` that would straddle one.
+
+| | gated MLP | recurrent step |
+|---|---|---|
+| tile | **wave count**: is the last wave still saturating DRAM? | **tabled ladder** on `(hidden, batch)`: a dependent launch has no next kernel to overlap its tail with, so what the measurements found was a boundary between two regimes, not a wave count |
+| cell | `(sm, dtype, activation)` | `(sm, dtype, kind)` — `lstm` / `rnn_tanh` / `rnn_relu` |
+| variants in a cell | 6 tiles x 2 bias = 12 | 8 tiles |
+
+The ladder is *inherited* from the CuTeDSL lane rather than re-derived, so both
+lanes run the same tile on every shape and an A/B between them compares
+kernels. `test_the_ladder_reproduces_the_cutedsl_lane` pins that.
+
+Three things it does that the CuTeDSL lane cannot:
+
+| Capability | Why not on `cute` |
+|---|---|
+| a **K residue** — the hidden width need not be a whole number of K tiles | there the mainloop loops `ceil_div(K, k_block)` and predicates only the row axis, so a partial K tile reads past the end of *both* operands |
+| **arbitrary row strides** on every operand | there the compiled signature marks the tensors compact, so a row-slice has to be copied first |
+| a staging buffer larger than the ring | there the epilogue *aliases* the ring; here it is a `union`, so `can_implement` needs no such clause |
+
+Two epilogue details are worth carrying, because nothing in the C++ says them:
+
+- **The global loads are issued before the staging barrier.** The transition
+  needs `input_gates` and `previous_c` from global memory and the affine from
+  shared; issuing the two gmem loads first puts their latency behind the
+  accumulator store and the `__syncthreads()` rather than in front of the
+  arithmetic.
+- **The accumulator staging is padded by 8 floats per row, not 1.** Both avoid
+  the MMA-C store's bank conflict; only 8 also keeps every row 16-byte aligned,
+  so a cell's four gates come back in one `LDS.128` instead of four `LDS.32`.
+  `stride % 32 == 8` puts a 16-lane `STS.64` phase on 32 distinct banks and an
+  8-lane `LDS.128` phase likewise. `cuobjdump -sass` confirms both.
+
+One declared limitation: the widest **one-gate** variant (tile 7, 32 epilogue
+slots on a 512-thread CTA) sits at REG:128 with a 32-byte stack frame, where
+every LSTM variant is at REG:54-120 with no spill. Nothing reaches it — a
+vanilla RNN is never routed under `auto`, and tile 7 needs `hidden > 1536` and
+`batch > 128` — so it is declared rather than fixed. The header comment records
+the two causes that were tested and refuted, so a later attempt starts past
+them.
+
+Routing is `oasr/jit/recurrent_cute.py` — the arbiter, and the CuTeDSL lane's
+compile cache. `OASR_RECURRENT_CUTE` decides whether to fuse;
+`OASR_RECURRENT_BACKEND` decides which lane. Measurements:
+`.artifacts/recurrent_cpp_validation.md`.
+
 ### CuteDSL kernels (`oasr/kernels/`)
 
 `oasr/kernels/` holds low-level implementations that do **not** use the TVM-FFI /
