@@ -310,13 +310,16 @@ def _to_icefall_sd(model):
       ``(frequency, channel)`` in the NHWC runtime layout and
       ``(channel, frequency)`` in icefall's NCHW one;
     * ``DepthwiseConv1d``, which stores ``(K, 1, C)`` against icefall's
-      ``(C, 1, K)``.
+      ``(C, 1, K)``;
+    * ``RelPositionMultiheadAttentionWeights.in_proj``, whose output rows are
+      head-interleaved ``[q_h | k_h | p_h]`` against icefall's ``[q | k | p]``.
 
     The fixture is saved as a plain ``dict``, so it reaches ``load_state_dict``
     without ``_metadata`` — version 1, exactly like a real icefall export, which
     is what arms the version-gated projection hook.
     """
     from oasr.layers import Conv2d
+    from oasr.models.zipformer.encoder import RelPositionMultiheadAttentionWeights
     from oasr.models.zipformer.subsampling import Conv2dSubsampling
 
     nhwc_conv = {
@@ -329,9 +332,19 @@ def _to_icefall_sd(model):
         for name, module in model.named_modules()
         if isinstance(module, Conv2dSubsampling)
     }
+    interleaved = {
+        f"{name}.in_proj.{param}": module.head_interleave_index()
+        for name, module in model.named_modules()
+        if isinstance(module, RelPositionMultiheadAttentionWeights)
+        for param in ("weight", "bias")
+    }
 
     sd = {}
     for k, v in model.state_dict().items():
+        if k in interleaved:
+            legacy = torch.empty_like(v)
+            legacy[interleaved[k]] = v  # new = legacy[index]
+            v = legacy
         if k in nhwc_conv:
             v = v.permute(0, 3, 1, 2).contiguous()  # KRSC -> KCRS
         elif k in projections:
