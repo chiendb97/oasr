@@ -289,11 +289,16 @@ class DepthwiseConv1d(nn.Module):
         x: torch.Tensor,
         mask: torch.Tensor | None = None,
         add_input: bool = False,
+        padding: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """Apply depthwise convolution, optionally fusing the FSMN masked residual.
 
         With ``mask`` and ``add_input=True`` this computes exactly
         ``(conv(x * mask) + x * mask) * mask`` in one CUDA kernel.
+
+        ``padding`` overrides the constructed ``(left, right)`` padding for this
+        call -- a causal conv pads its left context offline but reads it from a
+        cache when streaming, and the override spares either path a padded copy.
 
         The kernel path requires contiguous operands and **asserts** rather than
         copying: a model that reaches here with a strided view is doing a
@@ -302,6 +307,7 @@ class DepthwiseConv1d(nn.Module):
         ``check_depthwise_conv1d`` enforces the same contract one layer down;
         these asserts only fire earlier and name the fix.
         """
+        padding = self.padding if padding is None else padding
         if use_conv_kernel(x):
             # A last-dim slice of a fused QKV projection is the case that gets
             # here: last-dim contiguous, row stride a multiple of the channel
@@ -321,14 +327,14 @@ class DepthwiseConv1d(nn.Module):
                 x,
                 self.weight,
                 self.bias,
-                self.padding,
+                padding,
                 mask=mask,
                 add_input=add_input,
             )
         masked = x if mask is None else x * mask
         # (K, 1, C) -> (C, 1, K); (B, T, C) -> (B, C, T) and back.
         out: torch.Tensor = F.conv1d(
-            F.pad(masked.transpose(1, 2), self.padding),
+            F.pad(masked.transpose(1, 2), padding),
             self.weight.permute(2, 1, 0),
             self.bias,
             groups=self.channels,
