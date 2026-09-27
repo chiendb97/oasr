@@ -955,7 +955,7 @@ loses nothing and a repeated one double-counts nothing.
 | `oasr_engine_batch_size{mode}` | histogram | Rows in one executed batch. |
 | `oasr_engine_batch_padding_ratio` | histogram | Fraction of a padded offline batch that is padding — whether the bucketing policy is working, which is otherwise pure guesswork. Derived from host-side waveform lengths so the collate path gains no device-to-host sync. |
 | `oasr_engine_queue_wait_seconds{mode}` | histogram | Admission to first scheduled. A rising tail with a flat tick time means saturated, not slow. |
-| `oasr_engine_kv_blocks_{used,capacity}` | gauge | Paged streaming-encoder pool occupancy. Absent on a `StatefulStreamingBackend`, which has no pool. |
+| `oasr_engine_kv_blocks_{used,capacity}` | gauge | Paged streaming-encoder pool occupancy. Absent on the slot and stateful runtimes, which have no block pool. |
 | `oasr_engine_kv_exhausted_total` | counter | Streams finalized early because their encoder cache filled — a **truncated transcript**, ending with `finish_reason="length"`. Not "evictions": the pool does not evict, and its capacity gate means it is never asked for a block it cannot give. |
 | `oasr_engine_decode_slots_{in_use,capacity}` | gauge | AR decode slots. A capacity of `0` means no ceiling applies — the family is one-shot and parks nothing. |
 | `oasr_engine_tokens_generated_total` | counter | Tokens on finished outputs, counted once per request. |

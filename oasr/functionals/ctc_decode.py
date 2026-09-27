@@ -92,12 +92,18 @@ class GpuDecoderResult:
             is ever read — index it and the row materialises.
         lengths: Tensor ``[batch, beam]`` of decoded sequence lengths (int32, CUDA).
         scores: Tensor ``[batch, beam]`` of beam log-probabilities (float32, CUDA).
+        token_ids: Tensor ``[batch, beam, max_seq_len]`` — the same tokens,
+            still on the device (int32; positions past ``lengths`` are
+            unspecified).  Set by the offline decode, for a consumer that feeds
+            the hypotheses back to the GPU: rebuilding them from ``tokens``
+            costs one host-to-device copy per hypothesis.
     """
 
     tokens: List[List[List[int]]] = field(default_factory=list)
     times: Sequence = field(default_factory=list)
     lengths: Optional[torch.Tensor] = None
     scores: Optional[torch.Tensor] = None
+    token_ids: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -309,49 +315,22 @@ def _extract_tokens(
     return tokens, _LazyTimes(times_cpu, out_lengths_cpu, batch, beam_size)
 
 
-@oasr_api
-def ctc_beam_search_decode(
+def _launch_ctc_beam_search(
     log_prob: torch.Tensor,
     seq_lengths: torch.Tensor,
-    beam_size: int = 10,
-    blank_id: int = 0,
-    blank_threshold: float = 0.98,
-    max_seq_len: int = 200,
-    use_paged_memory: bool = False,
-    page_size: int = 16,
-    want_times: bool = False,
-) -> GpuDecoderResult:
-    """GPU-accelerated CTC prefix beam search decode (offline, full sequence).
+    beam_size: int,
+    blank_id: int,
+    blank_threshold: float,
+    max_seq_len: int,
+    use_paged_memory: bool,
+    page_size: int,
+    want_times: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Queue the offline beam search; return ``(tokens, times, lengths, scores)`` on device.
 
-    Parameters
-    ----------
-    log_prob : torch.Tensor
-        Log-probability tensor ``[batch, seq_len, vocab_size]`` on CUDA, float32.
-    seq_lengths : torch.Tensor
-        Actual sequence lengths ``[batch]`` on CUDA, int32.
-    beam_size : int
-        Number of beams.
-    blank_id : int
-        CTC blank token id.
-    blank_threshold : float
-        Skip threshold for blank probability.
-    max_seq_len : int
-        Maximum decoded output sequence length.
-    use_paged_memory : bool
-        Use paged-attention-style memory for decoded sequences.
-    page_size : int
-        Tokens per page when ``use_paged_memory=True`` (default 16).
-    want_times : bool
-        Also return the encoder frame each token was emitted at
-        (:attr:`GpuDecoderResult.times`).  The beam records these while it
-        decodes; this only asks for them to be copied back, which is why it is
-        opt-in rather than always on.
-
-    Returns
-    -------
-    GpuDecoderResult
-        Decoded tokens, lengths, and scores for each batch and beam — plus
-        per-token emission frames when ``want_times``.
+    Shared by :func:`ctc_beam_search_decode` and
+    :func:`ctc_beam_search_decode_async`, which differ only in how the result
+    comes back, so the two cannot launch differently.
     """
     mod = _get_ctc_decoder_module()
     batch = log_prob.size(0)
@@ -406,9 +385,186 @@ def ctc_beam_search_decode(
             blank_id,
             blank_threshold,
         )
+    return out_tokens, out_times, out_lengths, out_scores
 
+
+@oasr_api
+def ctc_beam_search_decode(
+    log_prob: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    beam_size: int = 10,
+    blank_id: int = 0,
+    blank_threshold: float = 0.98,
+    max_seq_len: int = 200,
+    use_paged_memory: bool = False,
+    page_size: int = 16,
+    want_times: bool = False,
+) -> GpuDecoderResult:
+    """GPU-accelerated CTC prefix beam search decode (offline, full sequence).
+
+    Parameters
+    ----------
+    log_prob : torch.Tensor
+        Log-probability tensor ``[batch, seq_len, vocab_size]`` on CUDA, float32.
+    seq_lengths : torch.Tensor
+        Actual sequence lengths ``[batch]`` on CUDA, int32.
+    beam_size : int
+        Number of beams.
+    blank_id : int
+        CTC blank token id.
+    blank_threshold : float
+        Skip threshold for blank probability.
+    max_seq_len : int
+        Maximum decoded output sequence length.
+    use_paged_memory : bool
+        Use paged-attention-style memory for decoded sequences.
+    page_size : int
+        Tokens per page when ``use_paged_memory=True`` (default 16).
+    want_times : bool
+        Also return the encoder frame each token was emitted at
+        (:attr:`GpuDecoderResult.times`).  The beam records these while it
+        decodes; this only asks for them to be copied back, which is why it is
+        opt-in rather than always on.
+
+    Returns
+    -------
+    GpuDecoderResult
+        Decoded tokens, lengths, and scores for each batch and beam — plus
+        per-token emission frames when ``want_times``.
+    """
+    batch = log_prob.size(0)
+    out_tokens, out_times, out_lengths, out_scores = _launch_ctc_beam_search(
+        log_prob,
+        seq_lengths,
+        beam_size,
+        blank_id,
+        blank_threshold,
+        max_seq_len,
+        use_paged_memory,
+        page_size,
+        want_times,
+    )
     tokens, times = _extract_tokens(out_tokens, out_lengths, batch, beam_size, out_times)
-    return GpuDecoderResult(tokens=tokens, times=times, lengths=out_lengths, scores=out_scores)
+    return GpuDecoderResult(
+        tokens=tokens, times=times, lengths=out_lengths, scores=out_scores, token_ids=out_tokens
+    )
+
+
+@dataclass
+class PendingCtcDecode:
+    """An offline beam search whose kernels and read-back are queued, not waited on.
+
+    :func:`ctc_beam_search_decode` ends in a blocking device→host copy, and
+    everything the host does after it — building the token lists, detokenizing,
+    finalising — runs with the GPU's queue empty.  Measured on Conformer offline
+    at ``B = 32``: ~1.1 ms of GPU idle per ~9.3 ms tick.  Here the copies go into
+    pinned buffers on the stream and an event marks their completion, so the
+    caller can queue the *next* micro-batch's forward before it asks for this
+    one's tokens, and the host tail runs behind GPU work instead of in front of
+    an idle GPU.
+    """
+
+    batch: int
+    beam: int
+    event: Optional["torch.cuda.Event"]
+    tokens_cpu: torch.Tensor
+    lengths_cpu: torch.Tensor
+    scores_cpu: torch.Tensor
+    times_cpu: Optional[torch.Tensor]
+    lengths: torch.Tensor
+    scores: torch.Tensor
+
+    def result(self) -> GpuDecoderResult:
+        """Wait for the read-back and build the same result the blocking call does."""
+        if self.event is not None:
+            self.event.synchronize()
+            self.event = None
+        tokens = _CPP.extract_beam_tokens(self.tokens_cpu, self.lengths_cpu, self.beam)
+        times: Sequence = (
+            _LazyTimes(self.times_cpu, self.lengths_cpu, self.batch, self.beam)
+            if self.times_cpu is not None
+            else []
+        )
+        return GpuDecoderResult(
+            tokens=tokens, times=times, lengths=self.lengths, scores=self.scores
+        )
+
+    def host_scores(self) -> List[List[float]]:
+        """``scores`` as host lists, from the same read-back (call after :meth:`result`)."""
+        return self.scores_cpu.tolist()
+
+
+def _to_host_async(t: torch.Tensor) -> torch.Tensor:
+    """A pinned host copy of ``t``, queued on the current stream."""
+    host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    host.copy_(t, non_blocking=True)
+    return host
+
+
+@oasr_api
+def ctc_beam_search_decode_async(
+    log_prob: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    beam_size: int = 10,
+    blank_id: int = 0,
+    blank_threshold: float = 0.98,
+    max_seq_len: int = 200,
+    use_paged_memory: bool = False,
+    page_size: int = 16,
+    want_times: bool = False,
+) -> PendingCtcDecode:
+    """:func:`ctc_beam_search_decode` without the blocking read-back.
+
+    Same launch (:func:`_launch_ctc_beam_search`), then every output the blocking
+    path reads back — tokens, lengths, scores, and the emission frames when asked
+    — is copied into pinned host memory on the current stream, and an event is
+    recorded after the last copy.  :meth:`PendingCtcDecode.result` waits on that
+    event and returns what :func:`ctc_beam_search_decode` would have.
+
+    On a non-CUDA device the copies are synchronous and no event is recorded.
+    """
+    batch = log_prob.size(0)
+    out_tokens, out_times, out_lengths, out_scores = _launch_ctc_beam_search(
+        log_prob,
+        seq_lengths,
+        beam_size,
+        blank_id,
+        blank_threshold,
+        max_seq_len,
+        use_paged_memory,
+        page_size,
+        want_times,
+    )
+    want = want_times and out_times.numel() > 0
+    if log_prob.device.type != "cuda":
+        return PendingCtcDecode(
+            batch=batch,
+            beam=beam_size,
+            event=None,
+            tokens_cpu=out_tokens.cpu(),
+            lengths_cpu=out_lengths.cpu(),
+            scores_cpu=out_scores.cpu(),
+            times_cpu=out_times.cpu() if want else None,
+            lengths=out_lengths,
+            scores=out_scores,
+        )
+    tokens_cpu = _to_host_async(out_tokens)
+    lengths_cpu = _to_host_async(out_lengths)
+    scores_cpu = _to_host_async(out_scores)
+    times_cpu = _to_host_async(out_times) if want else None
+    event = torch.cuda.Event()
+    event.record()
+    return PendingCtcDecode(
+        batch=batch,
+        beam=beam_size,
+        event=event,
+        tokens_cpu=tokens_cpu,
+        lengths_cpu=lengths_cpu,
+        scores_cpu=scores_cpu,
+        times_cpu=times_cpu,
+        lengths=out_lengths,
+        scores=out_scores,
+    )
 
 
 def _best_tokens(result: GpuDecoderResult) -> List[int]:
@@ -1090,6 +1246,68 @@ class GpuStreamingDecoder:
                 )
             )
         return results
+
+    def read_final_states(
+        self,
+        states: List[StreamState],
+        want_times: bool = False,
+    ) -> List[Tuple[List[List[int]], List[float], Optional[Sequence]]]:
+        """End-of-stream read-back for many streams at once.
+
+        What :meth:`finalize_stream` returns per stream — every beam, its
+        scores, and the emission frames when asked — for the whole set of
+        streams that end in one tick, from one batched read kernel and one
+        device→host read-back.  Per stream, ``finalize_stream`` + the
+        ``scores.cpu()`` its caller needs cost three synchronising copies and a
+        launch each; 64 streams ending in a backlog were ~11 ms of GPU idle per
+        97 ms run.
+
+        Returns ``(beams, scores, times)`` per state, in order: ``beams`` is the
+        ``[beam][token]`` list ``finalize_stream(...).tokens[0]`` holds,
+        ``scores`` the matching ``[beam]`` floats, ``times`` indexable as
+        ``[0][beam]`` like ``finalize_stream(...).times`` (``None`` unless
+        ``want_times``).  States with ``batch != 1`` take the per-state path.
+        """
+        n = len(states)
+        if n == 0:
+            return []
+        if any(s.batch != 1 for s in states):
+            out = []
+            for s in states:
+                r = self.peek_state(state=s, want_times=want_times)
+                scores = r.scores.cpu().tolist()[0] if r.scores is not None else []
+                out.append(
+                    (r.tokens[0] if r.tokens else [], scores, r.times if want_times else None)
+                )
+            return out
+
+        cfg = self._config
+        beam = cfg.beam_size
+        msl = cfg.max_seq_len
+        device = states[0].buffer.device
+        out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
+        out_times = _times_out(want_times, out_tokens)
+        out_lengths = torch.empty(n, beam, dtype=torch.int32, device=device)
+        out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
+        self._issue_read_states(states, out_tokens, out_times, out_lengths, out_scores)
+
+        tokens_cpu = out_tokens.cpu()
+        lengths_cpu = out_lengths.cpu()
+        scores = out_scores.cpu().tolist()
+        times_cpu = out_times.cpu() if want_times else None
+        all_beams = _CPP.extract_beam_tokens(tokens_cpu, lengths_cpu, beam)
+        return [
+            (
+                all_beams[i],
+                scores[i],
+                (
+                    _LazyTimes(times_cpu[i : i + 1], lengths_cpu[i : i + 1], 1, beam)
+                    if times_cpu is not None
+                    else None
+                ),
+            )
+            for i in range(n)
+        ]
 
     def peek_states_best(self, states: List[StreamState]) -> List[List[int]]:
         """Interim-partial read-back: the best hypothesis per stream, and nothing else.

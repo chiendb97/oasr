@@ -15,9 +15,11 @@ because the policies must differ:
   allocated as the sequence crosses page boundaries and freed only when the
   request finishes.
 
-Cross-attention KV is *not* managed here: it has a fixed length (the encoder
-output), is computed once at prefill, and lives as a dense per-request tensor
-owned by the decode strategy.
+An AED's cross-attention K/V can live here too, as a second slot per row with a
+fixed extent (the encoder output): created at prefill with ``prefill_len`` equal
+to that extent and ``max_new_tokens=0``, so admission reserves exactly the pages
+it maps and the slot never grows (``decoder_state.build_cross_kv``).  Paging it
+is what leaves a decode step with nothing at a per-batch address.
 
 The block tables / ``cache_seqlens`` this manager produces feed the same paged
 FMHA path the encoder uses (``oasr.fmha`` with ``block_table``).

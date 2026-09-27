@@ -126,6 +126,15 @@ _SOURCE_LIST: List[Source] = [
         note="loads with architecture='transducer'; the dir sniffs as zipformer",
     ),
     Source(
+        env="STREAMING_ZIPFORMER_CKPT",
+        kind=HF,
+        repo="Zengwei/icefall-asr-librispeech-streaming-zipformer-2023-05-17",
+        revision="37cb5606808f3d5e55a3fc73554bdf757d82465a",
+        allow=_ICEFALL_ALLOW + ("exp/jit_script_chunk_16_left_128.pt",),
+        approx_mib=506,
+        note="causal release; loads with architecture='transducer'; the export is the oracle",
+    ),
+    Source(
         env="WHISPER_CKPT",
         kind=HF,
         repo="openai/whisper-tiny",

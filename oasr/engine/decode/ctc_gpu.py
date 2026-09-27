@@ -14,12 +14,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
 from oasr.cache.ctc_state import CtcStateCacheManager
-from oasr.functionals.ctc_decode import GpuDecoderConfig, GpuDecoderResult, ctc_beam_search_decode
+from oasr.functionals.ctc_decode import (
+    GpuDecoderConfig,
+    GpuDecoderResult,
+    ctc_beam_search_decode,
+    ctc_beam_search_decode_async,
+)
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from ..request import Request, RequestOutput
@@ -150,22 +155,8 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             page_size=cfg.page_size,
             want_times=want_times,
         )
-        outputs = []
         scores_t = result.scores.cpu().tolist() if result.scores is not None else None
-        for b in range(enc_out.size(0)):
-            token_seqs = result.tokens[b]  # list of beam token lists
-            best_tokens = token_seqs[0] if token_seqs else []
-            beam_scores = scores_t[b] if scores_t is not None else None
-            text = self._detok.detokenize(best_tokens)
-            outputs.append(
-                RequestOutput(
-                    request_id="",
-                    text=text,
-                    tokens=token_seqs,
-                    scores=beam_scores,
-                    finished=True,
-                )
-            )
+        outputs = self._offline_outputs(result, scores_t, int(enc_out.size(0)))
         if want_times:
             attach_emission_timings(self, requests or [], outputs, result.times, enc_out)
         # ``enc_out`` is the (B, T, V) log-softmax, so the blank column is right
@@ -174,6 +165,62 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             outputs, enc_out, enc_lengths, requests, blank_id=cfg.blank_id
         )
         return outputs
+
+    def _offline_outputs(
+        self,
+        result: GpuDecoderResult,
+        scores: Optional[List[List[float]]],
+        batch: int,
+    ) -> List[RequestOutput]:
+        """One final output per row — shared by the blocking and queued decodes."""
+        outputs = []
+        for b in range(batch):
+            token_seqs = result.tokens[b]  # list of beam token lists
+            best_tokens = token_seqs[0] if token_seqs else []
+            outputs.append(
+                RequestOutput(
+                    request_id="",
+                    text=self._detok.detokenize(best_tokens),
+                    tokens=token_seqs,
+                    scores=scores[b] if scores is not None else None,
+                    finished=True,
+                )
+            )
+        return outputs
+
+    def decode_offline_async(
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
+    ) -> Optional[Callable[[], List[RequestOutput]]]:
+        """The beam search with its read-back queued rather than waited on.
+
+        Only for a batch that asked for neither word timings nor speech activity
+        (``requests is None`` — the facade drops it when nothing asked): both
+        read the log-probs *after* the read-back, which is the part this defers.
+        Such a batch takes :meth:`decode_offline` instead, unchanged.
+        """
+        if requests is not None or enc_out.device.type != "cuda":
+            return None
+        cfg = self.options.decoder_config
+        pending = ctc_beam_search_decode_async(
+            enc_out,
+            enc_lengths,
+            beam_size=cfg.beam_size,
+            blank_id=cfg.blank_id,
+            blank_threshold=cfg.blank_threshold,
+            max_seq_len=cfg.max_seq_len,
+            use_paged_memory=cfg.use_paged_memory,
+            page_size=cfg.page_size,
+        )
+        batch = int(enc_out.size(0))
+
+        def collect() -> List[RequestOutput]:
+            result = pending.result()
+            return self._offline_outputs(result, pending.host_scores(), batch)
+
+        return collect
 
     # ------------------------------------------------------------------
     # Streaming session lifecycle
@@ -327,6 +374,35 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
             tokens=snap.tokens[0] if snap.tokens else [],
             finished=False,
         )
+
+    def finalize_batch(self, requests: List[Request]) -> List[RequestOutput]:
+        """Every stream ending this tick, from one batched read-back.
+
+        Output for output what :meth:`finalize` returns per request; see
+        :meth:`GpuStreamingDecoder.read_final_states` for what it saves.
+        """
+        if len(requests) <= 1:
+            return [self.finalize(r) for r in requests]
+        mgr = self._ensure_ctc_mgr()
+        states = mgr.get_states([r.stream_id for r in requests])  # type: ignore[misc]
+        want = [wants_word_timings(r) for r in requests]
+        finals = mgr.decoder.read_final_states(states, want_times=any(want))
+        outputs: List[RequestOutput] = []
+        for req, wants, (token_seqs, beam_scores, times) in zip(requests, want, finals):
+            best = token_seqs[0] if token_seqs else []
+            out = RequestOutput(
+                request_id=req.request_id,
+                text=self._detok.detokenize(best),
+                tokens=token_seqs,
+                scores=beam_scores,
+                finished=True,
+            )
+            if wants and times is not None and times[0]:
+                frames = times[0][0]
+                if len(frames) == len(best):
+                    self.attach_emission_alignment(out, best, frames)
+            outputs.append(out)
+        return outputs
 
     def finalize(self, request: Request) -> RequestOutput:
         sid = request.stream_id

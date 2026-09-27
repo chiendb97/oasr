@@ -204,6 +204,7 @@ class GraphedEncoderForward:
         device: torch.device,
         pool: Optional[Tuple[int, int]] = None,
         extra_states: Sequence[str] = (),
+        max_captures: int = 512,
     ) -> None:
         self._chunk_forward = chunk_forward
         self._att_mgr = att_mgr
@@ -223,7 +224,10 @@ class GraphedEncoderForward:
         # Keyed by batch, input length, and cache-length bucket.
         self._captured: Dict[Tuple[int, int, int], _CapturedShape] = {}
         # Bound graph-pool growth; uncached shapes fall back to eager execution.
-        self._max_captures = 512
+        # The engine passes ``streaming_graph_max_shapes``: a separate constant
+        # here meant raising that budget grew the pre-warm and left this cap
+        # where it was, so the extra shapes fell back to eager anyway.
+        self._max_captures = int(max_captures)
 
     # ------------------------------------------------------------------
     # Public API

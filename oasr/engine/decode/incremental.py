@@ -377,9 +377,9 @@ class IncrementalArStrategy(DecodeStrategy):
         and on its own it buys no capacity while admission reserves each row's
         ceiling.  What it buys is *step graphs*, which need addresses that
         outlive a batch.  So ``auto`` pages exactly where that trade closes: a
-        decoder that will capture its steps.  A family that cannot capture (an
-        AED, whose cross-attention K/V is allocated per prefill) keeps the dense
-        buffer it was already paying nothing for.
+        decoder that will capture its steps — an AED included, because paged
+        storage pages its cross-attention K/V too.  A family that cannot
+        capture keeps the dense buffer it was already paying nothing for.
         """
         storage = str(getattr(self.options, "kv_storage", "auto"))
         if storage != "auto":
@@ -428,14 +428,24 @@ class IncrementalArStrategy(DecodeStrategy):
         # position budget — sizing past it would reserve VRAM no admission path
         # can use.  The second is the byte budget derived from remaining device
         # memory, which binds when the admission ceiling itself would not fit.
-        tokens = rows * self._position_budget()
+        #
+        # Counted in pages per row, the unit admission reserves in: each slot
+        # rounds its ceiling up to whole pages, and an AED row holds two slots —
+        # its self-attention and its fixed cross-attention window (declared as
+        # ``decoder_cache_spec.cross_attention_len``).  A token total would
+        # under-count both roundings, and a pool one page short per row refuses
+        # the last rows admission already promised.
+        cross_len = int(getattr(spec, "cross_attention_len", 0) or 0)
+        pages_per_row = -(-self._position_budget() // block_tokens)
+        if cross_len:
+            pages_per_row += -(-cross_len // block_tokens)
+        blocks = rows * pages_per_row
         budget_gib = float(self._config.decode_kv_budget_gib or 0.0)
         if budget_gib > 0:
-            per_row = self.kv_bytes_per_row()
-            if per_row:
-                per_token = per_row / max(1, self._position_budget())
-                tokens = min(tokens, int(budget_gib * (1024**3) / per_token))
-        blocks = max(1, -(-int(tokens) // block_tokens))
+            per_token = self._kv_bytes_per_token(spec)
+            if per_token:
+                blocks = min(blocks, int(budget_gib * (1024**3) / (per_token * block_tokens)))
+        blocks = max(1, int(blocks))
         pool = DecoderKVCacheManager.build_pool(
             num_layers=int(spec.num_layers),
             n_kv_head=int(spec.n_kv_head),
@@ -457,12 +467,13 @@ class IncrementalArStrategy(DecodeStrategy):
         ) / float(1024**3)
         logger.info(
             "decoder-KV pool: %d blocks x %d tokens (%.2f GiB) for up to %d rows "
-            "of %d positions",
+            "of %d positions%s",
             blocks,
             block_tokens,
             gib,
             rows,
             self._position_budget(),
+            f" + a {cross_len}-frame cross-attention window" if cross_len else "",
         )
         return DecoderKVCacheManager(pool)
 
@@ -516,7 +527,9 @@ class IncrementalArStrategy(DecodeStrategy):
         if graphs is not None:
             kv = state.get("kv") if isinstance(state, dict) else None
             if kv is not None:
-                logits = graphs.step(tokens, kv)
+                # The whole state: an AED's paged cross-attention is part of
+                # what the captured step reads.
+                logits = graphs.step(tokens, state)
                 if logits is not None:
                     kv.commit(1)
                     return logits, state
@@ -529,12 +542,16 @@ class IncrementalArStrategy(DecodeStrategy):
         A no-op for dense storage, which owns nothing outside its own tensors.
         Called where a group ends *without* a ``select`` — the last row of a
         group finishing, or an abort taking it — because ``select`` is what frees
-        rows the rest of the time and there is no other owner to notice.
+        rows the rest of the time and there is no other owner to notice.  Every
+        paged part of the state is freed, not only ``kv``: an AED's
+        cross-attention window holds more pages than its self-attention does.
         """
-        kv = state.get("kv") if isinstance(state, dict) else None
-        free = getattr(kv, "free", None)
-        if callable(free):
-            free()
+        if not isinstance(state, dict):
+            return
+        for part in state.values():
+            free = getattr(part, "free", None)
+            if callable(free):
+                free()
 
     # ------------------------------------------------------------------
     # Admission budgeting
@@ -551,15 +568,24 @@ class IncrementalArStrategy(DecodeStrategy):
         one.  That is what makes a pre-admission byte estimate meaningful here
         and not for a variable-length frontend.
 
+        An AED row also holds its cross-attention K/V over the whole encoder
+        window (``decoder_cache_spec.cross_attention_len`` positions, same
+        geometry), dense or paged alike, so that is added: a budget without it
+        would admit rows by a fraction of their real footprint.
+
         ``None`` when the model does not declare ``decoder_cache_spec``; the
         budget then stays off rather than guessing a footprint.
         """
         spec = getattr(self._model, "decoder_cache_spec", None)
         if spec is None:
             return None
+        cross_len = int(getattr(spec, "cross_attention_len", 0) or 0)
+        return self._kv_bytes_per_token(spec) * (int(self._position_budget()) + cross_len)
+
+    def _kv_bytes_per_token(self, spec: Any) -> int:
+        """K and V bytes for one position across every decoder layer."""
         itemsize = torch.empty((), dtype=self._config.dtype).element_size()
-        per_token = 2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize
-        return int(per_token) * int(self._position_budget())
+        return int(2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize)
 
     def _position_budget(self) -> int:
         """Positions one row can occupy: prompt estimate + generation cap."""

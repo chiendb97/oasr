@@ -404,6 +404,23 @@ thread that performs the GPU forward calls into them.
 6. **`block_size_frames == chunk_size`** is the simplest invariant: each
    chunk is exactly one block, eviction matches chunk granularity, and
    the dense `commit` shape check trivially holds.
+7. **No Python scalar is written through an index into a persistent tensor.**
+   `block_table[slot, i] = block_id` and `block_table[slots_t, kept_t] = 0` both
+   lower to a pageable 4-byte host-to-device copy, which waits for everything
+   queued on the stream (41.6 ms measured behind queued GEMMs). Admission writes
+   a row through one staged copy (`to_device`) and `fill_` on a slice, eviction
+   blanks the vacated column from a device scalar (`_zero`). On Nemotron — a
+   prefilled window, so five block writes per admission and an eviction every
+   step — these were most of the 16 synchronisations per tick.
+8. **The padding lane.** `BlockPool(config, scratch_blocks=1)` allocates one
+   physical block past `max_num_blocks` that is never on the free list (and that
+   `free` rejects), and `AttentionCacheManager(pool, config, pad_lanes=1)` adds
+   one slot row past `max_batch_size` whose block table points only at it, at the
+   cache length every stream starts with. The paged streaming backend pads a
+   cohort up to a captured width with that row (`SlotStateCache` gets the extra
+   slot too), so padding rows write K/V and conv state only where no stream will
+   ever read. `StreamSlotPool` still hands out `[0, max_batch_size)`, so no
+   stream can be bound to the lane. See [engine.md §9.8](engine.md).
 
 ## 10. Two storage disciplines, and how to add a cache
 
@@ -434,6 +451,15 @@ decoder that captures its steps — a graph needs addresses that outlive a batch
 and a per-group capacity buffer moves with every prefill. See
 [decoding.md](decoding.md#decoder-kv-storage).
 
+An AED's **cross-attention** K/V lives in the same pool as a *fixed-extent*
+region: a second slot per row created with `prefill_len` equal to the encoder
+window and no growth (`decoder_state.build_cross_kv`), so admission reserves
+exactly the pages it maps, and `select` / `merge` treat it like the
+self-attention's rows. It is block-addressed although it never grows because it
+is read by the same paged attention path as the self-attention, and because the
+alternative — a dense tensor per decode group — is the one thing that kept a
+Whisper step out of a CUDA graph.
+
 ### 10.1 Adding a fixed-extent cache — declare it
 
 `CnnCacheManager` is the single-spec instance of `SlotStateCache`. To add more,
@@ -461,9 +487,7 @@ Two things carry consequences:
 - **`slot_axis` is per spec.** It is why the conv cache keeps its historical
   `(layers, slots, frames, dim)` layout — and therefore its buffer *address*,
   which `GraphedEncoderForward` captures by reference. It is also exactly the
-  per-kind batch dimension a Zipformer-style recurrent state needs, which today
-  lives as a hand-written `stack_streaming_states` / `unstack_streaming_states`
-  pair on the encoder rather than as data.
+  per-kind batch dimension a Zipformer-style recurrent state needs (§10.4).
 - **Allocation zeroes the slot, and that is the initial *value*, not hygiene.**
   A zero left-context is precisely the padding an offline pass applies, so a
   stream's first chunk computes what an offline pass would.
@@ -496,17 +520,40 @@ Two things fall out for free, and one obligation:
   it feeds `CacheConfig.cnn_cache_frames`, `CnnCacheManager.buffer` and the graph
   cache's *address* capture. Rewriting three call sites for uniformity, on the
   one path with a known graph-capture invariant, buys nothing functional.
-- **Zipformer has not migrated**, though it is the strongest candidate: its state
-  *is* the fixed-extent kind, and migrating would delete
-  `stack_streaming_states` / `unstack_streaming_states` and make the state
-  graph-capturable, which is worth real throughput. The obstacle is that its
-  state is per-layer **heterogeneous** — icefall's stacks differ in width and
-  downsampling — so it is 20–40 specs generated from the encoder's own geometry,
-  against a working batched path that a subtle stacking bug would silently break.
-  `slot_axis` (§10.1) exists specifically to hold icefall's per-kind batch dims,
-  so the migration is a table plus a deletion whenever it is worth doing.
 
-### 10.4 Other extension points
+### 10.4 An encoder whose whole cache is fixed-extent — the slot runtime
+
+Zipformer's streaming state is all fixed-extent: per layer a left-context key,
+nonlin-attention and two value caches (a rolling window of `left_context //
+downsample` frames, not a growing one), two conv tails, plus the embed's cached
+frames and a processed-length counter — 98 tensors for the 16-layer release. It is
+not paged because it does not grow, and because each stack's window has its own
+width, which one uniform `BlockPool` geometry cannot hold. So it is declared
+instead: `ZipformerEncoder.slot_state_specs` is one `StreamStateSpec` per tensor,
+**derived from the encoder's own `get_streaming_init_states`** (on the `meta`
+device) so its order, shapes and batch axes cannot drift from the list API, and
+`streaming_kind="slot"` hands it to
+[`SlotStreamingBackend`](../oasr/engine/streaming_backend/slot.py):
+
+- one `SlotStateCache` holds every tensor, the stream slot on the tensor's own
+  batch axis (`slot_axis`), zero being every tensor's initial value;
+- a tick gathers the active slots into the list, runs one batched chunk forward
+  through the list API, and scatters the new list back — bit-identical to the
+  `"stateful"` runtime, which `cat`s every stream's lists together each tick;
+- stable addresses make the whole step one CUDA graph per batch width. Every
+  window is full (a short final one is padded with `streaming_pad_value`), so the
+  width is the only key, and the padding lane (`streaming_graph_pad_batch`, on
+  whenever steps are graphed) keeps it to a power-of-two ladder — 6 captures
+  instead of 32 at a 32-stream pool, 0.43 GiB of graphs instead of 1.7;
+- capture warms up and records the step, scatter included, **against a scratch
+  slot** past the streams', so a width captured while streams are live advances
+  none of them;
+- `reset` (rule 13) zeroes the slot in place and rewinds `offset`.
+
+Measured on the causal release at a 32-stream pool: 5.95× over the stateful
+runtime, transcripts unchanged; see `docs/models.md` for the geometry.
+
+### 10.5 Other extension points
 
 - **Custom stream identifiers.** Stream IDs are arbitrary integers — the
   engine assigns them monotonically, but external code can use any

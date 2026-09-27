@@ -163,12 +163,15 @@ Request → [VAD segmenter] → InputProcessor (fbank) → Scheduler (BatchingPo
   or `"both"` (hidden + log-probs — CTC+AED rescoring); and `incremental = True`
   for label-synchronous AR families driven via the bounded
   `begin_offline` / `advance(StepBudget)` / `has_pending` protocol.
-- The encoder declares `streaming_kind` (`"paged"` / `"stateful"` / `"none"`) plus
-  `subsampling_rate` / `right_context` / (stateful) `streaming_chunk_frames`; the
-  engine reads streaming geometry from there, not from hardcoded constants.
+- The encoder declares `streaming_kind` (`"paged"` / `"slot"` / `"stateful"` /
+  `"none"`) plus `subsampling_rate` / `right_context` / (slot, stateful)
+  `streaming_chunk_frames` and `streaming_window_frames`; the engine reads
+  streaming geometry from there, not from hardcoded constants.
 - The encoder also declares **what it carries across chunks**, so a new streaming
   cache is data rather than a new manager: `streaming_state_specs` (extra
-  fixed-extent per-stream tensors — see `docs/cache_manager.md` §10),
+  fixed-extent per-stream tensors beside paged K/V — see `docs/cache_manager.md`
+  §10), `slot_state_specs` (the *whole* cache, when every tensor in it is
+  fixed-extent — the slot runtime's contract),
   `fixed_attention_window` (a *trained* attention span, which makes the engine
   pre-fill the K/V window so one shared position table is correct), and
   `streaming_geometry(chunk_size)` (a front-end the generic window formula does not
@@ -186,8 +189,13 @@ Request → [VAD segmenter] → InputProcessor (fbank) → Scheduler (BatchingPo
 **Add an encoder architecture** (e.g. Paraformer, Branchformer):
 1. `class FooEncoder(BaseEncoder)` — implement `forward`, the introspection
    properties, and (for streaming) either `forward_chunk_paged`
-   (`streaming_kind="paged"`) or `get_streaming_init_states`/`streaming_forward`
-   (`streaming_kind="stateful"`).
+   (`streaming_kind="paged"`, for K/V that grows) or
+   `get_streaming_init_states`/`streaming_forward` over a list of state tensors.
+   When every tensor in that list is fixed-extent, also declare it
+   (`slot_state_specs`, in list order, zero-initialised) plus
+   `streaming_pad_value`, and return `"slot"`: the engine then owns the state in
+   a slot cache and captures the step. `"stateful"` threads the list per request
+   and captures nothing.
    `streaming_kind` must describe what *this config's weights* can actually do,
    not what the class implements — return `"none"` when the loaded checkpoint has
    no chunk-wise path (Zipformer does this for `causal=False`). It is the value
@@ -413,10 +421,11 @@ Per-request `DecodingOptions` (`oasr.engine.DecodingOptions` — n-best, generat
 cap, sampling knobs, LLM prompt override) ride on `Request` and through the
 serving front-end; engine-level knobs stay on `EngineConfig`.
 
-Both streaming backends are wired: Conformer/Nemotron (paged) and Zipformer
-(stateful). The stateful backend **batches** ready streams when the encoder
-exposes `stack_streaming_states` / `unstack_streaming_states`, running all
-same-chunk-length streams as one `B = N` forward. Encoders with
+Three streaming runtimes are wired: Conformer/Nemotron (paged), Zipformer
+(slot) and the list-state `stateful` runtime, which serves any encoder exposing
+the list API and is the slot runtime's parity oracle. Both of the latter batch
+ready streams into one `B = N` forward; the slot runtime also captures it, per
+power-of-two width through its padding lane. Encoders with
 `streaming_kind="none"` are rejected in streaming service mode.
 
 Deferred follow-ups, each with the measurement that justified deferring it:

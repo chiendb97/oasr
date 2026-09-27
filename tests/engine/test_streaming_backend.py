@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the pluggable streaming-encoder backend seam.
 
-* registry dispatch (paged / stateful / unknown),
+* registry dispatch (paged / slot / stateful / unknown),
 * StatefulStreamingBackend orchestration: it must thread the per-request encoder
-  state across chunks exactly like a manual ``model.streaming_forward`` loop.
+  state across chunks exactly like a manual ``model.streaming_forward`` loop,
+* SlotStreamingBackend: bit-identical to the stateful runtime, eager or replayed.
 
 The stateful test builds a tiny causal Zipformer (OASR-only, random weights) and
 compares the backend's output against a hand-rolled streaming loop over the same
@@ -25,6 +26,7 @@ from oasr.engine.streaming_backend.base import _REGISTRY
 
 def test_registry_has_builtin_backends():
     assert "paged" in _REGISTRY
+    assert "slot" in _REGISTRY
     assert "stateful" in _REGISTRY
 
 
@@ -74,20 +76,26 @@ class TestStatefulStreamingBackend:
 
     def test_streaming_kind_and_window(self):
         model = self._build_model()
-        assert model.encoder.streaming_kind == "stateful"
-        # chunk_size 16 * 2x embed = 32 input frames per steady-state chunk.
+        # The encoder runs on the slot runtime by default; this class drives it
+        # through the stateful one, which threads the same list API.
+        assert model.encoder.streaming_kind == "slot"
+        # chunk_size 16 * 2x embed = 32 input frames of new audio per chunk (the
+        # stride), read with the embed's 13-frame lookahead (the window).
         assert model.encoder.streaming_chunk_frames == 32
+        assert model.encoder.streaming_window_frames == 45
 
     def test_state_threading_matches_manual_loop(self):
         model = self._build_model()
         cfg = SimpleNamespace(device="cuda", dtype=torch.float16, chunk_size=16)
         backend = build_streaming_backend("stateful", model, cfg, None)
-        window = backend.decoding_window
-        assert window == 32
+        window, stride = backend.decoding_window, backend.stride
+        assert (window, stride) == (45, 32)
 
         n_chunks = 3
         feats = {
-            sid: torch.randn(window * n_chunks, 80, dtype=torch.float16, device="cuda")
+            sid: torch.randn(
+                stride * (n_chunks - 1) + window, 80, dtype=torch.float16, device="cuda"
+            )
             for sid in (0, 1)
         }
         reqs = [_make_request(sid, feats[sid]) for sid in (0, 1)]
@@ -111,7 +119,7 @@ class TestStatefulStreamingBackend:
             for sid in (0, 1):
                 state = model.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
                 for k in range(n_chunks):
-                    chunk = feats[sid][k * window : (k + 1) * window].unsqueeze(0)
+                    chunk = feats[sid][k * stride : k * stride + window].unsqueeze(0)
                     lens = torch.tensor([window], dtype=torch.int32, device="cuda")
                     lp, _ol, state = model.streaming_forward(chunk, lens, state)
                     torch.testing.assert_close(backend_out[sid][k], lp, atol=1e-2, rtol=1e-2)
@@ -160,18 +168,19 @@ class TestStatefulStreamingBackend:
         for r in (reused, fresh):
             backend.free(r)
 
-    def test_batched_grouping_with_short_tail(self):
-        """Mixed chunk lengths: full-window streams batch together; a stream
-        on its final short tail runs in its own singleton group.  Every
-        stream's output must match its independent B=1 reference loop."""
+    def test_a_short_final_window_is_padded_and_batched(self):
+        """A stream's final window is padded to a full one with the encoder's
+        pad value (icefall's ``LOG_EPS``), so it batches with the full windows
+        instead of taking the singleton path — and it must still match an
+        independent ``B=1`` loop over the same padded windows."""
         model = self._build_model()
         cfg = SimpleNamespace(device="cuda", dtype=torch.float16, chunk_size=16)
         backend = build_streaming_backend("stateful", model, cfg, None)
-        window = backend.decoding_window
+        window, stride = backend.decoding_window, backend.stride
+        pad = model.encoder.streaming_pad_value
 
-        # Streams 0/1: two full windows.  Stream 2: one full window + a
-        # half-window tail (audio_final so the tail is deemed ready).
-        lengths = {0: 2 * window, 1: 2 * window, 2: window + window // 2}
+        # Streams 0/1 end on a full window; stream 2's last window is 35 frames.
+        lengths = {0: 90, 1: 90, 2: 67}
         feats = {
             sid: torch.randn(n, 80, dtype=torch.float16, device="cuda")
             for sid, n in lengths.items()
@@ -181,7 +190,6 @@ class TestStatefulStreamingBackend:
             r.audio_final = True
             backend.allocate(r)
 
-        # Spy on the singleton path: only the tail chunk should take it.
         singles: list = []
         orig_forward_one = backend._forward_one  # noqa: SLF001
 
@@ -192,27 +200,26 @@ class TestStatefulStreamingBackend:
         backend._forward_one = spy  # noqa: SLF001
 
         backend_out = {sid: [] for sid in feats}
-        for _ in range(2):
+        for _ in range(4):
             out = backend.forward_step(reqs)
             for r in reqs:
                 if r.request_id in out:
                     backend_out[r.stream_id].append(out[r.request_id].clone())
-        # Tick 1: all three at a full window → one batched B=3 forward.
-        # Tick 2: streams 0/1 batch (B=2); stream 2's short tail is singleton.
-        assert singles == [2]
+        assert singles == [], "a padded tail must batch, not run alone"
+        assert [len(v) for v in backend_out.values()] == [3, 3, 3]
 
         with torch.no_grad():
-            for sid, total in lengths.items():
+            for sid in lengths:
                 state = model.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
-                cursor = 0
-                for lp_backend in backend_out[sid]:
-                    t = min(window, total - cursor)
-                    chunk = feats[sid][cursor : cursor + t].unsqueeze(0)
-                    lens = torch.tensor([t], dtype=torch.int32, device="cuda")
+                for k, lp_backend in enumerate(backend_out[sid]):
+                    chunk = feats[sid][k * stride : k * stride + window]
+                    chunk = torch.nn.functional.pad(
+                        chunk, (0, 0, 0, window - chunk.size(0)), value=pad
+                    ).unsqueeze(0)
+                    lens = torch.tensor([window], dtype=torch.int32, device="cuda")
                     lp, _ol, state = model.streaming_forward(chunk, lens, state)
                     torch.testing.assert_close(lp_backend, lp, atol=1e-2, rtol=1e-2)
                     assert torch.equal(lp_backend.argmax(-1), lp.argmax(-1))
-                    cursor += t
         for r in reqs:
             backend.free(r)
 
@@ -257,13 +264,166 @@ class TestStatefulStreamingBackend:
         with torch.no_grad():
             state = model.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
             for k in range(2):
-                chunk = feats[k * window : (k + 1) * window].unsqueeze(0)
+                chunk = feats[k * backend.stride : k * backend.stride + window].unsqueeze(0)
                 lens = torch.tensor([window], dtype=torch.int32, device="cuda")
                 hidden, _ol, state = model.encoder.streaming_forward(chunk, lens, state)
                 torch.testing.assert_close(got[k], hidden)
         # Hidden = encoder dim (max stack dim 96), not the 32-entry vocab.
         assert got[0].shape[-1] == 96
         backend.free(req)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+class TestSlotStreamingBackend:
+    """The slot runtime: the same encoder list API, state in an engine slot cache.
+
+    Its oracle is the stateful runtime, and the relation is **equality**: with
+    the same streams in the same order a tick is the same batched forward — the
+    states are gathered by slot instead of concatenated per stream, which moves
+    the same bytes.  A captured step must equal the eager one it replays, and a
+    capture taken while streams are live must not touch their state: warm-up and
+    capture run the whole step, scatter included, against a scratch slot.
+    """
+
+    _build_model = TestStatefulStreamingBackend._build_model
+
+    @staticmethod
+    def _cfg(graphs, cap=4, pad=None):
+        return SimpleNamespace(
+            device="cuda",
+            dtype=torch.float16,
+            chunk_size=16,
+            max_batch_size=cap,
+            use_cuda_graphs=graphs,
+            feature_config=SimpleNamespace(output_dim=80),
+            streaming_graph_max_shapes=64,
+            streaming_graph_pad_batch=pad,
+        )
+
+    def _roll(self, kind, graphs, lengths, seed=5, model=None, pad=None):
+        model = model or self._build_model()
+        backend = build_streaming_backend(kind, model, self._cfg(graphs, pad=pad), None)
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        reqs = []
+        for sid, n in enumerate(lengths):
+            r = _make_request(
+                sid, torch.randn(n, 80, device="cuda", dtype=torch.float16, generator=gen)
+            )
+            r.audio_final = True
+            backend.allocate(r)
+            reqs.append(r)
+        outs = {r.request_id: [] for r in reqs}
+        for _ in range(64):
+            res = backend.forward_step(reqs)
+            if not res:
+                break
+            for rid, o in res.items():
+                outs[rid].append(o.clone())
+        return backend, reqs, list(outs.values())
+
+    @staticmethod
+    def _equal(a, b):
+        return len(a) == len(b) and all(
+            len(x) == len(y) and all(torch.equal(p, q) for p, q in zip(x, y)) for x, y in zip(a, b)
+        )
+
+    def test_the_encoder_selects_it(self):
+        model = self._build_model()
+        assert model.encoder.streaming_kind == "slot"
+        backend = build_streaming_backend("slot", model, self._cfg(False), None)
+        assert (backend.decoding_window, backend.stride) == (45, 32)
+        assert backend.state_cache.names == [s.name for s in model.encoder.slot_state_specs]
+
+    def test_it_equals_the_stateful_runtime_bit_for_bit(self):
+        lengths = [150, 96, 45, 20]
+        _, _, stateful = self._roll("stateful", False, lengths)
+        _, _, slot = self._roll("slot", False, lengths)
+        assert [len(o) for o in slot] == [5, 3, 2, 1]
+        assert self._equal(stateful, slot)
+
+    @pytest.mark.parametrize("pad", [False, True], ids=["exact_widths", "padding_lane"])
+    def test_graph_replay_is_bit_identical_to_eager(self, pad):
+        """Streams finish at different ticks, so the width walks 4, 3, 2, 1 and
+        every width after the first is captured while other streams are live —
+        a capture that advanced them would show up as a mismatch here.
+
+        With the padding lane the 3-stream ticks run at width 4; the eager arm
+        is padded the same way, because padding happens before the graph/eager
+        branch — that is the property, not the unpadded result."""
+        lengths = [150, 96, 45, 20]
+        _, _, eager = self._roll("slot", False, lengths, pad=pad)
+        backend, _, replayed = self._roll("slot", True, lengths, pad=pad)
+        assert self._equal(eager, replayed)
+        stats = backend.stats()
+        assert stats["captured"] == (3 if pad else 4) and stats["eager_steps"] == 0
+
+    def test_the_padding_lane_runs_a_ladder_width_and_hands_back_live_rows(self):
+        model = self._build_model()
+        backend = build_streaming_backend("slot", model, self._cfg(True, cap=6), None)
+        assert list(backend.graph_batch_widths) == [1, 2, 4, 6]
+        assert [backend._run_width(b) for b in range(1, 7)] == [1, 2, 4, 4, 6, 6]  # noqa: SLF001
+        reqs = []
+        for sid in range(3):
+            r = _make_request(sid, torch.randn(90, 80, dtype=torch.float16, device="cuda"))
+            backend.allocate(r)
+            reqs.append(r)
+        out = backend.forward_step(reqs)
+        assert set(out) == {r.request_id for r in reqs}
+        assert all(o.size(0) == 1 for o in out.values())
+        assert backend.stats()["captured"] == 1 and 4 in backend._graphs  # noqa: SLF001
+
+    def test_a_reset_stream_matches_a_fresh_one(self):
+        """Rule 13 for the slot runtime: state *and* position back to the start,
+        in place — the stream keeps its slot."""
+        model = self._build_model()
+        backend = build_streaming_backend("slot", model, self._cfg(False), None)
+        window = backend.decoding_window
+        torch.manual_seed(3)
+        first = torch.randn(window, 80, dtype=torch.float16, device="cuda")
+        second = torch.randn(window * 2, 80, dtype=torch.float16, device="cuda")
+
+        reused = _make_request(0, torch.cat([first, second]))
+        backend.allocate(reused)
+        slot = reused.slot_id
+        backend.forward_step([reused])
+        assert reused.offset > 0
+        backend.reset(reused)
+        assert reused.offset == 0 and reused.slot_id == slot
+        reused.feature_cursor = window
+        after = [backend.forward_step([reused])[reused.request_id].clone() for _ in range(2)]
+
+        fresh = _make_request(1, second)
+        backend.allocate(fresh)
+        want = [backend.forward_step([fresh])[fresh.request_id].clone() for _ in range(2)]
+        for got, expect in zip(after, want):
+            assert torch.equal(got, expect), "the reset turn carried old state"
+
+    def test_a_freed_slot_is_reused_from_its_initial_state(self):
+        model = self._build_model()
+        backend = build_streaming_backend("slot", model, self._cfg(False, cap=1), None)
+        a = _make_request(0, torch.randn(90, 80, dtype=torch.float16, device="cuda"))
+        backend.allocate(a)
+        backend.forward_step([a])
+        backend.free(a)
+        b = _make_request(1, a.feature_buffer.clone())
+        backend.allocate(b)  # the only slot again: must start from zeros
+        got = backend.forward_step([b])[b.request_id]
+        c = _make_request(2, a.feature_buffer.clone())
+        backend.free(b)
+        backend.allocate(c)
+        assert torch.equal(got, backend.forward_step([c])[c.request_id])
+
+    def test_an_encoder_without_a_pad_value_is_refused(self):
+        model = self._build_model()
+        type(model.encoder).streaming_pad_value, saved = (
+            None,
+            type(model.encoder).streaming_pad_value,
+        )
+        try:
+            with pytest.raises(ValueError, match="streaming_pad_value"):
+                build_streaming_backend("slot", model, self._cfg(False), None)
+        finally:
+            type(model.encoder).streaming_pad_value = saved
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +460,7 @@ class _RoutingModelStub:
         raise AssertionError("not called in this test")
 
 
-def _paged_backend(consumes, max_batch_size=2):
+def _paged_backend(consumes, max_batch_size=2, pad_batch=None):
     from oasr.cache import CacheConfig
     from oasr.engine.streaming_backend.paged import PagedStreamingBackend
 
@@ -325,6 +485,7 @@ def _paged_backend(consumes, max_batch_size=2):
         chunk_size=16,
         use_cuda_graphs=True,  # must still be disabled by hidden routing / cpu
         feature_config=SimpleNamespace(output_dim=80),
+        streaming_graph_pad_batch=pad_batch,
     )
     model = _RoutingModelStub()
     return (
@@ -357,6 +518,102 @@ def test_graph_capture_follows_the_device_not_the_consumes_mode():
         assert backend._graph_cache is None, consumes  # noqa: SLF001
 
 
+class TestPaddingLane:
+    """A cohort is padded up to a ladder width through a lane no stream owns.
+
+    The lane is one slot row past ``max_batch_size`` whose block table points
+    only at a scratch block outside the free list.  What must hold is that the
+    padding rows touch nothing a stream owns and nothing downstream sees them:
+    the forward runs at the ladder width, but only live rows are handed out and
+    only live streams are committed.  (That live rows *compute* the same with or
+    without the padding is an end-to-end property — every encoder op is
+    row-local — measured as byte-identical transcripts on three real configs.)
+    """
+
+    def _backend(self, n_live, cap=4):
+        backend, _ = _paged_backend("log_probs", max_batch_size=cap, pad_batch=True)
+        seen = {}
+
+        def chunk_forward(xs, offsets, caches, cnn_cache, cache_t1=0):
+            seen.update(
+                xs=xs.clone(),
+                offsets=offsets.clone(),
+                block_table=caches[0].block_table.clone(),
+                slot_ids=cnn_cache.slot_ids.clone(),
+            )
+            # Row b answers with its own mean, so a mis-sliced output is visible.
+            return xs.mean(dim=(1, 2), keepdim=True).expand(-1, 4, 3).contiguous()
+
+        backend._chunk_forward = chunk_forward  # noqa: SLF001
+        window = backend.decoding_window
+        reqs = [
+            _make_request(sid, torch.full((window * 2, 80), float(sid + 1)))
+            for sid in range(n_live)
+        ]
+        for r in reqs:
+            backend.allocate(r)
+        return backend, reqs, seen
+
+    def test_the_ladder_is_powers_of_two_ending_at_the_cap(self):
+        backend, _, _ = self._backend(1, cap=6)
+        assert list(backend.graph_batch_widths) == [1, 2, 4, 6]
+        assert [backend._run_width(b) for b in range(1, 7)] == [1, 2, 4, 4, 6, 6]  # noqa: SLF001
+
+    def test_a_cohort_is_padded_with_the_lane_and_only_live_rows_come_back(self):
+        backend, reqs, seen = self._backend(3)
+        pad = backend._att_mgr.pad_slots[0]  # noqa: SLF001
+        results = backend.forward_step(reqs)
+
+        assert seen["slot_ids"].tolist() == [r.slot_id for r in reqs] + [pad]
+        assert seen["xs"].size(0) == 4 and torch.all(seen["xs"][3] == 0)
+        assert seen["offsets"].tolist()[3] == backend._att_mgr.pad_start  # noqa: SLF001
+        assert set(results) == {r.request_id for r in reqs}
+        for r in reqs:  # each stream gets its own row, not a neighbour's
+            assert torch.all(results[r.request_id] == float(r.stream_id + 1))
+
+    def test_the_lane_reads_and_writes_only_scratch(self):
+        backend, reqs, seen = self._backend(3)
+        scratch = backend.block_pool.scratch_block_ids
+        backend.forward_step(reqs)
+        lane_row = seen["block_table"][3]
+        assert scratch and torch.all(lane_row == scratch[0])
+        live = seen["block_table"][:3]
+        assert not torch.any(live == scratch[0]), "a stream was handed the scratch block"
+
+    def test_only_live_streams_are_committed(self):
+        backend, reqs, _ = self._backend(3)
+        mgr = backend._att_mgr  # noqa: SLF001
+        pad = mgr.pad_slots[0]
+        before = int(mgr.cache_seqlens[pad])
+        backend.forward_step(reqs)
+        assert int(mgr.cache_seqlens[pad]) == before
+        for r in reqs:
+            assert int(mgr.cache_seqlens[r.slot_id]) > 0
+
+    def test_the_scratch_block_is_never_allocated_or_freed(self):
+        backend, _, _ = self._backend(1)
+        pool = backend.block_pool
+        (scratch,) = pool.scratch_block_ids
+        assert scratch == pool.num_total_blocks  # just past the allocatable range
+        handed = pool.allocate(pool.num_free_blocks)
+        assert scratch not in handed
+        with pytest.raises(ValueError):
+            pool.free([scratch])
+
+    def test_no_stream_can_be_bound_to_the_lane(self):
+        backend, reqs, _ = self._backend(4)
+        pad = backend._att_mgr.pad_slots[0]  # noqa: SLF001
+        assert pad not in {r.slot_id for r in reqs}
+        with pytest.raises(ValueError):
+            backend._att_mgr.allocate_stream(99, slot_id=pad)  # noqa: SLF001
+
+    def test_a_full_cohort_is_not_padded(self):
+        backend, reqs, seen = self._backend(4)
+        backend.forward_step(reqs)
+        assert seen["xs"].size(0) == 4
+        assert backend._att_mgr.pad_slots[0] not in seen["slot_ids"].tolist()  # noqa: SLF001
+
+
 class TestGraphReplayBufferIsNotHandedOutTwice:
     """A step's earlier graph results must survive everything that follows them.
 
@@ -364,12 +621,16 @@ class TestGraphReplayBufferIsNotHandedOutTwice:
     each one cost real transcripts before it was understood:
 
     **Same-key reuse.**  One pre-allocated output buffer per
-    ``(B, T_input, cache_t1_bucket)`` key, and ``forward_step`` can replay one key
-    twice: a full-window *final* chunk goes through ``_forward_single`` at ``B=1``,
-    so two streams finalizing in the same step collide — as does a ``B=1`` batched
+    ``(B, T_input, cache_t1_bucket)`` key, and ``forward_step`` could replay one key
+    twice: a full-window *final* chunk went through ``_forward_single`` at ``B=1``,
+    so two streams finalizing in the same step collided — as did a ``B=1`` batched
     cohort alongside one such final.  Observed on the CTC path: three lockstep
     streams each ending on a full window produced two transcripts whose tails were
-    the *third* stream's final chunk.
+    the *third* stream's final chunk.  A full final window now joins the batched
+    cohort instead (``test_a_final_full_window_joins_the_batched_cohort``), which
+    removes that collision by construction; only a *sub-window* final still takes
+    the single path, and it runs eager.  The detach policy stays as defence in
+    depth, and the tests below drive it with sub-window finals.
 
     **A later capture.**  Captures share one memory pool, so a *first* capture at a
     new key may be handed the block an earlier capture's output buffer occupies —
@@ -391,11 +652,15 @@ class TestGraphReplayBufferIsNotHandedOutTwice:
         """Replace both forwards with recorders; return the recorded flags."""
         seen = {"batched": [], "single": []}
 
-        def batched(group, window, stride, context, results, detach=False):
+        def batched(group, window, stride, context, results, detach=False, final_ids=None):
             seen["batched"].append(detach)
+            seen.setdefault("final_ids", []).append(set(final_ids or ()))
             for r in group:
                 results[r.request_id] = torch.zeros(1, 4, 8)
-                r.feature_cursor += stride
+                if r.request_id in (final_ids or ()):
+                    r.feature_cursor = r.feature_frames
+                else:
+                    r.feature_cursor += stride
 
         def single(req, window, stride, context, results, detach=False):
             seen["single"].append(detach)
@@ -410,11 +675,12 @@ class TestGraphReplayBufferIsNotHandedOutTwice:
         backend, reqs = self._backend_and_reqs(4)
         seen = self._record_detach(backend)
 
-        # One mid-stream (batchable) + three finalizing (fallback).  A B=1
-        # cohort is the only width that can collide with a single.
+        # One mid-stream (batchable) + three finalizing on a *sub-window* tail
+        # (fallback).  A B=1 cohort is the only width that can collide with a
+        # single.
         for r in reqs[1:]:
             r.audio_final = True
-            r.feature_frames = r.feature_cursor + backend.decoding_window
+            r.feature_frames = r.feature_cursor + backend.decoding_window - 1
         backend.forward_step(reqs)
 
         assert seen["batched"] == [True]
@@ -428,13 +694,39 @@ class TestGraphReplayBufferIsNotHandedOutTwice:
         """
         backend, reqs = self._backend_and_reqs(4)
         seen = self._record_detach(backend)
-        for r in reqs[2:]:  # two batchable, two finalizing
+        for r in reqs[2:]:  # two batchable, two finalizing on a sub-window tail
             r.audio_final = True
-            r.feature_frames = r.feature_cursor + backend.decoding_window
+            r.feature_frames = r.feature_cursor + backend.decoding_window - 1
         backend.forward_step(reqs)
 
         assert seen["batched"] == [True]
         assert seen["single"] == [True, False]
+
+    def test_a_final_full_window_joins_the_batched_cohort(self):
+        """A stream's last window, when it is a whole window, is batched.
+
+        It used to take ``_forward_single`` — one ``B=1`` forward per finalizing
+        stream, serially.  For an encoder with a declared geometry the finalize pad
+        makes *every* stream's last window exactly ``window`` frames, so that was
+        one serial forward per stream (measured ~400 ms of a 664 ms Nemotron
+        backlog).  Batched, it must still be consumed whole, as the single path
+        consumed it, so the stream finalizes this tick rather than the next.
+        """
+        backend, reqs = self._backend_and_reqs(4)
+        seen = self._record_detach(backend)
+        for r in reqs[1:]:
+            r.audio_final = True
+            r.feature_frames = r.feature_cursor + backend.decoding_window
+        cursor0 = reqs[0].feature_cursor
+        backend.forward_step(reqs)
+
+        assert seen["single"] == []
+        assert seen["batched"] == [False]  # nothing follows it: no detach
+        assert seen["final_ids"] == [{r.request_id for r in reqs[1:]}]
+        assert reqs[0].feature_cursor == cursor0 + backend.stride
+        for r in reqs[1:]:
+            assert r.feature_cursor == r.feature_frames
+            assert not r.has_ready_encoder_chunk(backend.decoding_window)
 
     def test_a_lone_batched_cohort_still_aliases(self):
         """The steady state must stay copy-free — this is the hot path."""
@@ -734,14 +1026,14 @@ class TestOfflineModeSkipsTheStreamingBackend:
             service_mode=service_mode, use_cuda_graphs=False, use_offline_cuda_graphs=False
         )
 
-    @pytest.mark.parametrize("encoder_kind", ["paged", "stateful"])
+    @pytest.mark.parametrize("encoder_kind", ["paged", "slot", "stateful"])
     def test_offline_mode_selects_the_no_op_backend(self, monkeypatch, encoder_kind):
         mr, seen = self._spy(monkeypatch)
         cfg = self._cfg("offline")
         mr.ModelRunner(self._model(encoder_kind), cfg, object())
         assert seen["kind"] == "none"
 
-    @pytest.mark.parametrize("encoder_kind", ["paged", "stateful"])
+    @pytest.mark.parametrize("encoder_kind", ["paged", "slot", "stateful"])
     def test_streaming_mode_still_selects_the_encoders_own_backend(self, monkeypatch, encoder_kind):
         mr, seen = self._spy(monkeypatch)
         cfg = self._cfg("streaming")

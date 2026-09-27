@@ -52,6 +52,33 @@ partial-emission policy.
 
 `OutputProcessor` is a thin facade over whichever strategy is active.
 
+### Optional hooks the executors use when a family provides them
+
+Each has a default that keeps a family that ignores it exactly as it was.
+
+| Hook | Default | Implemented by | What it buys |
+|---|---|---|---|
+| `decode_offline_async(enc, lens, requests)` | `None` (decode synchronously) | `ctc_cuda` | The read-back is queued into pinned memory behind an event; the offline executor collects it next tick, behind that tick's forward. 1.09–1.17× on Conformer offline. A batch asking for word timings or speech activity decodes synchronously. |
+| `finalize_batch(requests)` | a loop over `finalize` | `ctc_cuda` | Every stream that ends in one tick is read back together — one batched kernel and one device→host copy instead of three synchronising copies per stream. |
+| `prewarm_streaming(batch_sizes, frames)` | nothing | `transducer` | Captures per-width decode graphs at construction, so none lands on a live tick. |
+
+### The transducer greedy loop is replayed, not issued
+
+`TransducerOptions.loop_graphs` (default on; gated by
+`use_transducer_cuda_graphs`) captures **16 iterations** of the greedy loop —
+the frame gather, the joiner, `argmax`, the masks, the predictor step and the
+`t`/`sym` updates — into one CUDA graph (`oasr/engine/greedy_graph.py`). The
+host comes back once per replay to ask whether any row is still inside its
+utterance, which is the eager loop's own termination check at its own stride, so
+the two run exactly the same iterations. Keys are the exact batch width (padding
+rows would change the joiner GEMMs' `M`) and a power-of-two frame capacity (a
+padded frame is only ever read by a row that is already past its end). The
+result is **bit-identical** to the eager loop — hypotheses, predictor state and
+projection — and **3.46×** on the icefall transducer offline, 1.51× on Nemotron
+(whose encoder is a larger share), 1.16× on Nemotron streaming. Word timings
+(`track=True`, a per-iteration host decision) and beam search keep the eager
+loop, whose predictor step is still captured by `PredictorStepGraphCache`.
+
 ## Per-family options
 
 **Do not add a field to `EngineConfig` for one family.** Each strategy declares an
@@ -137,14 +164,16 @@ cost no materialized mask and reach the fused kernel on the same terms the
 uniform case did.
 
 Merging is declared, not assumed: `can_merge` refuses a cache grown by
-`torch.cat` (no room for a second offset), an encoder window of a different width
-(an AED reads cross-attention unmasked over the whole window), and a beam group
-(its slot grid advances by one group-wide `steps` counter). `merge_groups=0`
-turns it off for an A/B.
+`torch.cat` (no room for a second offset), a *dense* AED state whose encoder
+window has a different width (dense cross-attention is read unmasked over the
+whole window; paged, each row's window is its own `kv_lens` entry, so any two
+merge), and a beam group (its slot grid advances by one group-wide `steps`
+counter). `merge_groups=0` turns it off for an A/B.
 
 ### Decoder-KV storage
 
-`kv_storage` picks where the self-attention KV lives. Both are row-indexed and
+`kv_storage` picks where the decoder KV lives — the self-attention and, for an
+AED, the cross-attention over the encoder window. Both modes are row-indexed and
 present the same surface, so neither decoder branches on the choice.
 
 | | Where | Merge costs | Notes |
@@ -165,9 +194,22 @@ buffer, so its transient grows with rows × capacity (2804 MiB at 8 rows on the
 7B, against 323 MiB paged plus a fixed 2120 MiB pool) — but the one that pays for
 the indirection is the last, so `auto` resolves to `paged` when `step_graphs` is
 on *and*
-the decoder declares `supports_step_graphs`, and to `dense` otherwise — an AED
-keeps the buffer it was already paying nothing for. Either value can be named
-explicitly, which is what makes the A/B possible.
+the decoder declares `supports_step_graphs`, and to `dense` otherwise. Either
+value can be named explicitly, which is what makes the A/B possible.
+
+**An AED pages both halves.** Paged, Whisper's cross-attention K/V is a second,
+fixed-extent slot per row in the same pool (`decoder_state.build_cross_kv`):
+prefilled with the whole encoder window, reserved at exactly that size, written
+once per layer at prefill and read after through the same paged attention path
+as the self-attention (`kv_lens` = the window, the row's block table). That is
+what leaves a step with nothing at a per-batch address, so Whisper declares
+`supports_step_graphs` and `auto` pages it. Its per-row footprint is declared
+(`decoder_cache_spec.cross_attention_len`) and counted in `kv_bytes_per_row` and
+in the pool, dense or paged — at large-v3 the cross half is ~245 MB of a ~320 MB
+row, so a budget without it admits rows by a fraction of their size. The paged
+read goes through the fused kernel where dense went through SDPA: whisper-tiny's
+gate moved 3.73 → 3.67 (two fewer errors), `kv_storage="dense"` still gives 3.73
+exactly, and paged eager equals paged replayed.
 
 The pool reserves each row's whole position budget **at admission**
 (`DecoderKVCacheManager.can_admit`) because there is no eviction to fall back on:
@@ -241,10 +283,16 @@ before trusting it on a new model: **one** real checkpoint, and no long-running
 soak on the serving path.
 
 Not everything is capturable, and the parts that are not are declared rather than
-discovered (`BaseDecoder.supports_step_graphs`). An AED's cross-attention K/V is
-allocated per prefill and far too large to copy into a static buffer per step, so
-`aed` steps run eager; a decoder-only speech-LLM has no such cache and does
-capture. Beam search does not page its KV at all, so it never reaches this path.
+discovered (`BaseDecoder.supports_step_graphs`), then checked per state: the
+graph cache captures a state only when every component a step reads is paged on
+its pool (`capturable`). A paged AED state is `{"kv", "cross"}`; the cross half
+is only a key-length vector and a block table, copied into static buffers like
+the self-attention's, and the shape key gains its (bucketed) table width. A
+*dense* AED state still carries per-group cross K/V and is refused. Measured on
+whisper-tiny offline: paged + graphs **1.96×** at `B = 32` and **3.08×** at
+`B = 8` against dense eager (paged eager alone is 0.75-0.80×: the indirection
+without the capture). Beam search does not page its KV at all, so it never
+reaches this path.
 
 ## Beam search
 

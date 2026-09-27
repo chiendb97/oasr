@@ -27,7 +27,7 @@ from torch import nn
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from oasr.cache.decoder_kv import DecoderKVCacheManager
 
-from oasr.cache import DecoderKv, build_kv
+from oasr.cache import DecoderKv, build_cross_kv, build_kv
 from oasr.cache.decoder_state import consume_cat_rows
 from oasr.layers import (
     TORCH_EPS,
@@ -201,6 +201,7 @@ class _DecoderLayer(nn.Module):
         self_kwargs: Dict[str, Any],
         trim: bool,
         collect: Optional["_CrossAttnCollector"] = None,
+        cross_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one decoder layer from an already-normalized input.
 
@@ -208,6 +209,10 @@ class _DecoderLayer(nn.Module):
         fuse their addition into the following layer's ``self_attn_layer_norm``.
         ``kv`` owns the self-attention cache: this layer hands it new K/V and
         gets back whatever the attention should read, at each row's own offset.
+
+        ``cross_k`` / ``cross_v`` are either the group's dense cross-attention
+        K/V or, with ``cross_kwargs`` (``kv_lens`` + ``block_table``), the pool
+        views that paged cross-attention reads through its block table.
         """
         k_new, v_new = self.self_attn.kv(h)
         k, v, extent = kv.append(layer_idx, k_new, v_new, trim=trim)
@@ -215,8 +220,10 @@ class _DecoderLayer(nn.Module):
         self_attn = self.self_attn(h, k, v, kv_extent=extent, **self_kwargs)
         h, residual = self.encoder_attn_layer_norm.forward_add_residual(self_attn, residual)
         if collect is not None:
+            if cross_kwargs:
+                raise RuntimeError("cross-attention collection needs the dense K/V, not pages")
             collect.capture(layer_idx, self.encoder_attn, h, cross_k)
-        cross_attn = self.encoder_attn(h, cross_k, cross_v)
+        cross_attn = self.encoder_attn(h, cross_k, cross_v, **(cross_kwargs or {}))
         h, residual = self.final_layer_norm.forward_add_residual(cross_attn, residual)
         return self.fc2(self.fc1(h)), residual
 
@@ -272,14 +279,28 @@ class WhisperDecoder(BaseDecoder):
 
     The KV state is a dict of a :class:`~oasr.cache.decoder_state.DecoderKv`
     (self-attention, one capacity buffer per layer, **per-row** write offsets and
-    position ids) plus ``cross_k``/``cross_v``: fixed, computed once at prefill.
-    Rows are dropped with :meth:`select` as requests finish (continuous
-    batching), and two prefilled states are joined with :meth:`merge` so a
-    trickle of arrivals still generates in one forward.
+    position ids) plus the cross-attention K/V, fixed and computed once at
+    prefill.  Rows are dropped with :meth:`select` as requests finish
+    (continuous batching), and two prefilled states are joined with
+    :meth:`merge` so a trickle of arrivals still generates in one forward.
+
+    Two storage modes, chosen by whether ``prefill`` is handed a pool:
+
+    * **dense** — ``{"kv", "cross_k", "cross_v"}``: a capacity buffer per group
+      and the cross K/V as per-group tensors;
+    * **paged** — ``{"kv", "cross"}``: both halves are
+      :class:`~oasr.cache.decoder_state.PagedDecoderKv` in one decoder pool, the
+      cross half a fixed-extent region per row (:func:`build_cross_kv`).  Nothing
+      a step reads then lives at a per-batch address, which is why this decoder
+      can declare :attr:`supports_step_graphs`: a captured step reads the pool's
+      pages through block tables copied into its static buffers each step.
     """
 
     decode_type = "aed"
     supports_paged_kv = True
+    #: True for the paged state only — a dense one still carries per-group
+    #: cross K/V, and the graph cache refuses such a state (``capturable``).
+    supports_step_graphs = True
 
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
@@ -331,6 +352,10 @@ class WhisperDecoder(BaseDecoder):
         trim = is_prefill
         self_kwargs: Dict[str, Any] = dict(kv.mask_kwargs(T, trimmed=trim))
         self_kwargs["is_causal"] = is_prefill and T > 1
+        # Paged cross-attention: every row's key extent and its pages, built once
+        # for all layers (the pages are the same block ids in each layer's pool).
+        cross = state.get("cross")
+        cross_kwargs = cross.mask_kwargs(0) if cross is not None else None
 
         layers = [cast(_DecoderLayer, layer) for layer in self.layers]
         if not layers:
@@ -341,16 +366,21 @@ class WhisperDecoder(BaseDecoder):
         residual = x
         h = layers[0].self_attn_layer_norm(x)
         for i, layer in enumerate(layers):
+            if cross is not None:
+                cross_k, cross_v = cross.manager.kv_view(i)
+            else:
+                cross_k, cross_v = state["cross_k"][i], state["cross_v"][i]
             ff, residual = layer(
                 h,
                 residual,
                 kv,
                 i,
-                state["cross_k"][i],
-                state["cross_v"][i],
+                cross_k,
+                cross_v,
                 self_kwargs,
                 trim,
                 collect=collect,
+                cross_kwargs=cross_kwargs,
             )
             if i + 1 < len(layers):
                 h, residual = layers[i + 1].self_attn_layer_norm.forward_add_residual(ff, residual)
@@ -412,31 +442,40 @@ class WhisperDecoder(BaseDecoder):
         slot in place — which is also what makes the state **mergeable**, since a
         ``cat``-grown cache has no room to hold rows at different offsets.
 
-        ``kv_manager`` (optional, requires ``capacity``): page the
-        self-attention KV out of a shared pool instead, one row per slot.  Only
-        the self-attention half — the cross-attention KV is a fixed length
-        computed once here and never grows, so it has no place in a pool built
-        for append-per-step growth.
+        ``kv_manager`` (optional, requires ``capacity``): page the decoder KV
+        out of a shared pool instead — the self-attention one slot per row that
+        grows a page at a time, and the cross-attention a second, fixed-extent
+        slot per row holding the whole encoder window (:func:`build_cross_kv`),
+        written here once per layer and only read after.  The prompt's own
+        forward already reads the cross K/V back through the pages, so prefill
+        and steps take one attention path.
         """
         n = len(self.layers)
-        P = prompt_ids.size(1)
+        layers = [cast(_DecoderLayer, layer) for layer in self.layers]
+        B, P = prompt_ids.shape
         cap = None if capacity is None else max(int(capacity), P)
-        state: Dict[str, Any] = {
-            "kv": build_kv(
-                n,
-                prompt_ids.size(0),
-                prompt_ids.device,
-                prefill_len=P,
-                cap=cap,
-                manager=kv_manager,
-            ),
-            "cross_k": [None] * n,
-            "cross_v": [None] * n,
-        }
+        kv = build_kv(n, B, prompt_ids.device, prefill_len=P, cap=cap, manager=kv_manager)
+        state: Dict[str, Any] = {"kv": kv}
         # Cross K/V project the *raw* encoder output (the decoder layer's
         # encoder_attn_layer_norm applies to the query side only).
-        for i, layer in enumerate(self.layers):
-            state["cross_k"][i], state["cross_v"][i] = layer.encoder_attn.kv(enc_out)
+        if kv_manager is not None:
+            t_enc = int(enc_out.size(1))
+            try:
+                cross = build_cross_kv(kv_manager, B, prompt_ids.device, length=t_enc)
+            except Exception:
+                kv.free()  # an exhausted pool refuses the batch whole, leaking nothing
+                raise
+            for i, layer in enumerate(layers):
+                k, v = layer.encoder_attn.kv(enc_out)
+                cross.append(i, k, v)
+                del k, v  # the pool holds them now; free each layer's pair at once
+            cross.commit(t_enc)
+            state["cross"] = cross
+        else:
+            state["cross_k"] = [None] * n
+            state["cross_v"] = [None] * n
+            for i, layer in enumerate(layers):
+                state["cross_k"][i], state["cross_v"][i] = layer.encoder_attn.kv(enc_out)
         logits = self._forward_tokens(prompt_ids, state, is_prefill=True)
         return logits[:, -1], state
 
@@ -449,8 +488,14 @@ class WhisperDecoder(BaseDecoder):
 
     @staticmethod
     def select(state: Dict[str, Any], keep: torch.Tensor) -> Dict[str, Any]:
-        """Drop finished rows: index-select every cached tensor along batch."""
+        """Drop finished rows: index-select every cached tensor along batch.
+
+        Paged, both halves free the pages of every row not in ``keep``.
+        """
         out: Dict[str, Any] = {"kv": state["kv"].select(keep)}
+        if "cross" in state:
+            out["cross"] = state["cross"].select(keep)
+            return out
         for key in ("cross_k", "cross_v"):
             out[key] = [t.index_select(0, keep) for t in state[key]]
         return out
@@ -459,26 +504,36 @@ class WhisperDecoder(BaseDecoder):
     def can_merge(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         """Whether two prefilled states can generate in one forward.
 
-        Beyond the self-attention cache's own conditions: the cross-attention KV
-        is read **unmasked** over the whole encoder window (Whisper's 30 s window
-        is real input, not padding), so two groups can only share a forward when
-        their windows are the same width.  Padding the shorter one would change
-        what the shorter group's rows attend to.
+        Beyond the self-attention cache's own conditions, the two must store
+        their cross-attention the same way.  Dense, the cross K/V is read
+        **unmasked** over the whole encoder window (Whisper's 30 s window is real
+        input, not padding), so two groups can only share a forward when their
+        windows are the same width — padding the shorter one would change what
+        its rows attend to.  Paged, each row's window travels as its own
+        ``kv_lens`` entry, so no such condition exists.
         """
         if not a["kv"].can_merge(b["kv"]):
             return False
+        if ("cross" in a) != ("cross" in b):
+            return False
+        if "cross" in a:
+            return bool(a["cross"].can_merge(b["cross"]))
         return all(x.shape[1:] == y.shape[1:] for x, y in zip(a["cross_k"], b["cross_k"]))
 
     @staticmethod
     def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         """Concatenate ``b``'s rows after ``a``'s into one generating state.
 
-        **Consumes both states** — see :meth:`DecoderKv.merge`.  The
-        cross-attention cache is the larger half here (a Whisper row's is the
-        whole 30 s window, fixed for the run), so releasing it layer by layer is
-        what keeps the merge's transient below one extra copy of the result.
+        **Consumes both states** — see :meth:`DecoderKv.merge`.  Dense, the
+        cross-attention cache is the larger half (a Whisper row's is the whole
+        30 s window, fixed for the run), so releasing it layer by layer is what
+        keeps the merge's transient below one extra copy of the result.  Paged,
+        both halves merge by concatenating block tables and no K/V moves.
         """
         out: Dict[str, Any] = {"kv": a["kv"].merge(b["kv"])}
+        if "cross" in a:
+            out["cross"] = a["cross"].merge(b["cross"])
+            return out
         for key in ("cross_k", "cross_v"):
             out[key] = consume_cat_rows(a[key], b[key])
         return out
@@ -519,9 +574,13 @@ class WhisperModel(BaseAsrModel):
         no encoder cache spec at all — but its AR decoder still allocates KV per
         generated token, and that is what bounds how many rows can be in flight.
 
-        Self-attention only: cross-attention KV is computed once from the
-        encoder output and does not grow per token, so it does not belong in a
-        per-token rate.
+        ``cross_attention_len`` declares the other half of a row's footprint:
+        the cross-attention K/V over the whole encoder window, fixed at
+        ``max_source_positions`` and with the self-attention's geometry (same
+        heads, same head dim).  It does not grow per token, but it is per row —
+        and on a large checkpoint it is most of the row (245 MB of ~320 MB at
+        large-v3) — so a budget that left it out would admit rows the device
+        cannot hold.
         """
         from oasr.models.base import CacheSpec
 
@@ -531,6 +590,7 @@ class WhisperModel(BaseAsrModel):
             n_kv_head=int(cfg.decoder_attention_heads),
             head_dim=int(cfg.d_model) // int(cfg.decoder_attention_heads),
             hidden_dim=int(cfg.d_model),
+            cross_attention_len=int(cfg.max_source_positions),
         )
 
     def load_weights(

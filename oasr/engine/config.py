@@ -131,6 +131,16 @@ class EngineConfig:
     # Offline-only: collate the next micro-batch on a side stream so host work and
     # feature extraction overlap the encoder.  Keeps one extra feature batch live.
     offline_collate_prefetch: bool = True
+    # Offline-only, with the prefetch: queue a micro-batch's decode read-back and
+    # collect it on the next tick, after that tick's forward is queued, so the
+    # host tail (token extraction, detokenization, finalisation) runs behind GPU
+    # work.  Families without a queued decode are unaffected.
+    offline_decode_overlap: bool = True
+    # Freeze the Python heap once the engine is built, so a full garbage
+    # collection walks only objects created afterwards.  A full collection over
+    # the constructed heap measured ~165 ms with the step loop stopped.  Process
+    # global and refcounted across engines; see ``oasr.engine.gc_freeze``.
+    gc_freeze: bool = True
 
     # Streaming chunking
     chunk_size: int = 16
@@ -163,7 +173,16 @@ class EngineConfig:
     #   "bucket"  — pick oldest, then fill batch with length-similar peers
     #   "sjf"     — shortest-job-first (best throughput, can starve long reqs;
     #               starvation is still bounded by ``max_wait_time``)
-    schedule_policy: str = "bucket"
+    #   "window"  — (default) length-sorted batches from the oldest
+    #               ``max_batch_size * length_window_factor`` requests, always
+    #               including the oldest; see ``oasr.engine.batching.WindowPolicy``.
+    #               1.27x offline Conformer throughput over "bucket" under load,
+    #               identical to FIFO below ``max_batch_size`` waiting requests.
+    schedule_policy: str = "window"
+    # ``schedule_policy="window"``: how many batches' worth of the oldest requests
+    # a batch may be chosen from.  Larger removes more padding and reorders more;
+    # 4 left 1.11x padding against FIFO's 1.48x at ``B = 32`` on LJSpeech.
+    length_window_factor: int = 4
     # Admit streaming requests in lockstep cohorts to avoid fragmented offset
     # groups.  ``False`` favors immediate admission over batch width.
     streaming_cohort_admit: bool = True
@@ -203,12 +222,24 @@ class EngineConfig:
     # which makes the axis unbounded under ``num_left_chunks=-1`` and captures a
     # graph on a live tick every 64 encoder frames for as long as a stream runs.
     streaming_graph_cache_growth: float = 1.5
-    # Batch widths to pre-warm streaming encoder graphs at.  ``None`` keeps the
-    # cheap default (``1``, ``max_batch_size`` and any ``preferred_batch_size``);
-    # an explicit list — e.g. ``list(range(1, max_batch_size + 1))`` — removes the
-    # remaining capture spikes as the active width walks, at ~28 ms of startup per
-    # captured shape.
+    # Batch widths streaming encoder graphs are captured (and pre-warmed) at.
+    # ``None``: powers of two up to ``max_batch_size`` with the padding lane on,
+    # every width ``1..max_batch_size`` with it off.  ``max_batch_size`` is always
+    # a width.
     streaming_graph_batch_ladder: Optional[List[int]] = None
+    # Pad a streaming cohort up to the next ladder width, through a reserved slot
+    # and scratch KV block no stream owns, so the graph key's width axis is the
+    # ladder rather than every width.  Without it the captured shapes are widths
+    # x cache rungs (576 at max_batch_size 64 — over the 512 budget, so the
+    # draining tail ran eager: 1.59x slower, 22 s of startup, 3 GiB of graphs).
+    # ``None`` (auto) pads exactly when the cache has more than one rung: a
+    # trained fixed window (Nemotron) has one, so every exact width is a cheap
+    # capture and padding would only add compute (measured 0.976x there).
+    # On the slot runtime (Zipformer) auto pads whenever steps are graphed: the
+    # width is its only key, but each width's graph costs memory that grows with
+    # the width (1.7 GiB for every width of a 32-stream pool, 0.43 GiB padded).
+    # CUDA graphs only; the eager fallback is padded identically.
+    streaming_graph_pad_batch: Optional[bool] = None
     # Ceiling on ``batch widths x cache rungs`` pre-warmed at construction, at
     # ~25 ms and a few MiB each.  Reached only by an unusually wide
     # ``max_batch_size``; the ladder is then truncated to the low widths plus the

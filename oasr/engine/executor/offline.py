@@ -34,7 +34,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, ClassVar, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, ClassVar, Deque, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -75,6 +75,19 @@ class _StagedBatch:
     ready: Optional["torch.cuda.Event"] = None
 
 
+@dataclass
+class _InflightDecode:
+    """One micro-batch forwarded and decoded on the device, read-back pending.
+
+    ``collect`` waits for the read-back and returns the decode outputs; the
+    staged batch rides along because failure isolation re-runs rows against its
+    features, and it holds them until the collect is done.
+    """
+
+    staged: _StagedBatch
+    collect: Callable[[], List[RequestOutput]]
+
+
 class OfflineExecutor(Executor):
     """Execute scheduled offline batches as sequential micro-batches.
 
@@ -98,6 +111,13 @@ class OfflineExecutor(Executor):
 
     streaming: ClassVar[bool] = False
 
+    #: Class-level defaults, not only ``__init__`` assignments, for the reason
+    #: ``StreamingExecutor._vad`` is one: the tests build executors minimally,
+    #: and an attribute that exists only after a full construction would turn
+    #: "overlap is off" into an ``AttributeError`` on the paths they exercise.
+    _decode_overlap: bool = False
+    _inflight: Optional[_InflightDecode] = None
+
     def __init__(
         self,
         *,
@@ -114,6 +134,7 @@ class OfflineExecutor(Executor):
         decode_admit_window_ms: float = 0.0,
         max_batch_size: int = 32,
         collate_prefetch: bool = True,
+        decode_overlap: bool = True,
         metrics: Optional[m.EngineMetrics] = None,
     ) -> None:
         if metrics is not None:
@@ -155,6 +176,12 @@ class OfflineExecutor(Executor):
         self._staged: Optional[_StagedBatch] = None
         #: Completion of the most recent collate, gating reuse of its staging.
         self._collate_done: Optional[torch.cuda.Event] = None
+        #: Queue a family's decode read-back and collect it next tick, once that
+        #: tick's forward is queued (see :meth:`_step_prefetched`).  Rides on the
+        #: prefetch pipeline, which is what stages that next forward's features.
+        self._decode_overlap = bool(decode_overlap) and self._prefetch
+        #: The micro-batch whose decode read-back is queued but not yet read.
+        self._inflight: Optional[_InflightDecode] = None
 
     # ------------------------------------------------------------------
     # Executor ABC
@@ -219,6 +246,7 @@ class OfflineExecutor(Executor):
         # them strands both the requests and the staged feature tensor.
         self._queued.clear()
         self._staged = None
+        self._inflight = None
 
     def step(self) -> List[RequestOutput]:
         """One engine tick, always bounded work.
@@ -368,6 +396,7 @@ class OfflineExecutor(Executor):
             or bool(self._pending)
             or self._staged is not None
             or bool(self._queued)
+            or self._inflight is not None
         )
 
     def num_running(self) -> int:
@@ -381,8 +410,10 @@ class OfflineExecutor(Executor):
         return len(self._pending) + self._num_in_flight()
 
     def _num_in_flight(self) -> int:
-        """Rows held by the prefetch pipeline — staged plus queued."""
+        """Rows held by the prefetch pipeline — staged, queued, and decoding."""
         n = len(self._staged.chunk) if self._staged is not None else 0
+        if self._inflight is not None:
+            n += len(self._inflight.staged.chunk)
         return n + sum(len(chunk) for chunk, _ in self._queued)
 
     def num_waiting(self) -> int:
@@ -494,9 +525,21 @@ class OfflineExecutor(Executor):
             # to chew on, so this one collate is unavoidably in front of it.
             outputs.extend(self._stage_next())
         staged, self._staged = self._staged, None
-        if staged is None:
-            return outputs
-        outputs.extend(self._run_staged(staged))
+        inflight, self._inflight = self._inflight, None
+        if staged is not None:
+            outputs.extend(self._run_staged(staged))
+        if inflight is not None:
+            # After this tick's forward and decode are queued, never before: the
+            # previous batch's host tail then runs while the GPU works on this one.
+            outputs.extend(self._collect_inflight(inflight))
+        if self._inflight is not None and self._staged is None and not self._queued:
+            # Nothing is staged behind the batch just issued, so no forward can
+            # hide its tail: read it now rather than a tick later.  That keeps a
+            # lone request's latency what it was, and keeps an issue-only tick
+            # from reading as idle to the serving dispatcher, which backs off
+            # for up to 2 ms after a tick that returned nothing.
+            last, self._inflight = self._inflight, None
+            outputs.extend(self._collect_inflight(last))
         return outputs
 
     def _run_staged(self, staged: _StagedBatch) -> List[RequestOutput]:
@@ -512,7 +555,12 @@ class OfflineExecutor(Executor):
         prefetched: List[RequestOutput] = []
         try:
             enc_out, output_lengths = self._encode_staged(staged)
+            collect = self._decode_queued(staged.chunk, enc_out, output_lengths)
             prefetched = self._stage_next()
+            if collect is not None:
+                # Read next tick, behind that tick's forward; see _step_prefetched.
+                self._inflight = _InflightDecode(staged=staged, collect=collect)
+                return prefetched
             outputs = self._finalise_decoded(
                 staged.chunk, self._decode_encoded(staged.chunk, enc_out, output_lengths)
             )
@@ -521,6 +569,48 @@ class OfflineExecutor(Executor):
                 prefetched
             )
         return self._restore_order(outputs, staged.order) + prefetched
+
+    def _decode_queued(
+        self,
+        chunk: List[Request],
+        enc_out,
+        output_lengths: torch.Tensor,
+    ) -> Optional[Callable[[], List[RequestOutput]]]:
+        """Issue this batch's decode with its read-back queued, if the family can.
+
+        ``None`` — overlap off, or a family (or a batch asking for word timings)
+        that decodes synchronously — and the caller decodes inline, as before.
+        """
+        if not self._decode_overlap:
+            return None
+        nvtx_push("offline.decode_issue")
+        try:
+            collect: Optional[Callable[[], List[RequestOutput]]] = self._op.decode_offline_async(
+                enc_out, output_lengths, chunk
+            )
+            return collect
+        finally:
+            nvtx_pop()
+
+    def _collect_inflight(self, inflight: _InflightDecode) -> List[RequestOutput]:
+        """Read back and finalise the batch the previous tick decoded.
+
+        The same failure contract as :meth:`_run_staged`: the features still
+        exist, so an error here is isolated by re-running each row against them.
+        """
+        staged = inflight.staged
+        nvtx_push("offline.decode")
+        t_decode = time.perf_counter()
+        try:
+            try:
+                outputs = inflight.collect()
+            finally:
+                nvtx_pop()
+            self._metrics.observe_stage("offline.decode", time.perf_counter() - t_decode)
+            outputs = self._finalise_decoded(staged.chunk, outputs)
+        except Exception as exc:  # noqa: BLE001 — one bad batch must not take the tick
+            return self._isolate_failure(staged.chunk, exc, staged.features, staged.lengths)
+        return self._restore_order(outputs, staged.order)
 
     def _encode_staged(self, staged: _StagedBatch) -> Tuple[Any, torch.Tensor]:
         """Hand the staged features to the main stream and issue the forward.

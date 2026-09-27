@@ -33,6 +33,13 @@ _NAMED_CANDIDATES = ("pretrained.pt", "model.pt", "checkpoint.pt", "cpu_jit.pt")
 # (num_heads, *_head_dim) factorization, which is otherwise degenerate in the
 # weight shapes.
 _POS_HEAD_DIM = 4
+# A causal (streaming) release's decode geometry is a runtime choice in icefall
+# (``--chunk-size`` / ``--left-context-frames``), not something the weights
+# record.  These are the values the published streaming releases are decoded and
+# exported at (``exp/decode.sh``, ``jit_script_chunk_16_left_128.pt``): 16 frames
+# at the embed's 50 Hz is a 320 ms chunk, with 2.56 s of left context.
+_CAUSAL_CHUNK_SIZE = 16
+_CAUSAL_LEFT_CONTEXT = 128
 
 
 def infer_encoder_config(sd: Mapping[str, torch.Tensor]) -> ZipformerEncoderConfig:
@@ -43,12 +50,21 @@ def infer_encoder_config(sd: Mapping[str, torch.Tensor]) -> ZipformerEncoderConf
     ``value_head_dim`` / ``feedforward_dim`` / ``cnn_module_kernel`` plus
     ``pos_dim`` from the parameter shapes, assuming ``pos_head_dim == 4``.
     ``feature_dim`` is not uniquely recoverable and defaults to 80.
+
+    **Causality is recoverable**: a causal release's convolution modules are
+    icefall's ``ChunkCausalDepthwiseConv1d`` (``causal_conv`` +
+    ``chunkwise_conv`` + ``chunkwise_conv_scale``) where a non-causal one has a
+    plain ``depthwise_conv.weight``.  Its chunk size and left context are not —
+    they are chosen at decode time — so a causal checkpoint gets the release's
+    own decode recipe (:data:`_CAUSAL_CHUNK_SIZE` / :data:`_CAUSAL_LEFT_CONTEXT`).
     """
     stacks = sorted(
         {int(m.group(1)) for k in sd if (m := re.match(r"encoder\.encoders\.(\d+)\.", k))}
     )
     ds, edim, nlayers, nheads, qhd, vhd, ffd, cnnk = [], [], [], [], [], [], [], []
     pos_dim = None
+    causal = any(k.endswith("depthwise_conv.chunkwise_conv.weight") for k in sd)
+    conv_key = "conv_module1.depthwise_conv." + ("chunkwise_conv.weight" if causal else "weight")
     for i in stacks:
         pre = f"encoder.encoders.{i}."
         if (pre + "downsample.bias") in sd:
@@ -63,7 +79,7 @@ def infer_encoder_config(sd: Mapping[str, torch.Tensor]) -> ZipformerEncoderConf
         l0 = lpre + "0."
         edim.append(sd[l0 + "norm.bias"].shape[0])
         ffd.append(sd[l0 + "feed_forward2.in_proj.weight"].shape[0])
-        cnnk.append(sd[l0 + "conv_module1.depthwise_conv.weight"].shape[-1])
+        cnnk.append(sd[l0 + conv_key].shape[-1])
         lin_pos = sd[l0 + "self_attn_weights.linear_pos.weight"].shape  # (H*pos_head_dim, pos_dim)
         in_proj = sd[l0 + "self_attn_weights.in_proj.weight"].shape[0]  # (2*qhd+pos_head_dim)*H
         v_in = sd[l0 + "self_attn1.in_proj.weight"].shape[0]  # H*vhd
@@ -87,7 +103,10 @@ def infer_encoder_config(sd: Mapping[str, torch.Tensor]) -> ZipformerEncoderConf
         feedforward_dim=tuple(ffd),
         cnn_module_kernel=tuple(cnnk),
         pos_dim=int(pos_dim),
-        causal=False,
+        causal=causal,
+        # ``(-1,)`` is the config's own default: full context, no chunking.
+        chunk_size=(_CAUSAL_CHUNK_SIZE,) if causal else (-1,),
+        left_context_frames=(_CAUSAL_LEFT_CONTEXT,) if causal else (-1,),
     )
 
 

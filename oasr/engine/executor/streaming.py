@@ -727,6 +727,8 @@ class StreamingExecutor(Executor):
         # transcript with ``finish_reason="length"`` instead of holding a slot.
         nvtx_push("finalize_streams")
         t0 = time.perf_counter()
+        ending: List[Request] = []
+        endpoints: List[Optional["EndpointDecision"]] = []
         for req in list(running):
             drained = (
                 req.audio_final
@@ -740,24 +742,30 @@ class StreamingExecutor(Executor):
             # since the Google-shaped surface landed.
             endpoint = self._vad.endpointed(req.request_id) if self._vad is not None else None
             if drained or req.cache_exhausted or endpoint is not None:
-                final = self._op.finalize_streaming(req)
-                self._op.fill_nbest_texts(req, final)
-                self._apply_turn_carry(req, final)
-                self._finish_vad(req, final, endpoint)
-                if req.cache_exhausted:
-                    # A truncated transcript, counted where it is decided.  The
-                    # allocator itself cannot report this: the capacity gate
-                    # exists precisely so the pool is never asked for a block
-                    # it cannot give, so there is no failed allocation to see.
-                    self._metrics.incr(m.KV_EXHAUSTED)
-                    if final.finish_reason is None:
-                        final.finish_reason = "length"
-                req.output = final
-                outputs.append(final)
-                self._op.free_session(req)  # decode-side beam state
-                self._mr.free_stream(req)  # encoder KV + CNN cache
-                self._close_vad(req.request_id)
-                self._scheduler.finish_request(req.request_id)
+                ending.append(req)
+                endpoints.append(endpoint)
+        # Every stream that ends this tick is read back together: per stream,
+        # the final hypothesis was its own synchronising read-back.  The
+        # bookkeeping below is per request and in the same order as before.
+        finals = self._op.finalize_streaming_batch(ending) if ending else []
+        for req, endpoint, final in zip(ending, endpoints, finals):
+            self._op.fill_nbest_texts(req, final)
+            self._apply_turn_carry(req, final)
+            self._finish_vad(req, final, endpoint)
+            if req.cache_exhausted:
+                # A truncated transcript, counted where it is decided.  The
+                # allocator itself cannot report this: the capacity gate
+                # exists precisely so the pool is never asked for a block
+                # it cannot give, so there is no failed allocation to see.
+                self._metrics.incr(m.KV_EXHAUSTED)
+                if final.finish_reason is None:
+                    final.finish_reason = "length"
+            req.output = final
+            outputs.append(final)
+            self._op.free_session(req)  # decode-side beam state
+            self._mr.free_stream(req)  # encoder KV + CNN cache
+            self._close_vad(req.request_id)
+            self._scheduler.finish_request(req.request_id)
         nvtx_pop()
         self._metrics.observe_stage("streaming.finalize", time.perf_counter() - t0)
 

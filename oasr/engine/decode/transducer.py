@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from oasr.models.decoders.base import Joiner, TransducerPredictor
 
     from ..config import EngineConfig
+    from ..greedy_graph import GreedyLoopGraphCache
     from ..predictor_graph import PredictorStepGraphCache
     from .detokenize import Detokenizer
 
@@ -143,6 +144,15 @@ class TransducerOptions:
             "DecodingOptions.n_best return real alternatives for this family."
         ),
     )
+    loop_graphs: bool = option(
+        True,
+        doc=(
+            "Replay the greedy loop from CUDA graphs, one graph per "
+            f"{_TERMINATION_CHECK_STRIDE} iterations (greedy, no word timings; "
+            "needs use_transducer_cuda_graphs).  False keeps the eager loop, whose "
+            "only captured piece is the predictor step."
+        ),
+    )
 
     def __post_init__(self) -> None:
         if self.max_sym_per_frame < 1:
@@ -216,6 +226,11 @@ class TransducerDecodeStrategy(DecodeStrategy):
             and getattr(config, "use_transducer_cuda_graphs", False)
             and self._beam <= 1
         )
+        # Capturing the step still leaves ~20 eager launches per iteration around
+        # it; this replays whole blocks of iterations.  See
+        # oasr/engine/greedy_graph.py.
+        self._loop_graphs: Optional["GreedyLoopGraphCache"] = None
+        self._loop_graphs_enabled = self._pred_graphs_enabled and bool(self.options.loop_graphs)
         if self._beam > 1 and model is not None:
             # Beam search keeps every hypothesis's state in one ``(B, k, ctx)``
             # buffer and reorders it onto the new parents with a ``gather``
@@ -266,6 +281,17 @@ class TransducerDecodeStrategy(DecodeStrategy):
 
         # Project the encoder output once; per step only the predictor is re-run.
         enc_proj = joiner.encoder_proj(enc_out)  # (B, T, J)
+        max_steps = int(T) * (max_sym + 1) + B + 1  # termination safety bound
+
+        if not track:
+            # The whole loop from graph replays when it can be served; the eager
+            # loop below is the same iteration, and what runs otherwise.
+            loop_graphs = self._greedy_loop_graphs()
+            if loop_graphs is not None:
+                served = loop_graphs.run(enc_proj, lengths, state, dec_proj, max_steps)
+                if served is not None:
+                    hyps_g, state_g, dec_proj_g = served
+                    return hyps_g, [], state_g, dec_proj_g
 
         t = torch.zeros(B, dtype=torch.long, device=device)
         sym = torch.zeros(B, dtype=torch.long, device=device)
@@ -279,7 +305,6 @@ class TransducerDecodeStrategy(DecodeStrategy):
         graphs = self._predictor_graphs()
         graphed = False
 
-        max_steps = int(T) * (max_sym + 1) + B + 1  # termination safety bound
         done = 0
         while done < max_steps:
             # Termination is checked once per block rather than per iteration (see
@@ -386,6 +411,23 @@ class TransducerDecodeStrategy(DecodeStrategy):
             joiner, decoder = self._surface()
             self._pred_graphs = PredictorStepGraphCache(decoder, joiner)
         return self._pred_graphs
+
+    def _greedy_loop_graphs(self) -> Optional["GreedyLoopGraphCache"]:
+        """The greedy-loop graph cache, built on first use.  ``None`` if off."""
+        if not self._loop_graphs_enabled:
+            return None
+        if self._loop_graphs is None:
+            from oasr.engine.greedy_graph import GreedyLoopGraphCache
+
+            joiner, decoder = self._surface()
+            self._loop_graphs = GreedyLoopGraphCache(
+                decoder,
+                joiner,
+                blank=int(cast(int, self._model.blank_id)),
+                max_sym=self._max_sym,
+                unroll=_TERMINATION_CHECK_STRIDE,
+            )
+        return self._loop_graphs
 
     def _surface(self) -> Tuple["Joiner", "TransducerPredictor"]:
         """``(joiner, predictor)`` with their real types.
@@ -515,6 +557,30 @@ class TransducerDecodeStrategy(DecodeStrategy):
 
     def free_session(self, request: Request) -> None:
         self._sessions.pop(request.request_id, None)
+
+    @torch.no_grad()
+    def prewarm_streaming(self, batch_sizes: Sequence[int], frames: int) -> None:
+        """Capture the greedy-loop graph for every streaming width up front.
+
+        A stream's chunk is always ``frames`` encoder frames, so the loop graph's
+        key is just the cohort width, and it walks ``1..max_batch_size`` as streams
+        come and go -- each new width a capture on a live tick otherwise.  Measured
+        on Nemotron streaming: a 52.7 ms tick against a 17.9 ms p50 when one landed
+        mid-run.  All rows are passed with length zero, so each warm-up call is one
+        inert replay after its capture.
+        """
+        graphs = self._greedy_loop_graphs()
+        if graphs is None:
+            return
+        joiner, _decoder = self._surface()
+        weight = next(joiner.parameters())
+        width = int(self._model.encoder.output_size)
+        for b in sorted({int(b) for b in batch_sizes if int(b) >= 1}):
+            enc = torch.zeros(b, int(frames), width, dtype=weight.dtype, device=weight.device)
+            enc_proj = joiner.encoder_proj(enc)  # type: ignore[operator]
+            state, dec_proj = self._init_state(b, weight.device)
+            lengths = torch.zeros(b, dtype=torch.long, device=weight.device)
+            graphs.run(enc_proj, lengths, state, dec_proj, max_steps=_TERMINATION_CHECK_STRIDE)
 
     def _session(self, request_id: str, device: torch.device) -> _Session:
         s = self._sessions.get(request_id)

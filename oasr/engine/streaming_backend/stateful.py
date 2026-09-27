@@ -1,27 +1,32 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Stateful streaming backend (Zipformer-style encoders).
+"""Stateful streaming backend: per-request state lists (``streaming_kind == "stateful"``).
 
-For encoders whose streaming cache is **per-layer recurrent state** owned by the
-encoder itself (``streaming_kind == "stateful"``), rather than the engine's
-paged-KV + slot-CNN model.  The backend threads one state list per request
-through ``model.streaming_forward(chunk, lens, states)`` chunk by chunk.
+For an encoder that exposes the list API — ``get_streaming_init_states`` and
+``streaming_forward(chunk, lens, states)`` — and declares nothing further.  The
+backend threads one state list per request chunk by chunk.  An encoder whose
+list is entirely fixed-extent and declared (``slot_state_specs``, Zipformer) runs
+on the slot runtime instead
+(:class:`~oasr.engine.streaming_backend.slot.SlotStreamingBackend`); this one
+stays its parity oracle, bit-identical to it given the same streams.
 
 Unlike :class:`~oasr.engine.streaming_backend.paged.PagedStreamingBackend`, there
-is no shared block pool, no slot CNN cache, and no CUDA-graph capture: the cache
+is no shared block pool, no slot cache, and no CUDA-graph capture: the cache
 lives inside the per-request state tensors.
 
 **Batching**: when the encoder exposes ``stack_streaming_states`` /
 ``unstack_streaming_states`` (Zipformer does — icefall's per-kind batch dims),
 ready streams with the same chunk length run as **one** ``B = N`` forward:
-stack states → batched chunk forward → unstack states.  Full windows all share
-one length, so steady-state pools batch completely; a stream's final partial
-tail runs in its own (usually singleton) group.  Encoders without the
-stack/unstack surface keep the sequential ``B = 1`` path.
+stack states → batched chunk forward → unstack states.  With a declared
+``streaming_pad_value`` every window is full, so a pool batches completely;
+without one, a stream's short final tail runs in its own group.  Encoders
+without the stack/unstack surface keep the sequential ``B = 1`` path.
 
-Window geometry comes from the encoder (``streaming_chunk_frames``): the engine's
-shared :class:`~oasr.engine.input_processor.InputProcessor` fills each request's
-feature buffer, and this backend windows it the same way the paged backend does.
+Window geometry comes from the encoder: ``streaming_chunk_frames`` is the stride
+and ``streaming_window_frames`` (when the front-end needs lookahead) the window.
+The engine's shared :class:`~oasr.engine.input_processor.InputProcessor` fills
+each request's feature buffer, and this backend windows it the same way the paged
+backend does.
 """
 
 from __future__ import annotations
@@ -84,15 +89,22 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
         self._stack = getattr(model.encoder, "stack_streaming_states", None)
         self._unstack = getattr(model.encoder, "unstack_streaming_states", None)
 
-        # Window/stride: the encoder declares how many input frames it consumes
-        # per streaming chunk.  Stateful encoders carry context in their state,
-        # so windows are non-overlapping (stride == window).
+        # Window/stride: the encoder declares how many input frames a stream
+        # advances per chunk (``streaming_chunk_frames``, the stride) and, when
+        # its front-end needs lookahead past the chunk, how many it reads
+        # (``streaming_window_frames``; Zipformer's embed needs 13 more).  Without
+        # the latter, windows are non-overlapping (stride == window).
         enc = model.encoder
-        window = getattr(enc, "streaming_chunk_frames", None)
-        if window is None:
+        stride = getattr(enc, "streaming_chunk_frames", None)
+        if stride is None:
             # Fallback: chunk_size encoder frames × total subsampling.
-            window = int(config.chunk_size) * int(getattr(enc, "subsampling_rate", 1))
-        self._window = int(window)
+            stride = int(config.chunk_size) * int(getattr(enc, "subsampling_rate", 1))
+        self._stride = int(stride)
+        self._window = int(getattr(enc, "streaming_window_frames", None) or self._stride)
+        #: Feature value a short final window is padded to a full one with, or
+        #: ``None`` to forward it short.  An encoder that streams only whole
+        #: chunks declares one (see ``ZipformerEncoder.streaming_pad_value``).
+        self._pad_value: Optional[float] = getattr(enc, "streaming_pad_value", None)
 
     # ------------------------------------------------------------------
     # Window geometry
@@ -104,8 +116,9 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
 
     @property
     def stride(self) -> int:
-        # Non-overlapping: the encoder state carries cross-chunk context.
-        return self._window
+        # The encoder state carries cross-chunk context; windows overlap only by
+        # the front-end's lookahead (``window - stride``).
+        return self._stride
 
     # ------------------------------------------------------------------
     # Per-request lifecycle
@@ -165,19 +178,17 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
                 results[req.request_id] = self._forward_one(req)
             return results
 
-        # Group by this tick's chunk length (torch.stack needs uniform T).
+        # Group by this tick's chunk length (torch.stack needs uniform T).  With
+        # a declared pad value every window is full, so this is one group.
         groups: Dict[int, List[Request]] = defaultdict(list)
         for req in ready:
-            available = req.feature_frames - req.feature_cursor
-            groups[min(window, available)].append(req)
+            groups[self._chunk_len(req)].append(req)
 
         for t_chunk, reqs in groups.items():
             if len(reqs) == 1:
                 results[reqs[0].request_id] = self._forward_one(reqs[0])
                 continue
-            chunks = torch.stack(
-                [r.feature_buffer[r.feature_cursor : r.feature_cursor + t_chunk] for r in reqs]
-            ).to(
+            chunks = torch.stack([self._window_of(r, t_chunk) for r in reqs]).to(
                 device=self._device, dtype=self._dtype
             )  # (B, T, F)
             lens = torch.full((len(reqs),), t_chunk, dtype=torch.int32, device=self._device)
@@ -191,12 +202,32 @@ class StatefulStreamingBackend(StreamingEncoderBackend):
 
         return results
 
+    def _chunk_len(self, req: Request) -> int:
+        """Frames this stream's next forward sees: a full window, or its short tail."""
+        available = req.feature_frames - req.feature_cursor
+        if self._pad_value is not None:
+            return self._window
+        return min(self._window, available)
+
+    def _window_of(self, req: Request, t_chunk: int) -> torch.Tensor:
+        """``(t_chunk, F)`` features at the cursor, padded when the tail is short.
+
+        Padding is icefall's streaming convention for an encoder that only
+        streams whole chunks: the frames past the audio are a constant (its
+        ``LOG_EPS``), counted in the chunk's length like real ones.
+        """
+        buf = req.feature_buffer
+        chunk = buf[req.feature_cursor : req.feature_cursor + t_chunk]
+        short = t_chunk - chunk.size(0)
+        if short > 0:
+            assert self._pad_value is not None
+            chunk = torch.nn.functional.pad(chunk, (0, 0, 0, short), value=float(self._pad_value))
+        return chunk
+
     def _forward_one(self, req: Request) -> torch.Tensor:
         """Single-stream ``B = 1`` chunk forward (fallback + singleton groups)."""
-        window = self._window
-        available = req.feature_frames - req.feature_cursor
-        end = req.feature_cursor + min(window, available)
-        chunk = req.feature_buffer[req.feature_cursor : end].unsqueeze(0)  # (1, T, F)
+        t_chunk = self._chunk_len(req)
+        chunk = self._window_of(req, t_chunk).unsqueeze(0)  # (1, T, F)
         chunk = chunk.to(device=self._device, dtype=self._dtype)
         lens = to_device([chunk.size(1)], dtype=torch.int32, device=self._device)
 

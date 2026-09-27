@@ -4,19 +4,25 @@
 
 Offline (:meth:`ZipformerEncoder.forward`) and chunk-wise streaming
 (:meth:`ZipformerModel.streaming_forward`) are both supported, faithfully
-ported from icefall.  Streaming uses Zipformer's own per-layer cache (see
-:meth:`get_streaming_init_states`); it does **not** use the engine's paged-KV /
-slot-CNN streaming pipeline, whose cache model is Conformer-specific.
+ported from icefall — streaming including its chunk geometry (windows of
+``2 * chunk_size + 13`` frames at a stride of ``2 * chunk_size``) and its
+processed-length mask over the left context.  The per-layer cache is declared
+as fixed-extent slot state (:attr:`ZipformerEncoder.slot_state_specs`), so
+the engine's slot runtime owns it; attention K/V is not paged, because each
+stack keeps its own ``left_context_frames // downsample`` of a different width.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+from oasr.cache.state import StreamStateSpec
 
 from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..heads.ctc import CTCHead
@@ -88,35 +94,59 @@ class ZipformerEncoder(BaseEncoder):
         device: torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
     ) -> List[Tensor]:
-        """Initial streaming state: ``[embed_cache] + encoder per-layer caches``."""
+        """Initial streaming state: ``[embed_cache] + encoder caches + [processed_lens]``.
+
+        ``processed_lens`` (``(B,)`` int32) counts the embed frames a stream has
+        been through.  It is what masks the part of the left-context cache that
+        is still the initial zeros: icefall's streaming recipe does exactly this
+        (``processed_mask`` in ``streaming_decode.py`` and in the exported
+        streaming encoder), and without it the first ``left_context_frames`` of
+        every stream attend a window of zero keys as though it were audio.
+        """
         embed_state = self.encoder_embed.get_init_states(batch_size, device, dtype)
         enc_states = self.encoder.get_init_states(batch_size, device, dtype)
-        return [embed_state] + enc_states
+        processed = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        return [embed_state] + enc_states + [processed]
 
     def streaming_forward(
         self, xs: Tensor, xs_lens: Tensor, states: List[Tensor]
     ) -> Tuple[Tensor, Tensor, List[Tensor]]:
-        embed_state, enc_states = states[0], states[1:]
+        """One chunk: ``xs (B, window, F)`` → ``(hidden, out_lens, new_states)``.
+
+        ``window`` must be :attr:`streaming_window_frames` input frames — the
+        embed then yields exactly ``chunk_size`` frames, the unit the encoder was
+        trained to stream in.  Consecutive windows overlap by the embed's
+        receptive field (:attr:`streaming_window_frames` minus
+        :attr:`streaming_chunk_frames`); that overlap is the chunk's lookahead,
+        not state.
+        """
+        embed_state, enc_states, processed = states[0], states[1:-1], states[-1]
         x, x_lens, new_embed = self.encoder_embed.streaming_forward(xs, xs_lens, embed_state)
         x = x.permute(1, 0, 2)  # (T', B, C0)
         batch_size, seq_len = x.size(1), x.size(0)
         left = self.encoder.left_context_frames[0]
-        # No padding within a single chunk for a contiguous stream.
-        src_key_padding_mask = torch.zeros(
-            batch_size, left + seq_len, dtype=torch.bool, device=x.device
-        )
+        # The left-context cache holds ``left`` frames of which only the
+        # ``processed`` most recent are real (icefall's ``processed_mask``, True =
+        # masked); the chunk itself masks nothing past ``x_lens``.
+        pos = torch.arange(left, device=x.device).expand(batch_size, left)
+        processed_mask = (processed.unsqueeze(1) <= pos).flip(1)
+        chunk_mask = make_pad_mask(x_lens, seq_len)
+        src_key_padding_mask = torch.cat([processed_mask, chunk_mask], dim=1)
         out, out_lens, new_enc = self.encoder.streaming_forward(
             x, x_lens, enc_states, src_key_padding_mask
         )
         out = out.permute(1, 0, 2)  # (B, T'', Cmax)
-        return out, out_lens, [new_embed] + new_enc
+        return out, out_lens, [new_embed] + new_enc + [processed + x_lens.to(processed.dtype)]
 
     # The embedding and convolution caches batch on dimension 0; attention and
-    # value caches batch on dimension 1, repeated in six tensors per layer.
+    # value caches batch on dimension 1, repeated in six tensors per layer; the
+    # trailing ``processed_lens`` is a plain ``(B,)``.
     _STATE_BATCH_DIM_CYCLE = (1, 1, 1, 1, 0, 0)
 
-    def _state_batch_dim(self, i: int) -> int:
-        return 0 if i == 0 else self._STATE_BATCH_DIM_CYCLE[(i - 1) % 6]
+    def _state_batch_dim(self, i: int, n: int) -> int:
+        if i == 0 or i == n - 1:
+            return 0
+        return self._STATE_BATCH_DIM_CYCLE[(i - 1) % 6]
 
     def stack_streaming_states(self, states_list: List[List[Tensor]]) -> List[Tensor]:
         """Stack per-stream state lists into one batched state list.
@@ -126,7 +156,8 @@ class ZipformerEncoder(BaseEncoder):
         """
         n = len(states_list[0])
         return [
-            torch.cat([s[i] for s in states_list], dim=self._state_batch_dim(i)) for i in range(n)
+            torch.cat([s[i] for s in states_list], dim=self._state_batch_dim(i, n))
+            for i in range(n)
         ]
 
     def unstack_streaming_states(self, states: List[Tensor]) -> List[List[Tensor]]:
@@ -136,8 +167,9 @@ class ZipformerEncoder(BaseEncoder):
         chunk re-stacks them, so the shared storage is transient.
         """
         outs: List[List[Tensor]] = []
+        n = len(states)
         for i, t in enumerate(states):
-            dim = self._state_batch_dim(i)
+            dim = self._state_batch_dim(i, n)
             rows = t.split(1, dim=dim)
             if not outs:
                 outs = [[] for _ in range(len(rows))]
@@ -177,8 +209,14 @@ class ZipformerEncoder(BaseEncoder):
 
     @property
     def streaming_kind(self) -> str:
-        """Zipformer owns per-layer recurrent state (icefall 6-tensor caches),
-        so it uses the engine's *stateful* streaming backend, not paged-KV.
+        """Zipformer's streaming cache is fixed-extent per stream, so it runs on
+        the engine's **slot** runtime: every icefall cache tensor (the per-layer
+        left-context keys/values, conv tails, the embed's cached frames, the
+        processed-length counter) is one :class:`~oasr.cache.StreamStateSpec`
+        in a :class:`~oasr.cache.SlotStateCache`, at stable addresses, which is
+        what lets the chunk forward be graph-captured.  The per-request list API
+        (:meth:`get_streaming_init_states` / :meth:`streaming_forward`) stays —
+        the ``"stateful"`` runtime drives it, and it is the parity oracle.
 
         Reports ``"none"`` for a non-causal config rather than claiming a
         capability the weights don't have. That distinction is load-bearing:
@@ -189,23 +227,58 @@ class ZipformerEncoder(BaseEncoder):
         It also makes :attr:`BaseEncoder.cache_spec` ``None``, so no paged
         pool is allocated for weights that can never stream.
         """
-        return "stateful" if self._streaming_capable else "none"
+        return "slot" if self._streaming_capable else "none"
+
+    @property
+    def slot_state_specs(self) -> Tuple[StreamStateSpec, ...]:
+        """Every streaming-state tensor as a slot-cache declaration, in list order.
+
+        The slot runtime's contract (:attr:`BaseEncoder.slot_state_specs`): the
+        **whole** streaming cache, where a paged encoder's
+        ``streaming_state_specs`` is only the extras beside paged K/V.
+
+        Derived from :meth:`get_streaming_init_states` itself (on the ``meta``
+        device, so nothing is allocated) rather than restated: the order, the
+        shapes and each tensor's batch axis then cannot drift from the list API
+        the ``"stateful"`` runtime and the parity tests drive.  All-zero is every
+        state's initial value — including the processed-length counter — which
+        is exactly what :class:`~oasr.cache.SlotStateCache` zeroes a slot to.
+        """
+        init = self.get_streaming_init_states(1, device=torch.device("meta"))
+        n = len(init)
+        kinds = ("key", "nonlin_attn", "val1", "val2", "conv1", "conv2")
+        specs = []
+        for i, t in enumerate(init):
+            axis = self._state_batch_dim(i, n)
+            if i == 0:
+                name = "embed"
+            elif i == n - 1:
+                name = "processed_lens"
+            else:
+                name = f"layer{(i - 1) // 6}.{kinds[(i - 1) % 6]}"
+            shape = tuple(int(d) for j, d in enumerate(t.shape) if j != axis)
+            specs.append(
+                StreamStateSpec(
+                    name=name,
+                    shape=shape,
+                    slot_axis=axis,
+                    dtype=None if t.dtype.is_floating_point else t.dtype,
+                )
+            )
+        return tuple(specs)
 
     @property
     def subsampling_rate(self) -> int:
         """2x Conv2dSubsampling embed × ``output_downsampling_factor`` = total."""
         return 2 * self.config.output_downsampling_factor
 
-    @property
-    def streaming_chunk_frames(self) -> int:
-        """Input fbank frames consumed per steady-state streaming chunk.
+    #: What icefall's streaming recipe pads a feature window with past the end of
+    #: the audio (``LOG_EPS = log(1e-10)`` in ``streaming_decode.py``).  A
+    #: short final window is padded with it to a full one, because the encoder
+    #: only ever streams whole chunks (see :attr:`streaming_window_frames`).
+    streaming_pad_value: float = math.log(1e-10)
 
-        ``chunk_size`` is in embed-output frames (Zipformer2 input); the
-        Conv2dSubsampling embed is 2×, so the steady-state input chunk is
-        ``chunk_size * 2`` frames (the first chunk's extra conv context is
-        absorbed by the embed's cached left-pad init state).  Requires a
-        causal/streaming config (``chunk_size > 0``).
-        """
+    def _streaming_chunk(self) -> int:
         cs = self.config.chunk_size
         cs = cs[0] if isinstance(cs, (tuple, list)) else cs
         cs = int(cs)
@@ -214,7 +287,40 @@ class ZipformerEncoder(BaseEncoder):
                 "ZipformerEncoder is not configured for streaming "
                 f"(chunk_size={cs}); build with causal=True and chunk_size>0."
             )
-        return cs * 2
+        return cs
+
+    @property
+    def streaming_chunk_frames(self) -> int:
+        """Input fbank frames a stream advances per chunk — the window **stride**.
+
+        ``chunk_size`` is in embed-output frames (Zipformer2 input) and the
+        Conv2dSubsampling embed is 2x, so a chunk is ``chunk_size * 2`` input
+        frames of new audio.  Requires a causal/streaming config
+        (``chunk_size > 0``).
+        """
+        return self._streaming_chunk() * 2
+
+    @property
+    def streaming_window_frames(self) -> int:
+        """Input frames per streaming window: one chunk plus the embed's lookahead.
+
+        In streaming the embed contracts ``T`` input frames to
+        ``(T - 7) // 2 - 3``: a 7-frame conv stack, then the ConvNeXt consuming
+        its 3-frame right context.  So ``chunk_size`` output frames take
+        ``2 * (chunk_size + 3) + 7`` input frames — 45 for a 16-frame chunk,
+        icefall's ``chunk_size * 2 + pad_length`` with ``pad_length = 13`` — and
+        consecutive windows overlap by 13 frames, advancing by
+        :attr:`streaming_chunk_frames`.
+
+        Exactly ``chunk_size`` embed frames per chunk is what the encoder was
+        trained on, and what its downsampled stacks need: a chunk that is not a
+        multiple of the deepest downsampling pads by *repeating* its last frame,
+        and the repeated frames go into the left-context caches.  A window of
+        only ``chunk_size * 2`` frames yields 9 embed frames for a 16-frame
+        chunk, which is what this runtime used to feed.
+        """
+        right = int(self.encoder_embed.convnext.padding[0])
+        return 2 * (self._streaming_chunk() + right) + 7
 
 
 class ZipformerModel(BaseAsrModel):

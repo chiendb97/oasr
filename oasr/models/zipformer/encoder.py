@@ -316,7 +316,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         pos_emb = pos_emb.reshape(seq_len2, num_heads, pos_head_dim).transpose(0, 1)
         pos_scores = oasr.bmm(p, pos_emb)  # (head, time1 * batch, seq_len2)
         # [h, b, i, j] -> pos_scores[h, i * B + b, (seq_len - 1) - i + j]
-        return pos_scores.as_strided(
+        return pos_scores.as_strided(  # type: ignore[no-any-return]
             (num_heads, batch_size, seq_len, k_len),
             (pos_scores.stride(0), seq_len2, batch_size * seq_len2 - 1, 1),
             storage_offset=pos_scores.storage_offset() + seq_len - 1,
@@ -464,6 +464,8 @@ class NonlinAttention(nn.Module):
 class ConvolutionModule(nn.Module):
     """ConvolutionModule in Zipformer2 (GLU gating + depthwise conv + SwooshR linear)."""
 
+    _zero: Tensor
+
     def __init__(self, channels: int, kernel_size: int, causal: bool):
         super().__init__()
         assert (kernel_size - 1) % 2 == 0
@@ -503,7 +505,8 @@ class ConvolutionModule(nn.Module):
             x = self.depthwise_conv(x, chunk_size=chunk_size)
         else:
             x = self.depthwise_conv(x)
-        return self.out_proj(x).transpose(0, 1)  # (time, batch, channels) view
+        # (time, batch, channels) view
+        return self.out_proj(x).transpose(0, 1)  # type: ignore[no-any-return]
 
     def _gate(self, x: Tensor, src_key_padding_mask: Optional[Tensor]) -> Tensor:
         """``(T, B, C)`` -> GLU-gated, key-padding-masked, contiguous ``(B, T, C)``.

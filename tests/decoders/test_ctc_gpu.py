@@ -798,6 +798,42 @@ class TestCtcDecoderBatchedReadBack:
         assert [r.tokens[0][0] for r in batched] == [[1], [1, 2], [1, 2, 3], [1, 2, 3, 4]]
         assert [r.tokens[0][0] for r in batched] == [r.tokens[0][0] for r in per_state]
 
+    @pytest.mark.parametrize("use_paged", [False, True], ids=["flat", "paged"])
+    @pytest.mark.parametrize("want_times", [False, True], ids=["tokens", "tokens+times"])
+    @pytest.mark.parametrize("n_states", [2, 65])
+    def test_read_final_states_matches_finalize_stream(
+        self, device, use_paged, want_times, n_states
+    ):
+        """The batched end-of-stream read returns what ``finalize_stream`` does,
+        per stream: every beam, the host scores its caller reads, the frames.
+
+        Depths differ per stream so the per-state ``step`` (which picks the live
+        half of the double buffer) is exercised, not only the byte delta.
+        """
+        V = 7
+        decoder = GpuStreamingDecoder(
+            GpuDecoderConfig(
+                beam_size=3, blank_id=0, max_seq_len=16, use_paged_memory=use_paged, page_size=16
+            )
+        )
+        states = [
+            decoder.create_state(batch=1, vocab_size=V, device=device) for _ in range(n_states)
+        ]
+        for i, state in enumerate(states):
+            path = [1 + ((i + t) % (V - 1)) if t % 2 == 0 else 0 for t in range(2 + i % 5)]
+            decoder.decode_chunk(_make_logp_gpu(len(path), V, path, device), state=state)
+
+        batched = decoder.read_final_states(states, want_times=want_times)
+        assert len(batched) == n_states
+        for i, (state, (beams, scores, times)) in enumerate(zip(states, batched)):
+            want = decoder.finalize_stream(state=state, want_times=want_times)
+            assert beams == want.tokens[0], f"stream {i} beams"
+            assert scores == want.scores.cpu().tolist()[0], f"stream {i} scores"
+            if want_times:
+                assert list(times[0][0]) == list(want.times[0][0]), f"stream {i} times"
+            else:
+                assert times is None
+
 
 # ---------------------------------------------------------------------------
 # Blank-mask staging
