@@ -70,7 +70,15 @@ class AttentionCacheManager:
         ``max_blocks_per_seq``).
     """
 
-    def __init__(self, block_pool: BlockPool, config: CacheConfig) -> None:
+    def __init__(self, block_pool: BlockPool, config: CacheConfig, pad_lanes: int = 0) -> None:
+        """``pad_lanes`` extra slot rows past ``max_batch_size``, for padding.
+
+        A padding lane is a row of the persistent tensors no stream is ever bound
+        to: its block table points only at the pool's scratch blocks, and its
+        length is the one every stream starts with, so a padding row of a batched
+        forward reads and writes nothing a stream owns.  See
+        ``PagedStreamingBackend``.
+        """
         self._pool = block_pool
         self._config = config
         self._streams: Dict[int, _StreamKVState] = {}
@@ -78,17 +86,50 @@ class AttentionCacheManager:
         # Persistent batched paging tensors. Allocated once at construction
         # so the batched paged forward only needs two ``index_select`` calls
         # to pull active-batch metadata, not a Python loop over B streams.
+        rows = config.max_batch_size + int(pad_lanes)
         self._block_table = torch.zeros(
-            config.max_batch_size,
+            rows,
             config.max_blocks_per_seq,
             dtype=torch.int32,
             device=config.device,
         )
         self._cache_seqlens = torch.zeros(
-            config.max_batch_size,
+            rows,
             dtype=torch.int32,
             device=config.device,
         )
+        self._pad_slots: List[int] = []
+        if pad_lanes:
+            scratch = block_pool.scratch_block_ids
+            if not scratch:
+                raise ValueError("padding lanes need a BlockPool built with scratch_blocks >= 1")
+            # Every column at scratch: the lane's own chunk writes land there, and
+            # so does any read past its length, whatever the kernel's key extent.
+            # The length is what an admitted stream starts with — a prefilled
+            # window when the encoder trains one, else zero — so a cohort padded
+            # with the lane still reports one uniform cache length.
+            start = (
+                config.max_logical_blocks * config.block_size_frames
+                if (config.prefill_kv_window and config.max_logical_blocks)
+                else 0
+            )
+            for i in range(int(pad_lanes)):
+                slot = config.max_batch_size + i
+                self._block_table[slot].fill_(scratch[i % len(scratch)])
+                self._cache_seqlens[slot : slot + 1].fill_(start)
+                self._pad_slots.append(slot)
+            self._pad_start = int(start)
+        else:
+            self._pad_start = 0
+
+        # The value eviction writes into a vacated column, held on the device.
+        # ``t[idx] = 0`` with a Python ``0`` — basic *or* advanced indexing —
+        # lowers to a pageable 4-byte H2D copy, and a pageable copy waits for
+        # everything already queued on the stream: measured 41.6 ms of host
+        # blocked behind queued GEMMs, against 0.04 ms with a device value.  So
+        # every per-admission and per-step write below goes through a device
+        # scalar, ``fill_`` (a kernel parameter) or a pinned staged index.
+        self._zero = torch.zeros((), dtype=torch.int32, device=config.device)
 
         # Pre-built per-layer PagedKVCache descriptors pointing at the FULL
         # persistent block_table / cache_seqlens. The batched paged forward
@@ -122,6 +163,16 @@ class AttentionCacheManager:
     @property
     def num_layers(self) -> int:
         return self._config.num_layers
+
+    @property
+    def pad_slots(self) -> List[int]:
+        """Slot rows reserved for padding (empty without padding lanes)."""
+        return list(self._pad_slots)
+
+    @property
+    def pad_start(self) -> int:
+        """The cache length a padding lane reports (its row's ``cache_seqlens``)."""
+        return self._pad_start
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -186,8 +237,9 @@ class AttentionCacheManager:
         reporting a shorter ``cache_seqlens`` than its cohort, which is exactly
         the relative-position mismatch ``_prefill_window`` exists to avoid.
         """
-        self._block_table[state.slot_id].zero_()
-        self._cache_seqlens[state.slot_id] = 0
+        slot = state.slot_id
+        self._block_table[slot].zero_()
+        self._cache_seqlens[slot : slot + 1].zero_()
         if self._config.prefill_kv_window:
             self._prefill_window_state(state)
 
@@ -215,12 +267,15 @@ class AttentionCacheManager:
         blocks = self._config.max_logical_blocks
         assert blocks is not None  # guaranteed by CacheConfig.__post_init__
         block_ids = self._pool.allocate(blocks)
-        for logical_idx, block_id in enumerate(block_ids):
-            state.logical_blocks.append(block_id)
-            self._block_table[state.slot_id, logical_idx] = block_id
+        state.logical_blocks.extend(block_ids)
+        # One staged copy for the row rather than a scalar store per block: each
+        # of those was a blocking H2D (see ``_zero``), five per admission here.
+        slot = state.slot_id
+        row = self._block_table[slot, : len(block_ids)]
+        row.copy_(to_device(block_ids, dtype=row.dtype, device=row.device))
         self._pool.zero_blocks(block_ids)
         state.num_committed_frames = blocks * self._config.block_size_frames
-        self._cache_seqlens[state.slot_id] = state.num_committed_frames
+        self._cache_seqlens[slot : slot + 1].fill_(state.num_committed_frames)
 
     def free_stream(self, stream_id: int) -> None:
         """Release all physical blocks for a stream and remove it.
@@ -278,7 +333,7 @@ class AttentionCacheManager:
         (block_id,) = self._pool.allocate(1)
         state.logical_blocks.append(block_id)
         logical_idx = len(state.logical_blocks) - 1
-        self._block_table[state.slot_id, logical_idx] = block_id
+        self._block_table[state.slot_id, logical_idx : logical_idx + 1].fill_(block_id)
 
     def prepare_chunks_batched(self, stream_ids: List[int]) -> None:
         """Allocate one new physical block for each of ``stream_ids``.
@@ -430,7 +485,8 @@ class AttentionCacheManager:
         """
         state = self._get_state(stream_id)
         state.num_committed_frames += chunk_frames
-        self._cache_seqlens[state.slot_id] = state.num_committed_frames
+        slot = state.slot_id
+        self._cache_seqlens[slot : slot + 1].fill_(state.num_committed_frames)
         self._evict_oldest(stream_id)
 
     def commit_chunks_paged_batched(
@@ -496,8 +552,10 @@ class AttentionCacheManager:
             # Shift every affected row left by one.  Advanced indexing on the
             # right builds a copy, so source and destination cannot alias.
             self._block_table[slots_t, : width - 1] = self._block_table[slots_t, 1:width]
-            # Blank the column each row just vacated (its new logical end).
-            self._block_table[slots_t, kept_t] = 0
+            # Blank the column each row just vacated (its new logical end).  A
+            # device value: ``= 0`` here drained the stream once per step for
+            # every capped-history stream (see ``_zero``).
+            self._block_table.index_put_((slots_t, kept_t), self._zero)
             self._cache_seqlens[slots_t] = (kept_t * block_size).to(self._cache_seqlens.dtype)
 
     def _evict_oldest(self, stream_id: int) -> None:

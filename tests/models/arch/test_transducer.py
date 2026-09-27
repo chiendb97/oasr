@@ -1005,13 +1005,18 @@ class TestPredictorStepGraph:
         joiner = NemotronRnntJoint(enc_dim, hidden, vocab)
         return TransducerModel(nn.Identity(), decoder, joiner, blank_id=blank).eval()
 
-    def _strategy(self, model, graphs, max_sym=3):
+    def _strategy(self, model, graphs, max_sym=3, loop_graphs=True):
+        """``graphs`` gates capture at all; ``loop_graphs`` picks which capture
+        serves a ``track=False`` loop — whole blocks of iterations
+        (``oasr.engine.greedy_graph``) or only the predictor step, which is
+        what the eager loop falls back to and what this class is named for."""
         cfg = SimpleNamespace(
             device="cuda",
             transducer_max_sym_per_frame=max_sym,
             partial_decode_interval=1,
             use_cuda_graphs=True,
             use_transducer_cuda_graphs=graphs,
+            decode_options={"loop_graphs": loop_graphs},
         )
         detok = SimpleNamespace(
             detokenize=lambda ids: " ".join(map(str, ids)),
@@ -1150,7 +1155,7 @@ class TestPredictorStepGraph:
         enc = torch.randn(batch, 9, 16, device=device)
         lengths = torch.full((batch,), 9, dtype=torch.long, device=device)
         off = self._strategy(model, graphs=False)
-        on = self._strategy(model, graphs=True)
+        on = self._strategy(model, graphs=True, loop_graphs=False)
         with torch.inference_mode():
             s0, p0 = off._init_state(batch, device)
             a = off._greedy_loop(enc, lengths, s0, p0)[0]
@@ -1158,6 +1163,53 @@ class TestPredictorStepGraph:
             b = on._greedy_loop(enc, lengths, s1, p1)[0]
         assert a == b
         assert on._pred_graphs is not None and on._pred_graphs.num_captured >= 1
+
+    @pytest.mark.cuda
+    @pytest.mark.parametrize("batch,frames,max_sym", [(1, 9, 3), (3, 9, 1), (5, 70, 3)])
+    def test_offline_loop_graph_is_bit_identical_to_the_eager_loop(
+        self, device, batch, frames, max_sym
+    ):
+        """The whole-loop replay is the eager iteration op for op, so everything
+        it returns — hypotheses, predictor state, projection — must be *equal*.
+
+        Ragged lengths put rows past their end while others still decode, so
+        inactive rows read the static frame buffer's padding; ``frames=70``
+        crosses the smallest capacity rung (64), so the buffer is wider than the
+        utterance.  Both are inert by construction, and this is what says so.
+        """
+        model = self._recurrent_model().to(device)
+        torch.manual_seed(17)
+        enc = torch.randn(batch, frames, 16, device=device)
+        lengths = torch.tensor(
+            [frames - (3 * i) % max(1, frames // 2) for i in range(batch)],
+            dtype=torch.long,
+            device=device,
+        )
+        off = self._strategy(model, graphs=False, max_sym=max_sym)
+        on = self._strategy(model, graphs=True, max_sym=max_sym, loop_graphs=True)
+        with torch.inference_mode():
+            s0, p0 = off._init_state(batch, device)
+            ha, _, sa, pa = off._greedy_loop(enc, lengths, s0, p0)
+            s1, p1 = on._init_state(batch, device)
+            hb, _, sb, pb = on._greedy_loop(enc, lengths, s1, p1)
+        assert on._loop_graphs is not None and on._loop_graphs.stats()["hits"] == 1
+        assert ha == hb
+        for i, (x, y) in enumerate(zip(sa, sb)):
+            assert torch.equal(x, y), f"state[{i}] diverged"
+        assert torch.equal(pa, pb)
+
+    @pytest.mark.cuda
+    def test_loop_graph_leaves_word_timings_to_the_eager_loop(self, device):
+        """``track=True`` gates its snapshot per iteration on the host, which a
+        replay cannot do; it must take the eager loop, and say so by not hitting."""
+        model = self._recurrent_model().to(device)
+        enc = torch.randn(2, 9, 16, device=device)
+        lengths = torch.full((2,), 9, dtype=torch.long, device=device)
+        strat = self._strategy(model, graphs=True, loop_graphs=True)
+        with torch.inference_mode():
+            s, p = strat._init_state(2, device)
+            strat._greedy_loop(enc, lengths, s, p, track=True)
+        assert strat._loop_graphs is None or strat._loop_graphs.stats()["hits"] == 0
 
     @pytest.mark.cuda
     def test_the_loop_syncs_per_iteration_only_for_word_timings(self, device):
@@ -1228,7 +1280,8 @@ class TestPredictorStepGraph:
         )
 
     @pytest.mark.cuda
-    def test_two_session_groups_in_one_tick_do_not_share_graph_state(self, device):
+    @pytest.mark.parametrize("loop_graphs", [False, True], ids=["step_graph", "loop_graph"])
+    def test_two_session_groups_in_one_tick_do_not_share_graph_state(self, device, loop_graphs):
         """The state a group keeps must survive *another* group's replay.
 
         Streams are grouped by chunk length, so one tick can run
@@ -1254,7 +1307,7 @@ class TestPredictorStepGraph:
         lengths = torch.full((2,), 5, dtype=torch.long, device=device)
 
         def rollout(graphs):
-            strat = self._strategy(model, graphs=graphs)
+            strat = self._strategy(model, graphs=graphs, loop_graphs=loop_graphs)
             with torch.inference_mode():
                 sa, pa = strat._init_state(2, device)
                 sb, pb = strat._init_state(2, device)

@@ -316,8 +316,9 @@ prepare_offline                    prepare_streaming
 | `service_mode` | `"streaming"` | Pins the engine to `"streaming"` or `"offline"` for its whole lifecycle; mismatched requests are rejected at admission. `"offline"` builds no streaming backend and no paged pool. |
 | `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). Also the master gate for the offline capture below. |
 | `streaming_graph_cache_growth` | `1.5` | Growth ratio of the streaming `cache_t1` graph-key ladder above 512 frames. `1.0` restores the legacy flat 64-frame rounding, which makes that axis **unbounded** under `num_left_chunks=-1`. See [§9.7](#9-performance-considerations). |
-| `streaming_graph_batch_ladder` | `None` | Batch widths to pre-warm streaming encoder graphs at. `None` = **every** width `1..max_batch_size`, because the graph key is the *active* batch size. |
-| `streaming_graph_max_shapes` | `512` | Ceiling on `widths x cache rungs` pre-warmed at construction (~25 ms and a few MiB each). Past it the ladder is truncated to the low widths plus the cap, and the rest capture lazily. |
+| `streaming_graph_batch_ladder` | `None` | Batch widths streaming encoder graphs are captured and pre-warmed at. `None` = powers of two up to `max_batch_size` with the padding lane on, **every** width `1..max_batch_size` with it off. |
+| `streaming_graph_pad_batch` | `None` (auto) | Pad a cohort up to the next ladder width through the padding lane ([§9.8](#9-performance-considerations)). Auto = on when the streaming cache has more than one rung (off for a trained fixed window). |
+| `streaming_graph_max_shapes` | `512` | Ceiling on `widths x cache rungs` pre-warmed at construction (~25 ms and a few MiB each), and on live captures. Past it the ladder is truncated to the low widths plus the cap, and the rest capture lazily. |
 | `use_offline_cuda_graphs` | `True` | Capture the **offline** encoder forward by `(B_bucket, T_bucket)` (`GraphedOfflineForward`). See [§9.7](#9-performance-considerations). |
 | `offline_graph_batch_buckets` | `None` | Batch widths to capture at. `None` takes `preferred_batch_size` when set, else powers of two up to `max_batch_size`. Set it *below* `max_batch_size` to exclude the widest batches, where capture is a small net loss. |
 | `offline_graph_frame_granularity` | `64` | Time-axis rounding, in feature frames. Overridden to `1` — exact, so no padding — for a fixed-window frontend. |
@@ -325,6 +326,8 @@ prepare_offline                    prepare_streaming
 | `offline_graph_max_captures` | `64` | Live captures. Past this, new shapes run eager and are counted. |
 | `long_form` | `False` | Fan a request longer than a fixed-window frontend's window out into consecutive windows, decode them through the normal batched path **in parallel**, and stitch one output. The caller sees one request id, so HTTP/gRPC need no change. `long_form_overlap_seconds` plus a word-level overlap merge recover most of the boundary accuracy. |
 | `recycle_streaming_history` | `False` | At the streaming cache ceiling, recycle the oldest KV block instead of finalising the request with `finish_reason="length"`. |
+| `offline_decode_overlap` | `True` | Collect a micro-batch's queued decode read-back on the next tick, behind that tick's forward ([§9.4b](#9-performance-considerations)). Needs `offline_collate_prefetch`; families without `decode_offline_async` are unaffected. |
+| `gc_freeze` | `True` | Freeze the Python heap after construction so full collections skip it ([§9.4c](#9-performance-considerations)). Process-global and refcounted. |
 
 ### Autoregressive decode
 
@@ -353,10 +356,11 @@ Only read by `incremental` decode families — see [decoding.md](decoding.md).
 |-------|---------|-------------|
 | `max_batch_size` | 32 | Encoder forward `B`. In streaming mode caps the running pool; in offline mode is the GPU forward width. Offline admission per `step()` is one length-bucketed batch of up to `max_batch_size`, run as a single forward. |
 | `preferred_batch_size` | `None` | When set, scheduler snaps streaming admission and offline micro-batches to one of these sizes; engine pre-warms the encoder CUDA-Graph cache at each value; defaults `feature_graph_batch_buckets`. `max_wait_time` is the escape valve. See [scheduler.md §4.6](scheduler.md). |
-| `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` in offline batch. |
-| `max_offline_pad_ratio` | 4.0 | Hard cap on padded/useful compute. |
+| `length_bucket_ratio` | 0.0 | Length-aware policies (`window`, `bucket`, `sjf`): floor on `min_len/max_len` in an offline batch. |
+| `max_offline_pad_ratio` | 4.0 | Length-aware policies: hard cap on padded/useful compute. |
 | `max_wait_time` | 0.2 | Starvation bound (seconds). |
-| `schedule_policy` | `"bucket"` | `fcfs` / `bucket` / `sjf`. |
+| `schedule_policy` | `"window"` | `fcfs` / `window` / `bucket` / `sjf`. See [scheduler.md §4.1.1](scheduler.md). |
+| `length_window_factor` | 4 | `window` policy: batches are chosen from the oldest `max_batch_size × factor` requests. |
 | `streaming_cohort_admit` | `True` | Admit only when running pool offsets align — enables full `B` batched paged forward. |
 
 ### Paged KV cache
@@ -627,10 +631,44 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
    run a step ahead of the device. `to_device` builds the tensor in pinned
    memory and copies it `non_blocking=True`; readers on the same stream need no
    further ordering, readers on another stream need the usual `wait_stream`.
-4. **Length bucketing trade-off.** `length_bucket_ratio=0` (default)
-   ships one big batch; `0.5` insists on ≥50 % length similarity;
-   `max_offline_pad_ratio=4.0` is the safety net against pathological
-   mixes.
+4. **Offline batches are length-sorted within a window** (`schedule_policy`
+   `"window"`, the default; [scheduler §4.1.1](scheduler.md)). With the forward
+   graph-captured, a batch's padding is GPU time: FIFO batches of 32 LJSpeech
+   utterances computed ~1.48× the useful frames. Choosing each batch as the
+   least-padded length-run that contains the oldest request, from the oldest
+   `4 × max_batch_size`, measured **1.27×** offline Conformer throughput (1.32× on
+   the transducer, whose greedy loop also runs to the batch's longest row) with
+   the accuracy gate unchanged. `max_batch_frames`, `max_offline_pad_ratio` and
+   `length_bucket_ratio` bound its runs as they bound the other policies'
+   batches.
+4a. **A Python scalar written through an index into a CUDA tensor blocks the host.**
+   `t[i, j] = 0` and `t[idx_t] = 0` both lower to a *pageable* 4-byte
+   host-to-device copy, which waits for everything queued on the stream —
+   measured 41.6 ms of host blocked behind queued GEMMs, against 0.04 ms for the
+   same write with a device scalar, `fill_` on a slice, or a staged index. The
+   cache manager's admission and eviction paths did this once per admitted
+   stream and once per step for every capped-history stream; see
+   `AttentionCacheManager._zero`.
+4b. **The offline decode read-back is collected a tick late**
+   (`offline_decode_overlap`, with `offline_collate_prefetch`). A blocking
+   read-back ends a tick with the GPU's queue empty, so its host tail — token
+   extraction, detokenization, finalisation — ran in front of an idle GPU (~1.1 ms
+   of a ~9.3 ms Conformer tick at `B = 32`). A family that implements
+   `DecodeStrategy.decode_offline_async` (GPU CTC) queues its read-back into pinned
+   memory behind an event; the executor collects it on the next tick, after that
+   tick's forward and decode are queued. **1.09–1.17×** on Conformer offline
+   (`B = 64 … 1`), transcripts unchanged. Two details carry it: the CTC offline
+   launcher no longer reads the selected-frame count back to size its tile loop
+   (the fused kernels mask per row, so it loops to the input length), and a batch
+   with nothing staged behind it is collected in its own tick — otherwise a lone
+   request's result would wait a tick and an issue-only tick would read as idle
+   to the serving dispatcher.
+4c. **The Python heap is frozen after construction** (`gc_freeze`). A full
+   garbage collection over the constructed engine's ~440k tracked objects stops
+   the step loop for **162–170 ms**, a tick in which every stream stalls; frozen,
+   collections walk only what was allocated since. Refcounted across engines in
+   one process (`oasr.engine.gc_freeze`); a dropped engine still returns its
+   device memory through reference counting.
 5. **NVTX profiling.** The step loop is annotated with
    `nvtx_push("engine.step")` → `schedule` / `allocate_stream` /
    `offline_batch` / `extract_fbank` / `forward_streaming` /
@@ -700,9 +738,30 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
 
    Together: **p99 31.4 → 3.2 ms** on long streams and **max 32.6 → 4.0 ms** at
    sustained concurrency 16, with zero live-tick captures in both. The cost is
-   startup — ~25 ms and a few MiB per shape, so +2.2 s at `max_batch_size=8` and
-   +9.5 s at 32 — bounded by `streaming_graph_max_shapes`. Transcripts are
-   unchanged.
+   startup — ~25 ms and a few MiB per shape — bounded by
+   `streaming_graph_max_shapes`. Transcripts are unchanged.
+
+   **The width axis is a ladder, not every width**
+   (`streaming_graph_pad_batch`, auto). Every width × every cache rung is 576
+   shapes at `max_batch_size=64` — over the 512 budget, so the draining tail ran
+   eager. A cohort is now padded up to the next power-of-two width through a
+   **padding lane**: one slot row past `max_batch_size` whose block table points
+   only at a scratch block outside the free list (`BlockPool(scratch_blocks=1)`,
+   `AttentionCacheManager(pad_lanes=1)`), fed zeros from the lane's own cache
+   length. Every encoder op is row-local, so padding rows compute garbage only for
+   themselves; padding happens before the graph/eager branch, so a shape that
+   falls back decodes exactly as one that replays. At `max_batch_size=64`:
+   **1.59×** streaming throughput, p99 18.2 → 6.1 ms, 512 → 63 shapes, startup
+   22 → 7.6 s, graph VRAM 3.0 → 0.8 GiB, transcripts byte-identical. Auto pads only
+   when the cache has more than one rung: a trained fixed window (Nemotron) has
+   exactly one, so its exact widths are cheap captures and padding would only add
+   compute.
+
+   **A stream's last full window is batched.** It used to take the per-stream
+   fallback, and for an encoder with a declared geometry the finalize pad makes
+   *every* stream's last window exactly one window long — one serial `B=1`
+   forward per finishing stream (~400 ms of a 664 ms Nemotron backlog). Batched,
+   and consumed whole as the fallback consumed it: Nemotron streaming **1.78×**.
 
 9. **Pool sizing.** The engine's most common production failure is
    `BlockPool` exhaustion. Size `max_num_blocks` for
@@ -734,9 +793,12 @@ core to add a variant.** `docs/architecture.md` is the authoritative map
   axis: `docs/decoding.md`.
 - **New streaming runtime** → `StreamingEncoderBackend` +
   `@register_streaming_backend`, keyed by the encoder's `streaming_kind`.
-  Implement `allocate` / `forward_step` / `free` + window geometry. Expose
-  `stack_streaming_states` / `unstack_streaming_states` on the encoder to get
-  batched (one `B = N` forward) stateful streaming for free.
+  Implement `allocate` / `forward_step` / `free` + window geometry. An encoder
+  whose whole cache is fixed-extent needs no new runtime: declare it
+  (`slot_state_specs` + `streaming_pad_value`, `streaming_kind="slot"`) and the
+  slot runtime owns the state and graph-captures the step. Without the
+  declaration, `stack_streaming_states` / `unstack_streaming_states` still get
+  batched (one `B = N` forward) stateful streaming.
 - **New batching / partition policy** → `@register_batching_policy` /
   `@register_partition_policy`; select via `EngineConfig.schedule_policy` and
   the partition flags.

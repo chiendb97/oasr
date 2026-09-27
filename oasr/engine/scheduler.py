@@ -3,16 +3,20 @@
 """Dynamic-batching request scheduler for the ASR engine.
 
 The scheduler is length-aware: it admits waiting requests into streaming and
-offline batches chosen to minimise padded-compute waste.  Three policies are
+offline batches chosen to minimise padded-compute waste.  Four policies are
 supported (set via ``EngineConfig.schedule_policy``):
 
 ``"fcfs"``
     Strict first-come-first-served — preserves arrival order; no bucketing.
-``"bucket"`` (default)
+``"window"`` (default)
+    Length-sorted batches from the oldest ``max_batch_size *
+    length_window_factor`` requests, always including the oldest: most of
+    ``"sjf"``'s padding reduction with the reordering bounded by the window.
+    Identical to FIFO while fewer than ``max_batch_size`` requests wait.
+``"bucket"``
     Pick the oldest waiting request as an "anchor", then greedily add
     arrival-ordered peers whose feature length is within
-    ``length_bucket_ratio`` of the anchor.  Good trade-off between latency and
-    throughput.
+    ``length_bucket_ratio`` of the anchor.
 ``"sjf"``
     Shortest-job-first — sort the waiting queue by feature length and pick
     the shortest group.  Best throughput, but relies on

@@ -17,25 +17,34 @@ buffers the graph was captured reading.
 
 Shape key
 ---------
-``(rows, block-table width bucket)``.  Rows are exact: a decoder step is
-weight-read bound so padding a batch up to a bucket would cost nearly a full
-step, and the reachable row counts are bounded by ``max_decode_slots`` anyway.
-The width is bucketed because it grows by one page every ``block_size`` tokens
-and would otherwise key a capture per page; the real table is copied into the
-bucket's buffer and the surplus columns point at page 0, which the kernel loads
-and then gives zero softmax weight — every column past ``cache_seqlens`` is
-masked, and a pool page is finite, which is the one thing masked columns must be.
+``(rows, block-table width bucket, cross block-table width bucket)``.  Rows are
+exact: a decoder step is weight-read bound so padding a batch up to a bucket
+would cost nearly a full step, and the reachable row counts are bounded by
+``max_decode_slots`` anyway.  The width is bucketed because it grows by one page
+every ``block_size`` tokens and would otherwise key a capture per page; the real
+table is copied into the bucket's buffer and the surplus columns point at page 0,
+which the kernel loads and then gives zero softmax weight — every column past
+``cache_seqlens`` is masked, and a pool page is finite, which is the one thing
+masked columns must be.  The third member is ``0`` for a decoder-only LM.
+
+The cross-attention side cache
+------------------------------
+An AED also reads the encoder output's K/V every step.  Dense, that is a
+per-group tensor — allocated per prefill, far too large to copy into a static
+buffer per step — and a state carrying one is refused (:meth:`capturable`).
+Paged (``state["cross"]``, a fixed-extent region of the *same* pool), it is only
+a block table and a key-length vector, copied into static buffers like the
+self-attention's, so the step captures whole.
 
 What is *not* captured
 ----------------------
 * **Prefill.** Its shapes follow the prompt, so it would key a capture per
   prompt length, and it runs once per batch against a step's many.
-* **A decoder with a per-group side cache.** An AED's cross-attention K/V is
-  allocated per prefill and is far too large to copy into a static buffer per
-  step, so ``aed`` is not capturable without pooling that as well.  Declared by
-  :attr:`~oasr.models.decoders.base.BaseDecoder.supports_step_graphs` rather
-  than discovered — a decoder that quietly captured a stale pointer would return
-  a plausible transcript of the previous batch's audio.
+* **Any state with a component outside the pool** (a dense ``cross_k`` list).
+  Declared by :attr:`~oasr.models.decoders.base.BaseDecoder.supports_step_graphs`
+  and checked per state rather than discovered — a decoder that quietly
+  captured a stale pointer would return a plausible transcript of the previous
+  batch's audio.
 * **Beam search**, which does not page its KV in the first place.
 
 Correctness notes
@@ -119,10 +128,17 @@ class _Captured:
     table: torch.Tensor
     logits: torch.Tensor
     starts: Optional[torch.Tensor] = None
+    #: The cross-attention side cache's key lengths and block table, when the
+    #: decoder pages one (an AED); ``None`` for a decoder-only LM.
+    cross_lens: Optional[torch.Tensor] = None
+    cross_table: Optional[torch.Tensor] = None
+
+
+_Key = Tuple[int, int, int]
 
 
 class DecoderStepGraphCache:
-    """Lazily captured decoder steps, keyed by ``(rows, width bucket)``.
+    """Lazily captured decoder steps, keyed by ``(rows, width bucket, cross bucket)``.
 
     Parameters
     ----------
@@ -161,12 +177,12 @@ class DecoderStepGraphCache:
         self._pool: Optional[Tuple[int, int]] = (
             pool if pool is not None else torch.cuda.graph_pool_handle()
         )
-        self._captured: Dict[Tuple[int, int], _Captured] = {}
+        self._captured: Dict[_Key, _Captured] = {}
         self._refused = False
         #: Shapes whose capture failed.  A capture costs a warm-up forward, so
         #: retrying one that already failed would pay that on *every* step of
         #: that shape and still run eager — the slowest possible outcome.
-        self._failed: Set[Tuple[int, int]] = set()
+        self._failed: Set[_Key] = set()
         #: Set when a capture ran out of memory.  That is a property of the
         #: process, not of the shape: the next shape is no more likely to fit,
         #: and each attempt burns a forward.  Stop trying and run eager.
@@ -180,34 +196,64 @@ class DecoderStepGraphCache:
     def num_captured(self) -> int:
         return len(self._captured)
 
-    def capturable(self, kv: Any) -> bool:
-        """Whether this KV state's storage is one a captured step can read."""
-        return (
-            isinstance(kv, PagedDecoderKv)
-            and kv.manager is self._mgr
-            and not kv.consumed
-            and bool(getattr(self._decoder, "supports_step_graphs", False))
-        )
+    def capturable(self, state: Any) -> bool:
+        """Whether this decode state's storage is one a captured step can read.
+
+        ``state`` is the decoder's state dict (a bare :class:`PagedDecoderKv` is
+        accepted as ``{"kv": it}``).  Every component a step reads must be paged
+        on this cache's pool — the self-attention KV and, for an AED, the
+        cross-attention side cache; anything else in the state holds per-group
+        addresses a graph would bake in.
+        """
+        return self._parts(state) is not None
+
+    def _parts(self, state: Any) -> Optional[Tuple[PagedDecoderKv, Optional[PagedDecoderKv]]]:
+        """``(kv, cross)`` for a capturable state, else ``None``."""
+        if not bool(getattr(self._decoder, "supports_step_graphs", False)):
+            return None
+        if isinstance(state, PagedDecoderKv):
+            state = {"kv": state}
+        if not isinstance(state, dict) or set(state) - {"kv", "cross"}:
+            return None
+        kv, cross = state.get("kv"), state.get("cross")
+        for part in (kv, cross):
+            if part is None:
+                continue
+            if not isinstance(part, PagedDecoderKv) or part.manager is not self._mgr:
+                return None
+            if part.consumed:
+                return None
+        if kv is None:
+            return None
+        return kv, cross
 
     # ------------------------------------------------------------------
     # Step
     # ------------------------------------------------------------------
 
-    def step(self, tokens: torch.Tensor, kv: PagedDecoderKv) -> Optional[torch.Tensor]:
+    def step(self, tokens: torch.Tensor, state: Any) -> Optional[torch.Tensor]:
         """One decoder step through a captured graph.
 
         Returns the ``(B, V)`` logits, or ``None`` when this state or shape is
-        not capturable and the caller should step eagerly.  On return ``kv`` has
-        **not** advanced — the caller commits, the same as it would after an
-        eager step.
+        not capturable and the caller should step eagerly.  On return the
+        self-attention KV has **not** advanced — the caller commits, the same as
+        it would after an eager step.  ``state`` is the decoder's state dict, or
+        a bare self-attention :class:`PagedDecoderKv`.
         """
-        if self._disabled or not self.capturable(kv):
+        parts = None if self._disabled else self._parts(state)
+        if parts is None:
             return None
+        kv, cross = parts
         kv.reserve(1)  # host-side page mapping; the graph runs no Python
         table = kv.block_table()
-        key = (kv.batch, self._bucket(table.size(1)))
-        state = self._captured.get(key)
-        if state is None:
+        cross_table = cross.block_table() if cross is not None else None
+        key = (
+            kv.batch,
+            self._bucket(table.size(1)),
+            0 if cross_table is None else self._bucket(cross_table.size(1)),
+        )
+        captured = self._captured.get(key)
+        if captured is None:
             if key in self._failed:
                 return None
             if len(self._captured) >= self._max_captures:
@@ -218,19 +264,23 @@ class DecoderStepGraphCache:
                         self._max_captures,
                     )
                 return None
-            state = self._capture(key, tokens, kv)
-            if state is None:
+            captured = self._capture(key, tokens, kv, cross)
+            if captured is None:
                 return None
-            self._captured[key] = state
+            self._captured[key] = captured
 
-        state.tokens.copy_(tokens)
-        state.lens.copy_(kv.lens)
-        if state.starts is not None and kv.starts is not None:
-            state.starts.copy_(kv.starts)
-        self._fill_table(state.table, table)
-        state.graph.replay()
+        captured.tokens.copy_(tokens)
+        captured.lens.copy_(kv.lens)
+        if captured.starts is not None and kv.starts is not None:
+            captured.starts.copy_(kv.starts)
+        self._fill_table(captured.table, table)
+        if cross is not None and cross_table is not None:
+            assert captured.cross_lens is not None and captured.cross_table is not None
+            captured.cross_lens.copy_(cross.lens)
+            self._fill_table(captured.cross_table, cross_table)
+        captured.graph.replay()
         # The buffer is live only until the next replay of this key.
-        return state.logits.clone()
+        return captured.logits.clone()
 
     # ------------------------------------------------------------------
     # Capture
@@ -268,9 +318,13 @@ class DecoderStepGraphCache:
         self._failed.clear()
 
     def _capture(
-        self, key: Tuple[int, int], tokens: torch.Tensor, kv: PagedDecoderKv
+        self,
+        key: _Key,
+        tokens: torch.Tensor,
+        kv: PagedDecoderKv,
+        cross: Optional[PagedDecoderKv] = None,
     ) -> Optional[_Captured]:
-        rows, width = key
+        rows, width, cross_width = key
         device = kv.lens.device
         tokens_buf = torch.empty_like(tokens)
         tokens_buf.copy_(tokens)
@@ -283,10 +337,24 @@ class DecoderStepGraphCache:
         table_buf = torch.zeros(rows, width, dtype=torch.int32, device=device)
         self._fill_table(table_buf, kv.block_table())
 
-        graph_kv = _GraphKv(self._mgr, lens_buf, starts_buf, table_buf, kv.lens_host)
+        graph_state: Dict[str, Any] = {
+            "kv": _GraphKv(self._mgr, lens_buf, starts_buf, table_buf, kv.lens_host)
+        }
+        cross_lens_buf: Optional[torch.Tensor] = None
+        cross_table_buf: Optional[torch.Tensor] = None
+        if cross is not None:
+            # The side cache is only read by a step, so its twin needs nothing
+            # but the two vectors the paged read takes, at static addresses.
+            cross_lens_buf = torch.empty(rows, dtype=torch.int32, device=device)
+            cross_lens_buf.copy_(cross.lens)
+            cross_table_buf = torch.zeros(rows, cross_width, dtype=torch.int32, device=device)
+            self._fill_table(cross_table_buf, cross.block_table())
+            graph_state["cross"] = _GraphKv(
+                self._mgr, cross_lens_buf, None, cross_table_buf, cross.lens_host
+            )
 
         def _run() -> torch.Tensor:
-            logits, _ = self._decoder.step(tokens_buf, {"kv": graph_kv})
+            logits, _ = self._decoder.step(tokens_buf, graph_state)
             return cast(torch.Tensor, logits)
 
         try:
@@ -330,7 +398,12 @@ class DecoderStepGraphCache:
                 exc,
             )
             return None
-        logger.info("captured decoder step: rows=%d block-table width=%d", rows, width)
+        logger.info(
+            "captured decoder step: rows=%d block-table width=%d cross width=%d",
+            rows,
+            width,
+            cross_width,
+        )
         return _Captured(
             graph=graph,
             tokens=tokens_buf,
@@ -338,4 +411,6 @@ class DecoderStepGraphCache:
             table=table_buf,
             logits=logits_buf,
             starts=starts_buf,
+            cross_lens=cross_lens_buf,
+            cross_table=cross_table_buf,
         )

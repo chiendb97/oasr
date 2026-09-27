@@ -35,6 +35,7 @@ import torch
 
 from oasr.functionals.ctc_decode import GpuDecoderConfig, ctc_beam_search_decode
 from oasr.models.decoders.transformer_decoder import add_sos_eos, reverse_pad_list
+from oasr.utils.staging import to_device
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, EncodeOutput, register_decode_strategy
@@ -203,12 +204,8 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             for b in range(B)
             for k in range(beam)
         ]
-        n = len(hyps)
         max_len = max((len(h) for h in hyps), default=0)
-        hyps_pad = torch.full((n, max(max_len, 1)), _IGNORE_ID, dtype=torch.long, device=device)
-        for i, h in enumerate(hyps):
-            if h:
-                hyps_pad[i, : len(h)] = torch.tensor(h, dtype=torch.long, device=device)
+        hyps_pad = self._pad_hypotheses(result, hyps, beam, max(max_len, 1), device)
         hyps_lens = (hyps_pad != _IGNORE_ID).sum(dim=1)  # (n,)
 
         # Ids outside the decoder vocab cannot be scored (the CTC head is
@@ -285,6 +282,37 @@ class CtcAedRescoringStrategy(DecodeStrategy):
                 outputs, log_probs, enc_lengths, requests, blank_id=cfg.blank_id
             )
         return outputs
+
+    @staticmethod
+    def _pad_hypotheses(
+        result, hyps: List[List[int]], beam: int, width: int, device: torch.device
+    ) -> torch.Tensor:
+        """``(B * beam, width)`` int64 hypotheses, ``_IGNORE_ID``-padded.
+
+        Cut out of the beam search's own device output rather than rebuilt from
+        the host lists.  The old loop issued one ``torch.tensor(h, device=...)``
+        per hypothesis — 320 per ``B = 32`` batch at beam 10 — and each is a
+        *pageable* host-to-device copy, which drains the stream before it
+        stages: 2608 synchronisations and 5664 copies per 256 utterances, with
+        the GPU 55% busy.  The device already holds exactly these tokens; only
+        the lengths come from the host lists (one staged copy), so every row is
+        what it was — the positions past a row's length are masked either way.
+        """
+        n = len(hyps)
+        token_ids = getattr(result, "token_ids", None)
+        if token_ids is None or token_ids.device != device or token_ids.size(2) < width:
+            # Not the offline beam search's result; build it on the host, once.
+            host = torch.full((n, width), _IGNORE_ID, dtype=torch.long)
+            for i, h in enumerate(hyps):
+                if h:
+                    host[i, : len(h)] = torch.tensor(h, dtype=torch.long)
+            if device.type == "cuda":
+                return host.pin_memory().to(device, non_blocking=True)
+            return host.to(device)
+        lens = to_device([len(h) for h in hyps], dtype=torch.long, device=device)
+        rows = token_ids[:, :beam, :width].reshape(n, width).long()
+        pos = torch.arange(width, device=device)
+        return torch.where(pos.unsqueeze(0) < lens.unsqueeze(1), rows, _IGNORE_ID)
 
     @staticmethod
     def _gather_scores(logits: torch.Tensor, ys_out: torch.Tensor) -> torch.Tensor:

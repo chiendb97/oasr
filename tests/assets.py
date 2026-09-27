@@ -119,6 +119,20 @@ _ASSET_LIST: List[Asset] = [
         ),
     ),
     Asset(
+        env="STREAMING_ZIPFORMER_CKPT",
+        kind=CHECKPOINT,
+        what="icefall *causal* (streaming) Zipformer pruned-RNNT release",
+        relpath="zipformer_streaming_transducer",
+        # The TorchScript streaming export is part of the asset: it is icefall's
+        # own streaming forward, the oracle the slot runtime is checked against.
+        marker="exp/jit_script_chunk_16_left_128.pt",
+        how=(
+            "huggingface.co/Zengwei/icefall-asr-librispeech-streaming-zipformer-2023-05-17 — "
+            "exp/pretrained.pt + exp/jit_script_chunk_16_left_128.pt + "
+            "data/lang_bpe_500/{tokens.txt,bpe.model}; architecture='transducer'"
+        ),
+    ),
+    Asset(
         env="WHISPER_CKPT",
         kind=CHECKPOINT,
         what="HF-format Whisper checkpoint",

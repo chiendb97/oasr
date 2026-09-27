@@ -18,6 +18,7 @@ import torch
 from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
+from . import gc_freeze
 from .config import EngineConfig
 from .decode import EncodeOutput, get_decode_strategy_class
 from .executor import (
@@ -292,8 +293,14 @@ class ASREngine:
         ):
             try:
                 cap = max(1, int(config.max_batch_size))
+                backend = self._model_runner.streaming_backend
+                widths = getattr(backend, "graph_batch_widths", None)
                 ladder = config.streaming_graph_batch_ladder
-                if ladder:
+                if widths:
+                    # The widths the backend actually forwards at: the padding
+                    # ladder when the padding lane is on, every width otherwise.
+                    batch_sizes = sorted({int(b) for b in widths})
+                elif ladder:
                     batch_sizes = sorted({int(b) for b in ladder})
                 else:
                     # Every width, because the graph key is the *active* batch
@@ -323,6 +330,12 @@ class ASREngine:
                 # stream older than that walked off the end and captured a graph
                 # on a live tick every 64 encoder frames.
                 self._model_runner.prewarm_encoder_graphs(batch_sizes, cache_t1_buckets=None)
+                # The decode side keys its graphs on the *live* cohort width —
+                # it sees the streams, never the padding — so it is pre-warmed
+                # at every width (a no-op for most families).
+                self._output_processor.strategy.prewarm_streaming(
+                    list(range(1, cap + 1)), frames=int(config.chunk_size)
+                )
             except Exception as exc:  # pragma: no cover
                 # An aborted capture leaves the allocator serving out of the
                 # capture's pool and the generator in capture mode; neither
@@ -455,6 +468,13 @@ class ASREngine:
                 vad_cfg.backend,
                 device,
             )
+
+        # Last, so everything construction allocated — the model, the prewarm's
+        # graphs and JIT modules — is frozen with it.  See ``gc_freeze``.
+        self._gc_frozen = False
+        if getattr(config, "gc_freeze", True):
+            gc_freeze.freeze()
+            self._gc_frozen = True
 
     # ------------------------------------------------------------------
     # VRAM-aware capacity sizing
@@ -1346,6 +1366,9 @@ class ASREngine:
             self._model_runner.release_graphs()
         except Exception:  # pragma: no cover - defensive
             logger.exception("graph pool release failed")
+        if getattr(self, "_gc_frozen", False):
+            self._gc_frozen = False
+            gc_freeze.release()
 
     def _recover_capture_state(self) -> None:
         """Best-effort undo of an aborted capture; never raises."""
@@ -1607,6 +1630,7 @@ class ASREngine:
             decode_admit_window_ms=config.decode_admit_window_ms,
             max_batch_size=config.max_batch_size,
             collate_prefetch=config.offline_collate_prefetch,
+            decode_overlap=getattr(config, "offline_decode_overlap", True),
             metrics=self._metrics,
         )
 

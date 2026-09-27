@@ -1085,6 +1085,9 @@ class TestStreamingStepDoesNotRaise:
         ex._op = SimpleNamespace(
             decode_streaming_batch=lambda reqs, m: [],
             finalize_streaming=lambda req: RequestOutput(req.request_id, "", [[]]),
+            finalize_streaming_batch=lambda reqs: [
+                RequestOutput(r.request_id, "", [[]]) for r in reqs
+            ],
             fill_nbest_texts=lambda req, out: None,
             free_session=rec.free_session,
         )
@@ -1173,6 +1176,7 @@ def _lookahead_executor(order: _OrderRecorder, *, lookahead: bool):
     ex._op = SimpleNamespace(
         decode_streaming_batch=decode,
         finalize_streaming=lambda req: RequestOutput(req.request_id, "", [[]]),
+        finalize_streaming_batch=lambda reqs: [RequestOutput(r.request_id, "", [[]]) for r in reqs],
         fill_nbest_texts=lambda req, out: None,
         free_session=lambda r: None,
     )
@@ -1366,6 +1370,110 @@ class TestOfflineCollatePrefetch:
             seen.extend(o.request_id for o in ex.step())
 
         assert seen == [f"r{i}" for i in range(5)]
+
+
+def _overlap_executor(order: _OrderRecorder, batches):
+    """``_prefetch_executor`` with a family that can queue its decode read-back."""
+    ex = _prefetch_executor(order, batches, prefetch=True)
+
+    def decode_offline_async(enc, lens, requests=None):
+        order.seen.append("issue")
+
+        def collect():
+            order.seen.append("collect")
+            return [RequestOutput(request_id=i, text=f"ok-{i}", tokens=[[1]]) for i in enc.ids]
+
+        return collect
+
+    ex._op.decode_offline_async = decode_offline_async
+    ex._decode_overlap = True
+    ex._inflight = None
+    return ex
+
+
+class TestOfflineDecodeOverlap:
+    """A batch's read-back is collected one tick later, behind the next forward.
+
+    The blocking read-back ends a tick with the GPU's queue empty, and the host
+    tail after it — token extraction, detokenization, finalisation — ran in
+    front of an idle GPU (~1.1 ms of a ~9.3 ms Conformer tick at ``B = 32``).
+    Collecting it only after the next batch's forward and decode are queued
+    puts that tail behind GPU work.
+    """
+
+    def test_the_previous_batch_is_collected_after_this_ones_forward(self):
+        order = _OrderRecorder()
+        ex = _overlap_executor(order, [[_request("a")], [_request("b")], [_request("c")]])
+
+        first = ex.step()
+        # a is issued, b is staged behind it: a stays in flight.
+        assert first == []
+        assert order.seen == ["schedule", "collate", "forward", "issue", "schedule", "collate"]
+
+        order.seen.clear()
+        second = ex.step()
+        # b's forward and decode are queued before a is read back.
+        assert order.seen[:2] == ["forward", "issue"]
+        assert order.seen.index("collect") > order.seen.index("issue")
+        assert [o.request_id for o in second] == ["a"]
+
+    def test_a_batch_with_nothing_behind_it_is_collected_in_its_own_tick(self):
+        """No forward can hide its tail, so holding it a tick buys nothing and
+        makes an issue-only tick look idle to the serving dispatcher."""
+        order = _OrderRecorder()
+        ex = _overlap_executor(order, [[_request("solo")]])
+
+        out = ex.step()
+
+        assert [o.request_id for o in out] == ["solo"]
+        assert ex._inflight is None
+        assert not ex.has_pending()
+
+    def test_an_inflight_batch_keeps_the_engine_pending(self):
+        order = _OrderRecorder()
+        ex = _overlap_executor(order, [[_request("a1"), _request("a2")], [_request("b1")]])
+
+        ex.step()
+
+        assert ex._inflight is not None
+        assert ex.has_pending()
+        assert ex.num_running() == 3  # two in flight, one staged
+
+    def test_every_request_comes_back_exactly_once(self):
+        order = _OrderRecorder()
+        batches = [[_request(f"r{i}")] for i in range(5)]
+        ex = _overlap_executor(order, [list(b) for b in batches])
+
+        seen: list[str] = []
+        for _ in range(8):
+            seen.extend(o.request_id for o in ex.step())
+
+        assert seen == [f"r{i}" for i in range(5)]
+        assert not ex.has_pending()
+
+    def test_a_failed_collect_is_isolated_to_its_own_batch(self):
+        """An error surfacing at read-back belongs to the in-flight batch, not to
+        the batch whose forward was issued in the same tick."""
+        order = _OrderRecorder()
+        ex = _overlap_executor(order, [[_request("bad")], [_request("good")]])
+        issue = ex._op.decode_offline_async
+
+        def poisoned(enc, lens, requests=None):
+            collect = issue(enc, lens, requests)
+            if "bad" not in enc.ids:
+                return collect
+
+            def boom():
+                raise RuntimeError("read-back failed")
+
+            return boom
+
+        ex._op.decode_offline_async = poisoned
+        seen = {}
+        for _ in range(4):
+            for o in ex.step():
+                seen[o.request_id] = o.finish_reason
+        assert seen == {"bad": "error", "good": None}
 
 
 class TestOfflinePrefetchOrdering:

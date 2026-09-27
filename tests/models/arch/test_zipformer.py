@@ -135,7 +135,7 @@ class TestZipformerRegistry:
         assert isinstance(entry.converter, IcefallConverter)
 
     def test_contract(self):
-        # Streaming-capable (causal) config: advertises the stateful backend and
+        # Streaming-capable (causal) config: advertises the slot runtime and
         # therefore reports a cache geometry.
         cfg = ZipformerModelConfig(
             encoder=_tiny_encoder_config(causal=True, chunk_size=(8,)), vocab_size=32
@@ -143,7 +143,7 @@ class TestZipformerRegistry:
         model = ZipformerModel.from_config(cfg).eval()
         assert model.decode_type == "ctc"
         assert model.head is model.ctc
-        assert model.encoder.streaming_kind == "stateful"
+        assert model.encoder.streaming_kind == "slot"
         assert isinstance(model.cache_spec, CacheSpec)
         # cache_spec from the live model and from the config must agree.
         assert model.cache_spec == cfg.cache_spec
@@ -322,6 +322,117 @@ class TestInProjHeadInterleave:
 # --------------------------------------------------------------------------- #
 
 
+class TestStreamingContract:
+    """What the streaming runtime reads off the encoder, pinned to icefall's recipe.
+
+    Each of these was wrong before a causal checkpoint existed here to show it:
+    the window was ``2 * chunk`` frames (9 embed frames for a 16-frame chunk,
+    against the 16 the encoder is trained to stream and its downsampled stacks
+    need), the left-context cache was never masked, and a converter meeting a
+    causal release could not load it at all.
+    """
+
+    @staticmethod
+    def _model(chunk=16, left=32):
+        cfg = ZipformerModelConfig(
+            encoder=_tiny_encoder_config(
+                causal=True, chunk_size=(chunk,), left_context_frames=(left,)
+            ),
+            vocab_size=32,
+        )
+        return ZipformerModel.from_config(cfg).eval()
+
+    @pytest.mark.parametrize("chunk", [8, 16, 32])
+    def test_a_window_is_one_chunk_plus_the_embeds_lookahead(self, chunk):
+        """``(T - 7) // 2 - 3`` embed frames from ``T`` inputs, so a chunk takes
+        ``2 * chunk + 13`` — icefall's ``chunk_size * 2 + pad_length`` — and the
+        stream advances by ``2 * chunk``."""
+        enc = self._model(chunk=chunk).encoder
+        assert enc.streaming_window_frames == 2 * chunk + 13
+        assert enc.streaming_chunk_frames == 2 * chunk
+        if not torch.cuda.is_available():
+            return  # the embed's streaming forward runs OASR kernels
+        embed = enc.encoder_embed.half().cuda()
+        x = torch.zeros(1, enc.streaming_window_frames, 80, device="cuda", dtype=torch.float16)
+        with torch.no_grad():
+            y, y_lens, _ = embed.streaming_forward(
+                x,
+                torch.tensor([x.size(1)], device="cuda"),
+                embed.get_init_states(1, device="cuda", dtype=torch.float16),
+            )
+        assert y.size(1) == chunk and int(y_lens[0]) == chunk
+
+    def test_slot_state_specs_follow_the_list_api(self):
+        """Order, per-stream shape, batch axis and dtype of every declared state
+        must be exactly what ``get_streaming_init_states`` builds — the slot
+        runtime gathers into that list — and zero must be the initial value,
+        because zero is what a slot cache resets a slot to."""
+        enc = self._model().encoder
+        specs = enc.slot_state_specs
+        init = enc.get_streaming_init_states(3)
+        assert len(specs) == len(init) == 1 + 6 * 2 + 1
+        assert specs[0].name == "embed" and specs[-1].name == "processed_lens"
+        for spec, t in zip(specs, init):
+            assert tuple(spec.buffer_shape(3)) == tuple(t.shape), spec.name
+            assert (spec.dtype or torch.float32) == t.dtype, spec.name
+            assert not torch.any(t != 0), spec.name
+        assert init[-1].dtype == torch.int32
+
+    def test_the_left_context_is_masked_until_it_holds_audio(self):
+        """icefall masks the part of the cache that is still initial zeros; the
+        counter that drives it advances by the embed frames of every chunk."""
+        if not torch.cuda.is_available():
+            pytest.skip("the streaming forward runs OASR kernels")
+        model = self._model(chunk=16, left=32).half().cuda()
+        enc = model.encoder
+        states = enc.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
+        w = enc.streaming_window_frames
+        seen = []
+        with torch.no_grad():
+            for _ in range(3):
+                x = torch.randn(1, w, 80, device="cuda", dtype=torch.float16)
+                _, _, states = enc.streaming_forward(
+                    x, torch.tensor([w], dtype=torch.int32, device="cuda"), states
+                )
+                seen.append(int(states[-1][0]))
+        assert seen == [16, 32, 48]
+
+    def test_a_causal_checkpoint_is_detected_from_its_conv_modules(self, tmp_path):
+        """icefall's causal release uses ``ChunkCausalDepthwiseConv1d``
+        (``causal_conv`` + ``chunkwise_conv`` + ``chunkwise_conv_scale``) where a
+        non-causal one has ``depthwise_conv.weight``; the converter reads which,
+        and gives a causal release the decode geometry it was published at.
+
+        The state dicts come from icefall's own modules, not this port's — the
+        port stores depthwise weights transposed, so only icefall's layout is a
+        checkpoint."""
+        from oasr.models.zipformer.convert import (
+            _CAUSAL_CHUNK_SIZE,
+            _CAUSAL_LEFT_CONTEXT,
+            infer_encoder_config,
+        )
+
+        ref_zip, ref_sub = _load_reference(tmp_path)
+
+        def icefall_sd(enc_cfg):
+            embed, zip_enc = _build_reference(ref_zip, ref_sub, enc_cfg)
+            sd = {"encoder." + k: v for k, v in zip_enc.state_dict().items()}
+            sd.update({"encoder_embed." + k: v for k, v in embed.state_dict().items()})
+            return sd
+
+        causal = infer_encoder_config(
+            icefall_sd(
+                _tiny_encoder_config(causal=True, chunk_size=(16,), left_context_frames=(32,))
+            )
+        )
+        assert causal.causal is True
+        assert causal.chunk_size == (_CAUSAL_CHUNK_SIZE,)
+        assert causal.left_context_frames == (_CAUSAL_LEFT_CONTEXT,)
+        assert causal.cnn_module_kernel == (15, 15)
+        plain = infer_encoder_config(icefall_sd(_tiny_encoder_config()))
+        assert plain.causal is False and plain.cnn_module_kernel == (15, 15)
+
+
 class TestZipformerParity:
     """Parity vs the fp32 icefall reference.
 
@@ -400,7 +511,16 @@ class TestZipformerParity:
             # reference one-chunk streaming
             xe, xle, _ = ref_embed.streaming_forward(x, xl, ref_embed_state)
             xe_t = xe.permute(1, 0, 2)
-            spm = torch.zeros(B, L + xe_t.size(0), dtype=torch.bool)
+            # icefall's streaming mask for a stream's first chunk: the left
+            # context is all initial zeros, so all of it is masked
+            # (``processed_mask`` in icefall's streaming_decode.py).
+            spm = torch.cat(
+                [
+                    torch.ones(B, L, dtype=torch.bool),
+                    torch.zeros(B, xe_t.size(0), dtype=torch.bool),
+                ],
+                dim=1,
+            )
             ref_out, ref_lens, _ = ref_enc.streaming_forward(xe_t, xle, ref_enc_states, spm)
             ref_out = ref_out.permute(1, 0, 2)
 
@@ -515,8 +635,8 @@ class TestRealIcefallCheckpoint:
         assert len(report.mapped) > 500, "suspiciously few tensors mapped"
         assert sorted(model.capabilities) == ["ctc"]
         # This release is `cr-ctc`, i.e. non-causal, so it is offline-only and
-        # must say so; a causal release would report "stateful" here.
-        expect = "stateful" if model.encoder.config.causal else "none"
+        # must say so; a causal release would report "slot" here.
+        expect = "slot" if model.encoder.config.causal else "none"
         assert model.encoder.streaming_kind == expect
 
     def test_feature_spec_uses_icefall_audio_scale(self, bundle):
@@ -677,3 +797,91 @@ class TestRealIcefallCheckpoint:
             with pytest.raises((ValueError, RuntimeError)) as ei:
                 self._engine("streaming")
             assert "stream" in str(ei.value).lower(), ei.value
+
+
+# --------------------------------------------------------------------------- #
+# A real causal (streaming) release, against icefall's own streaming forward
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.requires_assets("STREAMING_ZIPFORMER_CKPT", "WAV_DIR")
+class TestCausalRelease:
+    """The one checkpoint that exercises streaming Zipformer on real weights.
+
+    The oracle is the release's TorchScript streaming export
+    (``exp/jit_script_chunk_16_left_128.pt``): icefall's own streaming encoder,
+    left-context mask and all.  Both sides get the same features and the same
+    windows, built as icefall's ``streaming_decode.py`` builds them, so what is
+    compared is the streaming forward itself, chunk by chunk.
+
+    Before this existed the port matched icefall only on a stream's first chunk
+    with an unmasked cache — which is not what icefall runs — and the engine fed
+    it windows two-thirds the trained size; the encoder output was 17-91% off on
+    a stream's first chunks and the published streaming WER unreachable.
+    """
+
+    LOG_EPS = -23.025850929940457  # icefall's log(1e-10)
+
+    def _feats(self, bundle, path):
+        import soundfile as sf
+
+        from oasr.features import build_extractor
+
+        fcfg = bundle.feature_spec.to_feature_config()
+        wav, _sr = sf.read(path, dtype="float32")
+        w = torch.from_numpy(wav).cuda().unsqueeze(0) * float(bundle.feature_spec.audio_scale)
+        f, n = build_extractor(fcfg)(w, torch.tensor([w.size(1)], device="cuda"), fcfg)
+        return f[0, : int(n[0])].float()
+
+    def _windows(self, feats, window, stride):
+        padded = torch.nn.functional.pad(feats, (0, 0, 0, 13 + 30), value=self.LOG_EPS)
+        out = []
+        for start in range(0, padded.size(0), stride):
+            c = padded[start : start + window]
+            out.append(
+                torch.nn.functional.pad(c, (0, 0, 0, window - c.size(0)), value=self.LOG_EPS)
+            )
+        return out
+
+    def test_streaming_matches_icefalls_exported_streaming_encoder(self):
+        import os
+
+        from oasr.models.loaders import load_pretrained
+
+        if not torch.cuda.is_available():
+            pytest.skip("the port's streaming forward runs OASR kernels")
+        ckpt = assets.require("STREAMING_ZIPFORMER_CKPT")
+        wav_dir = assets.require("WAV_DIR")
+        bundle = load_pretrained(
+            ckpt, architecture="transducer", device="cuda", dtype=torch.float16
+        )
+        enc = bundle.model.encoder.eval()
+        assert enc.config.causal and enc.streaming_kind == "slot"
+        jit = torch.jit.load(
+            os.path.join(ckpt, "exp", "jit_script_chunk_16_left_128.pt"), map_location="cuda"
+        ).eval()
+        window, stride = enc.streaming_window_frames, enc.streaming_chunk_frames
+        assert (window, stride) == (
+            int(jit.encoder.chunk_size) * 2 + int(jit.encoder.pad_length),
+            32,
+        )
+
+        worst = 0.0
+        for name in sorted(os.listdir(wav_dir))[:2]:
+            feats = self._feats(bundle, os.path.join(wav_dir, name))
+            ours = enc.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
+            theirs = jit.encoder.get_init_states(1, torch.device("cuda"))
+            with torch.no_grad():
+                for c in self._windows(feats, window, stride):
+                    ref, _, theirs = jit.encoder(
+                        c.unsqueeze(0), torch.tensor([window], device="cuda"), theirs
+                    )
+                    got, _, ours = enc.streaming_forward(
+                        c.half().unsqueeze(0),
+                        torch.tensor([window], dtype=torch.int32, device="cuda"),
+                        ours,
+                    )
+                    rel = ((got.float() - ref).abs().max() / ref.abs().max()).item()
+                    worst = max(worst, rel)
+        # fp16 against fp32 measures ~3e-3; the defects this pins were 0.17-0.91.
+        assert worst < 1e-2, worst

@@ -357,3 +357,58 @@ class TestEngineRescoringE2E:
         for t in texts:
             text = t.text if hasattr(t, "text") else t
             assert isinstance(text, str) and len(text) > 0
+
+
+class TestHypothesisPadding:
+    """``_pad_hypotheses`` cuts the padded hypotheses out of the beam's device output.
+
+    The host-built form it replaced issued one pageable host-to-device copy per
+    hypothesis — each a stream drain.  What must hold is that the device form is
+    the *same tensor*: every position a row's length covers comes from the beam,
+    every other one is ``_IGNORE_ID``, whatever the beam buffer holds past the
+    length (it is stale there — the double buffer's previous step).
+    """
+
+    @staticmethod
+    def _reference(hyps, width):
+        ref = torch.full((len(hyps), width), -1, dtype=torch.long)
+        for i, h in enumerate(hyps):
+            if h:
+                ref[i, : len(h)] = torch.tensor(h, dtype=torch.long)
+        return ref
+
+    @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)])
+    def test_device_padding_equals_the_host_reference(self, device):
+        from types import SimpleNamespace
+
+        from oasr.engine.decode.rescoring import CtcAedRescoringStrategy
+
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("CUDA unavailable")
+        gen = torch.Generator().manual_seed(3)
+        B, beam_full, beam, seq = 3, 5, 4, 12
+        # Stale garbage everywhere, including past each row's length.
+        token_ids = torch.randint(1, 50, (B, beam_full, seq), generator=gen, dtype=torch.int32)
+        lengths = torch.randint(0, 9, (B, beam_full), generator=gen, dtype=torch.int32)
+        lengths[1, 2] = 0  # an empty hypothesis
+        hyps = [
+            token_ids[b, k, : int(lengths[b, k])].tolist() for b in range(B) for k in range(beam)
+        ]
+        width = max(1, max(len(h) for h in hyps))
+        result = SimpleNamespace(token_ids=token_ids.to(device))
+
+        got = CtcAedRescoringStrategy._pad_hypotheses(
+            result, hyps, beam, width, torch.device(device)
+        )
+        assert torch.equal(got.cpu(), self._reference(hyps, width))
+
+    def test_without_device_tokens_it_builds_the_same_tensor_on_the_host(self):
+        from types import SimpleNamespace
+
+        from oasr.engine.decode.rescoring import CtcAedRescoringStrategy
+
+        hyps = [[5, 6, 7], [], [8]]
+        got = CtcAedRescoringStrategy._pad_hypotheses(
+            SimpleNamespace(token_ids=None), hyps, 1, 3, torch.device("cpu")
+        )
+        assert torch.equal(got, self._reference(hyps, 3))

@@ -8,8 +8,11 @@ It is the seam that lets different encoder streaming models share one engine:
 
 * ``"paged"`` (:class:`~oasr.engine.streaming_backend.paged.PagedStreamingBackend`)
   — Conformer-style paged-KV + slot-CNN cache, CUDA-graph captured.
+* ``"slot"`` (:class:`~oasr.engine.streaming_backend.slot.SlotStreamingBackend`)
+  — fixed-extent per-stream state the encoder declares (Zipformer's icefall
+  caches) in an engine-owned slot cache, CUDA-graph captured.
 * ``"stateful"`` (:class:`~oasr.engine.streaming_backend.stateful.StatefulStreamingBackend`)
-  — Zipformer-style per-layer recurrent state.
+  — per-request state lists threaded through the encoder's own list API.
 
 The engine (via :class:`~oasr.engine.model_runner.ModelRunner`) selects a backend
 from ``model.encoder.streaming_kind`` and drives it through ``allocate`` /

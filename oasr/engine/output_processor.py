@@ -14,7 +14,7 @@ per-request decode state.  Add a decode family by registering a new
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 
@@ -77,11 +77,28 @@ class OutputProcessor:
         ``vad_events``); it is dropped when nothing in the micro-batch asked, so
         the default path hands the strategy exactly what it used to get.
         """
+        return self._strategy.decode_offline(log_probs, lengths, self._asking(requests))
+
+    def decode_offline_async(
+        self,
+        log_probs: torch.Tensor,
+        lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
+    ) -> Optional[Callable[[], List[RequestOutput]]]:
+        """:meth:`decode_offline`, queued; ``None`` when the family decodes synchronously.
+
+        See :meth:`~oasr.engine.decode.base.DecodeStrategy.decode_offline_async`.
+        """
+        return self._strategy.decode_offline_async(log_probs, lengths, self._asking(requests))
+
+    @staticmethod
+    def _asking(requests: Optional[List[Request]]) -> Optional[List[Request]]:
+        """``requests``, or ``None`` when no row asked for anything per-request."""
         if requests is not None and not any(
             wants_word_timings(req) or wants_speech_activity(req) for req in requests
         ):
-            requests = None
-        return self._strategy.decode_offline(log_probs, lengths, requests)
+            return None
+        return requests
 
     # ------------------------------------------------------------------
     # Streaming session lifecycle
@@ -112,6 +129,10 @@ class OutputProcessor:
     def finalize_streaming(self, request: Request) -> RequestOutput:
         """Finalize streaming decoding and return the complete transcript."""
         return self._strategy.finalize(request)
+
+    def finalize_streaming_batch(self, requests: List[Request]) -> List[RequestOutput]:
+        """:meth:`finalize_streaming` for every stream ending this tick, in order."""
+        return self._strategy.finalize_batch(requests)
 
     # ------------------------------------------------------------------
     # Detokenization (kept on the facade for callers/tests)

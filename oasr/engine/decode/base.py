@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     ClassVar,
     Dict,
     List,
@@ -537,6 +538,24 @@ class DecodeStrategy(ABC):
         """
         raise NotImplementedError
 
+    def decode_offline_async(
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
+    ) -> Optional[Callable[[], List[RequestOutput]]]:
+        """Queue :meth:`decode_offline` and return the call that completes it.
+
+        The returned callable produces exactly what :meth:`decode_offline` would
+        have, but everything up to its device→host read-back is issued now, so
+        the offline executor can queue the next micro-batch's forward before it
+        waits — the host tail of one batch then runs behind the GPU work of the
+        next.  ``None`` (the default) means this family decodes synchronously
+        for these arguments, and the executor calls :meth:`decode_offline`.
+        """
+        del enc_out, enc_lengths, requests
+        return None
+
     # -- incremental offline protocol (``incremental = True`` strategies) ---
     def begin_offline(
         self,
@@ -582,6 +601,19 @@ class DecodeStrategy(ABC):
         """Release per-request decode state on finalize/abort.  Default: no-op."""
         return None
 
+    def prewarm_streaming(self, batch_sizes: Sequence[int], frames: int) -> None:
+        """Capture this family's per-width decode graphs ahead of traffic.
+
+        Called once at engine construction in streaming mode, with the batch
+        widths the encoder graphs were pre-warmed at and the encoder frames one
+        chunk yields.  The reason is the same as the encoder pre-warm's: a
+        capture on a live tick stalls every stream in it, and the active width
+        walks ``1..max_batch_size`` as streams join and finish.  Default: nothing
+        to capture.
+        """
+        del batch_sizes, frames
+        return None
+
     # -- streaming decode --------------------------------------------------
     @abstractmethod
     def decode_streaming_batch(
@@ -599,6 +631,15 @@ class DecodeStrategy(ABC):
     def finalize(self, request: Request) -> RequestOutput:
         """Finalize a stream and return its complete transcript."""
         raise NotImplementedError
+
+    def finalize_batch(self, requests: List[Request]) -> List[RequestOutput]:
+        """:meth:`finalize` for every stream that ends in one tick, in order.
+
+        The default is exactly that loop.  A family whose final hypothesis
+        lives on the device overrides it to read all of them back at once — the
+        per-stream read-back is a synchronisation per stream otherwise.
+        """
+        return [self.finalize(r) for r in requests]
 
 
 def wants_speech_activity(request: Optional[Request]) -> bool:

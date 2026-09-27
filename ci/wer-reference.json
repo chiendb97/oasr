@@ -43,6 +43,16 @@
       "insertions": 10
     },
     {
+      "_comment": [
+        "Re-recorded 2026-09-27 at 3.67 (was 3.73, 104S 10D 13I): the decoder's",
+        "cross-attention K/V is now paged next to its self-attention by default",
+        "(kv_storage='auto' pages an AED, whose steps are then graph-captured), and",
+        "a paged read goes through the fused attention kernel where the dense",
+        "tensors went through SDPA. Attributed, not assumed: kv_storage='dense'",
+        "still measures 3.73 with the recorded counts exactly, and paged with",
+        "step_graphs=0 measures the same 3.67 as with graphs, so the capture is",
+        "exact and the two errors are the kernel's rounding."
+      ],
       "key": "whisper",
       "asset": "WHISPER_CKPT",
       "architecture": "whisper-tiny (aed)",
@@ -51,11 +61,11 @@
       "max_batch_size": 16,
       "metric": "wer",
       "normalizer": "english",
-      "error_rate_pct": 3.73,
+      "error_rate_pct": 3.67,
       "ref_units": 3403,
-      "substitutions": 104,
+      "substitutions": 103,
       "deletions": 10,
-      "insertions": 13
+      "insertions": 12
     },
     {
       "_comment": [
@@ -155,6 +165,48 @@
       "substitutions": 64,
       "deletions": 31,
       "insertions": 15
+    },
+    {
+      "_comment": [
+        "Recorded 2026-09-27: the first streaming Zipformer row. icefall's causal",
+        "zipformer/2023-05-17 release (Zipformer2 + stateless predictor + joiner),",
+        "streamed at the chunk 16 / left context 128 it is published at, on the",
+        "engine's slot runtime with CUDA graphs. Upstream reports 3.06 / 7.78",
+        "chunk-wise streaming greedy on LibriSpeech test-clean/test-other.",
+        "",
+        "Recorded with the padding lane on (the default whenever steps are",
+        "graphed: a cohort runs at the next power-of-two width). Unpadded — exact",
+        "widths, or the stateful runtime — measures 5.23 (73S 93D 12I): one",
+        "transcript of 200 differs, a batched-GEMM M change on a padded tick.",
+        "",
+        "The reference is icefall itself, not this number: the release's own",
+        "TorchScript streaming export, decoded with streaming_decode.py's recipe",
+        "on the same features, scores 5.26 (74S 93D 12I) here. Offline (full",
+        "context) the same weights score 3.20 (65S 35D 9I). The 58 extra deletions",
+        "are first words: LJSpeech clips start without leading silence and a",
+        "streaming model with no left context misses them — icefall's decode",
+        "drops the same ones (LJ001-0006 'and', LJ001-0024 'but').",
+        "",
+        "Before this row the streaming path had never met real causal weights: it",
+        "fed windows of 2*chunk frames instead of 2*chunk + 13 and never masked the",
+        "left-context cache, and short tails crashed the embed. Pinned structurally",
+        "by tests/models/arch/test_zipformer.py::TestCausalRelease."
+      ],
+      "key": "zipformer_streaming",
+      "asset": "STREAMING_ZIPFORMER_CKPT",
+      "load_architecture": "transducer",
+      "architecture": "zipformer-transducer, causal (icefall pruned RNN-T, streaming)",
+      "decode_method": null,
+      "service_mode": "streaming",
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "error_rate_pct": 5.2,
+      "ref_units": 3403,
+      "substitutions": 72,
+      "deletions": 93,
+      "insertions": 12
     },
     {
       "_comment": [

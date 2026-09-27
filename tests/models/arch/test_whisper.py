@@ -339,8 +339,11 @@ class TestDecoderMerge:
     @pytest.mark.cuda
     @pytest.mark.parametrize("block_tokens", [8, 16, 64])
     def test_paged_storage_matches_dense(self, block_tokens):
-        """Paging the self-attention KV must not change a single logit.
+        """Paging the decoder KV must not change a single logit.
 
+        Both halves are paged: the self-attention, and the cross-attention over
+        the encoder window (a 50-frame window here, so its last page is partial
+        at every page size tested — the extent a row's ``kv_lens`` must bound).
         On CUDA in a **served** dtype, because that is the only way the paged
         attention kernel is reached at all: fp32 and CPU route to SDPA, where a
         launcher precondition — the block table's width against the kernel's K
@@ -377,6 +380,8 @@ class TestDecoderMerge:
         def run(manager):
             with torch.no_grad():
                 logits, state = dec.prefill(enc, prompt, capacity=cap, kv_manager=manager)
+                if manager is not None:
+                    assert set(state) == {"kv", "cross"}, "the cross-attention was not paged"
                 out = [logits.float().cpu()]
                 for t in range(steps):
                     logits, state = dec.step(feed[:, t], state)
@@ -387,8 +392,8 @@ class TestDecoderMerge:
             torch.testing.assert_close(dense, paged, atol=0, rtol=0)
 
     def test_a_different_encoder_window_declares_itself_unmergeable(self):
-        """Whisper reads cross-attention unmasked over the whole window, so two
-        groups whose windows differ cannot share a forward."""
+        """Dense, Whisper reads cross-attention unmasked over the whole window, so
+        two groups whose windows differ cannot share a forward."""
         cfg = _tiny_config()
         torch.manual_seed(15)
         model = WhisperModel(cfg).eval()
@@ -401,6 +406,176 @@ class TestDecoderMerge:
                 torch.randn(1, cfg.max_source_positions // 2, cfg.d_model), prompt, capacity=24
             )
         assert not model.decoder.can_merge(wide, narrow)
+
+    @staticmethod
+    def _cpu_pool(cfg, blocks=64, block_tokens=8):
+        from oasr.cache.decoder_kv import DecoderKVCacheManager
+
+        return DecoderKVCacheManager(
+            DecoderKVCacheManager.build_pool(
+                num_layers=cfg.decoder_layers,
+                n_kv_head=cfg.decoder_attention_heads,
+                head_dim=cfg.d_model // cfg.decoder_attention_heads,
+                block_tokens=block_tokens,
+                max_num_blocks=blocks,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        )
+
+    def test_paged_windows_of_different_widths_merge_and_stay_exact(self):
+        """Paged, each row's window is its own ``kv_lens`` entry, so the width
+        condition dense storage needs does not exist — and the merged forward
+        must still give each row exactly what it got on its own."""
+        cfg = _tiny_config()
+        torch.manual_seed(17)
+        model = WhisperModel(cfg).eval()
+        dec = model.decoder
+        mgr = self._cpu_pool(cfg)
+        prompt = torch.randint(3, 59, (2, 3))
+        feed = torch.randint(3, 59, (2, 4))
+        wide_enc = torch.randn(1, cfg.max_source_positions, cfg.d_model)
+        narrow_enc = torch.randn(1, cfg.max_source_positions // 2 + 3, cfg.d_model)
+
+        def solo(enc, row):
+            with torch.no_grad():
+                _, st = dec.prefill(enc, prompt[[row]], capacity=24, kv_manager=mgr)
+                out = []
+                for t in range(4):
+                    logits, st = dec.step(feed[[row], t], st)
+                    out.append(logits)
+            st["kv"].free()
+            st["cross"].free()
+            return torch.cat(out)
+
+        want = [solo(wide_enc, 0), solo(narrow_enc, 1)]
+        free0 = mgr.pool.num_free_blocks
+        with torch.no_grad():
+            _, a = dec.prefill(wide_enc, prompt[[0]], capacity=24, kv_manager=mgr)
+            _, b = dec.prefill(narrow_enc, prompt[[1]], capacity=24, kv_manager=mgr)
+            assert dec.can_merge(a, b)
+            state = dec.merge(a, b)
+            assert state["cross"].lens_host == [wide_enc.size(1), narrow_enc.size(1)]
+            got = []
+            for t in range(4):
+                logits, state = dec.step(feed[:, t], state)
+                got.append(logits)
+        for row in (0, 1):
+            torch.testing.assert_close(
+                torch.stack([g[row] for g in got]), want[row], atol=1e-5, rtol=1e-4
+            )
+        state["kv"].free()
+        state["cross"].free()
+        assert mgr.pool.num_free_blocks == free0 and mgr.num_active() == 0
+
+    def test_a_refused_cross_window_leaks_no_self_attention_pages(self):
+        """The two halves are reserved separately; a pool that can hold a row's
+        self-attention but not its cross-attention window must refuse the batch
+        whole, with nothing left mapped."""
+        from oasr.cache.decoder_kv import DecoderKvExhausted
+
+        cfg = _tiny_config()
+        model = WhisperModel(cfg).eval()
+        # 3 pages of 8 tokens: enough for a 24-position self-attention ceiling,
+        # not also for a 50-frame window (7 pages).
+        mgr = self._cpu_pool(cfg, blocks=3)
+        enc = torch.randn(1, cfg.max_source_positions, cfg.d_model)
+        prompt = torch.randint(3, 59, (1, 3))
+        with torch.no_grad(), pytest.raises(DecoderKvExhausted):
+            model.decoder.prefill(enc, prompt, capacity=24, kv_manager=mgr)
+        assert mgr.pool.num_free_blocks == 3 and mgr.num_active() == 0
+
+
+@pytest.mark.cuda
+class TestWhisperStepGraphs:
+    """A captured Whisper step reads both paged halves through static buffers.
+
+    What must hold is the graph cache's contract, now with a side cache in the
+    state: replay is **bit-identical** to the eager paged step it replaces
+    (rule 11 — the same kernels, since routing is a function of shapes), and a
+    state still carrying dense cross-attention K/V is refused rather than
+    captured with a pointer into one batch's tensors.
+    """
+
+    @staticmethod
+    def _setup(rows=3):
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        from oasr.cache.decoder_kv import DecoderKVCacheManager
+
+        cfg = _tiny_config(d_model=128, decoder_attention_heads=2, max_target_positions=64)
+        torch.manual_seed(31)
+        model = WhisperModel(cfg).eval().cuda().to(torch.float16)
+        mgr = DecoderKVCacheManager(
+            DecoderKVCacheManager.build_pool(
+                num_layers=cfg.decoder_layers,
+                n_kv_head=cfg.decoder_attention_heads,
+                head_dim=cfg.d_model // cfg.decoder_attention_heads,
+                block_tokens=16,
+                max_num_blocks=128,
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+            )
+        )
+        enc = torch.randn(
+            rows, cfg.max_source_positions, cfg.d_model, device="cuda", dtype=torch.float16
+        )
+        prompt = torch.randint(3, 59, (rows, 3), device="cuda")
+        feed = torch.randint(3, 59, (rows, 20), device="cuda")
+        return model.decoder, mgr, enc, prompt, feed
+
+    def _roll(self, dec, mgr, enc, prompt, feed, graphs=None):
+        out = []
+        with torch.no_grad():
+            _, state = dec.prefill(enc, prompt, capacity=40, kv_manager=mgr)
+            for t in range(feed.size(1)):
+                if graphs is None:
+                    logits, state = dec.step(feed[:, t], state)
+                else:
+                    logits = graphs.step(feed[:, t], state)
+                    assert logits is not None, "the paged Whisper step was not captured"
+                    state["kv"].commit(1)
+                out.append(logits.float().cpu())
+        state["kv"].free()
+        state["cross"].free()
+        return out
+
+    def test_replay_is_bit_identical_to_the_eager_paged_step(self):
+        """20 steps cross a 16-token page, so the self-attention table grows
+        mid-run while the cross table stays put — both refilled every replay."""
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        dec, mgr, enc, prompt, feed = self._setup()
+        eager = self._roll(dec, mgr, enc, prompt, feed)
+        graphs = DecoderStepGraphCache(dec, mgr, width_pages=1)
+        replayed = self._roll(dec, mgr, enc, prompt, feed, graphs)
+        for want, got in zip(eager, replayed):
+            assert torch.equal(want, got)
+        # 3 prompt tokens + 20 steps: the table is one page until position 16,
+        # then two.
+        widths = sorted(key[1] for key in graphs._captured)  # noqa: SLF001
+        assert widths == [1, 2], "the self-attention table's page growth was not keyed"
+        assert {key[2] for key in graphs._captured} == {
+            4
+        }  # 50 frames / 16 = 4 pages  # noqa: SLF001
+
+    def test_a_dense_cross_attention_state_is_refused(self):
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        dec, mgr, enc, prompt, feed = self._setup(rows=1)
+        graphs = DecoderStepGraphCache(dec, mgr)
+        with torch.no_grad():
+            _, paged = dec.prefill(enc, prompt, capacity=40, kv_manager=mgr)
+            _, dense = dec.prefill(enc, prompt, capacity=40)
+        assert graphs.capturable(paged)
+        assert not graphs.capturable(dense)
+        # The self-attention half alone is paged here, but the step would still
+        # read the dense cross K/V, so the whole state is what is refused.
+        mixed = {"kv": paged["kv"], "cross_k": dense["cross_k"], "cross_v": dense["cross_v"]}
+        assert not graphs.capturable(mixed)
+        assert graphs.step(feed[:, 0], mixed) is None
+        paged["kv"].free()
+        paged["cross"].free()
 
 
 # ---------------------------------------------------------------------------
@@ -580,28 +755,54 @@ class TestTaskAndLanguagePrompt:
         assert self._paged_strategy().kv_manager() is not None
         assert beam.kv_manager() is None
 
-    def test_kv_storage_auto_keeps_an_aed_dense(self):
-        """``auto`` pages for the sake of step graphs, and an AED has none.
+    def test_kv_storage_auto_pages_an_aed_for_its_step_graphs(self):
+        """``auto`` pages for the sake of step graphs, and an AED now has them.
 
         Paging on its own is a cost, not a win: the block-table indirection is
         3-9% and, while admission reserves each row's ceiling, it saves no VRAM.
-        What pays for it is capturing the step, which a Whisper decoder cannot —
-        its cross-attention K/V is allocated per prefill, so
-        ``supports_step_graphs`` is False and ``auto`` must land on dense.  A
-        family that resolved to paged anyway would pay the indirection for
-        nothing.
+        What pays for it is capturing the step — and a Whisper step captures
+        once its cross-attention K/V is paged next to the self-attention, since
+        nothing it reads is then at a per-batch address.  So the declaration is
+        on, and ``auto`` pages a CUDA decoder; off the device there is no graph
+        to capture, and with ``step_graphs=0`` nothing pays for the paging.
         """
         strat = self._strategy()
         assert strat.options.kv_storage == "auto"
         # The declaration is the reason, so assert it rather than only the
-        # outcome: on CPU `auto` would land on dense anyway, and a test that
-        # cannot tell the two apart would keep passing if the declaration flipped.
-        assert not strat._decoder().supports_step_graphs
-        assert strat._resolve_storage(strat._decoder()) == "dense"
-        assert strat.kv_manager() is None
-        forced = self._strategy()
-        forced.options = replace(forced.options, step_graphs=True)
-        assert forced._resolve_storage(forced._decoder()) == "dense"
+        # outcome: on CPU `auto` lands on dense regardless of it.
+        assert strat._decoder().supports_step_graphs
+        assert strat._resolve_storage(strat._decoder()) == "dense"  # CPU
+        if torch.cuda.is_available():
+            strat._model.cuda()
+            assert strat._resolve_storage(strat._decoder()) == "paged"
+            eager = self._strategy()
+            eager._model.cuda()
+            eager.options = replace(eager.options, step_graphs=False)
+            assert eager._resolve_storage(eager._decoder()) == "dense"
+
+    def test_a_row_budget_counts_its_cross_attention_window(self):
+        """An AED row's footprint is its self-attention ceiling *plus* the
+        cross-attention K/V over the whole encoder window — per row, dense or
+        paged — and the pool is sized in the pages admission reserves.
+
+        Counting the self-attention alone (what this used to do) admits rows by
+        a fraction of their real size: at large-v3 the cross half is ~245 MB of
+        a ~320 MB row.
+        """
+        strat = self._paged_strategy()
+        cfg = strat._mcfg
+        spec = strat._model.decoder_cache_spec
+        assert spec.cross_attention_len == cfg.max_source_positions
+        itemsize = torch.empty((), dtype=strat._config.dtype).element_size()
+        per_token = 2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize
+        assert strat.kv_bytes_per_row() == per_token * (
+            strat._position_budget() + cfg.max_source_positions
+        )
+        mgr = strat.kv_manager()
+        bt = int(strat.options.kv_block_tokens)
+        rows = int(strat._config.max_decode_slots or strat._config.max_batch_size)
+        pages = -(-strat._position_budget() // bt) + -(-cfg.max_source_positions // bt)
+        assert mgr.pool.num_blocks == rows * pages
 
     def test_finished_rows_hand_their_pages_back(self):
         """Every page a batch took must be free again once it finishes — the

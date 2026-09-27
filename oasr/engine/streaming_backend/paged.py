@@ -13,7 +13,7 @@ seam so other encoder streaming models can plug in alongside it.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -33,7 +33,6 @@ from ..graph_cache import (
     GraphedEncoderForward,
     cache_bucket_ladder,
     pick_cache_bucket,
-    round_up_bucket,
 )
 from ..request import Request
 from .base import StreamingEncoderBackend, register_streaming_backend
@@ -119,13 +118,30 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # slot-addressed cache over the convolutional left-context plus whatever
         # else the encoder declared (``CacheSpec.stream_states``) — one buffer per
         # declaration, one ``slot_ids`` index for all of them.
-        self._block_pool = BlockPool(cache_config)
-        self._att_mgr = AttentionCacheManager(self._block_pool, cache_config)
+        # The padding lane (see ``_forward_batched_paged``): one slot row and one
+        # scratch block no stream is ever given, so a cohort can be padded up to
+        # a captured width without a padding row touching a stream's state.
+        self._use_cuda_graphs = (
+            config.use_cuda_graphs and torch.device(config.device).type == "cuda"
+        )
+        pad = getattr(config, "streaming_graph_pad_batch", None)
+        if pad is None:
+            # Auto: only where it buys graph coverage.  A prefilled window has one
+            # cache length, so its shapes are only the widths themselves; see
+            # ``EngineConfig.streaming_graph_pad_batch``.
+            pad = self._use_cuda_graphs and not cache_config.prefill_kv_window
+        self._pad_batch = bool(pad)
+        lanes = 1 if self._pad_batch else 0
+        self._block_pool = BlockPool(cache_config, scratch_blocks=lanes)
+        self._att_mgr = AttentionCacheManager(self._block_pool, cache_config, pad_lanes=lanes)
         self._state_mgr = SlotStateCache(
             [conv_state_spec(cache_config), *cache_config.stream_states],
-            max_batch_size=cache_config.max_batch_size,
+            max_batch_size=cache_config.max_batch_size + lanes,
             device=cache_config.device,
             dtype=cache_config.dtype,
+        )
+        self._batch_widths: List[int] = self._resolve_batch_widths(
+            config, int(cache_config.max_batch_size)
         )
         # Names beyond ``"conv"``: passed to the chunk forward as ``states=`` only
         # when non-empty, preserving the narrower call signature for encoders
@@ -169,9 +185,6 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # ``_chunk_forward`` the strategy routed to is what gets captured, so
         # hidden-mode families (transducer) get the same ~200-kernel-to-one
         # collapse the fused CTC path has always had.
-        self._use_cuda_graphs = (
-            config.use_cuda_graphs and torch.device(config.device).type == "cuda"
-        )
         if self._use_cuda_graphs:
             self._graph_cache: Optional[GraphedEncoderForward] = GraphedEncoderForward(
                 self._chunk_forward,
@@ -180,9 +193,46 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 device=torch.device(config.device),
                 pool=self._graph_pool,
                 extra_states=self._extra_states,
+                max_captures=int(getattr(config, "streaming_graph_max_shapes", 512)),
             )
         else:
             self._graph_cache = None
+
+    # ------------------------------------------------------------------
+    # Batch widths (the padding lane)
+    # ------------------------------------------------------------------
+
+    def _resolve_batch_widths(self, config: "EngineConfig", cap: int) -> List[int]:
+        """The cohort widths a forward runs at, ascending, ``cap`` always last.
+
+        With the padding lane a cohort runs at the smallest of these that holds
+        it, so these are exactly the widths the graph cache needs.  Without it,
+        every width ``1..cap`` is a width.
+        """
+        ladder = getattr(config, "streaming_graph_batch_ladder", None)
+        if ladder:
+            return sorted({int(b) for b in ladder if 1 <= int(b) <= cap} | {cap})
+        if not self._pad_batch:
+            return list(range(1, cap + 1))
+        widths, b = [], 1
+        while b < cap:
+            widths.append(b)
+            b *= 2
+        return widths + [cap]
+
+    @property
+    def graph_batch_widths(self) -> Sequence[int]:
+        """Every width a batched forward can run at — what the pre-warm covers."""
+        return tuple(self._batch_widths)
+
+    def _run_width(self, active: int) -> int:
+        """The width ``active`` streams are forwarded at."""
+        if not self._pad_batch:
+            return active
+        for w in self._batch_widths:
+            if w >= active:
+                return w
+        return active
 
     # ------------------------------------------------------------------
     # Window geometry / introspection
@@ -442,11 +492,22 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
         results: Dict[str, torch.Tensor] = {}
 
-        # Partition into batchable (full-window paged) and the partial/final
-        # fallback. Full-window streams go through the batched paged forward;
-        # partial/final windows run one-at-a-time through ``_forward_single``.
+        # Partition into batchable (full-window paged) and the sub-window
+        # fallback. Every full window goes through the batched paged forward —
+        # a stream's *final* one included — and only a final window shorter
+        # than ``window`` runs one-at-a-time through ``_forward_single``.
+        #
+        # The final full window used to be a fallback too, and for an encoder
+        # with a declared geometry that is every stream's last chunk: the
+        # finalize pad aligns the stream to the stride, so its last window is
+        # exactly ``window`` frames.  On Nemotron that sent one B=1 forward per
+        # stream down the serial path — 64 of them in a 64-stream backlog,
+        # ~400 ms of a 664 ms run — each waiting out the one before it.
         batchable: List[Request] = []
         fallback: List[Request] = []
+        #: Batched streams whose window is their last: consumed whole, the way
+        #: ``_forward_single`` consumes a final window, rather than by a stride.
+        final_ids: Set[str] = set()
 
         for req in requests:
             if not req.has_ready_encoder_chunk(window):
@@ -477,8 +538,10 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 and (req.audio_tail is None or req.audio_tail.numel() == 0)
                 and available <= window
             )
-            if not is_final_window and available >= window:
+            if available >= window:
                 batchable.append(req)
+                if is_final_window:
+                    final_ids.add(req.request_id)
             else:
                 fallback.append(req)
 
@@ -493,6 +556,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
                 context,
                 results,
                 detach=bool(fallback),
+                final_ids=final_ids,
             )
 
         for i, req in enumerate(fallback):
@@ -515,6 +579,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         context: int,
         results: Dict[str, torch.Tensor],
         detach: bool = False,
+        final_ids: Optional[Set[str]] = None,
     ) -> None:
         """Run one paged forward on ``B = len(group)`` stacked streams.
 
@@ -531,11 +596,23 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         """
         nvtx_push(f"batched_paged[B={len(group)}]")
         B_active = len(group)
+        # Padded up to a captured width with the padding lane: a row bound to a
+        # slot and a scratch block no stream owns, fed zeros from the lane's own
+        # (constant) position.  Every op in the encoder is row-local, so the
+        # padding rows compute garbage only for themselves, and the lane's writes
+        # land in its own conv row and scratch block.  Padding happens *before*
+        # the graph/eager branch, so a shape that falls back decodes exactly as
+        # one that replays.  Collapses the graph key's width axis from every
+        # width to the ladder: 576 -> 63 shapes at max_batch_size 64.
+        B_run = self._run_width(B_active)
+        n_pad = B_run - B_active
         stream_ids = [req.stream_id for req in group]
         slot_ids_host: List[int] = []
         for req in group:
             assert req.slot_id is not None, "all batched streams must have an allocated slot_id"
             slot_ids_host.append(req.slot_id)
+        if n_pad:
+            slot_ids_host.extend([self._att_mgr.pad_slots[0]] * n_pad)
         device = self._att_mgr.block_table.device
         slot_ids_device = to_device(slot_ids_host, dtype=torch.long, device=device)
 
@@ -556,17 +633,17 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         feature_chunks = [
             req.feature_buffer[req.feature_cursor : req.feature_cursor + window] for req in group
         ]
-        xs = torch.stack(feature_chunks, dim=0)  # (B, window, F)
+        if n_pad:
+            feature_chunks.extend([feature_chunks[0].new_zeros(feature_chunks[0].shape)] * n_pad)
+        xs = torch.stack(feature_chunks, dim=0)  # (B_run, window, F)
         states = self._state_mgr.views(slot_ids_device)
         cnn_cache = states[CONV_STATE]
 
         # 3. Per-stream encoder-frame offsets (always a tensor for the
-        #    graphed path; the eager fallback accepts the same tensor).
-        offsets_device = to_device(
-            [req.offset for req in group],
-            dtype=torch.int32,
-            device=device,
-        )
+        #    graphed path; the eager fallback accepts the same tensor).  The lane
+        #    sits at its own cache length, as an aged stream sits at its own.
+        offsets_host = [req.offset for req in group] + [self._att_mgr.pad_start] * n_pad
+        offsets_device = to_device(offsets_host, dtype=torch.int32, device=device)
 
         # 4. Encoder forward — graph replay for any captured (B, bucket)
         #    shape; eager fallback when the graph cache is saturated or
@@ -583,7 +660,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         out = None
         if self._use_cuda_graphs and self._graph_cache is not None:
             out = self._graph_cache.replay(
-                B_active,
+                B_run,
                 xs.size(1),
                 cache_t1_bucket,
                 xs=xs,
@@ -596,7 +673,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             # rewrite the rows we are about to hand out; ``detach`` says the
             # caller saw that risk.  See ``forward_step`` for when it applies.
             if out is not None and detach:
-                out = out.clone()
+                out = out[:B_active].clone()
         if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
@@ -604,6 +681,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             out = self._call_chunk_forward(
                 xs, offsets_device, batched_att_caches, cnn_cache, cache_t1, states
             )
+        out = out[:B_active]  # the padding rows are the lane's own; drop them
         actual_frames = out.size(1)
         nvtx_pop()
 
@@ -612,9 +690,16 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         #    encoder through ``cnn_cache.scatter()``.
         nvtx_push("commit")
         self._att_mgr.commit_chunks_paged_batched(stream_ids, actual_frames)  # type: ignore[arg-type]
+        finals = final_ids or ()
         for b, req in enumerate(group):
             req.offset += actual_frames
-            req.feature_cursor += stride
+            if req.request_id in finals:
+                # What ``_forward_single`` does with a final window: nothing of
+                # this stream is left to forward, so the drained check can
+                # finalize it this tick rather than after one more.
+                req.feature_cursor = req.feature_frames
+            else:
+                req.feature_cursor += stride
             results[req.request_id] = out[b : b + 1]
         nvtx_pop()
         nvtx_pop()  # batched_paged
@@ -687,8 +772,13 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         cnn_cache = states[CONV_STATE]
 
         cache_t1 = self._fixed_cache_t1 if self._fixed_cache_t1 is not None else req.offset
+        # The ladder, as in the batched path: it is what the pre-warm covered, and
+        # a flat 64-frame round is off the ladder past its knee, so a long stream
+        # reaching here would have captured a graph on a live tick.
         cache_t1_bucket = (
-            cache_t1 if self._fixed_cache_t1 is not None else round_up_bucket(req.offset)
+            cache_t1
+            if self._fixed_cache_t1 is not None
+            else pick_cache_bucket(req.offset, self._cache_ladder)
         )
         nvtx_push("single.encoder_call")
         out = None

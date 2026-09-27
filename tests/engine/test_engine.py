@@ -586,7 +586,7 @@ def test_batching_registries_and_builders():
     from oasr.engine.batching import build_batching_policy, build_partition_policy
     from oasr.engine.batching.base import _BATCHING, _PARTITION
 
-    assert set(_BATCHING) == {"fcfs", "bucket", "sjf"}
+    assert set(_BATCHING) == {"fcfs", "bucket", "sjf", "window"}
     assert set(_PARTITION) == {"count", "frames", "packing"}
 
     cfg = SimpleNamespace(
@@ -595,6 +595,8 @@ def test_batching_registries_and_builders():
         max_batch_frames=None,
     )
     assert type(build_batching_policy(cfg)).__name__ == "BucketPolicy"
+    cfg.schedule_policy = "window"
+    assert type(build_batching_policy(cfg)).__name__ == "WindowPolicy"
     assert type(build_partition_policy(cfg)).__name__ == "CountPartition"
 
     cfg.enable_sequence_packing = True

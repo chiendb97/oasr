@@ -56,7 +56,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["recover_from_failed_capture", "restore_rng_after_failed_capture"]
+__all__ = [
+    "capture_warmup_stream",
+    "recover_from_failed_capture",
+    "restore_rng_after_failed_capture",
+]
 
 
 def _release_pool(device: torch.device, pool: Any) -> bool:
@@ -123,3 +127,27 @@ def recover_from_failed_capture(device: torch.device, pool: Optional[Any] = None
         return True
     freed = _release_pool(device, pool)
     return restore_rng_after_failed_capture(device) and freed
+
+
+_WARMUP_STREAMS: dict = {}
+
+
+def capture_warmup_stream(device: torch.device) -> "torch.cuda.Stream":
+    """The one side stream every capture cache warms its shapes up on.
+
+    A cache that warms each capture on a fresh ``torch.cuda.Stream()`` gets up to
+    32 distinct pooled streams, and cuBLAS keeps a workspace for every stream it
+    has run on — tens of MiB each on this class of GPU, allocated through the
+    caching allocator and never returned.  Measured on the causal Zipformer's
+    32-width streaming pre-warm: ~1 GiB of workspaces from the transducer loop
+    graphs alone.  Warm-ups are serialised against the current stream on both
+    sides, so one stream per device serves every cache in the process.
+    """
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    stream = _WARMUP_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=index)
+        _WARMUP_STREAMS[index] = stream
+    return stream

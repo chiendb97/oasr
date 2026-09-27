@@ -247,7 +247,7 @@ extension cookbook for each axis.
 | `oasr/engine/scheduler.py` | Batch selection and partition, starvation bounds |
 | `oasr/engine/decode/` | Decode strategies (`ctc_gpu`, `ctc_wfst`, `transducer`, `aed`, `llm`, `paraformer`, `rescoring`) + `options.py` |
 | `oasr/engine/decode/{alignment,ctc_align,attention_align}.py` | Word timings: the shared frames→words half, and the two per-family aligners |
-| `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `StatefulStreamingBackend` |
+| `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `SlotStreamingBackend` (fixed-extent state the encoder declares, graph-captured), `StatefulStreamingBackend` |
 | `oasr/engine/graph_cache.py` | CUDA-graph capture of the steady-state streaming encoder |
 | `oasr/engine/offline_graph.py` | CUDA-graph capture of the offline forward, keyed `(B_bucket, T_bucket)` |
 | `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
@@ -342,6 +342,17 @@ extension cookbook for each axis.
 ### CUDA graphs & kernels
 - **Reusing a CUDA-graph replay buffer's output.** One buffer per shape key; a returned tensor
   is live only until the next replay *or capture*. Copy when a step can hit the same key twice.
+- **A tensor a CUDA graph reads, freed after capture.** A graph reads the *address* it was
+  captured with; an `arange` or fill value built as a local of the capture function is freed on
+  return and its address handed to the next allocation, so the replay reads garbage — a
+  device-side assert if lucky, wrong tokens if not. Keep every captured input on the captured
+  record (`greedy_graph._Captured`).
+- **Warming each capture up on a fresh `torch.cuda.Stream()`.** cuBLAS keeps a workspace per
+  stream it has run on and `torch.cuda.Stream()` hands out up to 32 pooled streams, so a
+  capture cache doing this strands tens of MiB per captured shape for the life of the process
+  (~1 GiB for 32 widths of transducer loop graphs). Warm up on
+  `capture_recovery.capture_warmup_stream(device)`; and when captures share a pool, capture
+  the widest shape first or no later capture can reuse what it freed.
 - **Retrying a capture that already failed.** Capture costs a warm-up forward before it records
   anything, then runs eager regardless — strictly worse than never trying. Remember the failed
   shape; treat an OOM as a fact about the process and stop capturing (`DecoderStepGraphCache`).
@@ -387,6 +398,14 @@ extension cookbook for each axis.
   the stream, so a 40-byte slot-id tensor costs whatever is queued behind it — one of these sat
   after the streaming encoder forward and the host waited out that forward every step. Use
   `oasr.utils.staging.to_device`; same for `.to(device, non_blocking=True)` from unpinned memory.
+  **`t[i, j] = 0` into a CUDA tensor is the same copy** — basic indexing as well as advanced —
+  and cost 41.6 ms behind queued GEMMs; write through `fill_` on a slice or a device scalar.
+- **A streaming window that omits the front-end's lookahead.** An encoder whose subsampling
+  contracts its input (Zipformer's embed: `(T - 7) // 2 - 3`) needs `window > stride` —
+  `streaming_window_frames` vs `streaming_chunk_frames`. Feeding `window == stride` still
+  produces a transcript: Zipformer then streamed 9-frame chunks for a trained 16, its
+  downsampled stacks padded by repeating frames into their caches, and short tails crashed
+  the embed. Only a real causal checkpoint and the upstream streaming export could show it.
 - **Reading a streaming frame index out of `select_seqs`.** It is a ring of width `max_seq_len`
   and a stream decodes past its token cap, so the value wraps. Use `device_frame_idx_ptr`;
   offline may read the ring, where step == frame.

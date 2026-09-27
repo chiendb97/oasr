@@ -25,20 +25,30 @@ class BlockPool:
     ``(block_size_frames, n_kv_head, head_dim)`` block.
     """
 
-    def __init__(self, config: CacheConfig) -> None:
+    def __init__(self, config: CacheConfig, scratch_blocks: int = 0) -> None:
+        """``scratch_blocks`` extra physical blocks that are never handed out.
+
+        They sit past ``max_num_blocks`` — addressable by a block table, absent
+        from the free list, rejected by :meth:`free` — so a padding row of a
+        captured streaming forward has somewhere to write its K/V that no stream
+        will ever read (see ``PagedStreamingBackend``'s padding lane).
+        """
         self._config = config
         self._lock = threading.Lock()
 
         cfg = config
         pool_shape = (
             cfg.num_layers,
-            cfg.max_num_blocks,
+            cfg.max_num_blocks + int(scratch_blocks),
             cfg.block_size_frames,
             cfg.n_kv_head,
             cfg.head_dim,
         )
         self._k_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
         self._v_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
+        self._scratch_ids: List[int] = list(
+            range(cfg.max_num_blocks, cfg.max_num_blocks + int(scratch_blocks))
+        )
 
         # Free list: all block IDs are initially free.
         self._free_list: collections.deque[int] = collections.deque(range(cfg.max_num_blocks))
@@ -65,8 +75,13 @@ class BlockPool:
 
     @property
     def num_total_blocks(self) -> int:
-        """Total number of physical blocks in the pool."""
+        """Total number of allocatable physical blocks in the pool."""
         return self._config.max_num_blocks
+
+    @property
+    def scratch_block_ids(self) -> List[int]:
+        """The never-allocated scratch blocks (see ``__init__``)."""
+        return list(self._scratch_ids)
 
     # ------------------------------------------------------------------
     # Allocation / free

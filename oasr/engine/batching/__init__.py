@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pluggable batching + partition policies for the ASR scheduler.
 
-Importing this package registers the built-in policies (fcfs / bucket / sjf and
-count / frames / packing) so the builders resolve them.  Add a new policy by
-subclassing :class:`BatchingPolicy` / :class:`PartitionPolicy` and decorating it
-with :func:`register_batching_policy` / :func:`register_partition_policy`.
+Importing this package registers the built-in policies (fcfs / bucket / sjf /
+window and count / frames / packing) so the builders resolve them.  Add a new
+policy by subclassing :class:`BatchingPolicy` / :class:`PartitionPolicy` and
+decorating it with :func:`register_batching_policy` /
+:func:`register_partition_policy`.
 """
 
 # Import for side effects: each module registers its policies on import.

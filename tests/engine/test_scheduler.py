@@ -663,3 +663,155 @@ class TestScheduler:
         output = sched.schedule()
         admitted_ids = [r.request_id for r in output.newly_admitted]
         assert admitted_ids == [r1.request_id, r2.request_id]
+
+
+# ---------------------------------------------------------------------------
+# Window policy: length-sorted batches from a bounded window of the oldest
+# ---------------------------------------------------------------------------
+
+
+def _window_scheduler(mb: int = 4, factor: int = 4, **kw) -> Scheduler:
+    cfg = _make_config(max_batch_size=mb, schedule_policy="window", **kw)
+    cfg.length_window_factor = factor
+    return Scheduler(cfg)
+
+
+def _padded(batch: List[Request]) -> int:
+    return max(r.num_frames for r in batch) * len(batch) - sum(r.num_frames for r in batch)
+
+
+class TestWindowPolicy:
+    """Batches are length-sorted, but only within the oldest ``cap * factor``
+    requests, and the oldest is always in the batch — so nothing starves and no
+    ``max_wait_time`` flush is needed to guarantee progress."""
+
+    def test_below_capacity_it_is_fifo(self):
+        sched = _window_scheduler(mb=4)
+        reqs = _make_requests([900, 100, 500])
+        for r in reqs:
+            sched.add_request(r)
+        assert sched.schedule_offline() == reqs
+
+    def test_the_oldest_request_always_ships(self):
+        sched = _window_scheduler(mb=2, factor=4)
+        # The anchor is an outlier; the least-padded pair overall is (100, 100),
+        # but the pair must contain the anchor.
+        reqs = _make_requests([1000, 100, 100, 900, 120])
+        for r in reqs:
+            sched.add_request(r)
+        batch = sched.schedule_offline()
+        assert reqs[0] in batch
+        assert [r.num_frames for r in batch] == [1000, 900]
+
+    def test_it_takes_the_least_padded_run_and_keeps_arrival_order(self):
+        sched = _window_scheduler(mb=3, factor=4)
+        reqs = _make_requests([500, 100, 510, 110, 490, 105, 900])
+        for r in reqs:
+            sched.add_request(r)
+        batch = sched.schedule_offline()
+        assert [r.num_frames for r in batch] == [500, 510, 490]
+        # The passed-over requests keep their arrival order in the queue.
+        rest = [r.num_frames for r in sched._offline_waiting]  # noqa: SLF001
+        assert rest == [100, 110, 105, 900]
+
+    def test_it_pads_no_more_than_fifo(self):
+        import random
+
+        rng = random.Random(0)
+        frames = [rng.randint(150, 1000) for _ in range(256)]
+        fifo_waste = sum(
+            _padded(_make_requests(frames[i : i + 16])) for i in range(0, len(frames), 16)
+        )
+        sched = _window_scheduler(mb=16, factor=4)
+        for r in _make_requests(frames):
+            sched.add_request(r)
+        waste, served = 0, 0
+        while True:
+            batch = sched.schedule_offline()
+            if not batch:
+                break
+            waste += _padded(batch)
+            served += len(batch)
+        assert served == len(frames)
+        assert waste < 0.5 * fifo_waste
+
+    def test_reordering_is_bounded_by_the_window(self):
+        """A request is only ever passed over while it is among the oldest
+        ``cap * factor``, so it ships within ``factor`` batches of reaching the
+        head of the queue."""
+        mb, factor = 4, 2
+        sched = _window_scheduler(mb=mb, factor=factor)
+        reqs = _make_requests([100 + (i * 37) % 900 for i in range(40)])
+        for r in reqs:
+            sched.add_request(r)
+        shipped_at = {}
+        tick = 0
+        while True:
+            batch = sched.schedule_offline()
+            if not batch:
+                break
+            for r in batch:
+                shipped_at[r.request_id] = tick
+            tick += 1
+        for i, r in enumerate(reqs):
+            fifo_tick = i // mb
+            assert shipped_at[r.request_id] <= fifo_tick + factor * mb, (
+                i,
+                shipped_at[r.request_id],
+            )
+
+    def test_only_the_anchors_priority_class_is_mixed(self):
+        sched = _window_scheduler(mb=2, factor=4)
+        urgent = _make_requests([900, 890])
+        for r in urgent:
+            r.priority = -1
+        normal = _make_requests([895, 100])
+        for r in normal + urgent:
+            sched.add_request(r)
+        assert sched.schedule_offline() == urgent
+
+    def test_the_frame_budget_narrows_the_batch(self):
+        sched = _window_scheduler(mb=4, factor=2, max_batch_frames=1000)
+        for r in _make_requests([400, 300, 300, 300, 300]):
+            sched.add_request(r)
+        batch = sched.schedule_offline()
+        assert max(r.num_frames for r in batch) * len(batch) <= 1000
+        assert batch[0].num_frames == 400
+
+    def test_the_pad_ratio_guard_narrows_the_batch(self):
+        """``max_offline_pad_ratio`` means here what it means under ``bucket``: a
+        run padding more than that is not a candidate.  It used to be dropped
+        silently, which went unnoticed only because the default policy was not
+        this one."""
+        frames = [1000, 100, 100, 100, 950]
+        unguarded = _window_scheduler(mb=4, factor=2)
+        for r in _make_requests(frames):
+            unguarded.add_request(r)
+        assert len(unguarded.schedule_offline()) == 4  # 4000 padded for 2150 useful
+
+        sched = _window_scheduler(mb=4, factor=2, max_offline_pad_ratio=1.3)
+        for r in _make_requests(frames):
+            sched.add_request(r)
+        # Four pad 1.86x and three 1.46x; the pair (1000, 950) pads 1.03x.
+        assert [r.num_frames for r in sched.schedule_offline()] == [1000, 950]
+        rest = [r.num_frames for r in sched._offline_waiting]  # noqa: SLF001
+        assert rest == [100, 100, 100]
+
+    def test_the_length_ratio_guard_narrows_the_batch(self):
+        sched = _window_scheduler(mb=3, factor=2, length_bucket_ratio=0.88)
+        for r in _make_requests([500, 300, 450, 420]):
+            sched.add_request(r)
+        # (420, 450, 500) is the least-padded triple, but 420 / 500 < 0.88.
+        assert [r.num_frames for r in sched.schedule_offline()] == [500, 450]
+
+    def test_the_anchor_ships_alone_when_no_run_passes_a_guard(self):
+        sched = _window_scheduler(mb=4, factor=2, max_offline_pad_ratio=1.2)
+        for r in _make_requests([1000, 100, 120]):
+            sched.add_request(r)
+        assert [r.num_frames for r in sched.schedule_offline()] == [1000]
+
+    def test_a_decode_slot_limit_caps_the_batch(self):
+        sched = _window_scheduler(mb=8)
+        for r in _make_requests([200] * 8):
+            sched.add_request(r)
+        assert len(sched.schedule_offline(limit=3)) == 3

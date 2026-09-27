@@ -52,7 +52,7 @@ from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 
-from .capture_recovery import recover_from_failed_capture
+from .capture_recovery import capture_warmup_stream, recover_from_failed_capture
 
 logger = logging.getLogger("oasr.engine.predictor_graph")
 
@@ -255,7 +255,7 @@ class PredictorStepGraphCache:
         tok_buf = tok.clone()
         emit_buf = emit.clone()
         try:
-            side = torch.cuda.Stream()
+            side = capture_warmup_stream(tok.device)
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 for _ in range(3):

@@ -208,19 +208,20 @@ pub struct Cli {
     /// Values must be <= max_batch_size; the engine dedupes/sorts internally.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub preferred_batch_sizes: Option<Vec<u32>>,
-    /// Offline scheduling policy.  ``"bucket"`` (engine default) groups by
-    /// audio length using ``max_offline_pad_ratio`` as the safety cap;
-    /// ``"fcfs"`` is strict FIFO with no bucketing (bigger batches under
-    /// HTTP-trickle admission but more padded compute waste); ``"sjf"`` is
-    /// shortest-job-first.
+    /// Offline scheduling policy.  ``"window"`` (engine default) length-sorts
+    /// batches within the oldest ``max_batch_size * 4`` requests, always
+    /// including the oldest; ``"bucket"`` groups by audio length using
+    /// ``max_offline_pad_ratio`` as the safety cap; ``"fcfs"`` is strict FIFO
+    /// with no bucketing (bigger batches under HTTP-trickle admission but more
+    /// padded compute waste); ``"sjf"`` is shortest-job-first.
     #[arg(long)]
     pub schedule_policy: Option<String>,
-    /// Padded-waste ratio cap for the bucket policy: a candidate is rejected
-    /// if adding it would push ``(max_len * batch_size) / sum_len`` above
-    /// this value.  Engine default is 4.0; raise to 8-16 for service
-    /// workloads where the per-batch padding cost is much smaller than the
-    /// per-batch dispatch overhead — directly grows per-step batches from
-    /// 10-20 to 30-60 on mixed-length traffic.
+    /// Padded-waste ratio cap for the length-aware policies (window, bucket,
+    /// sjf): a candidate is rejected if adding it would push
+    /// ``(max_len * batch_size) / sum_len`` above this value.  Engine default
+    /// is 4.0; raise to 8-16 for service workloads where the per-batch padding
+    /// cost is much smaller than the per-batch dispatch overhead — directly
+    /// grows per-step batches from 10-20 to 30-60 on mixed-length traffic.
     #[arg(long)]
     pub max_offline_pad_ratio: Option<f64>,
     /// Offline length-aware batching: hard cap on **padded** input frames per

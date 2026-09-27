@@ -98,10 +98,18 @@ force_flush = q[0].waited_for >= max_wait_time
 if policy == "fcfs":
     return [popleft() up to cap]
 
+if policy == "window":                       # the default; see §4.1.1
+    window = oldest cap * length_window_factor requests of q[0]'s priority
+    sort window by cost; among the contiguous runs of cap that contain
+    q[0] and pass the guards below (and max_batch_frames), take the one
+    with the least padding (max_len * cap - sum_len); if none passes,
+    cap -= 1 and look again (the anchor alone always ships)
+    return that run, in arrival order
+
 if policy == "sjf" and not force_flush:
     sort q by (priority, num_frames)        # ascending length
 
-# "bucket" (default) and "sjf" share length-aware selection:
+# "bucket" and "sjf" share length-aware selection:
 anchor = q.popleft()                         # oldest (or shortest if SJF)
 batch  = [anchor]
 min_len, max_len = anchor.num_frames, anchor.num_frames
@@ -128,7 +136,8 @@ for cand in q:
 return batch
 ```
 
-Two independent guards bound padded-compute waste:
+Two independent guards bound padded-compute waste, in every length-aware
+policy (`"window"`, `"bucket"`, `"sjf"`):
 
 - **`length_bucket_ratio`** — soft floor on `min_len / max_len` within a
   batch. Disabled (`0`) by default because splitting one bursty
@@ -138,6 +147,35 @@ Two independent guards bound padded-compute waste:
 - **`max_offline_pad_ratio`** — hard cap on `(max_len × B) / sum_len`.
   Default `4.0` admits LJSpeech-scale spreads in one batch but rejects
   pathological mixes of ~1 s and ~30 s clips.
+
+#### 4.1.1 Why `"window"` is the default
+
+A padded batch costs its **longest** row times its width, and once the offline
+forward is graph-captured that padding is GPU time, not a host-side detail.
+Arrival-order batching therefore pays for the length spread of whatever arrived
+together: on LJSpeech (1.5–10 s) FIFO batches of 32 compute ~1.48× the useful
+frames. Sorting the whole queue (`"sjf"`) removes nearly all of it, but under
+continuous arrivals a long request loses to every newer short one until
+`max_wait_time` forces a FIFO flush — which brings the padding back.
+
+`"window"` bounds the reordering instead. It sorts only the oldest
+`max_batch_size × length_window_factor` requests and always ships the oldest,
+choosing the least-padded length-run of `max_batch_size` that contains it:
+
+- **no starvation by construction** — the anchor always ships, so the policy
+  needs no flush to guarantee progress, and a request can be passed over only
+  while it is still inside the window;
+- **a no-op below capacity** — with fewer than `max_batch_size` requests
+  waiting there is nothing to choose, so light load sees FIFO exactly;
+- **one priority class at a time** — the window is the anchor's class.
+
+With the default factor of 4 the padding falls to ~1.11× (simulated on 2048
+LJSpeech arrivals; no request delayed more than 8 batches). The accuracy gate's
+five offline entries are error-for-error identical under it. `max_batch_frames`,
+`max_offline_pad_ratio` and `length_bucket_ratio` bound its runs as they bound the
+other policies' batches: a run that breaks one is not a candidate, and the batch
+narrows until one fits. At their defaults none of them changes a batch on the
+LJSpeech benchmark workloads.
 
 ### 4.2 Streaming admission: `_admit_streaming`
 
@@ -295,7 +333,8 @@ All scheduler-relevant knobs live on `EngineConfig`:
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` inside a bucket. `0` disables. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on `(max_len × B) / sum_len`. `0` disables. |
 | `max_wait_time` | 0.2 s | Starvation bound: oldest offline request triggers forced flush. |
-| `schedule_policy` | `"bucket"` | One of `"fcfs"`, `"bucket"`, `"sjf"`. |
+| `schedule_policy` | `"window"` | One of `"fcfs"`, `"window"`, `"bucket"`, `"sjf"`. |
+| `length_window_factor` | 4 | `"window"`: batches are chosen from the oldest `max_batch_size × factor` requests. Larger removes more padding and reorders more. |
 | `streaming_cohort_admit` | `True` | Length-bucket the waiting queue before admission so each batched paged forward sees length-similar utterances. **No longer gates on offset alignment** (FlexAttention handles per-stream `cache_seqlens` natively). |
 
 ### Choosing a policy
@@ -303,7 +342,8 @@ All scheduler-relevant knobs live on `EngineConfig`:
 | Workload | Recommended policy |
 |----------|-------------------|
 | Ordering matters (live transcription, real-time pipelines) | `fcfs` |
-| Mixed length, throughput-sensitive (default) | `bucket` |
+| Mixed length, throughput-sensitive (default) | `window` |
+| Anchor plus first-fit peers from the whole queue (the previous default) | `bucket` |
 | Heavy backlog of mixed lengths, latency-tolerant for outliers | `sjf` |
 
 `sjf` can starve long requests indefinitely without `max_wait_time` —

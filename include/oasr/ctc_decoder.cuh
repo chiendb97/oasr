@@ -3242,6 +3242,41 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
 // Host launcher: full batch decode (offline)
 // =============================================================================
 
+// Upper bound on the selected (non-blank-dominant) frames of any row: the tile
+// loop's trip count.
+//
+// The legacy multi-kernel step needs the *exact* batch maximum, so it reads
+// ``select_seq_lens`` back -- and a read-back is a ``cudaStreamSynchronize``,
+// which makes the host wait out everything queued ahead of the decode, the
+// encoder forward included.  That sync is what defeated a queued offline decode:
+// the host could not issue the next micro-batch's forward before this one's
+// forward had finished.
+//
+// The fused path does not need it.  Its pre-pass and chunk kernels both return
+// a row as soon as ``step >= select_seq_lens[row]``, so a tile past the batch's
+// longest selection is inert, and the input frame count bounds every row's
+// selection (``init_select_kernel`` writes at most ``seq_lengths[b] <= T``).
+// The result parity then comes from each row's own ``select_seq_lens`` on the
+// device -- ``fixup_parity_kernel`` / ``gather_paged_results_kernel`` -- so the
+// common parity only has to be *some* parity, not the batch maximum's.  Bit
+// identical: every row runs exactly the steps it ran before, and the final copy
+// reads the same buffer.
+inline int offline_select_bound(InternalData* data, int input_frames, bool fused_path, int batch,
+                                cudaStream_t stream) {
+    if (fused_path)
+        return input_frames;
+    int* h_select_lens = new int[batch];
+    cudaMemcpyAsync(h_select_lens, data->select_seq_lens, sizeof(int) * batch,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    int max_select = 0;
+    for (int b = 0; b < batch; ++b)
+        if (h_select_lens[b] > max_select)
+            max_select = h_select_lens[b];
+    delete[] h_select_lens;
+    return max_select;
+}
+
 inline cudaError_t ctc_beam_search_decode_batch(
     const float* log_prob,  // [batch, seq_len, vocab_size]
     int batch_stride, int seq_stride, int vocab_stride,
@@ -3293,19 +3328,6 @@ inline cudaError_t ctc_beam_search_decode_batch(
         log_prob, batch_stride, seq_stride, vocab_stride, seq_lengths, batch, data.max_seq_len,
         blank_id, log_threshold, data.select_seqs, data.select_seq_lens);
 
-    // Read select_seq_lens to determine the main loop bound.
-    int* h_select_lens = new int[batch];
-    cudaMemcpyAsync(h_select_lens, data.select_seq_lens, sizeof(int) * batch,
-                    cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    int max_select = 0;
-    for (int b = 0; b < batch; ++b)
-        if (h_select_lens[b] > max_select)
-            max_select = h_select_lens[b];
-    delete[] h_select_lens;
-    data.max_select_seq_len = max_select;
-
     // The fused path receives the step by value (d_step_dynamic=false), so no
     // per-step device-counter update is needed.  The legacy kernels read
     // ``*d_step``; reuse the otherwise-unused ``ptid`` buffer as the scratch
@@ -3313,6 +3335,11 @@ inline cudaError_t ctc_beam_search_decode_batch(
     // with a per-step H2D copy.
     int* d_step_scratch = data.ptid;
     const bool fused_path = step_uses_fused(beam);
+
+    // Main loop bound.  See offline_select_bound: the fused path needs no
+    // read-back, the legacy path still does.
+    const int max_select = offline_select_bound(&data, max_seq_len, fused_path, batch, stream);
+    data.max_select_seq_len = max_select;
 
     // Main decode loop, tiled by PREPASS_TILE.  Fused path: two launches per
     // tile — the parallel vocab top-K pre-pass (grid = tile_len x batch) and
@@ -4864,23 +4891,14 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
         batch, data.max_seq_len, blank_id, log_threshold,
         data.select_seqs, data.select_seq_lens);
 
-    int* h_select_lens = new int[batch];
-    cudaMemcpyAsync(h_select_lens, data.select_seq_lens, sizeof(int) * batch,
-                    cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    int max_select = 0;
-    for (int b = 0; b < batch; ++b)
-        if (h_select_lens[b] > max_select)
-            max_select = h_select_lens[b];
-    delete[] h_select_lens;
-    data.max_select_seq_len = max_select;
-
     // See ctc_beam_search_decode_batch: ptid doubles as the legacy step
     // counter; the fused path runs two launches per PREPASS_TILE tile (vocab
     // top-K pre-pass + in-kernel multi-step chunk kernel).
     int* d_step_scratch = data.ptid;
     const bool fused_path = step_uses_fused(beam);
+
+    const int max_select = offline_select_bound(&data, max_seq_len, fused_path, batch, stream);
+    data.max_select_seq_len = max_select;
 
     for (int tile_begin = 0; tile_begin < max_select; tile_begin += PREPASS_TILE) {
         const int tile_len = min(PREPASS_TILE, max_select - tile_begin);

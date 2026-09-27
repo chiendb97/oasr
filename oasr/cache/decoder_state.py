@@ -7,6 +7,12 @@ valid keys are ``[starts, lens)``. Dense caches support fixed-capacity writes or
 exact-size growth. Paged caches make group merges data-free but reject repeated
 row selection because it would alias writable pages.
 
+A paged pool also holds an AED's **cross-attention** K/V (:func:`build_cross_kv`):
+a fixed-extent region per row, written once at prefill and only read after, so it
+is a :class:`PagedDecoderKv` whose whole length is its prefill.  Paging it next to
+the self-attention is what leaves nothing a decode step reads at a per-batch
+address — the condition for capturing the step.
+
 Unused capacity is zeroed because attention reads the final in-bounds tile past
 the logical length; uninitialized values there could propagate NaNs.
 """
@@ -24,7 +30,7 @@ from .paged_kv import flat_write_index
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .decoder_kv import DecoderKVCacheManager
 
-__all__ = ["DecoderKv", "PagedDecoderKv", "build_kv", "consume_cat_rows"]
+__all__ = ["DecoderKv", "PagedDecoderKv", "build_kv", "build_cross_kv", "consume_cat_rows"]
 
 #: Capacity-buffer growth granularity, in tokens.  Growth is a safety valve —
 #: the strategies size ``cap`` from the batch's generation cap — so this only
@@ -711,6 +717,36 @@ def build_kv(
         prefill_len=prefill_len,
         capacity=cap,
         starts=starts,
+    )
+
+
+def build_cross_kv(
+    manager: "DecoderKVCacheManager",
+    batch_size: int,
+    device: torch.device,
+    *,
+    length: int,
+) -> PagedDecoderKv:
+    """Pages for a fixed-extent side cache — an AED's cross-attention K/V.
+
+    One slot per row whose whole ``length`` is the prefill and whose ceiling is
+    that same length, so admission reserves exactly the pages it maps now and the
+    row never grows.  The decoder writes every layer once through
+    :meth:`PagedDecoderKv.append`, commits ``length``, and from then on only
+    reads it: ``mask_kwargs(0)`` is the key-length vector plus the block table
+    the paged attention takes, which is also all a captured step needs from it.
+
+    Everything else is the self-attention cache's own contract: ``select`` frees
+    the rows it drops, ``merge`` concatenates block tables and moves no K/V, and
+    rows need not share a ``length`` to share a forward, because each row's key
+    extent travels in its own ``kv_lens`` entry.
+    """
+    return PagedDecoderKv.create(
+        manager,
+        batch_size,
+        device,
+        prefill_len=int(length),
+        capacity=int(length),
     )
 
 

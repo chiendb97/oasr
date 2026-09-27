@@ -215,6 +215,52 @@ def test_toy_batched_offline_equivalence(toy_fst):
     assert list(b_tokens[0]) == _TOY_WORDS
 
 
+def test_toy_strategy_decode_offline_does_not_fail_the_batch(toy_fst):
+    """The engine's ``ctc_wfst`` strategy decodes a batch — not just the decoder.
+
+    ``CtcWfstDecodeStrategy.decode_offline`` read ``decoder_config.blank_id``, a
+    field ``DecoderConfig`` does not have (it is ``blank``).  The keyword was
+    evaluated on every call, so every offline batch raised and the executor's
+    failure isolation returned an empty ``finish_reason="error"`` for every
+    request.  The decoder-level tests above could not see it: they never go
+    through the strategy.
+    """
+    _module()
+    from types import SimpleNamespace
+
+    from oasr.decode import DecoderConfig
+    from oasr.engine.decode import Detokenizer, build_decode_strategy
+
+    cfg = SimpleNamespace(
+        decoder_type="ctc_wfst",
+        device="cuda",
+        dtype=None,
+        max_batch_size=2,
+        use_cuda_graphs=False,
+        use_ctc_cuda_graphs=False,
+        _model_config=SimpleNamespace(vocab_size=_TOY_VOCAB),
+        ctc_decoder_config=None,
+        wfst_decoder_config=DecoderConfig(
+            search_type="wfst",
+            wfst_min_active_states=1,
+            wfst_max_active_states=100,
+            wfst_blank_skip_thresh=1.0,
+        ),
+        fst_path=toy_fst,
+    )
+    # The CTC capability surface; the strategy never calls either member.
+    model = SimpleNamespace(head=lambda *a: None, forward_offline=lambda *a: None)
+    strategy = build_decode_strategy("ctc", cfg, Detokenizer(None, None), model)
+    assert strategy.speech_activity_kwargs() == {"blank_id": 0}
+
+    rows = [_toy_logp([1, 2, 0], "cuda"), _toy_logp([1, 0, 2], "cuda")]
+    log_probs = torch.stack(rows)
+    lengths = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
+    outputs = strategy.decode_offline(log_probs, lengths)
+    assert [o.tokens[0] for o in outputs] == [_TOY_WORDS, _TOY_WORDS]
+    assert all(o.finished for o in outputs)
+
+
 def test_toy_winners_gc_matches_plain(toy_fst):
     """gc_interval > 0 (segmented decode + winners-log GC + host prefix merge) must
     reproduce the plain decode exactly, including across repeats on the same decoder."""

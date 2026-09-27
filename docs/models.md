@@ -21,7 +21,7 @@ architectures. The registry seams themselves are in
 | `forward_offline_packed` | Gapless varlen offline forward, used when sequence packing is enabled |
 | `cache_spec` | `CacheSpec` describing the streaming cache; **`None`** when `streaming_kind == "none"` |
 | `decode_type` / `default_decode_type` / `capabilities` | Which decode families this checkpoint can serve (`DecodeType` in `base.py`) |
-| `encoder.streaming_kind` | `"paged"` / `"stateful"` / `"none"` |
+| `encoder.streaming_kind` | `"paged"` / `"slot"` / `"stateful"` / `"none"` |
 | `encoder.subsampling_rate`, `encoder.right_context` | Streaming geometry inputs |
 | `load_weights(state_dict) → LoadReport` | Weight loading, reporting `mapped` / `dropped` / `missing` |
 
@@ -113,12 +113,14 @@ Two batched decoder shapes exist, and both are driven from
 
   Two class-level declarations go with it, both answered by the decoder rather
   than probed. `supports_paged_kv` says `prefill` accepts a `kv_manager` and will
-  page its self-attention KV out of that pool; `supports_step_graphs` says a step
-  can be recorded into a CUDA graph — which requires that *everything* it reads
-  either lives at a process-stable address or is small enough to copy into a
-  static buffer per step. A Whisper decoder fails the second: its
-  cross-attention K/V is allocated per prefill, so a graph would bake in a
-  pointer to the batch it was captured on.
+  page its decoder KV out of that pool — for an AED, the cross-attention over
+  the encoder window as well (`build_cross_kv`); `supports_step_graphs` says a
+  step can be recorded into a CUDA graph — which requires that *everything* it
+  reads either lives at a process-stable address or is small enough to copy
+  into a static buffer per step. Whisper meets it only paged: dense, its
+  cross-attention K/V is allocated per prefill and a graph would bake in a
+  pointer to the batch it was captured on, so the graph cache refuses a dense
+  state whatever the class declares.
 
   `supports_step_graphs` also decides **storage** under the default
   `kv_storage="auto"`: paging is what makes a step capturable, and a cost
@@ -186,7 +188,7 @@ closed.
 | Registry key | Package | Decode families | Streaming | Source format |
 |---|---|---|---|---|
 | `conformer` | `models/conformer/` | `ctc`, `ctc_aed_rescoring` | paged | WeNet |
-| `zipformer` | `models/zipformer/` | `ctc` | stateful (config-dependent) | icefall |
+| `zipformer` | `models/zipformer/` | `ctc` | slot (config-dependent) | icefall |
 | `transducer` | `models/transducer/` | `transducer` | follows the encoder | icefall (**explicit only**) |
 | `nemotron` | `models/nemotron/` | `transducer` | paged | Hugging Face |
 | `whisper` | `models/whisper/` | `aed` | none | Hugging Face |
@@ -221,15 +223,35 @@ Rescoring is opt-in via `EngineConfig.decode_method`. The decoder config — inc
 `model.py`, `encoder.py`, `subsampling.py`, `scaling.py`, `config.py`,
 `convert.py::IcefallConverter` (which infers the config from checkpoint shapes).
 
-`streaming_kind` is `"stateful"` only when the config is streaming-capable
+`streaming_kind` is `"slot"` only when the config is streaming-capable
 (`causal=True and chunk_size > 0`), otherwise `"none"` — so a non-causal release
 such as `zipformer-large-cr-ctc` is refused in streaming service mode at engine
-construction rather than raising on its first request.
+construction rather than raising on its first request. The converter tells a
+causal release from its conv modules (icefall's `ChunkCausalDepthwiseConv1d`
+has `causal_conv` + `chunkwise_conv` where a non-causal one has
+`depthwise_conv.weight`) and gives it the decode geometry the releases are
+published at, chunk 16 / left context 128.
 
-`ZipformerEncoder.stack_streaming_states` / `unstack_streaming_states` declare the
-per-kind state batch dimensions following icefall's `streaming_decode.py`
-convention (embed + conv caches dim 0; key / nonlin / value caches dim 1), which
-is what lets the stateful backend batch streams into one `B = N` forward.
+Streaming follows icefall's recipe exactly, pinned against the release's own
+TorchScript streaming export (`TestCausalRelease`):
+
+* **windows** of `2 * chunk + 13` input frames at a stride of `2 * chunk`
+  (`streaming_window_frames` / `streaming_chunk_frames`) — the embed turns `T`
+  frames into `(T - 7) // 2 - 3`, so that is what yields exactly `chunk` embed
+  frames, the unit the downsampled stacks need whole; a short final window is
+  padded with icefall's `LOG_EPS` (`streaming_pad_value`);
+* a **processed-length mask**: the state's last tensor counts the embed frames a
+  stream has been through, and the part of the left-context cache that is still
+  initial zeros is masked.
+
+The whole per-stream cache — the embed's cached frames, six tensors per layer
+(key, nonlin-attention, two value caches, two conv tails), the processed-length
+counter — is declared as `slot_state_specs`, one `StreamStateSpec` per tensor with
+its icefall batch axis as the slot axis. The engine's slot runtime owns it (see
+[cache_manager.md § 10](cache_manager.md)) and graph-captures the whole step; the
+list API (`get_streaming_init_states` / `streaming_forward`, plus
+`stack_streaming_states` / `unstack_streaming_states`) stays for the
+`"stateful"` runtime, which is the parity oracle.
 The NonlinAttention gate uses the standalone `Tanh` waist module; its gate is
 one chunk of a three-way projection output, so a whole-GEMM epilogue cannot
 represent the operation.
@@ -249,7 +271,7 @@ add, relative shift, masks, softmax) is the open item.
 `model.py::TransducerModel`, `decoder.py` (stateless predictor), `joiner.py`,
 `config.py`, `convert.py::IcefallTransducerConverter`.
 `encoder_type ∈ {"conformer", "zipformer"}` selects the acoustic front-end, and
-streaming follows the encoder (paged vs stateful).
+streaming follows the encoder (paged, or slot for a causal Zipformer).
 
 **Not auto-detected.** icefall directories sniff as `zipformer` (CTC) and hybrid
 checkpoints carry both branches, so load with

@@ -59,8 +59,9 @@ if TYPE_CHECKING:
     from oasr.models.decoders import BaseDecoder
 
 # Streaming-cache model an encoder uses, read by the engine to select a
-# ``StreamingEncoderBackend``.  Values: "paged" (engine paged-KV + slot-CNN,
-# "stateful" (encoder owns per-layer recurrent state), or "none" (offline-only).
+# ``StreamingEncoderBackend``.  Values: "paged" (engine paged-KV + slot-CNN),
+# "slot" (engine slot cache over the encoder's declared fixed-extent state),
+# "stateful" (per-request state lists), or "none" (offline-only).
 # Kept a plain ``str``.
 StreamingKind = str
 
@@ -94,6 +95,13 @@ class CacheSpec:
     which is what makes one shared relative-position table — and one CUDA graph
     per batch size — correct.  ``None`` keeps the grow-then-evict behaviour every
     other encoder has.
+
+    ``cross_attention_len`` is the one decoder-only field (read from a model's
+    ``decoder_cache_spec``): the fixed per-row cross-attention K/V an AED
+    decoder carries next to its self-attention — the encoder output it attends,
+    written once at prefill and never appended to.  With paged decoder KV it is
+    paged into the same pool, so it counts toward each row's footprint there;
+    ``0`` for a decoder with no cross-attention cache.
     """
 
     num_layers: int
@@ -103,6 +111,7 @@ class CacheSpec:
     conv_kernel_size: int = 1
     stream_states: Tuple["StreamStateSpec", ...] = ()
     fixed_attention_window: Optional[int] = None
+    cross_attention_len: int = 0
 
 
 @dataclass
@@ -484,6 +493,25 @@ class BaseEncoder(nn.Module, ABC):
         return ()
 
     @property
+    def slot_state_specs(self) -> Tuple["StreamStateSpec", ...]:
+        """The **whole** streaming cache as slot declarations — the slot runtime's contract.
+
+        For an encoder whose every cross-chunk tensor is fixed-extent (no K/V
+        that grows), ``streaming_kind == "slot"`` hands the cache to the engine:
+        one :class:`~oasr.cache.StreamStateSpec` per tensor **in the order of**
+        :meth:`get_streaming_init_states`, each with its batch axis as
+        ``slot_axis``, and all-zero as every tensor's initial value.  The slot
+        runtime then gathers the active slots into that list, calls
+        :meth:`streaming_forward`, and scatters the new list back, at stable
+        addresses a CUDA graph can capture.
+
+        Distinct from :attr:`streaming_state_specs`, which a *paged* encoder
+        uses for the extras it carries beside paged K/V and the conv cache.
+        Default ``()`` — not a slot encoder.
+        """
+        return ()
+
+    @property
     def fixed_attention_window(self) -> Optional[int]:
         """Trained attention left-context in encoder frames, if it is a constant.
 
@@ -503,9 +531,12 @@ class BaseEncoder(nn.Module, ABC):
 
         ``"paged"`` — the engine's paged-KV + slot-CNN cache (Conformer-style);
         the encoder implements :meth:`forward_chunk_paged`.
-        ``"stateful"`` — the encoder owns per-layer recurrent state
-        (Zipformer-style); it implements :meth:`get_streaming_init_states` /
-        :meth:`streaming_forward` instead.
+        ``"slot"`` — every cross-chunk tensor is fixed-extent and declared
+        (:attr:`slot_state_specs`); the engine owns it in a slot cache and
+        drives :meth:`get_streaming_init_states` / :meth:`streaming_forward`
+        over it (Zipformer).
+        ``"stateful"`` — per-request state lists threaded through that same
+        list API, for an encoder that declares nothing further.
         ``"none"`` — offline only.
 
         Default derives from :attr:`supports_paged_streaming`; stateful encoders

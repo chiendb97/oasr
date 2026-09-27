@@ -67,8 +67,14 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     # the batched decoder does not surface its per-arc frame positions.
 
     def speech_activity_kwargs(self) -> Dict[str, Any]:
-        """The blank id, which is where this family's speech signal lives."""
-        return {"blank_id": int(self.options.decoder_config.blank_id)}
+        """The blank id, which is where this family's speech signal lives.
+
+        ``DecoderConfig`` names it ``blank``, not ``blank_id`` as the GPU CTC
+        config does.  Reading the wrong name raised on every offline batch, and
+        the executor's failure isolation turned that into an empty
+        ``finish_reason="error"`` output for every request.
+        """
+        return {"blank_id": int(self.options.decoder_config.blank)}
 
     @property
     def asr_speech_activity_modes(self) -> Tuple[str, ...]:
@@ -156,9 +162,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
                     finished=True,
                 )
             )
-        self.attach_asr_speech_activity(
-            outputs, enc_out, enc_lengths, requests, blank_id=cfg.blank_id
-        )
+        self.attach_asr_speech_activity(outputs, enc_out, enc_lengths, requests, blank_id=cfg.blank)
         return outputs
 
     # ------------------------------------------------------------------
