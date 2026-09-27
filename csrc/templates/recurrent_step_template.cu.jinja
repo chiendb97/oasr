@@ -24,45 +24,19 @@ constexpr RecurrentKind kKind = RecurrentKind::{{ kind_enum }};
 constexpr int kGates = recurrentGateCount(kKind);
 constexpr bool kHasCell = recurrentHasCell(kKind);
 
-/*! \brief `stride(-1) == 1`, which the `_1{}` in every stride assumes.
+/*! \brief One 2-D operand: on the device, rank 2, last axis contiguous.
  *
- * Not optional: without it a tensor whose last stride is not 1 is read at
- * wrong addresses silently, with no fault.  This is the price of taking an
- * arbitrary *row* stride, which is what lets a caller hand over a row-slice of
- * a wider buffer without a copy.
+ * `CHECK_VECTOR_ALIGNED` is applied separately, and only to the three operands
+ * the kernel reads in 128-bit pieces -- `previous_h` and `weight_hh` along K in
+ * the mainloop, `input_gates` along N in the epilogue.  The outputs are
+ * deliberately **not** subject to it: `h` and `c` are written one element per
+ * hidden unit, so any row stride addresses correctly.
  */
-#define CHECK_LAST_STRIDE_ONE(x)                                                         \
-    TVM_FFI_ICHECK_EQ((x).stride((x).ndim() - 1), 1)                                     \
-        << #x << " must have a contiguous last dimension; got stride "                   \
-        << (x).stride((x).ndim() - 1)
-
-/*! \brief The 128-bit vector contract: base pointer and row stride both aligned.
- *
- * Applied to the three operands the kernel reads in vector pieces --
- * `previous_h` and `weight_hh` along K in the mainloop, `input_gates` along N
- * in the epilogue.  A base that is not 16-byte aligned, or a row stride that
- * is not a whole number of 8-element vectors, makes every row after the first
- * misaligned -- which surfaces as `misaligned address` on a good day and as a
- * wrong answer on a bad one.
- *
- * The outputs are deliberately **not** subject to it: `h` and `c` are written
- * one element per hidden unit, so any row stride addresses correctly.
- */
-#define CHECK_VECTOR_ALIGNED(x)                                                          \
-    do {                                                                                 \
-        TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>((x).data_ptr()) % 16, 0u)           \
-            << #x << " must be 16-byte aligned (the 128-bit load width)";                \
-        TVM_FFI_ICHECK_EQ((x).stride(0) % oasr::recurrent::kRecurrentStepAlignment, 0)    \
-            << #x << " needs a row stride that is a multiple of "                        \
-            << oasr::recurrent::kRecurrentStepAlignment << " elements; got "             \
-            << (x).stride(0);                                                            \
-    } while (0)
-
 #define CHECK_2D_INPUT(x)                                                                \
     do {                                                                                 \
         CHECK_INPUT(x);                                                                  \
         CHECK_DIM(2, x);                                                                 \
-        CHECK_LAST_STRIDE_ONE(x);                                                        \
+        CHECK_LAST_DIM_CONTIGUOUS_INPUT(x);                                              \
     } while (0)
 
 }  // namespace
@@ -104,9 +78,9 @@ void {{ func_name }}(TensorView h, Optional c, TensorView previous_h, TensorView
     CHECK_DEVICE(previous_h, h);
     CHECK_DEVICE(previous_h, weight_hh);
     CHECK_DEVICE(previous_h, input_gates);
-    CHECK_VECTOR_ALIGNED(previous_h);
-    CHECK_VECTOR_ALIGNED(weight_hh);
-    CHECK_VECTOR_ALIGNED(input_gates);
+    CHECK_VECTOR_ALIGNED(previous_h, oasr::recurrent::kRecurrentStepAlignment);
+    CHECK_VECTOR_ALIGNED(weight_hh, oasr::recurrent::kRecurrentStepAlignment);
+    CHECK_VECTOR_ALIGNED(input_gates, oasr::recurrent::kRecurrentStepAlignment);
 
     int const M = int(previous_h.size(0));
     int const K = int(previous_h.size(1));

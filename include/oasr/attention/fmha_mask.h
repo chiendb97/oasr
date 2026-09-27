@@ -90,15 +90,15 @@ struct Mask {
         Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
         Tensor tScS = thread_mma.partition_C(cS);
         Tensor tSrS_rowcol =
-            make_tensor(tSrS.data(), convert_layout_acc_rowcol(tSrS.layout()));
+            make_tensor(tSrS.data(), cute_sm80::convert_layout_acc_rowcol(tSrS.layout()));
         Tensor tScS_rowcol =
-            make_tensor(tScS.data(), convert_layout_acc_rowcol(tScS.layout()));
+            make_tensor(tScS.data(), cute_sm80::convert_layout_acc_rowcol(tScS.layout()));
         // Thread 0's coordinates are compile-time constants.  Comparing against
         // a limit that has *this* thread's own offset subtracted out therefore
         // keeps the inner compare free of per-thread address arithmetic.
         Tensor t0ScS = thread0_mma.partition_C(cS);
         Tensor t0ScS_rowcol =
-            make_tensor(t0ScS.data(), convert_layout_acc_rowcol(t0ScS.layout()));
+            make_tensor(t0ScS.data(), cute_sm80::convert_layout_acc_rowcol(t0ScS.layout()));
 
         int const thread_col_offset = get<1>(tScS_rowcol(_0{}, _0{}));
         int const seqlenk_col_limit = seqlen_k - n_block * kBlockN - thread_col_offset;

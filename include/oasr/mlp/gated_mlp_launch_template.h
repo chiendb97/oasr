@@ -19,16 +19,14 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/device_kernel.h>
 
-#include <oasr/common/arch_dispatch.h>
+#include <oasr/common/cute_sm80.h>
 
 #include "cutlass_gated_mlp_configs.h"
-#include "epilogue.h"
+#include "gated_mlp_epilogue.h"
 #include "gated_mlp_kernel.h"
+#include "gated_mlp_mainloop_sm80.h"
 #include "gated_mlp_params.h"
-#include "mainloop_sm80.h"
 
 namespace oasr {
 namespace mlp {
@@ -98,24 +96,9 @@ cudaError_t run_gated_mlp(GatedMlpParams<Element> const& params, cudaStream_t st
     static_assert(Kernel::SharedStorageSize <= ArchTraits::kSmemBudgetBytes,
                   "this tile overflows the architecture's shared memory");
 
-    dim3 const grid = Kernel::get_grid_shape(params);
-    dim3 const block = Kernel::get_block_shape();
-    int const smem_size = Kernel::SharedStorageSize;
-
-    auto kernel = cutlass::device_kernel<Kernel>;
-    // The table says what the architecture offers; this asks what *this*
-    // device grants.  They agree on every part we ship, and when they do not
-    // the failure should name both numbers rather than surface as a driver
-    // error from inside `cudaFuncSetAttribute`.
-    if (smem_size > oasr::getDeviceMaxSharedMemoryOptin()) {
-        return cudaErrorInvalidValue;
-    }
-    cudaError_t status = oasr::optInSharedMemory(kernel, size_t(smem_size));
-    if (status != cudaSuccess) {
-        return status;
-    }
-    kernel<<<grid, block, smem_size, stream>>>(params);
-    return cudaGetLastError();
+    // The table says what the architecture offers; the launcher asks what
+    // *this* device grants before opting in.
+    return cute_sm80::launch_kernel<Kernel>(params, stream);
 }
 
 }  // namespace mlp

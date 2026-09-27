@@ -45,9 +45,29 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
     TVM_FFI_ICHECK((x).device().device_id == (y).device().device_id)                     \
         << "Tensors must be on the same device"
 
+// `stride(-1) == 1`.  Not optional wherever a kernel's layout carries a
+// compile-time unit stride on the last axis (every CuTe family's `_1`): a
+// tensor whose last stride is not 1 is then read at wrong addresses silently,
+// with no fault.  That is the price of accepting an arbitrary stride on every
+// other axis.
 #define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x)                                                \
     TVM_FFI_ICHECK((x).stride((x).ndim() - 1) == 1)                                     \
-        << "Tensor must be contiguous along the last dimension"
+        << #x << " must have a contiguous last dimension; got stride "                    \
+        << (x).stride((x).ndim() - 1)
+
+// The 128-bit vector contract: a 16-byte-aligned base *and* a row stride that
+// is a whole number of `elems`-element vectors.  Either one alone is not
+// enough -- a misaligned stride makes every row after the first misaligned,
+// which surfaces as `misaligned address` on a good day and as a wrong answer
+// on a bad one.
+#define CHECK_VECTOR_ALIGNED(x, elems)                                                    \
+    do {                                                                                  \
+        TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>((x).data_ptr()) % 16, 0u)            \
+            << #x << " must be 16-byte aligned (the 128-bit load/store width)";           \
+        TVM_FFI_ICHECK_EQ((x).stride(0) % (elems), 0)                                      \
+            << #x << " needs a row stride that is a multiple of " << (elems)              \
+            << " elements; got " << (x).stride(0);                                        \
+    } while (0)
 
 // Full row-major contiguity.  Stronger than CHECK_LAST_DIM_CONTIGUOUS_INPUT and
 // what a kernel indexing rows as `base + row * row_len` actually needs: a
@@ -96,6 +116,12 @@ inline bool IsRowDense(const TensorView& x) {
 // activation directly instead of making Python `reshape(-1, K)` first, which
 // cost ~1.3 us per call on shapes where the kernel itself costs ~10.
 #define FLATTENED_ROWS(x) ((x).numel() / (x).size((x).ndim() - 1))
+
+// The data pointer of an optional tensor, or null when it is absent.
+template <class T>
+inline T* OptionalDataPtr(Optional const& t) {
+    return t.has_value() ? static_cast<T*>(t.value().data_ptr()) : nullptr;
+}
 
 // Alignment-8 iterators require both free dimensions to divide by eight. Check
 // uniformly at the launcher boundary instead of failing or rerouting later.

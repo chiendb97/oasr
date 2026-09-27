@@ -22,10 +22,6 @@
 
 #pragma once
 
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-
 #include "cutlass_fmha_configs.h"
 #include "fmha_params.h"
 #include "fmha_seqlen.h"
@@ -42,7 +38,7 @@ using namespace cute;
  * \tparam NumEpilogueThreads the mainloop's MMA thread count
  */
 template <class TileShape_MNK_PV_, class Element_, class ArchTag_, int NumEpilogueThreads_>
-struct CollectiveEpilogue {
+struct CollectiveFmhaEpilogue {
     using TileShape_MNK_PV = TileShape_MNK_PV_;
     using Element = Element_;
     using ArchTag = ArchTag_;
@@ -51,7 +47,7 @@ struct CollectiveEpilogue {
     static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
     static constexpr int kHeadDimV = get<1>(TileShape_MNK_PV{});
 
-    using SmemLayoutAtomO = typename FmhaSmemLayoutAtom<Element, kHeadDimV>::type;
+    using SmemLayoutAtomO = typename cute_sm80::SmemLayoutAtomSwizzled<Element, kHeadDimV>::type;
     using SmemLayoutO =
         decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 1>(TileShape_MNK_PV{})));
 
@@ -62,7 +58,8 @@ struct CollectiveEpilogue {
     static constexpr int kGmemElemsPerStore = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDimV % kGmemElemsPerStore == 0,
                   "head_dim must be a multiple of the 128-bit store width");
-    static constexpr int kBlockKGmem = FmhaSmemLayoutAtom<Element, kHeadDimV>::kBlockKGmem;
+    static constexpr int kBlockKGmem =
+        cute_sm80::SmemLayoutAtomSwizzled<Element, kHeadDimV>::kRowWidth;
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerStore;
     static_assert(NumEpilogueThreads % kGmemThreadsPerRow == 0);
     using GmemLayoutAtomO =
@@ -99,7 +96,7 @@ struct CollectiveEpilogue {
 
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_o.data()),
                                 SmemLayoutO{});
-        Tensor tOrO_out = convert_type<Element>(tOrO);
+        Tensor tOrO_out = cute_sm80::convert_type<Element>(tOrO);
 
         // rmem -> smem, through the MMA's own C partition.
         auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
@@ -136,9 +133,11 @@ struct CollectiveEpilogue {
         // Rows past this stream's query length are never written: under varlen
         // they belong to the *next* segment, so zeroing them would corrupt a
         // neighbour rather than merely waste a store.
-        copy_predicated</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false,
-                        /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOrO_store, tOgO, tOcO, tOpO,
-                                               info.seqlen_q - m_block * kBlockM);
+        int const row_limit = info.seqlen_q - m_block * kBlockM;
+        cute_sm80::copy_if(
+            gmem_tiled_copy_O, tOrO_store, tOgO,
+            [&](int m) { return int(get<0>(tOcO(_0{}, m, _0{}))) < row_limit; },
+            [&](int k) { return bool(tOpO(k)); });
     }
 
     /*! \brief Write one split's unnormalised-but-rescaled `O` and its LSE.
@@ -170,8 +169,8 @@ struct CollectiveEpilogue {
         auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
         Tensor cO = cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{}));
         Tensor tOcO = thr_mma.partition_C(cO);
-        Tensor tOcO_rc = make_tensor(tOcO.data(), convert_layout_acc_rowcol(tOcO.layout()));
-        Tensor tOrO_rc = make_tensor(tOrO.data(), convert_layout_acc_rowcol(tOrO.layout()));
+        Tensor tOcO_rc = make_tensor(tOcO.data(), cute_sm80::convert_layout_acc_rowcol(tOcO.layout()));
+        Tensor tOrO_rc = make_tensor(tOrO.data(), cute_sm80::convert_layout_acc_rowcol(tOrO.layout()));
 
         int64_t const plane = int64_t(T_q) * D;
         float* o_base = params.ptr_o_partial +
@@ -230,9 +229,11 @@ struct CollectiveEpilogue {
         for (int k = 0; k < size(tOpO); ++k) {
             tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_o);
         }
-        copy_predicated</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false,
-                        /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
-                                               info.seqlen_q - m_block * kBlockM);
+        int const row_limit = info.seqlen_q - m_block * kBlockM;
+        cute_sm80::copy_if(
+            gmem_tiled_copy_O, tOrO, tOgO,
+            [&](int m) { return int(get<0>(tOcO(_0{}, m, _0{}))) < row_limit; },
+            [&](int k) { return bool(tOpO(k)); });
     }
 };
 

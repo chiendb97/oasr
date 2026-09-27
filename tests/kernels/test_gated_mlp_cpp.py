@@ -294,7 +294,7 @@ class TestKResidue:
     **zero**, which is the identity for the dot product being accumulated -- so
     a partial K tile is *correct*, not merely safe.  Written as a branch
     (`if (pred) copy else clear`) instead it would still be correct and would
-    cost ~11%; see ``copy_zfill_2d``.
+    cost ~11%; see ``oasr::cute_sm80::copy_zfill``.
     """
 
     def setup_method(self):

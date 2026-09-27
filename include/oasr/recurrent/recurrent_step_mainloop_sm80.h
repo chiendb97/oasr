@@ -48,14 +48,8 @@
 
 #pragma once
 
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-
-#include <cute/tensor.hpp>
-
 #include "cutlass_recurrent_step_configs.h"
 #include "recurrent_step_params.h"
-#include "recurrent_step_utils.h"
 
 namespace oasr {
 namespace recurrent {
@@ -99,7 +93,7 @@ struct CollectiveRecurrentStepMainloopSm80 {
 
     // --- shared memory ----------------------------------------------------
     //! Chosen from the K tile: K is the contiguous axis of both operands.
-    using SmemLayoutAtom = typename RecurrentStepSmemLayoutAtom<Element, kBlockK>::type;
+    using SmemLayoutAtom = typename cute_sm80::SmemLayoutAtomSwizzled<Element, kBlockK>::type;
     using SmemLayoutA = decltype(tile_to_shape(
         SmemLayoutAtom{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<kStages>{})));
     using SmemLayoutB = decltype(tile_to_shape(
@@ -112,7 +106,7 @@ struct CollectiveRecurrentStepMainloopSm80 {
 
     // --- copy atoms -------------------------------------------------------
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-    static constexpr int kSmemRowWidth = RecurrentStepSmemLayoutAtom<Element, kBlockK>::kRowWidth;
+    static constexpr int kSmemRowWidth = cute_sm80::SmemLayoutAtomSwizzled<Element, kBlockK>::kRowWidth;
     static constexpr int kGmemThreadsPerRow = kSmemRowWidth / kGmemElemsPerLoad;
     static_assert(kBlockK % kSmemRowWidth == 0);
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0);
@@ -212,12 +206,13 @@ struct CollectiveRecurrentStepMainloopSm80 {
         // the pair, so group index stays equal to K-tile index.
         auto load_tile = [&](int const k_tile, int const stage) {
             int const max_k = params.K - k_tile * kBlockK - k_col_offset;
-            Tensor tAsA_cur = tAsA(_, _, _, stage);
-            Tensor tBsB_cur = tBsB(_, _, _, stage);
-            copy_zfill_2d</*Is_even_MN=*/false, /*Is_even_K=*/false>(
-                gmem_tiled_copy, tAgA(_, _, _, k_tile), tAsA_cur, t0AcA, tApA, max_k);
-            copy_zfill_2d</*Is_even_MN=*/false, /*Is_even_K=*/false>(
-                gmem_tiled_copy, tBgB(_, _, _, k_tile), tBsB_cur, t0BcB, tBpB, max_k);
+            // The K predicate compares thread 0's compile-time column against a
+            // limit with this thread's own offset already folded in.
+            auto k_ok = [&](int k) { return int(get<1>(t0AcA(_0{}, _0{}, k))) < max_k; };
+            cute_sm80::copy_zfill(gmem_tiled_copy, tAgA(_, _, _, k_tile), tAsA(_, _, _, stage),
+                                  [&](int m) { return bool(tApA(m)); }, k_ok);
+            cute_sm80::copy_zfill(gmem_tiled_copy, tBgB(_, _, _, k_tile), tBsB(_, _, _, stage),
+                                  [&](int m) { return bool(tBpB(m)); }, k_ok);
         };
 
         // --- prologue ------------------------------------------------------
@@ -242,14 +237,14 @@ struct CollectiveRecurrentStepMainloopSm80 {
 
             int const next_tile = k_tile + kStages - 1;
             int const write_stage = smem_pipe_write;
-            gemm_sm80(acc, tCrA, tCrB, tCsA(_, _, _, smem_pipe_read), tCsB(_, _, _, smem_pipe_read),
-                      tiled_mma, smem_tiled_copy_A, smem_tiled_copy_B, smem_thr_copy_A,
-                      smem_thr_copy_B, [&] {
-                          if (next_tile < k_tiles) {
-                              load_tile(next_tile, write_stage);
-                          }
-                          cute::cp_async_fence();
-                      });
+            cute_sm80::gemm_sm80(acc, tCrA, tCrB, tCsA(_, _, _, smem_pipe_read),
+                                 tCsB(_, _, _, smem_pipe_read), tiled_mma, smem_tiled_copy_A,
+                                 smem_tiled_copy_B, smem_thr_copy_A, smem_thr_copy_B, [&] {
+                                     if (next_tile < k_tiles) {
+                                         load_tile(next_tile, write_stage);
+                                     }
+                                     cute::cp_async_fence();
+                                 });
 
             smem_pipe_read = smem_pipe_read + 1 < kStages ? smem_pipe_read + 1 : 0;
             smem_pipe_write = smem_pipe_write + 1 < kStages ? smem_pipe_write + 1 : 0;

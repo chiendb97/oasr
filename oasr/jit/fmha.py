@@ -43,9 +43,9 @@ from __future__ import annotations
 import functools
 from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from . import env
+from . import arch_facts, env
 from .core import JitSpec, _get_target_sm, gen_jit_spec
 from .cubin_loader import write_if_different
 from .templates import render_template
@@ -70,21 +70,9 @@ __all__ = [
 #: The omission is counted in :func:`fmha_coverage_report`, not hidden.
 SUPPORTED_SM: Tuple[int, ...] = (80, 86, 89, 120)
 
-#: Opt-in shared memory per architecture, mirroring
-#: ``oasr::attention::fmhaSmemCapacity``.  A *table*, not a device query: the
-#: capability surface is parametrised over four architectures in the tests so
-#: one box can hold the line for all of them, and a live query would collapse
-#: that to whatever card happens to be present -- which is precisely the
-#: coverage that caught sm_86/sm_89 being budgeted with A100's 163 KB.
-_SMEM_CAPACITY: Dict[int, int] = {
-    80: 166912,
-    86: 101376,
-    89: 101376,
-    90: 232448,
-    100: 232448,
-    120: 101376,
-}
-_DRIVER_SMEM_RESERVE = 1024
+#: Opt-in shared memory per architecture, mirrored once for every C++ CuTe
+#: family in :mod:`oasr.jit.arch_facts` (``oasr::smemCapacityForSm``).
+_SMEM_CAPACITY = arch_facts.SMEM_CAPACITY
 _MAX_STAGES = 3
 _N_BLOCK_LADDER = (64, 32, 16)
 _BLOCK_M = 64
@@ -137,10 +125,8 @@ def padded_head_dim(head_dim: int) -> int:
     return (head_dim + 31) // 32 * 32
 
 
-def smem_budget(sm: int) -> int:
-    """Shared memory a launch on ``sm`` is actually granted."""
-    cap = _SMEM_CAPACITY.get(sm, 0)
-    return cap - _DRIVER_SMEM_RESERVE if cap else 0
+#: Mirrors ``oasr::attention::fmhaSmemBudget`` (``oasr::smemBudgetForSm``).
+smem_budget = arch_facts.smem_budget
 
 
 def _smem_bytes(block_m: int, block_n: int, d_q: int, d_v: int, stages: int, elem: int) -> int:
@@ -210,9 +196,7 @@ def config_supported(
     return True
 
 
-def _ceildiv(a: int, b: int) -> int:
-    """Mirror of ``oasr::attention::fmhaCeilDiv``."""
-    return (a + b - 1) // b
+_ceildiv = arch_facts.ceil_div  # mirrors ``oasr::tileCeilDiv``
 
 
 def _split_eligible(s: int, n_blocks: int) -> bool:

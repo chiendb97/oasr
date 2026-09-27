@@ -6,9 +6,11 @@
 // template / dispatch) that GEMM, BMM, Conv2D, attention and the gated MLP all
 // follow -- see `include/oasr/mlp/cutlass_gated_mlp_configs.h`.
 //
-// One thing lives here: `RecurrentStepArch<SM>` -- what an architecture *is*,
-// for this kernel family: its shared-memory budget, its warp slots, its MMA
-// and copy atoms, and explicit capability bools.
+// One thing lives here: `RecurrentStepArch<SM>` -- which architectures this
+// family serves, and its own ceilings.  What an architecture *is* -- its
+// shared-memory budget, its warp slots, its MMA and copy atoms and its
+// capability bools -- is `oasr::cute_sm80::ArchAmpere`
+// (`include/oasr/common/cute_sm80.h`), shared with attention and the gated MLP.
 //
 // It is `constexpr` over an `sm` **argument**, never over `__CUDA_ARCH__` and
 // never over a live device query, for the reasons `oasr/common/arch_facts.h`
@@ -17,36 +19,11 @@
 
 #pragma once
 
-// clang-format off
-//
-// This block is **order-sensitive and must not be sorted**.  `cute/tensor.hpp`
-// is CuTe's entry point and has to come before any individual `cute/atom/*` or
-// `cute/arch/*` header -- the atoms' free functions are declared against
-// declarations it pulls in, and including them bare is a parse error.
-//
-// The repo's `.clang-format` sets `IncludeBlocks: Regroup` with
-// `SortIncludes: true`, which merges the groups below and sorts
-// `cute/arch/copy_sm75.hpp` *above* `cute/tensor.hpp` -- exactly the parse
-// error this comment describes.  `AGENTS.md`'s formatting command covers
-// `csrc/` and not `include/`, which is why the sibling families' hand-ordered
-// headers survive; the guard is here so this one survives a wider invocation
-// too.
-#include <cute/tensor.hpp>
-
-#include <oasr/common/arch_facts.h>
+// `cute_sm80.h` carries the order-sensitive CuTe include block (with its own
+// `// clang-format off` guard); nothing here needs an individual CuTe header.
+#include <oasr/common/cute_sm80.h>
 
 #include "recurrent_step_tiles.h"
-
-#include <cute/arch/copy_sm75.hpp>
-#include <cute/arch/copy_sm80.hpp>
-#include <cute/atom/copy_atom.hpp>
-#include <cute/atom/mma_atom.hpp>
-#include <cutlass/arch/arch.h>
-#include <cutlass/arch/mma_sm80.h>
-#include <cutlass/numeric_types.h>
-
-#include <type_traits>
-// clang-format on
 
 namespace oasr {
 namespace recurrent {
@@ -57,71 +34,29 @@ namespace recurrent {
 
 /*! \brief What one architecture is, for this kernel family.
  *
- * `Tag` selects *instructions*; `kSmemBudgetBytes` and `kMaxThreadsPerSm`
- * select *tuning*.  Keeping those two jobs apart is why sm_86, sm_89 and
- * sm_120 all route through `cutlass::arch::Sm80` -- the tag they share is the
- * tag whose instructions they run -- while still budgeting their own 99 KB and
- * their own 1536 warp slots.
+ * The instruction selection -- the MMA atom, the ZFILL gmem copy, `ldmatrix`
+ * -- and the budgets are `oasr::cute_sm80::ArchAmpere`'s, shared with the
+ * attention and gated-MLP families.  What a specialization here adds is the
+ * *decision to serve* that architecture, plus this family's own ceilings.
  *
- * \warning Never branch on `Tag::kMinComputeCapability >= 90`.  `Sm120`'s is
- *   120, so that test is *true* on consumer Blackwell, which has neither TMA
- *   nor warp specialization.  Branch on `kHasTma` / `kIsWarpSpecialized`,
- *   which say what they mean.
+ * `previous_h` is `(M, K)` row-major and `weight_hh` is `(N, K)` -- the
+ * gate-interleaved `(out, in)` layout the packer produces -- so both operands
+ * of the TN `mma.sync` read through the same non-transposed `ldmatrix`
+ * (`SmemCopyAtom`).  The ZFILL `GmemCopyAtom` is what lets a hidden width that
+ * is not a whole number of K tiles be predicated rather than refused: a
+ * predicated-off copy writes zeros, the identity for the dot product.
+ *
+ * \warning Never branch on `Tag::kMinComputeCapability >= 90`; see
+ *   `cute_sm80::ArchAmpere`.
  */
 template <int SmVersion>
 struct RecurrentStepArch;
 
 namespace detail {
 
-/*! \brief The Ampere-class (mma.sync + cp.async) traits every sm_8x/sm_12x shares.
- *
- * This composition -- a cp.async multistage ring, swizzled shared memory,
- * `ldmatrix.x4`, warp-level `mma.sync` m16n8k16, FP32 accumulate -- is what
- * SM80 through SM120 all actually run for FP16/BF16.  GeForce Blackwell has no
- * FP16 tcgen05 path, so its own CUTLASS GEMM uses the same warp-level atom.
- */
 template <int SmVersion>
-struct RecurrentStepArchAmpere {
-    using Tag = cutlass::arch::Sm80;
-
-    static constexpr int kSmVersion = SmVersion;
-    static constexpr int kSmemCapacityBytes = smemCapacityForSm(SmVersion);
-    static constexpr int kSmemBudgetBytes = smemBudgetForSm(SmVersion);
-    static constexpr int kMaxThreadsPerSm = maxThreadsPerSmForSm(SmVersion);
-
-    //! Register file and L2 differ enough on the consumer parts to move the
-    //! tile choice; they do not change which instructions are legal.
-    static constexpr bool kIsSm86Or89 = (SmVersion == 86 || SmVersion == 89);
-
-    static constexpr bool kHasCpAsync = true;
-    static constexpr bool kHasTma = false;
-    static constexpr bool kIsWarpSpecialized = false;
-
+struct RecurrentStepArchAmpere : cute_sm80::ArchAmpere<SmVersion> {
     static constexpr int kMaxThreadsPerBlock = 1024;
-
-    template <class Element>
-    using MmaAtom = std::conditional_t<std::is_same_v<Element, cutlass::half_t>,
-                                       cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>,
-                                       cute::MMA_Atom<cute::SM80_16x8x16_F32BF16BF16F32_TN>>;
-
-    //! gmem -> smem for `previous_h` and `weight_hh`.  ZFILL, not the plain
-    //! cp.async: a predicated-off copy writes **zeros** rather than leaving
-    //! stale shared memory, and a zero is the identity for the dot product
-    //! this kernel is accumulating.  That is what lets the K residue be
-    //! handled by predication instead of by refusing every hidden width that
-    //! is not a whole number of K tiles -- which is the contract the CuTeDSL
-    //! lane silently imposes (it loops `ceil_div(K, k_block)` and predicates
-    //! only the row axis).
-    template <class Element>
-    using GmemCopyAtom =
-        cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>, Element>;
-
-    //! `previous_h` is `(M, K)` row-major and `weight_hh` is `(N, K)` -- the
-    //! gate-interleaved `(out, in)` layout the packer produces -- so both the
-    //! A and the B operand of the TN `mma.sync` read through the *same*
-    //! non-transposed `ldmatrix`.
-    template <class Element>
-    using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
 };
 
 }  // namespace detail
@@ -157,10 +92,6 @@ struct RecurrentStepArch<120> : detail::RecurrentStepArchAmpere<120> {};
 //
 // The kernel shell, the arguments, the tile table, the FFI signature and the
 // whole Python side are arch-free and do not move.
-
-static_assert(!RecurrentStepArch<120>::kHasTma && !RecurrentStepArch<120>::kIsWarpSpecialized,
-              "consumer Blackwell has neither; a kMinComputeCapability >= 90 test would "
-              "claim both");
 
 }  // namespace recurrent
 }  // namespace oasr

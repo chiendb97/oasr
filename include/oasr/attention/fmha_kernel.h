@@ -7,7 +7,8 @@
 // Structurally FlashAttention's `hopper/flash_fwd_kernel_sm80.h`.  This is the
 // piece that makes the family arch-extensible: it names no architecture and
 // touches no layout, so an SM90 warp-specialized collective is a different
-// `CollectiveMainloop_` and nothing here changes.
+// `CollectiveMainloop_` and nothing here changes.  (Named without an `Sm80`
+// suffix for that reason, like `GatedMlpKernel` and `RecurrentStepKernel`.)
 
 #pragma once
 
@@ -24,7 +25,7 @@ namespace attention {
 using namespace cute;
 
 template <class CollectiveMainloop_, class CollectiveEpilogue_, class TileScheduler_>
-struct FmhaKernelSm80 {
+struct FmhaKernel {
     using CollectiveMainloop = CollectiveMainloop_;
     using CollectiveEpilogue = CollectiveEpilogue_;
     using TileScheduler = TileScheduler_;

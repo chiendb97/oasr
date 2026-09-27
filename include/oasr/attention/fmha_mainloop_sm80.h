@@ -48,12 +48,21 @@
 // up to the K-*tile* boundary above the length: a NaN there used to enter
 // through `P @ V`, where `0 * NaN` is NaN and no mask can intercept it, and it
 // did so non-deterministically -- repeated identical runs disagreed.
+//
+// Every load but one -- Q, every deeper K/V tile, the paged gather -- folds
+// its predicates into the ZFILL atom's own `src_size` (`cute_sm80::copy_zfill`)
+// rather than into control flow.  The branching form, `if (pred) copy else
+// clear`, makes ptxas order a synchronous `STS` against the asynchronous
+// `LDGSTS` to the same address, and it paid for that with a `BSSY`/`BSYNC`
+// pair and three dead `LDS` per copy: 144-168 dead instructions per variant,
+// on every K tile.  Zero-filling is correct for every skipped element here --
+// K rows past the length are masked to `-inf`, V rows must be zero (above), Q
+// rows past `seqlen_q` are never stored, and the head-dim residue must be zero
+// because the QK gemm runs over the padded extent.  The one exception is the
+// dense first tile, issued once per CTA; `copy_rows_or_clear` records why it
+// keeps the branch.
 
 #pragma once
-
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
 
 #include "cutlass_fmha_configs.h"
 #include "fmha_bias.h"
@@ -73,7 +82,7 @@ using namespace cute;
 template <int kNWarps_, int kStages_, bool Q_in_regs_, class TileShape_MNK_, int kHeadDimV_,
           class Element_, class ElementAccum_, int SmVersion_, bool Is_causal_,
           bool Is_local_, bool Has_bias_, bool PagedKV_, bool Split_ = false>
-struct CollectiveMainloopSm80 {
+struct CollectiveFmhaMainloopSm80 {
     using TileShape_MNK = TileShape_MNK_;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
@@ -109,7 +118,7 @@ struct CollectiveMainloopSm80 {
     static constexpr int NumMmaThreads = CUTE_STATIC_V(size(TiledMma{}));
 
     // --- shared memory ----------------------------------------------------
-    using SmemLayoutAtomQKV = typename FmhaSmemLayoutAtom<Element, kHeadDim>::type;
+    using SmemLayoutAtomQKV = typename cute_sm80::SmemLayoutAtomSwizzled<Element, kHeadDim>::type;
     using SmemLayoutQ =
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{})));
     using SmemLayoutK = decltype(tile_to_shape(
@@ -147,14 +156,15 @@ struct CollectiveMainloopSm80 {
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0,
                   "padded head dim must be a multiple of the 128-bit load width");
-    static constexpr int kBlockKGmem = FmhaSmemLayoutAtom<Element, kHeadDim>::kBlockKGmem;
+    static constexpr int kBlockKGmem =
+        cute_sm80::SmemLayoutAtomSwizzled<Element, kHeadDim>::kRowWidth;
     static constexpr int kGmemThreadsPerRow = kBlockKGmem / kGmemElemsPerLoad;
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0);
     using GmemLayoutAtom =
         Layout<Shape<Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                Stride<Int<kGmemThreadsPerRow>, _1>>;
     using GmemTiledCopyQKV =
-        decltype(make_tiled_copy(typename ArchTraits::template GmemCopyAtomKV<Element>{},
+        decltype(make_tiled_copy(typename ArchTraits::template GmemCopyAtom<Element>{},
                                  GmemLayoutAtom{},
                                  Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));
     static_assert(kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0,
@@ -197,7 +207,7 @@ struct CollectiveMainloopSm80 {
             // the mask predicates a narrowed range conservatively (a tile that
             // is interior to the *whole* range is also interior to a chunk of
             // it), so narrowing here is the entire mainloop-side cost.
-            cute_fmha_range const r =
+            FmhaBlockRange const r =
                 fmhaSplitRange(n_block_min_, n_block_max_, split_idx, params.num_splits);
             n_block_min_ = r.lo;
             n_block_max_ = r.hi;
@@ -280,55 +290,46 @@ struct CollectiveMainloopSm80 {
         // deeper tile lies wholly inside [0, seqlen_k) by construction.
         int const max_pages = PagedKV ? int(get<1>(params.shape_pagetable)) : 0;
 
-        auto load_K = [&](int const n_blk, int const stage, auto seqlenk_mask_type) {
+        // One loader for both K and V, dense or paged: every skipped row and
+        // column arrives as zeros through the ZFILL atom.  For V that is
+        // required, not merely tidy -- a stale NaN past the length would reach
+        // the output through `P @ V`, where the softmax weight is 0 but
+        // `0 * NaN` is NaN.  For K it is harmless: those columns are masked.
+        auto kv_col_ok = [&](int k) { return bool(tKVpKV(k)); };
+        auto load_KV = [&](auto const& mPool, auto&& sDst, auto const& tSrc, auto&& tDst,
+                           int const n_blk, auto seqlenk_mask_type) {
             static constexpr bool Seqlenk_mask = decltype(seqlenk_mask_type)::value;
             if constexpr (PagedKV) {
-                Tensor sK_cur = sK(_, _, stage);
-                paged_gather_tile<kBlockN, kHeadDim, Seqlenk_mask, /*Clear_OOB=*/false>(
-                    mKpool, sK_cur, params.ptr_pagetable, get<0>(params.stride_pagetable),
-                    bidb, bidh_kv, n_blk, seqlen_k, max_pages, params.page_size_divmod,
+                paged_gather_tile<kBlockN, kHeadDim, Seqlenk_mask>(
+                    mPool, sDst, params.ptr_pagetable, get<0>(params.stride_pagetable), bidb,
+                    bidh_kv, n_blk, seqlen_k, max_pages, params.page_size_divmod,
                     gmem_tiled_copy_QKV, gmem_thr_copy_QKV, tKVcKV, tKVpKV);
-                return;
+            } else if constexpr (Seqlenk_mask) {
+                // The first tile, once per CTA: the branching form, on purpose.
+                // See `copy_rows_or_clear` for the measurement.
+                int const row_limit =
+                    seqlen_k - n_blk * kBlockN - int(get<0>(tKVcKV(_0{}, _0{}, _0{})));
+                copy_rows_or_clear(
+                    typename ArchTraits::template GmemCopyAtom<Element>{}, tSrc, tDst,
+                    [&](int m) { return int(get<0>(t0KVcKV(_0{}, m, _0{}))) < row_limit; },
+                    kv_col_ok);
+            } else {
+                // Every deeper tile lies wholly inside [0, seqlen_k).
+                cute_sm80::copy_zfill(gmem_tiled_copy_QKV, tSrc, tDst, cute_sm80::AlwaysTrue{},
+                                      kv_col_ok);
             }
-            Tensor tKsK_cur = tKsK(_, _, _, stage);
-            int const avail = seqlen_k - n_blk * kBlockN;
-            int const rows = !Seqlenk_mask ? int(kBlockN)
-                                           : (avail < int(kBlockN) ? avail : int(kBlockN));
-            int const row_limit = -int(get<0>(tKVcKV(_0{}, _0{}, _0{}))) + rows;
-            copy_predicated</*Is_even_MN=*/!Seqlenk_mask, /*Is_even_K=*/false,
-                            /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_QKV, tKgK(_, _, _, n_blk), tKsK_cur, t0KVcKV, tKVpKV,
-                row_limit);
+        };
+        auto load_K = [&](int const n_blk, int const stage, auto seqlenk_mask_type) {
+            load_KV(mKpool, sK(_, _, stage), tKgK(_, _, _, n_blk), tKsK(_, _, _, stage), n_blk,
+                    seqlenk_mask_type);
         };
         auto load_V = [&](int const n_blk, int const stage, auto seqlenk_mask_type) {
-            static constexpr bool Seqlenk_mask = decltype(seqlenk_mask_type)::value;
-            if constexpr (PagedKV) {
-                Tensor sV_cur = sV(_, _, stage);
-                // V zeroes its skipped rows: a stale NaN past the length would
-                // reach the output through `P @ V`, where the weight is 0 but
-                // `0 * NaN` is not.
-                paged_gather_tile<kBlockN, kHeadDim, Seqlenk_mask, /*Clear_OOB=*/true>(
-                    mVpool, sV_cur, params.ptr_pagetable, get<0>(params.stride_pagetable),
-                    bidb, bidh_kv, n_blk, seqlen_k, max_pages, params.page_size_divmod,
-                    gmem_tiled_copy_QKV, gmem_thr_copy_QKV, tKVcKV, tKVpKV);
-                return;
-            }
-            Tensor tVsV_cur = tVsV(_, _, _, stage);
-            int const avail = seqlen_k - n_blk * kBlockN;
-            int const rows = !Seqlenk_mask ? int(kBlockN)
-                                           : (avail < int(kBlockN) ? avail : int(kBlockN));
-            int const row_limit = -int(get<0>(tKVcKV(_0{}, _0{}, _0{}))) + rows;
-            // V must be **zeroed** past the length, not merely skipped: a stale
-            // NaN here reaches the output through `P @ V`, where the softmax
-            // weight is 0 but `0 * NaN` is NaN.  ZFILL gives that for free.
-            copy_predicated</*Is_even_MN=*/!Seqlenk_mask, /*Is_even_K=*/false,
-                            /*Clear_OOB_MN=*/true, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_QKV, tVgV(_, _, _, n_blk), tVsV_cur, t0KVcKV, tKVpKV,
-                row_limit);
+            load_KV(mVpool, sV(_, _, stage), tVgV(_, _, _, n_blk), tVsV(_, _, _, stage), n_blk,
+                    seqlenk_mask_type);
         };
 
         auto preprocess_Q = [&] {
-            cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
+            cute::cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
             if constexpr (Q_in_regs) {
                 __syncthreads();
                 Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
@@ -352,14 +353,17 @@ struct CollectiveMainloopSm80 {
             for (int k = 0; k < size(tQpQ); ++k) {
                 tQpQ(k) = get<1>(tQcQ(_0{}, _0{}, k)) < get<1>(params.shape_q);
             }
-            // Q rows past `seqlen_q` are skipped, not zeroed.  Their scores are
-            // garbage, but per-row state never crosses rows and the epilogue
-            // does not store them, so the garbage is inert -- and skipping the
-            // clear keeps a compare out of the inner loop.
-            copy_predicated</*Is_even_MN=*/false, /*Is_even_K=*/false,
-                            /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
-                gmem_tiled_copy_QKV, tQgQ, tQsQ, t0QcQ, tQpQ,
-                info.seqlen_q - m_block * kBlockM - get<0>(tQcQ(_0{}, _0{}, _0{})));
+            // Q rows past `seqlen_q` arrive as zeros.  Their scores are inert
+            // either way -- per-row state never crosses rows and the epilogue
+            // does not store them.  Thread 0's row coordinates are
+            // compile-time constants; this thread's offset is folded into the
+            // limit instead.
+            int const q_row_limit =
+                info.seqlen_q - m_block * kBlockM - int(get<0>(tQcQ(_0{}, _0{}, _0{})));
+            cute_sm80::copy_zfill(
+                gmem_tiled_copy_QKV, tQgQ, tQsQ,
+                [&](int m) { return int(get<0>(t0QcQ(_0{}, m, _0{}))) < q_row_limit; },
+                [&](int k) { return bool(tQpQ(k)); });
         }
         cute::cp_async_fence();
 
@@ -375,33 +379,6 @@ struct CollectiveMainloopSm80 {
         } else {
             __syncthreads();
         }
-
-        cute::for_each(cute::make_int_sequence<kStages>{}, [&](auto stage) {
-            static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
-            static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
-            if constexpr (!Share_QV_Smem || !Is_first_stage) {
-                if (Is_first_stage || n_block - stage >= n_block_min) {
-                    load_K(n_block - stage, stage, cute::bool_constant<Is_first_stage>{});
-                }
-                // Fence outside the `if`: the committed group count must not
-                // depend on how many tiles exist, or the waits below are wrong.
-                cute::cp_async_fence();
-            }
-            if constexpr (!Is_last_stage) {
-                if (Is_first_stage || n_block - stage >= n_block_min) {
-                    load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{});
-                }
-                cute::cp_async_fence();
-            }
-        });
-
-        if constexpr (!Share_QV_Smem) {
-            preprocess_Q();
-        }
-
-        Mask<kBlockM, kBlockN, TiledMma> mask(thread_idx, seqlen_k, info.seqstart_k,
-                                              params.window_size_left,
-                                              params.window_size_right);
 
         // The bias plane for this (batch, head).  Its extents -- not the
         // sequence lengths -- are what the load predicates against, because it
@@ -446,11 +423,38 @@ struct CollectiveMainloopSm80 {
             bias_packed ? ((info.seqlen_k % 2) == 0 && (info.bias_offset % 2) == 0)
                         : params.bias_vectorizable;
 
+        cute::for_each(cute::make_int_sequence<kStages>{}, [&](auto stage) {
+            static constexpr bool Is_first_stage = CUTE_STATIC_V(stage) == 0;
+            static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
+            if constexpr (!Share_QV_Smem || !Is_first_stage) {
+                if (Is_first_stage || n_block - stage >= n_block_min) {
+                    load_K(n_block - stage, stage, cute::bool_constant<Is_first_stage>{});
+                }
+                // Fence outside the `if`: the committed group count must not
+                // depend on how many tiles exist, or the waits below are wrong.
+                cute::cp_async_fence();
+            }
+            if constexpr (!Is_last_stage) {
+                if (Is_first_stage || n_block - stage >= n_block_min) {
+                    load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{});
+                }
+                cute::cp_async_fence();
+            }
+        });
+
+        if constexpr (!Share_QV_Smem) {
+            preprocess_Q();
+        }
+
+        Mask<kBlockM, kBlockN, TiledMma> mask(thread_idx, seqlen_k, info.seqstart_k,
+                                              params.window_size_left,
+                                              params.window_size_right);
+
         int smem_pipe_read = 0;
         int smem_pipe_write = kStages - 1;
 
         auto sync = [&] {
-            cp_async_wait<kStages * 2 - 2>();
+            cute::cp_async_wait<kStages * 2 - 2>();
             __syncthreads();
         };
         auto load_K_next = [&] {
@@ -481,19 +485,23 @@ struct CollectiveMainloopSm80 {
             // The next V copy is issued from *inside* the gemm, after the first
             // k-tile's ldmatrix, so it overlaps the whole QK rather than
             // sitting in front of it.
-            gemm_sm80<Q_in_regs>(tSrS, tSrQ_cur, tSrK, tSsQ,
-                                 tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma,
-                                 smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q,
-                                 smem_thr_copy_K, load_V_next);
+            cute_sm80::gemm_sm80<Q_in_regs>(
+                tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
+                load_V_next);
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             if constexpr (kStages == 1) {
                 sync();
                 load_K_next();
             }
             if constexpr (Has_bias) {
-                add_bias_tile<kBlockM, kBlockN>(tSrS, bias_plane, tiled_mma, thread_idx,
-                                                m_block, n_blk, bias_vectorizable,
-                                                params.inv_softmax_scale);
+                // Read after the QK gemm, deliberately not a tile ahead: see
+                // `fmha_bias.h` for the prefetch that was measured and why it
+                // is not here.
+                auto rBias = make_bias_fragment<kBlockM, kBlockN, Element>(tiled_mma, thread_idx);
+                load_bias_tile<kBlockM, kBlockN>(rBias, bias_plane, tiled_mma, thread_idx,
+                                                 m_block, n_blk, bias_vectorizable);
+                apply_bias_tile(tSrS, rBias, params.inv_softmax_scale);
             }
             // Bias first, then mask: a score modification applied *after* the
             // mask would turn a -inf back into a finite number.
@@ -501,9 +509,9 @@ struct CollectiveMainloopSm80 {
             auto scores_scale = softmax.template max_get_scale<Is_first, /*Check_inf=*/true>(
                 tSrS);
             softmax.template online_softmax<Is_first>(tSrS, scores_scale);
-            Tensor tOrP_acc =
-                make_tensor(tSrS.data(), convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
-            Tensor tOrP = convert_type<Element>(tOrP_acc);
+            Tensor tOrP_acc = make_tensor(
+                tSrS.data(), cute_sm80::convert_layout_acc_Aregs<TiledMma>(tSrS.layout()));
+            Tensor tOrP = cute_sm80::convert_type<Element>(tOrP_acc);
             if constexpr (!Is_first) {
                 softmax.rescale_o(tOrO, scores_scale);
             }
@@ -511,8 +519,9 @@ struct CollectiveMainloopSm80 {
                 sync();
             }
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
-            gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                         tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+            cute_sm80::gemm_rs_sm80(tOrO, tOrP, tOrV,
+                                    tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma,
+                                    smem_tiled_copy_V, smem_thr_copy_V);
             if constexpr (kStages > 1) {
                 load_K_next();
             }

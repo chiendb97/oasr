@@ -19,20 +19,18 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/device_kernel.h>
 
-#include <oasr/common/arch_dispatch.h>
+#include <oasr/common/cute_sm80.h>
 
 #include "cutlass_fmha_configs.h"
-#include "epilogue.h"
 #include "fmha_combine.h"
+#include "fmha_epilogue.h"
+#include "fmha_mainloop_sm80.h"
 #include "fmha_params.h"
-#include "mainloop_sm80.h"
-#include "tile_scheduler.h"
-// `fmha_kernel_sm80.h` must follow the scheduler: it names
+#include "fmha_tile_scheduler.h"
+// `fmha_kernel.h` must follow the scheduler: it names
 // `TileScheduler::SharedStorage` in its own union.
-#include "fmha_kernel_sm80.h"
+#include "fmha_kernel.h"
 
 namespace oasr {
 namespace attention {
@@ -70,8 +68,8 @@ cudaError_t run_fmha(FmhaParams<Element> const& params, cudaStream_t stream) {
     //
     //     using CollectiveMainloop = std::conditional_t<
     //         ArchTraits::kIsWarpSpecialized,
-    //         CollectiveMainloopSm90<...>,
-    //         CollectiveMainloopSm80<...>>;
+    //         CollectiveFmhaMainloopSm90<...>,
+    //         CollectiveFmhaMainloopSm80<...>>;
     //
     // and nothing below this line changes.  Asserting it here rather than
     // writing a `conditional_t` whose two arms are identical keeps the
@@ -80,16 +78,16 @@ cudaError_t run_fmha(FmhaParams<Element> const& params, cudaStream_t stream) {
                   "a warp-specialized arch needs its own collective; add the conditional_t "
                   "arm described above");
     using CollectiveMainloop =
-        CollectiveMainloopSm80<kTile.num_warps, kTile.num_stages, kTile.q_in_regs,
-                                  TileShape_MNK, kHeadDimV, Element, float, Arch, Is_causal,
-                                  Is_local, Has_bias, PagedKV, Split>;
+        CollectiveFmhaMainloopSm80<kTile.num_warps, kTile.num_stages, kTile.q_in_regs,
+                                   TileShape_MNK, kHeadDimV, Element, float, Arch, Is_causal,
+                                   Is_local, Has_bias, PagedKV, Split>;
 
-    using CollectiveEpilogue = CollectiveEpilogue<
+    using CollectiveEpilogue = CollectiveFmhaEpilogue<
         cute::Shape<cute::Int<kTile.block_m>, cute::Int<kHeadDimV>, cute::Int<kTile.block_n>>,
         Element, typename ArchTraits::Tag, CollectiveMainloop::NumMmaThreads>;
 
     using Scheduler = SingleTileScheduler;
-    using AttnKernel = FmhaKernelSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
+    using AttnKernel = FmhaKernel<CollectiveMainloop, CollectiveEpilogue, Scheduler>;
 
     static_assert(AttnKernel::SharedStorageSize <= ArchTraits::kSmemBudgetBytes,
                   "fmhaResolveTile and sizeof(SharedStorage) disagree");
@@ -121,24 +119,9 @@ cudaError_t run_fmha(FmhaParams<Element> const& params, cudaStream_t stream) {
         {num_blocks_m, int(cute::get<2>(params.shape_q)), int(cute::get<3>(params.shape_q)),
          num_splits});
 
-    dim3 const grid = AttnKernel::get_grid_shape(kernel_params);
-    dim3 const block = AttnKernel::get_block_shape();
-    int const smem_size = AttnKernel::SharedStorageSize;
-
-    auto kernel = cutlass::device_kernel<AttnKernel>;
-    // The table above says what the architecture offers; this asks what *this*
-    // device grants.  They agree on every part we ship, and when they do not
-    // the failure should name both numbers rather than surface as a driver
-    // error from inside `cudaFuncSetAttribute`.
-    if (smem_size > oasr::getDeviceMaxSharedMemoryOptin()) {
-        return cudaErrorInvalidValue;
-    }
-    cudaError_t status = oasr::optInSharedMemory(kernel, size_t(smem_size));
-    if (status != cudaSuccess) {
-        return status;
-    }
-    kernel<<<grid, block, smem_size, stream>>>(kernel_params);
-    return cudaGetLastError();
+    // The table above says what the architecture offers; the launcher asks
+    // what *this* device grants before opting in.
+    return cute_sm80::launch_kernel<AttnKernel>(kernel_params, stream);
 }
 
 /*! \brief The combine pass for a split launch.

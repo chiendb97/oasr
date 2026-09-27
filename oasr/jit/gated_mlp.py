@@ -50,7 +50,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from . import env
+from . import arch_facts, env
 from .core import JitSpec, _get_target_sm, gen_jit_spec
 from .cubin_loader import write_if_different
 from .measured import Machine, MeasuredOn, note_extrapolation
@@ -110,31 +110,10 @@ ACTIVATIONS: Tuple[str, ...] = tuple(sorted(_ACTIVATION_ID))
 
 _DTYPES = {"float16": "cutlass::half_t", "bfloat16": "cutlass::bfloat16_t"}
 
-#: Opt-in shared memory per architecture, mirroring ``oasr::smemCapacityForSm``.
-#: A *table*, not a device query: the capability surface is parametrised over
-#: four architectures in the tests so one box can hold the line for all of
-#: them, and a live query would collapse that to whatever card is present.
-_SMEM_CAPACITY: Dict[int, int] = {
-    80: 166912,
-    86: 101376,
-    89: 101376,
-    90: 232448,
-    100: 232448,
-    120: 101376,
-}
-#: Mirrors ``oasr::maxThreadsPerSmForSm``.
-_MAX_THREADS_PER_SM: Dict[int, int] = {
-    80: 2048,
-    86: 1536,
-    89: 1536,
-    90: 2048,
-    100: 2048,
-    120: 1536,
-}
-#: Mirrors ``oasr::kDriverSmemReserve``.
-_DRIVER_SMEM_RESERVE = 1024
-#: Mirrors ``oasr::mlp::kGatedMlpMaxBlocksPerSm``.
-_MAX_BLOCKS_PER_SM = 24
+#: Hardware tables, mirrored once for every C++ CuTe family in
+#: :mod:`oasr.jit.arch_facts`.  Re-exported under the names the mirror tests use.
+_SMEM_CAPACITY = arch_facts.SMEM_CAPACITY
+_MAX_THREADS_PER_SM = arch_facts.MAX_THREADS_PER_SM
 
 
 @dataclass(frozen=True)
@@ -190,17 +169,7 @@ _REFUSED: "Counter[str]" = Counter()
 # ---------------------------------------------------------------------------
 
 
-def smem_budget(sm: int) -> int:
-    """Shared memory a launch on ``sm`` is actually granted, in bytes."""
-    cap = _SMEM_CAPACITY.get(sm, 0)
-    return cap - _DRIVER_SMEM_RESERVE if cap else 0
-
-
-def _smem_row_width(extent: int, elem_size: int) -> int:
-    """Mirrors ``gatedMlpSmemRowWidth``."""
-    nbytes = extent * elem_size
-    b = 128 if nbytes % 128 == 0 else (64 if nbytes % 64 == 0 else 32)
-    return b // elem_size
+smem_budget = arch_facts.smem_budget
 
 
 def smem_bytes(tile: Tile, elem_size: int = 2) -> int:
@@ -221,41 +190,25 @@ def tile_valid(tile: Tile, sm: int, elem_size: int = 2) -> bool:
 
     Mirrors ``gatedMlpTileValid`` clause for clause.  Each one is a *silent*
     failure if dropped: the MMA clauses become an unreadable CuTe layout
-    error, the ``rows_per_pass`` clauses become an illegal access no predicate
-    can intercept (the *partition* is out of range), and the shared-memory
-    clause becomes a launch failure with an empty message.
+    error, the tiled-copy clauses become an illegal access no predicate can
+    intercept (the *partition* is out of range), and the shared-memory clause
+    becomes a launch failure with an empty message.
     """
     if elem_size != 2:
         return False
-    if tile.threads % 32 or tile.threads < 32 or tile.threads > 1024:
-        return False
-    warps = tile.threads // 32
-    if tile.warps_n < 1 or warps % tile.warps_n:
-        return False
-    warps_m = warps // tile.warps_n
-    if tile.block_m % (16 * warps_m) or tile.block_n % (16 * tile.warps_n):
+    if not arch_facts.sm80_warp_tiling_valid(
+        tile.block_m, tile.block_n, tile.threads, tile.warps_n
+    ):
         return False
     if tile.block_k % 32 or tile.stages < 2:
         return False
-    vec = 16 // elem_size
-    k_row = _smem_row_width(tile.block_k, elem_size)
-    threads_per_row = k_row // vec
-    if threads_per_row <= 0 or tile.threads % threads_per_row or tile.block_k % k_row:
+    if not (
+        arch_facts.sm80_tiled_copy_fits(tile.block_m, tile.block_k, tile.threads, elem_size)
+        and arch_facts.sm80_tiled_copy_fits(tile.block_n, tile.block_k, tile.threads, elem_size)
+        and arch_facts.sm80_tiled_copy_fits(tile.block_m, tile.block_n, tile.threads, elem_size)
+    ):
         return False
-    rows_per_pass = tile.threads // threads_per_row
-    if rows_per_pass <= 0 or tile.block_m % rows_per_pass or tile.block_n % rows_per_pass:
-        return False
-    n_row = _smem_row_width(tile.block_n, elem_size)
-    o_threads_per_row = n_row // vec
-    if o_threads_per_row <= 0 or tile.threads % o_threads_per_row or tile.block_n % n_row:
-        return False
-    o_rows_per_pass = tile.threads // o_threads_per_row
-    if o_rows_per_pass <= 0 or tile.block_m % o_rows_per_pass:
-        return False
-    budget = smem_budget(sm)
-    if budget <= 0 or _MAX_THREADS_PER_SM.get(sm, 0) < tile.threads:
-        return False
-    return smem_bytes(tile, elem_size) <= budget
+    return arch_facts.fits_sm(smem_bytes(tile, elem_size), tile.threads, sm)
 
 
 def ctas_per_sm(tile: Tile, sm: int, elem_size: int = 2) -> int:
@@ -266,15 +219,10 @@ def ctas_per_sm(tile: Tile, sm: int, elem_size: int = 2) -> int:
     would never bind.  A tile that changed that would show up as a *measured*
     regression, not as a wrong number here.
     """
-    nbytes = smem_bytes(tile, elem_size)
-    budget = smem_budget(sm)
-    by_smem = budget // nbytes if nbytes > 0 else _MAX_BLOCKS_PER_SM
-    by_threads = _MAX_THREADS_PER_SM.get(sm, 0) // tile.threads if tile.threads > 0 else 0
-    return max(1, min(by_smem, by_threads, _MAX_BLOCKS_PER_SM))
+    return arch_facts.ctas_per_sm(smem_bytes(tile, elem_size), tile.threads, sm)
 
 
-def _ceildiv(a: int, b: int) -> int:
-    return -(-a // b)
+_ceildiv = arch_facts.ceil_div
 
 
 def _waves(tile: Tile, sm: int, num_sms: int, rows: int, n: int, elem_size: int) -> int:

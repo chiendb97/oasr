@@ -3,7 +3,7 @@
 //
 // The fused recurrent step's CTA tiles, and the ladder that picks one.
 //
-// Pure integers: this header pulls in nothing but `oasr/common/arch_facts.h`,
+// Pure integers: this header pulls in nothing but `oasr/common/tile_rules.h`,
 // no CuTe and no CUDA.  That is deliberate, and it is the same split
 // `include/oasr/mlp/gated_mlp_tiles.h` makes for the same reason --
 // `csrc/recurrent_step_jit_binding.cu` exports these answers so that
@@ -31,7 +31,7 @@
 
 #pragma once
 
-#include <oasr/common/arch_facts.h>
+#include <oasr/common/tile_rules.h>
 
 namespace oasr {
 namespace recurrent {
@@ -122,13 +122,6 @@ inline constexpr RecurrentStepRoute kRecurrentStepRoutes[] = {
 inline constexpr int kRecurrentStepRouteCount =
     int(sizeof(kRecurrentStepRoutes) / sizeof(kRecurrentStepRoutes[0]));
 
-/*! \brief Hardware ceiling on resident blocks per SM.
- *
- * The tiles here never approach it -- shared memory binds at 1 or 2 -- but
- * leaving it out would let a hypothetical tiny tile claim absurd occupancy.
- */
-inline constexpr int kRecurrentStepMaxBlocksPerSm = 24;
-
 /*! \brief The 128-bit vector contract, in elements.
  *
  * The mainloop loads `previous_h` and `weight_hh` in 128-bit pieces along K,
@@ -136,25 +129,6 @@ inline constexpr int kRecurrentStepMaxBlocksPerSm = 24;
  * number, same reason, as `oasr.layers._backend.GEMM_ALIGNMENT`.
  */
 inline constexpr int kRecurrentStepAlignment = 8;
-
-//! `ceil(a / b)` for non-negative \p a and positive \p b.
-constexpr int recurrentStepCeilDiv(int a, int b) {
-    return (a + b - 1) / b;
-}
-
-/*! \brief Elements per shared-memory "row" for a tile of \p extent elements.
- *
- * One row covers a whole number of 128-byte cache lines where it can, so the
- * swizzle is bank-conflict free for the widest `ldmatrix` that fits.  Same
- * rule as `gatedMlpSmemRowWidth` and as the attention family's
- * `fmhaBlockKGmem`, and it agrees with the CuTeDSL lane's
- * `make_smem_swizzle_atom` at every extent either of them uses.
- */
-constexpr int recurrentStepSmemRowWidth(int extent, int elem_size) {
-    int const bytes = extent * elem_size;
-    int const b = (bytes % 128 == 0) ? 128 : ((bytes % 64 == 0) ? 64 : 32);
-    return b / elem_size;
-}
 
 /*! \brief The cp.async ring, in bytes: `stages * (M + N) * K`.
  *
@@ -220,17 +194,7 @@ constexpr bool recurrentStepTileValid(RecurrentStepTile t, int sm, int elem_size
     if (gates != 1 && gates != 4) {
         return false;
     }
-    if (t.threads % 32 != 0 || t.threads < 32 || t.threads > 1024) {
-        return false;
-    }
-    int const warps = t.threads / 32;
-    if (t.warps_n < 1 || warps % t.warps_n != 0) {
-        return false;
-    }
-    int const warps_m = warps / t.warps_n;
-    // The MMA is tiled (warps_m, warps_n) over a 16x16 permutation of the
-    // m16n8k16 atom, so each axis must cover a whole number of those.
-    if (t.block_m % (16 * warps_m) != 0 || t.block_n % (16 * t.warps_n) != 0) {
+    if (!sm80WarpTilingValid(t.block_m, t.block_n, t.threads, t.warps_n)) {
         return false;
     }
     // A tile holds whole hidden units, and the MMA atom is 8 wide.
@@ -242,14 +206,9 @@ constexpr bool recurrentStepTileValid(RecurrentStepTile t, int sm, int elem_size
     if (t.block_k % 32 != 0 || t.stages < 2) {
         return false;
     }
-    int const vec = 16 / elem_size;  // the 128-bit cp.async width
-    int const k_row = recurrentStepSmemRowWidth(t.block_k, elem_size);
-    int const threads_per_row = k_row / vec;
-    if (threads_per_row <= 0 || t.threads % threads_per_row != 0 || t.block_k % k_row != 0) {
-        return false;
-    }
-    int const rows_per_pass = t.threads / threads_per_row;
-    if (rows_per_pass <= 0 || t.block_m % rows_per_pass != 0 || t.block_n % rows_per_pass != 0) {
+    // Both mainloop operands are loaded K-major by one tiled copy.
+    if (!sm80TiledCopyFits(t.block_m, t.block_k, t.threads, elem_size) ||
+        !sm80TiledCopyFits(t.block_n, t.block_k, t.threads, elem_size)) {
         return false;
     }
     // The epilogue walks `(row, hidden unit)` slots, `t.threads` at a time.
@@ -259,11 +218,7 @@ constexpr bool recurrentStepTileValid(RecurrentStepTile t, int sm, int elem_size
     if ((t.block_m * (t.block_n / gates)) % t.threads != 0) {
         return false;
     }
-    int const budget = smemBudgetForSm(sm);
-    if (budget <= 0 || maxThreadsPerSmForSm(sm) < t.threads) {
-        return false;
-    }
-    return recurrentStepSmemBytes(t, elem_size) <= budget;
+    return tileFitsSm(recurrentStepSmemBytes(t, elem_size), t.threads, sm);
 }
 
 /*! \brief How many of these CTAs are resident at once, by shared memory and warps.
@@ -273,16 +228,7 @@ constexpr bool recurrentStepTileValid(RecurrentStepTile t, int sm, int elem_size
  * as a *measured* regression, not as a wrong number here.
  */
 constexpr int recurrentStepCtasPerSm(RecurrentStepTile t, int sm, int elem_size) {
-    int const bytes = recurrentStepSmemBytes(t, elem_size);
-    int const budget = smemBudgetForSm(sm);
-    int const by_smem = bytes > 0 ? budget / bytes : kRecurrentStepMaxBlocksPerSm;
-    int const threads_per_sm = maxThreadsPerSmForSm(sm);
-    int const by_threads = t.threads > 0 ? threads_per_sm / t.threads : 0;
-    int r = by_smem < by_threads ? by_smem : by_threads;
-    if (r > kRecurrentStepMaxBlocksPerSm) {
-        r = kRecurrentStepMaxBlocksPerSm;
-    }
-    return r < 1 ? 1 : r;
+    return tileCtasPerSm(recurrentStepSmemBytes(t, elem_size), t.threads, sm);
 }
 
 /*! \brief Index into `kRecurrentStepTiles` for this shape, or -1 if none fits.
