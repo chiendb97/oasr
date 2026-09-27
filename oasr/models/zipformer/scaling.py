@@ -20,6 +20,8 @@ https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/scal
 
 from __future__ import annotations
 
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -49,17 +51,22 @@ class ChunkCausalDepthwiseConv1d(nn.Module):
     Implemented as a half-width causal conv plus a within-chunk conv scaled by a
     learnable position-in-chunk correction.  Faithful port of the icefall module
     (inference + streaming).  Parameter names (``causal_conv``, ``chunkwise_conv``,
-    ``chunkwise_conv_scale``) match icefall.  Both convs run on the
-    ``oasr.depthwise_conv1d`` kernel: icefall keeps tensors in ``(N, C, T)``, so
-    each conv call transposes to the kernel's ``(N, T, C)`` layout and back.
+    ``chunkwise_conv_scale``) match icefall.
+
+    Unlike icefall this works in ``(N, T, C)``, the ``oasr.depthwise_conv1d``
+    kernel's own layout, so neither conv needs a transpose: the causal left
+    context is a padding argument offline and the cache when streaming, and
+    splitting the time axis into chunks is a free view rather than a permute.
+    The streaming cache is ``(N, left_pad, C)`` accordingly.
     """
 
     def __init__(self, channels: int, kernel_size: int, bias: bool = True) -> None:
         super().__init__()
         assert kernel_size % 2 == 1
         half_kernel_size = (kernel_size + 1) // 2
-        # causal_conv: a "valid" (padding=0) conv over the manually left-padded
-        # input.  chunkwise_conv: symmetric padding keeps the length.
+        # causal_conv: a "valid" (padding=0) conv over its left context -- the
+        # cache when streaming, a ``padding=(left_pad, 0)`` override offline.
+        # chunkwise_conv: symmetric padding keeps the length.
         self.causal_conv = DepthwiseConv1d(
             channels=channels, kernel_size=half_kernel_size, padding=0, bias=True
         )
@@ -69,40 +76,33 @@ class ChunkCausalDepthwiseConv1d(nn.Module):
         self.chunkwise_conv_scale = nn.Parameter(torch.zeros(2, channels, kernel_size))
         self.kernel_size = kernel_size
 
-    @staticmethod
-    def _depthwise(conv: DepthwiseConv1d, x: Tensor) -> Tensor:
-        """Run a depthwise conv given ``x`` in ``(N, C, T)`` (icefall layout)."""
-        return conv(x.transpose(1, 2).contiguous()).transpose(1, 2)
-
     def forward(self, x: Tensor, chunk_size: int = -1) -> Tensor:
-        batch_size, num_channels, seq_len = x.shape
+        """``x``: contiguous ``(N, T, C)`` -> ``(N, T, C)``."""
+        batch_size, seq_len, num_channels = x.shape
         left_pad = self.kernel_size // 2
         if chunk_size < 0 or chunk_size > seq_len:
             chunk_size = seq_len
         right_pad = -seq_len % chunk_size
 
-        x = torch.nn.functional.pad(x, (left_pad, right_pad))
+        x_causal = self.causal_conv(x, padding=(left_pad, 0))
 
-        x_causal = self._depthwise(self.causal_conv, x[..., : left_pad + seq_len])
-        assert x_causal.shape == (batch_size, num_channels, seq_len)
-
-        x_chunk = x[..., left_pad:]
-        num_chunks = x_chunk.shape[2] // chunk_size
-        x_chunk = x_chunk.reshape(batch_size, num_channels, num_chunks, chunk_size)
-        x_chunk = x_chunk.permute(0, 2, 1, 3).reshape(
-            batch_size * num_chunks, num_channels, chunk_size
+        x_chunk = F.pad(x, (0, 0, 0, right_pad)) if right_pad else x
+        num_chunks = x_chunk.shape[1] // chunk_size
+        x_chunk = self.chunkwise_conv(
+            x_chunk.view(batch_size * num_chunks, chunk_size, num_channels)
+        )  # does not change shape
+        chunk_scale = self._get_chunk_scale(chunk_size)  # (chunk_size, C)
+        if right_pad:
+            x_chunk = (x_chunk * chunk_scale).view(batch_size, -1, num_channels)[:, :seq_len]
+            return x_chunk + x_causal
+        # x_causal + x_chunk * chunk_scale, one kernel.
+        shape4 = (batch_size, num_chunks, chunk_size, num_channels)
+        return torch.addcmul(x_causal.view(shape4), x_chunk.view(shape4), chunk_scale).view(
+            batch_size, seq_len, num_channels
         )
-        x_chunk = self._depthwise(self.chunkwise_conv, x_chunk)  # does not change shape
-
-        chunk_scale = self._get_chunk_scale(chunk_size)
-        x_chunk = x_chunk * chunk_scale
-        x_chunk = x_chunk.reshape(batch_size, num_chunks, num_channels, chunk_size).permute(
-            0, 2, 1, 3
-        )
-        x_chunk = x_chunk.reshape(batch_size, num_channels, num_chunks * chunk_size)[..., :seq_len]
-        return x_chunk + x_causal
 
     def _get_chunk_scale(self, chunk_size: int) -> Tensor:
+        """The ``(chunk_size, C)`` position-in-chunk scale (a transposed view)."""
         left_edge = self.chunkwise_conv_scale[0]
         right_edge = self.chunkwise_conv_scale[1]
         if chunk_size < self.kernel_size:
@@ -114,23 +114,21 @@ class ChunkCausalDepthwiseConv1d(nn.Module):
             pad = torch.zeros(channels, t, device=left_edge.device, dtype=left_edge.dtype)
             left_edge = torch.cat((left_edge, pad), dim=-1)
             right_edge = torch.cat((pad, right_edge), dim=-1)
-        return 1.0 + (left_edge + right_edge)
+        return (1.0 + (left_edge + right_edge)).t()
 
-    def streaming_forward(self, x: Tensor, cache: Tensor):
-        batch_size, num_channels, seq_len = x.shape
+    def streaming_forward(self, x: Tensor, cache: Tensor) -> Tuple[Tensor, Tensor]:
+        """``x``: contiguous ``(N, T, C)``; ``cache``: ``(N, left_pad, C)``."""
         left_pad = self.kernel_size // 2
-        assert cache.shape[-1] == left_pad, (cache.shape[-1], left_pad)
-        x = torch.cat([cache, x], dim=2)
-        cache = x[..., -left_pad:]
+        assert cache.shape[1] == left_pad, (cache.shape[1], left_pad)
+        x_pad = torch.cat([cache, x], dim=1)
+        cache = x_pad[:, -left_pad:]
 
-        x_causal = self._depthwise(self.causal_conv, x)
-        assert x_causal.shape == (batch_size, num_channels, seq_len)
-
-        x_chunk = x[..., left_pad:]
-        x_chunk = self._depthwise(self.chunkwise_conv, x_chunk)
-        chunk_scale = self._get_chunk_scale(chunk_size=seq_len)
-        x_chunk = x_chunk * chunk_scale
-        return x_chunk + x_causal, cache
+        x_causal = self.causal_conv(x_pad)
+        # The within-chunk conv sees only this chunk -- which is ``x`` itself,
+        # already contiguous, not the cache-prefixed buffer.
+        x_chunk = self.chunkwise_conv(x)
+        chunk_scale = self._get_chunk_scale(chunk_size=x.shape[1])
+        return torch.addcmul(x_causal, x_chunk, chunk_scale), cache
 
 
 class ActivationDropoutAndLinear(nn.Module):

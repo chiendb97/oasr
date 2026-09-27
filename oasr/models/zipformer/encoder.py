@@ -8,7 +8,8 @@ with training-only machinery (Balancer, Whiten, dropout, layer-skip, ScaledAdam
 scaling, diagnostics) removed.  Module + parameter names mirror icefall exactly
 so an icefall checkpoint loads with a 1:1 key mapping.
 
-Tensors are time-first ``(seq_len, batch, dim)`` throughout, as in icefall.
+Activations are time-first ``(seq_len, batch, dim)``, as in icefall; only the
+depthwise convolution works batch-first (see "Layout" below).
 
 Reference:
 https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/zipformer.py
@@ -59,6 +60,31 @@ from .scaling import (
 # Folding the operands in is bit-exact, and the 200-utterance WER gate is
 # unchanged error count for error count; 1.7-3.7x on the kernel, at the shapes
 # this stack produces.
+#
+# Layout.  The forward is host-issue-bound, so a layout conversion costs a launch
+# before it costs bandwidth, and the layouts below are chosen to need none:
+#
+# * Activations stay time-first ``(T, B, C)`` as in icefall, because that is the
+#   layout in which the value products collapse to *one* launch.  ``oasr.bmm``
+#   advances every operand by one batch stride, so its two batch axes merge only
+#   when all three tensors are affine in the same flattened ``(head, batch)``
+#   index.  A ``(T, B, H, Dv)`` activation is affine batch-major, so the
+#   probabilities are stored batch-major too (``(B, H, T, T)``, handed out as an
+#   ``(H, B, T, T)`` view) and each value product writes its result straight into
+#   a ``(T, B, H * Dv)`` buffer through a strided ``out=`` view -- no permute copy
+#   before ``out_proj``, and no per-head launch loop.
+# * The score product collapses the same way, because ``in_proj``'s output rows
+#   are stored *head-interleaved* -- ``[q_h | k_h | p_h]`` per head rather than
+#   icefall's ``[q | k | p]`` -- so the query and key slices are affine
+#   batch-major too.  The permutation is applied to the weights once, at load
+#   (``RelPositionMultiheadAttentionWeights._version``).
+# * The relative-position product is a single 3-D product: the query rows
+#   ``(T, B)`` fold into M, since ``pos_emb`` is shared by the whole batch.
+# * Only the depthwise convolution wants ``(B, T, C)``.  The one elementwise
+#   pass the module needs anyway -- the key-padding ``masked_fill`` -- does the
+#   transpose too, the conv and ``out_proj`` then run on that contiguous
+#   buffer, and the module returns a transposed view, which the residual add
+#   consumes in place.
 
 
 def _to_tuple(x, length: int):
@@ -119,8 +145,55 @@ class CompactRelPositionalEncoding(nn.Module):
         return pos_emb.to(dtype=x.dtype)
 
 
+def _batch_major_scores(q: Tensor, k_len: int) -> Tensor:
+    """An ``(H, B, T, k_len)`` output view over ``(B, H, T, k_len)`` storage."""
+    num_heads, batch_size, seq_len, _ = q.shape
+    out = torch.empty(batch_size, num_heads, seq_len, k_len, device=q.device, dtype=q.dtype)
+    return out.transpose(0, 1)
+
+
+def _masked_softmax_batch_major(
+    attn_scores: Tensor,
+    pos_scores: Tensor,
+    attn_mask: Optional[Tensor],
+    key_padding_mask: Optional[Tensor],
+) -> Tensor:
+    """Softmax over the batch-major storage of ``attn_scores``; returns the ``(H, B, ...)`` view.
+
+    ``masked_softmax`` wants a contiguous input, which the storage is; the bias
+    and masks are broadcast against it and read through their strides, so they
+    are permuted views, not copies.
+    """
+    probs = oasr.masked_softmax(
+        attn_scores.transpose(0, 1),
+        bias=pos_scores.transpose(0, 1),
+        mask=attn_mask,
+        mask2=None if key_padding_mask is None else key_padding_mask[:, None, None, :],
+        mask_value=-1000.0,
+    )
+    return probs.transpose(0, 1)
+
+
+def _head_view(buf: Tensor, num_heads: int) -> Tensor:
+    """``(T, B, H * D)`` -> the ``(H, B, T, D)`` view a value product writes through."""
+    seq_len, batch_size, dim = buf.shape
+    return buf.view(seq_len, batch_size, num_heads, dim // num_heads).permute(2, 1, 0, 3)
+
+
 class RelPositionMultiheadAttentionWeights(nn.Module):
-    """Computes shared multi-head attention weights with relative position encoding."""
+    """Computes shared multi-head attention weights with relative position encoding.
+
+    ``in_proj`` produces, for every head ``h``, the contiguous run
+    ``[q_h (query_head_dim) | k_h (query_head_dim) | p_h (pos_head_dim)]``.  icefall
+    orders the same rows ``[q (all heads) | k | p]``; with that order a head's
+    query slice is not an affine function of the flattened ``(head, batch)``
+    index, and ``oasr.bmm`` has to issue the score product once per head.  v2 of
+    this module stores the rows head-interleaved; icefall (and v1) weights are
+    permuted once in :meth:`_load_from_state_dict`.
+    """
+
+    # v2: ``in_proj`` rows are head-interleaved.  icefall and v1 use ``[q | k | p]``.
+    _version = 2
 
     def __init__(
         self,
@@ -141,6 +214,58 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         self.in_proj = Linear(embed_dim, in_proj_dim, bias=True)
         self.linear_pos = Linear(pos_dim, num_heads * pos_head_dim, bias=False)
 
+    def head_interleave_index(self) -> Tensor:
+        """``new_rows = legacy_rows[index]``: icefall ``[q | k | p]`` -> per-head runs."""
+        num_heads, qd, pd = self.num_heads, self.query_head_dim, self.pos_head_dim
+        q = torch.arange(num_heads * qd).view(num_heads, qd)
+        k = q + num_heads * qd
+        p = torch.arange(num_heads * pd).view(num_heads, pd) + 2 * num_heads * qd
+        return torch.cat((q, k, p), dim=1).flatten()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Interleave icefall/v1 ``in_proj`` rows per head, once, on load.
+
+        A state dict without per-module metadata (a plain icefall dict, as
+        :meth:`ZipformerModel.load_weights` builds) counts as v1; a native
+        checkpoint is stamped with the current versions by
+        ``oasr.checkpoints.native.load_native_weights``, so it is never permuted
+        twice.
+        """
+        if local_metadata.get("version", 1) < 2:
+            index = None
+            for name in ("weight", "bias"):
+                key = prefix + "in_proj." + name
+                if key in state_dict:
+                    if index is None:
+                        index = self.head_interleave_index()
+                    tensor = state_dict[key]
+                    if tensor.shape[0] != index.numel():
+                        raise ValueError(
+                            f"{key} has {tensor.shape[0]} rows; expected {index.numel()} "
+                            f"({self.num_heads} heads x (2 x {self.query_head_dim} + "
+                            f"{self.pos_head_dim}))"
+                        )
+                    state_dict[key] = tensor[index.to(tensor.device)].contiguous()
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def forward(
         self,
         x: Tensor,
@@ -150,55 +275,51 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
     ) -> Tensor:
         x = self.in_proj(x)
         query_head_dim = self.query_head_dim
-        pos_head_dim = self.pos_head_dim
         num_heads = self.num_heads
         seq_len, batch_size, _ = x.shape
-        query_dim = query_head_dim * num_heads
 
-        q = x[..., 0:query_dim]
-        k = x[..., query_dim : 2 * query_dim]
-        p = x[..., 2 * query_dim :]
+        # (time, batch, head, [q | k | p]): each head's slices are affine in the
+        # flattened batch-major (head, batch) index, so the product is one launch.
+        heads = x.view(seq_len, batch_size, num_heads, -1)
+        q = heads[..., :query_head_dim].permute(2, 1, 0, 3)  # (head, batch, time1, qhd)
+        k = heads[..., query_head_dim : 2 * query_head_dim].permute(2, 1, 0, 3)
 
-        q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
-        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
-        k = k.reshape(seq_len, batch_size, num_heads, query_head_dim)
+        # Batch-major storage, head-major view: see "Layout" at the top.
+        attn_scores = oasr.bmm(q, k, out=_batch_major_scores(q, seq_len))
 
-        q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
-        p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
-        k = k.permute(2, 1, 0, 3)  # (head, batch, time2, query_head_dim)
-
-        attn_scores = oasr.bmm(q, k)
-
-        pos_emb = self.linear_pos(pos_emb)
-        seq_len2 = 2 * seq_len - 1
-        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 1, 3)
-        # (head, {1 or batch}, seq_len2, pos_dim)
-        pos_scores = oasr.bmm(p, pos_emb)
-        pos_scores = pos_scores.as_strided(
-            (num_heads, batch_size, seq_len, seq_len),
-            (
-                pos_scores.stride(0),
-                pos_scores.stride(1),
-                pos_scores.stride(2) - pos_scores.stride(3),
-                pos_scores.stride(3),
-            ),
-            storage_offset=pos_scores.stride(3) * (seq_len - 1),
-        )
-        assert attn_scores.shape == (num_heads, batch_size, seq_len, seq_len)
+        pos_scores = self._pos_scores(x, pos_emb, seq_len, seq_len)
         if attn_mask is not None:
             assert attn_mask.dtype == torch.bool
         if key_padding_mask is not None:
             assert key_padding_mask.shape == (batch_size, seq_len), key_padding_mask.shape
 
-        # ``pos_scores`` above is a shifted window over the (H, B, T, 2T-1)
-        # product and ``key_padding_mask`` is a ``[..., ::ds]`` slice; both are
-        # consumed as strides, so neither is materialized.
-        return oasr.masked_softmax(
-            attn_scores,
-            bias=pos_scores,
-            mask=attn_mask,
-            mask2=None if key_padding_mask is None else key_padding_mask.unsqueeze(1),
-            mask_value=-1000.0,
+        # ``pos_scores`` is a shifted window over the relative-position product
+        # and ``key_padding_mask`` is a ``[..., ::ds]`` slice; both are consumed
+        # as strides, so neither is materialized.
+        return _masked_softmax_batch_major(attn_scores, pos_scores, attn_mask, key_padding_mask)
+
+    def _pos_scores(self, x: Tensor, pos_emb: Tensor, seq_len: int, k_len: int) -> Tensor:
+        """The ``(H, B, seq_len, k_len)`` relative-position bias, as a strided view.
+
+        ``pos_emb`` is shared by the batch, so the query rows ``(T, B)`` fold into
+        M and the product is one 3-D ``(H, T * B, 2T - 1 + left)`` GEMM rather than
+        a broadcast 4-D one (which ``oasr.bmm`` has to issue once per head).  Row
+        ``i * B + b`` of it holds query ``i`` of sequence ``b``; the bias is the
+        usual shifted window over each row.
+        """
+        num_heads, pos_head_dim = self.num_heads, self.pos_head_dim
+        batch_size = x.shape[1]
+        seq_len2 = pos_emb.shape[-2]
+        rows = x.view(seq_len * batch_size, num_heads, -1)
+        p = rows[..., 2 * self.query_head_dim :].transpose(0, 1)  # (head, time1 * batch, phd)
+        pos_emb = self.linear_pos(pos_emb)
+        pos_emb = pos_emb.reshape(seq_len2, num_heads, pos_head_dim).transpose(0, 1)
+        pos_scores = oasr.bmm(p, pos_emb)  # (head, time1 * batch, seq_len2)
+        # [h, b, i, j] -> pos_scores[h, i * B + b, (seq_len - 1) - i + j]
+        return pos_scores.as_strided(
+            (num_heads, batch_size, seq_len, k_len),
+            (pos_scores.stride(0), seq_len2, batch_size * seq_len2 - 1, 1),
+            storage_offset=pos_scores.storage_offset() + seq_len - 1,
         )
 
     def streaming_forward(
@@ -211,53 +332,31 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
     ) -> Tuple[Tensor, Tensor]:
         x = self.in_proj(x)
         query_head_dim = self.query_head_dim
-        pos_head_dim = self.pos_head_dim
         num_heads = self.num_heads
         seq_len, batch_size, _ = x.shape
-        query_dim = query_head_dim * num_heads
 
-        q = x[..., 0:query_dim]
-        k = x[..., query_dim : 2 * query_dim]
-        p = x[..., 2 * query_dim :]
+        heads = x.view(seq_len, batch_size, num_heads, -1)
+        q = heads[..., :query_head_dim]
+        k = heads[..., query_head_dim : 2 * query_head_dim]
 
+        # The cache keeps icefall's (time, batch, key_dim) shape; ``cat`` makes
+        # the keys contiguous (time, batch, head, qhd), which is affine too.
         assert cached_key.shape[0] == left_context_len, (cached_key.shape[0], left_context_len)
-        k = torch.cat([cached_key, k], dim=0)
-        cached_key = k[-left_context_len:, ...]
+        k = torch.cat([cached_key.unflatten(-1, (num_heads, query_head_dim)), k], dim=0)
         k_len = k.shape[0]
-
-        q = q.reshape(seq_len, batch_size, num_heads, query_head_dim)
-        p = p.reshape(seq_len, batch_size, num_heads, pos_head_dim)
-        k = k.reshape(k_len, batch_size, num_heads, query_head_dim)
+        cached_key = k[-left_context_len:].flatten(-2)
 
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
-        p = p.permute(2, 1, 0, 3)  # (head, batch, time1, pos_head_dim)
         k = k.permute(2, 1, 0, 3)  # (head, batch, k_len, query_head_dim)
 
-        attn_scores = oasr.bmm(q, k)
+        attn_scores = oasr.bmm(q, k, out=_batch_major_scores(q, k_len))
 
-        pos_emb = self.linear_pos(pos_emb)
-        seq_len2 = 2 * seq_len - 1 + left_context_len
-        pos_emb = pos_emb.reshape(-1, seq_len2, num_heads, pos_head_dim).permute(2, 0, 1, 3)
-        pos_scores = oasr.bmm(p, pos_emb)
-        pos_scores = pos_scores.as_strided(
-            (num_heads, batch_size, seq_len, k_len),
-            (
-                pos_scores.stride(0),
-                pos_scores.stride(1),
-                pos_scores.stride(2) - pos_scores.stride(3),
-                pos_scores.stride(3),
-            ),
-            storage_offset=pos_scores.stride(3) * (seq_len - 1),
-        )
+        assert pos_emb.shape[-2] == 2 * seq_len - 1 + left_context_len, pos_emb.shape
+        pos_scores = self._pos_scores(x, pos_emb, seq_len, k_len)
         if key_padding_mask is not None:
             assert key_padding_mask.shape == (batch_size, k_len), key_padding_mask.shape
 
-        attn_weights = oasr.masked_softmax(
-            attn_scores,
-            bias=pos_scores,
-            mask2=None if key_padding_mask is None else key_padding_mask.unsqueeze(1),
-            mask_value=-1000.0,
-        )
+        attn_weights = _masked_softmax_batch_major(attn_scores, pos_scores, None, key_padding_mask)
         return attn_weights, cached_key
 
 
@@ -273,12 +372,13 @@ class SelfAttention(nn.Module):
         seq_len, batch_size, embed_dim = x.shape
         num_heads = attn_weights.shape[0]
         x = self.in_proj(x)
+        out = torch.empty_like(x)
         # (head, batch, value_head_dim, time) -- the logical [N, K] operand, as a
-        # view: its N axis is the contiguous one, which oasr.bmm accepts.
-        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0)
-        x = oasr.bmm(attn_weights, x)
-        x = x.permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, -1)
-        return self.out_proj(x)
+        # view: its N axis is the contiguous one, which oasr.bmm accepts.  The
+        # result lands in ``out`` already time-major.
+        x = x.view(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0)
+        oasr.bmm(attn_weights, x, out=_head_view(out, num_heads))
+        return self.out_proj(out)
 
     def streaming_forward(
         self, x: Tensor, attn_weights: Tensor, cached_val: Tensor, left_context_len: int
@@ -288,12 +388,12 @@ class SelfAttention(nn.Module):
         seq_len2 = seq_len + left_context_len
         x = self.in_proj(x)
         assert cached_val.shape[0] == left_context_len, (cached_val.shape[0], left_context_len)
+        out = torch.empty_like(x)
         x = torch.cat([cached_val, x], dim=0)
         cached_val = x[-left_context_len:, ...]
-        x = x.reshape(seq_len2, batch_size, num_heads, -1).permute(2, 1, 3, 0)
-        x = oasr.bmm(attn_weights, x)
-        x = x.permute(2, 1, 0, 3).contiguous().view(seq_len, batch_size, -1)
-        return self.out_proj(x), cached_val
+        x = x.view(seq_len2, batch_size, num_heads, -1).permute(2, 1, 3, 0)
+        oasr.bmm(attn_weights, x, out=_head_view(out, num_heads))
+        return self.out_proj(out), cached_val
 
 
 class FeedforwardModule(nn.Module):
@@ -330,12 +430,13 @@ class NonlinAttention(nn.Module):
         x = x * s
 
         num_heads = attn_weights.shape[0]
-        x = x.reshape(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0)
-        x = oasr.bmm(attn_weights, x)
-        x = x.permute(2, 1, 0, 3).reshape(seq_len, batch_size, -1)
-
-        x = x * y
-        return self.out_proj(x)
+        out = torch.empty_like(x)
+        oasr.bmm(
+            attn_weights,
+            x.view(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0),
+            out=_head_view(out, num_heads),
+        )
+        return self.out_proj(out.mul_(y))
 
     def streaming_forward(
         self, x: Tensor, attn_weights: Tensor, cached_x: Tensor, left_context_len: int
@@ -355,11 +456,9 @@ class NonlinAttention(nn.Module):
         cached_x = x_pad[:, :, -left_context_len:, :]
         # The cache is (head, batch, time, dim), so the [N, K] operand is its
         # transposed view; ``cat`` already made it contiguous along dim.
-        x = oasr.bmm(attn_weights, x_pad.permute(0, 1, 3, 2))
-        x = x.permute(2, 1, 0, 3).reshape(seq_len, batch_size, -1)
-
-        x = x * y
-        return self.out_proj(x), cached_x
+        out = torch.empty(seq_len, batch_size, hidden_channels, device=y.device, dtype=y.dtype)
+        oasr.bmm(attn_weights, x_pad.permute(0, 1, 3, 2), out=_head_view(out, num_heads))
+        return self.out_proj(out.mul_(y)), cached_x
 
 
 class ConvolutionModule(nn.Module):
@@ -374,13 +473,13 @@ class ConvolutionModule(nn.Module):
         # GLU gating (chunk + sigmoid + mul) is fused into ``oasr.glu`` in forward.
         self.in_proj = Linear(channels, 2 * bottleneck_dim)
 
+        # Both convs work in (batch, time, channels), ``oasr.depthwise_conv1d``'s
+        # layout; the icefall [C, 1, K] weights are converted to [K, 1, C] on load.
         if causal:
             self.depthwise_conv = ChunkCausalDepthwiseConv1d(
                 channels=bottleneck_dim, kernel_size=kernel_size
             )
         else:
-            # ``oasr.depthwise_conv1d`` works in (batch, time, channels); the
-            # icefall [C, 1, K] weight is converted to [K, 1, C] on load.
             self.depthwise_conv = DepthwiseConv1d(
                 channels=bottleneck_dim,
                 kernel_size=kernel_size,
@@ -388,6 +487,9 @@ class ConvolutionModule(nn.Module):
             )
 
         self.out_proj = ActivationDropoutAndLinear(bottleneck_dim, channels, activation="SwooshR")
+        # The masked value as a device tensor: ``torch.where`` materializes a
+        # Python scalar with a fill kernel of its own on every call.
+        self.register_buffer("_zero", torch.zeros(()), persistent=False)
 
     def forward(
         self,
@@ -395,44 +497,45 @@ class ConvolutionModule(nn.Module):
         src_key_padding_mask: Optional[Tensor] = None,
         chunk_size: int = -1,
     ) -> Tensor:
-        x = oasr.glu(self.in_proj(x))  # (time, batch, channels)
-        x = x.permute(1, 2, 0)  # (batch, channels, time)
-        if src_key_padding_mask is not None:
-            x = x.masked_fill(src_key_padding_mask.unsqueeze(1).expand_as(x), 0.0)
+        x = self._gate(x, src_key_padding_mask)  # (batch, time, channels)
         if chunk_size >= 0:
             assert self.causal, "Must initialize with causal=True to use chunk_size"
             x = self.depthwise_conv(x, chunk_size=chunk_size)
-        elif self.causal:
-            x = self.depthwise_conv(x)
         else:
-            # oasr depthwise expects (batch, time, channels).
-            x = self.depthwise_conv(x.transpose(1, 2).contiguous()).transpose(1, 2)
-        x = x.permute(2, 0, 1)  # (time, batch, channels)
-        x = self.out_proj(x)
-        return x
+            x = self.depthwise_conv(x)
+        return self.out_proj(x).transpose(0, 1)  # (time, batch, channels) view
+
+    def _gate(self, x: Tensor, src_key_padding_mask: Optional[Tensor]) -> Tensor:
+        """``(T, B, C)`` -> GLU-gated, key-padding-masked, contiguous ``(B, T, C)``.
+
+        The mask is applied by the same elementwise pass that transposes, so the
+        conv's layout costs no pass of its own.
+        """
+        x = oasr.glu(self.in_proj(x)).transpose(0, 1)
+        if src_key_padding_mask is None:
+            return x.contiguous()
+        return torch.where(src_key_padding_mask.unsqueeze(-1), self._zero, x)
 
     def streaming_forward(
         self, x: Tensor, cache: Tensor, src_key_padding_mask: Tensor
     ) -> Tuple[Tensor, Tensor]:
-        x = oasr.glu(self.in_proj(x))  # (time, batch, channels)
-        x = x.permute(1, 2, 0)  # (batch, channels, time)
-        if src_key_padding_mask is not None:
-            x = x.masked_fill(src_key_padding_mask.unsqueeze(1).expand_as(x), 0.0)
+        x = self._gate(x, src_key_padding_mask)  # (batch, time, channels)
         x, cache = self.depthwise_conv.streaming_forward(x, cache=cache)
-        x = x.permute(2, 0, 1)  # (time, batch, channels)
-        x = self.out_proj(x)
-        return x, cache
+        return self.out_proj(x).transpose(0, 1), cache
 
 
 class BypassModule(nn.Module):
-    """Learnable per-channel bypass scale: ``src_orig + (src - src_orig) * scale``."""
+    """Learnable per-channel bypass scale: ``src_orig + (src - src_orig) * scale``.
+
+    Computed as one ``lerp`` rather than three elementwise kernels.
+    """
 
     def __init__(self, embed_dim: int):
         super().__init__()
         self.bypass_scale = nn.Parameter(torch.full((embed_dim,), 0.5))
 
     def forward(self, src_orig: Tensor, src: Tensor) -> Tensor:
-        return src_orig + (src - src_orig) * self.bypass_scale
+        return torch.lerp(src_orig, src, self.bypass_scale)
 
 
 class SimpleDownsample(nn.Module):
@@ -868,7 +971,11 @@ class Zipformer2(nn.Module):
         dtype: torch.dtype = torch.float32,
     ) -> List[Tensor]:
         """Per-layer cache: [cached_key, cached_nonlin_attn, cached_val1, cached_val2,
-        cached_conv1, cached_conv2] x num_layers, flattened."""
+        cached_conv1, cached_conv2] x num_layers, flattened.
+
+        As icefall's, except that the conv caches are ``(batch, left_pad, channels)``
+        rather than ``(batch, channels, left_pad)``: the depthwise conv's layout.
+        """
         num_encoder_layers = _to_tuple(self.num_encoder_layers, len(self.encoders))
         num_heads_t = _to_tuple(self.num_heads, len(self.encoders))
         query_head_dim_t = _to_tuple(self.query_head_dim, len(self.encoders))
@@ -894,7 +1001,7 @@ class Zipformer2(nn.Module):
                     z(1, batch_size, downsample_left, nonlin_attn_head_dim),
                     z(downsample_left, batch_size, value_dim),
                     z(downsample_left, batch_size, value_dim),
-                    z(batch_size, embed_dim, conv_left_pad),
-                    z(batch_size, embed_dim, conv_left_pad),
+                    z(batch_size, conv_left_pad, embed_dim),
+                    z(batch_size, conv_left_pad, embed_dim),
                 ]
         return states
