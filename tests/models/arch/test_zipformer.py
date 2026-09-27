@@ -238,6 +238,86 @@ class TestZipformerRegistry:
 
 
 # --------------------------------------------------------------------------- #
+# in_proj head-interleave migration (always run, CPU)
+# --------------------------------------------------------------------------- #
+
+
+def _attn_weight_modules(model):
+    from oasr.models.zipformer.encoder import RelPositionMultiheadAttentionWeights
+
+    return [
+        (name, m)
+        for name, m in model.named_modules()
+        if isinstance(m, RelPositionMultiheadAttentionWeights)
+    ]
+
+
+class TestInProjHeadInterleave:
+    """icefall's ``[q | k | p]`` in_proj rows load once into per-head ``[q_h | k_h | p_h]``.
+
+    Function preservation is the icefall parity tests' job (their reference
+    state dict is v1); these pin the row mapping itself and that no load path
+    applies it twice.
+    """
+
+    def _model(self):
+        torch.manual_seed(0)
+        return ZipformerModel(ZipformerModelConfig(encoder=_tiny_encoder_config(), vocab_size=32))
+
+    def test_icefall_rows_are_interleaved_per_head(self):
+        model = self._model()
+        (name, attn), *_ = _attn_weight_modules(model)
+        H, D, P = attn.num_heads, attn.query_head_dim, attn.pos_head_dim
+        E = attn.in_proj.weight.shape[1]
+        legacy_w = torch.randn(H * (2 * D + P), E)
+        legacy_b = torch.randn(H * (2 * D + P))
+        # A plain dict, as ``ZipformerModel.load_weights`` hands over: no metadata => v1.
+        attn.load_state_dict(
+            {
+                "in_proj.weight": legacy_w,
+                "in_proj.bias": legacy_b,
+                **{k: v for k, v in attn.state_dict().items() if not k.startswith("in_proj.")},
+            }
+        )
+        got_w = attn.in_proj.weight.detach().view(H, 2 * D + P, E)
+        got_b = attn.in_proj.bias.detach().view(H, 2 * D + P)
+        for h in range(H):
+            q = slice(h * D, (h + 1) * D)
+            k = slice(H * D + h * D, H * D + (h + 1) * D)
+            p = slice(2 * H * D + h * P, 2 * H * D + (h + 1) * P)
+            assert torch.equal(got_w[h, :D], legacy_w[q])
+            assert torch.equal(got_w[h, D : 2 * D], legacy_w[k])
+            assert torch.equal(got_w[h, 2 * D :], legacy_w[p])
+            assert torch.equal(got_b[h], torch.cat((legacy_b[q], legacy_b[k], legacy_b[p])))
+
+    def test_state_dict_round_trip_does_not_permute_again(self):
+        model = self._model()
+        again = self._model()
+        again.load_state_dict(model.state_dict())
+        for (_, a), (_, b) in zip(_attn_weight_modules(model), _attn_weight_modules(again)):
+            assert torch.equal(a.in_proj.weight, b.in_proj.weight)
+            assert torch.equal(a.in_proj.bias, b.in_proj.bias)
+
+    def test_native_round_trip_does_not_permute_again(self, tmp_path):
+        pytest.importorskip("safetensors")
+        from oasr.checkpoints.native import load_native, load_native_weights, save_native
+
+        model = self._model()
+        save_native(
+            tmp_path,
+            architecture="zipformer",
+            model=model,
+            model_config=model.config,
+        )
+        bundle = load_native(tmp_path)
+        loaded = ZipformerModel(bundle.model_config)
+        load_native_weights(loaded, dict(bundle.state_dict))
+        expected = model.state_dict()
+        for key, value in loaded.state_dict().items():
+            assert torch.equal(value, expected[key]), key
+
+
+# --------------------------------------------------------------------------- #
 # Parity tests vs icefall reference
 # --------------------------------------------------------------------------- #
 

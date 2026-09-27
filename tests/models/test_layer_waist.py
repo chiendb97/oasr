@@ -403,17 +403,32 @@ def test_models_do_not_hand_roll_a_masked_softmax():
 
 
 def test_zipformer_attention_weights_use_the_fused_masked_softmax():
-    """The offline and streaming score paths both have to reach the kernel."""
+    """The offline and streaming score paths both have to reach the kernel.
+
+    Both go through one module-level helper (the batch-major softmax), so the
+    check is that the helper calls ``oasr.masked_softmax`` and that each of the
+    two methods calls the helper or the kernel directly.
+    """
     encoder = REPO_ROOT / "oasr" / "models" / "zipformer" / "encoder.py"
     tree = ast.parse(encoder.read_text(), filename=str(encoder))
-    calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and _dotted_name(node.func) == "oasr.masked_softmax"
+
+    def calls_in(node):
+        return {_dotted_name(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)} - {None}
+
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    reaching = {"oasr.masked_softmax"} | {
+        name for name, fn in functions.items() if "oasr.masked_softmax" in calls_in(fn)
+    }
+    (weights_cls,) = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "RelPositionMultiheadAttentionWeights"
     ]
-    assert len(calls) == 2, (
+    methods = {n.name: n for n in weights_cls.body if isinstance(n, ast.FunctionDef)}
+    missing = [m for m in ("forward", "streaming_forward") if not calls_in(methods[m]) & reaching]
+    assert not missing, (
         f"expected oasr.masked_softmax on both Zipformer attention-weight paths "
-        f"(forward and streaming_forward), found {len(calls)}"
+        f"(forward and streaming_forward); not reached from {missing}"
     )
 
 
