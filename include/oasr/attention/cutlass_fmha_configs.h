@@ -9,8 +9,11 @@
 //
 // Two things live here and nowhere else:
 //
-//   * `FmhaArch<SM>`  -- what an architecture *is*: its shared-memory budget,
-//     its MMA and copy atoms, and explicit capability bools.
+//   * `FmhaArch<SM>`  -- which architectures this family serves, and its own
+//     tuning ceilings.  What an architecture *is* -- its shared-memory budget,
+//     its MMA and copy atoms, its capability bools -- is
+//     `oasr::cute_sm80::ArchAmpere` (`include/oasr/common/cute_sm80.h`),
+//     shared with the gated MLP and the recurrent step.
 //   * `fmhaResolveTile` -- what tile that architecture can run for a shape.
 //
 // Both are `constexpr` over an `sm` **argument**, never over `__CUDA_ARCH__` and
@@ -26,63 +29,36 @@
 //     caught sm_86/sm_89 being budgeted with A100's shared memory
 //     (`.artifacts/arch_portability_audit.md` § A3).
 //
-// The device query is not absent -- it is *demoted*.  `fmha.cuh` asserts the
-// resolved `smem_bytes` against `oasr::getDeviceMaxSharedMemoryOptin()` at
-// launch, so a part that grants less than this table claims fails loudly with
-// both numbers rather than at `cudaErrorInvalidValue` inside
-// `cudaFuncSetAttribute`.
+// The device query is not absent -- it is *demoted*.  The launcher
+// (`cute_sm80::launch_kernel`) checks the resolved shared-memory size against
+// `oasr::getDeviceMaxSharedMemoryOptin()` before opting in, so a part that
+// grants less than this table claims refuses the launch rather than failing
+// inside `cudaFuncSetAttribute`.
 
 #pragma once
 
-// `cute/tensor.hpp` is CuTe's entry point and must come before any individual
-// `cute/atom/*` header -- the atoms' free functions are declared against
-// declarations it pulls in, and including them bare is a parse error.
-#include <cute/tensor.hpp>
-
-#include <oasr/common/arch_facts.h>
-
-#include <cute/arch/copy_sm75.hpp>
-#include <cute/arch/copy_sm80.hpp>
-#include <cute/atom/copy_atom.hpp>
-#include <cute/atom/mma_atom.hpp>
-#include <cutlass/arch/arch.h>
-#include <cutlass/arch/mma_sm80.h>
-#include <cutlass/numeric_types.h>
+// `cute_sm80.h` carries the order-sensitive CuTe include block (with its own
+// `// clang-format off` guard); nothing here needs an individual CuTe header.
+#include <oasr/common/cute_sm80.h>
 
 #include <cstdint>
-#include <type_traits>
 
 namespace oasr {
 namespace attention {
 
-/*! \brief Shared memory the driver keeps for itself, in bytes.
+/*! \brief Shared memory a launch on \p sm will actually be granted, in bytes.
  *
- * Budgeting against the architectural maximum is what let the CuTeDSL recurrent
- * step clear `can_implement` at `num_stages=5` and then die at launch with an
- * empty error.  Same constant and same rationale as
- * `oasr/kernels/cute/attention/fmha_sm80.py::_DRIVER_SMEM_RESERVE` and
- * `oasr/kernels/cute/mlp/gated.py`, so the two backends budget alike.
- *
- * A property of the *driver*, not of attention, so it is stated once in
- * `oasr/common/arch_facts.h` and aliased here under this family's name.
+ * `oasr::smemBudgetForSm` -- the architectural opt-in maximum less the
+ * driver's 1 KB per-block reserve -- under this family's name, because the
+ * capability oracle exports it as `fmha_smem_budget`.  Budgeting against the
+ * raw maximum is what let the CuTeDSL recurrent step clear `can_implement` at
+ * `num_stages=5` and then die at launch with an empty error; the CuTeDSL
+ * attention lane budgets the same way (`fmha_sm80.py::_DRIVER_SMEM_RESERVE`),
+ * so both backends approve the same shapes.  Returns 0 for an architecture no
+ * table knows, which `fmhaResolveTile` turns into "no tile fits".
  */
-inline constexpr int kFmhaDriverSmemReserve = kDriverSmemReserve;
-
-/*! \brief Opt-in shared memory an architecture offers a single block, in bytes.
- *
- * These are the architectural maxima, *not* a device query -- see the file
- * header.  They match what CuTeDSL's `get_smem_capacity_in_bytes("sm_NN")`
- * returns, which is what the CuTeDSL backend budgets against, so the two
- * backends agree on which shapes are implementable.
- *
- * Returns 0 for an architecture this family does not know, which
- * `fmhaResolveTile` turns into "no tile fits" rather than a wrong answer.
- */
-constexpr int fmhaSmemCapacity(int sm) { return smemCapacityForSm(sm); }
-
-/*! \brief Shared memory a launch on \p sm will actually be granted, in bytes. */
 constexpr int fmhaSmemBudget(int sm) {
-    return fmhaSmemCapacity(sm) == 0 ? 0 : fmhaSmemCapacity(sm) - kFmhaDriverSmemReserve;
+    return smemBudgetForSm(sm);
 }
 
 /*! \brief Head dim rounded up to the m16n8k16 MMA k-stride.
@@ -97,72 +73,29 @@ constexpr int fmhaPaddedHeadDim(int head_dim) { return (head_dim + 31) / 32 * 32
 // Per-architecture traits
 // ---------------------------------------------------------------------------
 
-/*! \brief What one architecture is, for this kernel family.
+/*! \brief Which architectures this family serves, and its ceilings.
  *
- * `Tag` selects *instructions*; `kIsSm86Or89` and `kSmemBudgetBytes` select
- * *tuning*.  Keeping those two jobs apart is why sm_86 and sm_89 route through
- * `cutlass::arch::Sm80` -- the tag they share is the tag whose instructions
- * they run -- while still budgeting their own 99 KB.  FlashAttention makes the
- * same split (`hopper/flash_fwd_launch_template.h:36` pairs
- * `cutlass::arch::Sm80` with a separate `Arch == 86 || Arch == 89` bool).
+ * `Tag`, the budgets, `kIsSm86Or89` and the atoms come from
+ * `cute_sm80::ArchAmpere`.  The load atom is ZFILL, which is what lets the
+ * K/V load be bounded by `cache_seqlens` and retires the caller-side "V must
+ * be finite past the length" precondition; V is consumed transposed by the PV
+ * gemm through `SmemCopyAtomTransposed` (`ldmatrix.trans`).
  *
- * \warning Never branch on `Tag::kMinComputeCapability >= 90`.  `Sm120`'s is
- *   120, so that test is *true* on consumer Blackwell -- which has no TMA and
- *   no warp specialization.  FA's epilogue selects its TMA store path exactly
- *   that way (`hopper/epilogue_fwd.hpp:37`), so porting the test along with the
- *   code would silently pick a path this kernel does not implement.  Branch on
- *   `kHasTma` / `kIsWarpSpecialized`, which say what they mean.
+ * \warning Never branch on `Tag::kMinComputeCapability >= 90`; see
+ *   `cute_sm80::ArchAmpere`.  The launch template dispatches on
+ *   `kIsWarpSpecialized` instead.
  */
 template <int SmVersion>
 struct FmhaArch;
 
 namespace detail {
 
-/*! \brief The Ampere-class (mma.sync + cp.async) traits every sm_8x/sm_12x shares. */
 template <int SmVersion>
-struct FmhaArchAmpere {
-    using Tag = cutlass::arch::Sm80;
-
-    static constexpr int kSmVersion = SmVersion;
-    static constexpr int kSmemCapacityBytes = fmhaSmemCapacity(SmVersion);
-    static constexpr int kSmemBudgetBytes = fmhaSmemBudget(SmVersion);
-
-    //! Register file and L2 differ enough on the Ampere/Ada consumer parts to
-    //! move the tile choice; they do not change which instructions are legal.
-    static constexpr bool kIsSm86Or89 = (SmVersion == 86 || SmVersion == 89);
-
-    static constexpr bool kHasCpAsync = true;
-    static constexpr bool kHasTma = false;
-    static constexpr bool kIsWarpSpecialized = false;
-
+struct FmhaArchAmpere : cute_sm80::ArchAmpere<SmVersion> {
     //! Deepest cp.async ring worth building. Past this the extra latency hiding
     //! stops paying for the shared memory -- FlashAttention's own ceiling.
     static constexpr int kMaxStages = 3;
     static constexpr int kMaxThreadsPerBlock = 256;
-
-    template <class Element>
-    using MmaAtom = std::conditional_t<std::is_same_v<Element, cutlass::half_t>,
-                                       cute::MMA_Atom<cute::SM80_16x8x16_F32F16F16F32_TN>,
-                                       cute::MMA_Atom<cute::SM80_16x8x16_F32BF16BF16F32_TN>>;
-
-    //! gmem -> smem for Q/K/V.  ZFILL, not the plain cp.async: a predicated-off
-    //! copy writes **zeros** rather than leaving stale shared memory, which is
-    //! what lets the K/V load be bounded by `cache_seqlens` and retires the
-    //! caller-side "V must be finite past the length" precondition.
-    template <class Element>
-    using GmemCopyAtomKV =
-        cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<cute::uint128_t>, Element>;
-
-    template <class Element>
-    using GmemCopyAtomO =
-        cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
-
-    template <class Element>
-    using SmemCopyAtom = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
-
-    //! V is consumed transposed by the PV gemm; `ldmatrix.trans` does it for free.
-    template <class Element>
-    using SmemCopyAtomTransposed = cute::Copy_Atom<cute::SM75_U16x8_LDSM_T, Element>;
 };
 
 }  // namespace detail
@@ -184,23 +117,19 @@ struct FmhaArch<120> : detail::FmhaArchAmpere<120> {};
 // Adding them later is: one `FmhaArch<90>` here, one collective, one
 // `conditional_t` arm in `fmha_launch_template.h`.  Nothing else moves.
 
-static_assert(!FmhaArch<120>::kHasTma && !FmhaArch<120>::kIsWarpSpecialized,
-              "consumer Blackwell has neither; a kMinComputeCapability >= 90 test would "
-              "claim both");
-
 // ---------------------------------------------------------------------------
 // Tile resolution
 // ---------------------------------------------------------------------------
 
-/*! \brief A resolved CTA tile, or `valid == false` if nothing fits. */
 //! A half-open `[lo, hi)` K-tile range.  A plain struct rather than
 //! `cute::tuple` so it can be `constexpr` in host code the tests compile
 //! without CuTe.
-struct cute_fmha_range {
+struct FmhaBlockRange {
     int lo;
     int hi;
 };
 
+/*! \brief A resolved CTA tile, or `valid == false` if nothing fits. */
 struct FmhaTile {
     bool valid;
     int block_m;
@@ -370,11 +299,6 @@ inline constexpr int kFmhaSplitMaxUtilPct = 60;
  */
 inline constexpr int kFmhaSplitDepthPerCta = 30;
 
-//! `ceil(a / b)` for non-negative `a` and positive `b`.
-constexpr int fmhaCeilDiv(int a, int b) {
-    return (a + b - 1) / b;
-}
-
 /*! \brief Would an `s`-way split actually shorten the longest chunk?
  *
  * With 16 K tiles, 5 splits hand out `ceil(16/5) = 4` tiles just as 4 splits
@@ -383,7 +307,7 @@ constexpr int fmhaCeilDiv(int a, int b) {
  * at 4 splits and 14.34 us at 5.  FlashAttention guards the same case.
  */
 constexpr bool fmhaSplitEligible(int s, int n_blocks) {
-    return s <= 1 || fmhaCeilDiv(n_blocks, s) != fmhaCeilDiv(n_blocks, s - 1);
+    return s <= 1 || tileCeilDiv(n_blocks, s) != tileCeilDiv(n_blocks, s - 1);
 }
 
 /*! \brief How many ways to cut the K range, from shape and SM count alone.
@@ -420,7 +344,7 @@ constexpr int fmhaNumSplits(int cta_count, int n_blocks, int num_sms) {
         return 1;  // too little K work to divide -- see the constant
     }
     if (int64_t(100) * cta_count >
-        int64_t(kFmhaSplitMaxUtilPct) * num_sms * fmhaCeilDiv(cta_count, num_sms)) {
+        int64_t(kFmhaSplitMaxUtilPct) * num_sms * tileCeilDiv(cta_count, num_sms)) {
         return 1;  // the unsplit grid already uses the machine well enough
     }
     if (int64_t(n_blocks) * num_sms < int64_t(kFmhaSplitDepthPerCta) * cta_count) {
@@ -438,13 +362,13 @@ constexpr int fmhaNumSplits(int cta_count, int n_blocks, int num_sms) {
     }
     // Utilisation of an `s`-way grid as the exact rational `a_s / b_s`.
     int64_t am = int64_t(cta_count);
-    int64_t bm = int64_t(num_sms) * fmhaCeilDiv(cta_count, num_sms);
+    int64_t bm = int64_t(num_sms) * tileCeilDiv(cta_count, num_sms);
     for (int s = 2; s <= hi; ++s) {
         if (!fmhaSplitEligible(s, n_blocks)) {
             continue;
         }
         int64_t const a = int64_t(cta_count) * s;
-        int64_t const b = int64_t(num_sms) * fmhaCeilDiv(cta_count * s, num_sms);
+        int64_t const b = int64_t(num_sms) * tileCeilDiv(cta_count * s, num_sms);
         if (a * bm > am * b) {
             am = a;
             bm = b;
@@ -455,7 +379,7 @@ constexpr int fmhaNumSplits(int cta_count, int n_blocks, int num_sms) {
             continue;
         }
         int64_t const a = int64_t(cta_count) * s;
-        int64_t const b = int64_t(num_sms) * fmhaCeilDiv(cta_count * s, num_sms);
+        int64_t const b = int64_t(num_sms) * tileCeilDiv(cta_count * s, num_sms);
         if (int64_t(100) * a * bm >= int64_t(85) * am * b) {
             return s;
         }
@@ -470,11 +394,11 @@ constexpr int fmhaNumSplits(int cta_count, int n_blocks, int num_sms) {
  * combine weights out -- because a grid whose CTA count depends on the *data*
  * (the per-stream `cache_seqlens`) is not capturable.
  */
-constexpr cute_fmha_range fmhaSplitRange(int n_block_min, int n_block_max, int split_idx,
+constexpr FmhaBlockRange fmhaSplitRange(int n_block_min, int n_block_max, int split_idx,
                                          int num_splits) {
     int const total = n_block_max - n_block_min;
     if (total <= 0 || num_splits <= 1) {
-        return cute_fmha_range{n_block_min, n_block_max};
+        return FmhaBlockRange{n_block_min, n_block_max};
     }
     int const per = (total + num_splits - 1) / num_splits;
     int lo = n_block_min + split_idx * per;
@@ -485,7 +409,7 @@ constexpr cute_fmha_range fmhaSplitRange(int n_block_min, int n_block_max, int s
     if (hi > n_block_max) {
         hi = n_block_max;
     }
-    return cute_fmha_range{lo, hi};
+    return FmhaBlockRange{lo, hi};
 }
 
 }  // namespace attention

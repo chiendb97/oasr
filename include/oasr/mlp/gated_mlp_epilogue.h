@@ -20,13 +20,8 @@
 
 #pragma once
 
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-
 #include "cutlass_gated_mlp_configs.h"
 #include "gated_mlp_params.h"
-#include "gated_mlp_utils.h"
 
 namespace oasr {
 namespace mlp {
@@ -57,7 +52,7 @@ struct CollectiveGatedMlpEpilogue {
 
     //! Sized on N, the output's contiguous axis -- a different atom from the
     //! mainloop's, which is sized on K.
-    using SmemLayoutAtomO = typename GatedMlpSmemLayoutAtom<Element, kBlockN>::type;
+    using SmemLayoutAtomO = typename cute_sm80::SmemLayoutAtomSwizzled<Element, kBlockN>::type;
     using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, TileShape_MN{}));
 
     struct TensorStorage : cute::aligned_struct<128> {
@@ -65,7 +60,8 @@ struct CollectiveGatedMlpEpilogue {
     };
 
     static constexpr int kGmemElemsPerStore = sizeof(cute::uint128_t) / sizeof(Element);
-    static constexpr int kSmemRowWidth = GatedMlpSmemLayoutAtom<Element, kBlockN>::kRowWidth;
+    static constexpr int kSmemRowWidth =
+        cute_sm80::SmemLayoutAtomSwizzled<Element, kBlockN>::kRowWidth;
     static constexpr int kGmemThreadsPerRow = kSmemRowWidth / kGmemElemsPerStore;
     static_assert(kBlockN % kSmemRowWidth == 0);
     static_assert(NumEpilogueThreads % kGmemThreadsPerRow == 0);
@@ -92,10 +88,12 @@ struct CollectiveGatedMlpEpilogue {
         // The `(row, col)` view exists for one reason: the bias is per column,
         // and in this view a thread's *distinct* columns are `size<1>`.  Read
         // per element instead and the same few values are fetched once per row.
-        Tensor acc_g_rc = make_tensor(acc_g.data(), convert_layout_acc_rowcol(acc_g.layout()));
-        Tensor acc_u_rc = make_tensor(acc_u.data(), convert_layout_acc_rowcol(acc_u.layout()));
+        Tensor acc_g_rc =
+            make_tensor(acc_g.data(), cute_sm80::convert_layout_acc_rowcol(acc_g.layout()));
+        Tensor acc_u_rc =
+            make_tensor(acc_u.data(), cute_sm80::convert_layout_acc_rowcol(acc_u.layout()));
         Tensor tAcc_c_rc =
-            make_tensor(tAcc_c.data(), convert_layout_acc_rowcol(tAcc_c.layout()));
+            make_tensor(tAcc_c.data(), cute_sm80::convert_layout_acc_rowcol(tAcc_c.layout()));
 
         int const n0 = n_block * kBlockN;
         // Declared unconditionally so the loop below can name them; with
@@ -126,7 +124,7 @@ struct CollectiveGatedMlpEpilogue {
                 acc_g_rc(i, j) = Activation::apply(g) * u;
             }
         }
-        Tensor rO = convert_type<Element>(acc_g);
+        Tensor rO = cute_sm80::convert_type<Element>(acc_g);
 
         // rmem -> smem, through the MMA's own C partition.  The mainloop has
         // already drained its ring and barriered, which is what makes writing
@@ -168,8 +166,9 @@ struct CollectiveGatedMlpEpilogue {
         // `kBlockN` are both multiples of the 8-element store width, so a
         // vector is either wholly in range or wholly out and there is no
         // straddling case to split.
-        copy_predicated_2d</*Is_even_MN=*/false, /*Is_even_K=*/false>(
-            gmem_tiled_copy_O, tOrO, tOgO, t0OcO, tOpO, col_limit);
+        cute_sm80::copy_if(
+            gmem_tiled_copy_O, tOrO, tOgO, [&](int m) { return bool(tOpO(m)); },
+            [&](int k) { return int(get<1>(t0OcO(_0{}, _0{}, k))) < col_limit; });
     }
 };
 

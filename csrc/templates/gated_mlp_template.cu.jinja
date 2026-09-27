@@ -23,34 +23,6 @@ constexpr int kTileIdx = {{ tile_index }};
 constexpr int kActivation = {{ activation_id }};
 constexpr bool kHasBias = {{ 'true' if has_bias else 'false' }};
 
-/*! \brief `stride(-1) == 1`, which the `_1{}` in every stride assumes.
- *
- * Not optional: without it a tensor whose last stride is not 1 is read at
- * wrong addresses silently, with no fault.  This is the price of taking an
- * arbitrary *row* stride, which is what lets a caller hand over a row-slice of
- * a wider buffer without a copy.
- */
-#define CHECK_LAST_STRIDE_ONE(x)                                                         \
-    TVM_FFI_ICHECK_EQ((x).stride((x).ndim() - 1), 1)                                     \
-        << #x << " must have a contiguous last dimension; got stride "                   \
-        << (x).stride((x).ndim() - 1)
-
-/*! \brief The 128-bit vector contract: base pointer and row stride both aligned.
- *
- * The mainloop loads and the epilogue stores in 128-bit pieces.  A base that is
- * not 16-byte aligned, or a row stride that is not a whole number of 8-element
- * vectors, makes every row after the first misaligned -- which surfaces as
- * `misaligned address` on a good day and as a wrong answer on a bad one.
- */
-#define CHECK_VECTOR_ALIGNED(x)                                                          \
-    do {                                                                                 \
-        TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>((x).data_ptr()) % 16, 0u)           \
-            << #x << " must be 16-byte aligned (the 128-bit load/store width)";          \
-        TVM_FFI_ICHECK_EQ((x).stride(0) % oasr::mlp::kGatedMlpAlignment, 0)               \
-            << #x << " needs a row stride that is a multiple of "                        \
-            << oasr::mlp::kGatedMlpAlignment << " elements; got " << (x).stride(0);       \
-    } while (0)
-
 }  // namespace
 
 /*! \brief `activation(x @ w_gate^T + b_gate) * (x @ w_up^T + b_up)`.
@@ -79,17 +51,17 @@ void {{ func_name }}(TensorView out, TensorView x, TensorView w_gate, TensorView
     CHECK_DIM(2, x);
     CHECK_DIM(2, w_gate);
     CHECK_DIM(2, w_up);
-    CHECK_LAST_STRIDE_ONE(out);
-    CHECK_LAST_STRIDE_ONE(x);
-    CHECK_LAST_STRIDE_ONE(w_gate);
-    CHECK_LAST_STRIDE_ONE(w_up);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(out);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(x);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(w_gate);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(w_up);
     CHECK_DEVICE(x, out);
     CHECK_DEVICE(x, w_gate);
     CHECK_DEVICE(x, w_up);
-    CHECK_VECTOR_ALIGNED(out);
-    CHECK_VECTOR_ALIGNED(x);
-    CHECK_VECTOR_ALIGNED(w_gate);
-    CHECK_VECTOR_ALIGNED(w_up);
+    CHECK_VECTOR_ALIGNED(out, oasr::mlp::kGatedMlpAlignment);
+    CHECK_VECTOR_ALIGNED(x, oasr::mlp::kGatedMlpAlignment);
+    CHECK_VECTOR_ALIGNED(w_gate, oasr::mlp::kGatedMlpAlignment);
+    CHECK_VECTOR_ALIGNED(w_up, oasr::mlp::kGatedMlpAlignment);
 
     int const M = int(x.size(0));
     int const K = int(x.size(1));

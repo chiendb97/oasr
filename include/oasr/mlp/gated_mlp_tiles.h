@@ -3,7 +3,7 @@
 //
 // The gated MLP's CTA tiles, and the arithmetic that picks one.
 //
-// Pure integers: this header pulls in nothing but `oasr/common/arch_facts.h`,
+// Pure integers: this header pulls in nothing but `oasr/common/tile_rules.h`,
 // no CuTe and no CUDA.  That is deliberate.  `csrc/gated_mlp_jit_binding.cu`
 // exports these answers so that `oasr/jit/gated_mlp.py`'s mirror of them can
 // be checked against the original rather than trusted, and a mirror test is
@@ -24,7 +24,7 @@
 
 #pragma once
 
-#include <oasr/common/arch_facts.h>
+#include <oasr/common/tile_rules.h>
 
 namespace oasr {
 namespace mlp {
@@ -84,29 +84,6 @@ inline constexpr GatedMlpTile kGatedMlpTiles[] = {
 inline constexpr int kGatedMlpTileCount =
     int(sizeof(kGatedMlpTiles) / sizeof(kGatedMlpTiles[0]));
 
-/*! \brief Hardware ceiling on resident blocks per SM.
- *
- * The tiles here never approach it -- shared memory binds at 1 or 2 -- but
- * leaving it out would let a hypothetical tiny tile claim absurd occupancy.
- */
-inline constexpr int kGatedMlpMaxBlocksPerSm = 24;
-
-//! `ceil(a / b)` for non-negative `a` and positive `b`.
-constexpr int gatedMlpCeilDiv(int a, int b) { return (a + b - 1) / b; }
-
-/*! \brief Elements per shared-memory "row" for a tile of \p extent elements.
- *
- * One row should cover a whole number of 128-byte cache lines where it can, so
- * the swizzle is bank-conflict free for the widest `ldmatrix` that fits.  Same
- * rule as the attention family's `fmhaBlockKGmem`, and it agrees with the
- * CuTeDSL lane's `make_smem_swizzle_atom` at every extent either of them uses.
- */
-constexpr int gatedMlpSmemRowWidth(int extent, int elem_size) {
-    int const bytes = extent * elem_size;
-    int const b = (bytes % 128 == 0) ? 128 : ((bytes % 64 == 0) ? 64 : 32);
-    return b / elem_size;
-}
-
 /*! \brief The cp.async ring, in bytes: `stages * (M + 2N) * K`.
  *
  * Half again what a plain GEMM's ring costs, because one stage carries A **and
@@ -159,17 +136,7 @@ constexpr bool gatedMlpTileValid(GatedMlpTile t, int sm, int elem_size) {
     if (elem_size != 2) {
         return false;  // fp16 / bf16; the MMA atom and the 128-bit vector both assume it
     }
-    if (t.threads % 32 != 0 || t.threads < 32 || t.threads > 1024) {
-        return false;
-    }
-    int const warps = t.threads / 32;
-    if (t.warps_n < 1 || warps % t.warps_n != 0) {
-        return false;
-    }
-    int const warps_m = warps / t.warps_n;
-    // The MMA is tiled (warps_m, warps_n) over a 16x16 permutation of the
-    // m16n8k16 atom, so each axis must cover a whole number of those.
-    if (t.block_m % (16 * warps_m) != 0 || t.block_n % (16 * t.warps_n) != 0) {
+    if (!sm80WarpTilingValid(t.block_m, t.block_n, t.threads, t.warps_n)) {
         return false;
     }
     // 32 is the swizzle atom's narrowest row; 16 would be legal for the MMA
@@ -177,62 +144,36 @@ constexpr bool gatedMlpTileValid(GatedMlpTile t, int sm, int elem_size) {
     if (t.block_k % 32 != 0 || t.stages < 2) {
         return false;
     }
-    int const vec = 16 / elem_size;  // the 128-bit cp.async / store width
-    int const k_row = gatedMlpSmemRowWidth(t.block_k, elem_size);
-    int const threads_per_row = k_row / vec;
-    if (threads_per_row <= 0 || t.threads % threads_per_row != 0 ||
-        t.block_k % k_row != 0) {
+    // X and both weights are loaded K-major by one tiled copy...
+    if (!sm80TiledCopyFits(t.block_m, t.block_k, t.threads, elem_size) ||
+        !sm80TiledCopyFits(t.block_n, t.block_k, t.threads, elem_size)) {
         return false;
     }
-    int const rows_per_pass = t.threads / threads_per_row;
-    if (rows_per_pass <= 0 || t.block_m % rows_per_pass != 0 ||
-        t.block_n % rows_per_pass != 0) {
+    // ...and the output is stored N-major by another, whose atom is sized on N.
+    if (!sm80TiledCopyFits(t.block_m, t.block_n, t.threads, elem_size)) {
         return false;
     }
-    // ...and the same again for the epilogue, whose atom is sized on N.
-    int const n_row = gatedMlpSmemRowWidth(t.block_n, elem_size);
-    int const o_threads_per_row = n_row / vec;
-    if (o_threads_per_row <= 0 || t.threads % o_threads_per_row != 0 ||
-        t.block_n % n_row != 0) {
-        return false;
-    }
-    int const o_rows_per_pass = t.threads / o_threads_per_row;
-    if (o_rows_per_pass <= 0 || t.block_m % o_rows_per_pass != 0) {
-        return false;
-    }
-    int const budget = smemBudgetForSm(sm);
-    if (budget <= 0 || maxThreadsPerSmForSm(sm) < t.threads) {
-        return false;
-    }
-    return gatedMlpSmemBytes(t, elem_size) <= budget;
+    return tileFitsSm(gatedMlpSmemBytes(t, elem_size), t.threads, sm);
 }
 
 /*! \brief How many of these CTAs are resident at once, by shared memory and warps.
  *
- * Registers are deliberately not modelled: every tile here measures ~64-96
- * registers per thread, which binds at 8 blocks or more -- far above the 1-2
- * that shared memory allows.  A tile that changed that would show up as a
- * *measured* regression, not as a wrong number here.
+ * Registers are deliberately not modelled: every tile here measures 80-170
+ * registers per thread (`ncu launch__registers_per_thread`, sm_120), which
+ * binds at 3 blocks or more -- above the 1-2 that shared memory allows.  A
+ * tile that changed that would show up as a *measured* regression, not as a
+ * wrong number here.
  */
 constexpr int gatedMlpCtasPerSm(GatedMlpTile t, int sm, int elem_size) {
-    int const bytes = gatedMlpSmemBytes(t, elem_size);
-    int const budget = smemBudgetForSm(sm);
-    int const by_smem = bytes > 0 ? budget / bytes : kGatedMlpMaxBlocksPerSm;
-    int const threads_per_sm = maxThreadsPerSmForSm(sm);
-    int const by_threads = t.threads > 0 ? threads_per_sm / t.threads : 0;
-    int r = by_smem < by_threads ? by_smem : by_threads;
-    if (r > kGatedMlpMaxBlocksPerSm) {
-        r = kGatedMlpMaxBlocksPerSm;
-    }
-    return r < 1 ? 1 : r;
+    return tileCtasPerSm(gatedMlpSmemBytes(t, elem_size), t.threads, sm);
 }
 
 /*! \brief Waves this tile's grid takes on a machine with \p num_sms SMs. */
 constexpr int gatedMlpWaves(GatedMlpTile t, int sm, int num_sms, int rows, int n,
                             int elem_size) {
     int const slots = num_sms * gatedMlpCtasPerSm(t, sm, elem_size);
-    int const grid = gatedMlpCeilDiv(n, t.block_n) * gatedMlpCeilDiv(rows, t.block_m);
-    return gatedMlpCeilDiv(grid, slots);
+    int const grid = tileCeilDiv(n, t.block_n) * tileCeilDiv(rows, t.block_m);
+    return tileCeilDiv(grid, slots);
 }
 
 /*! \brief The `block_m` group that owns \p rows: the smallest that covers it. */

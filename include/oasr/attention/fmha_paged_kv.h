@@ -58,25 +58,25 @@ using namespace cute;
  * \param page_table `(batch, max_pages)` int32
  * \param n_block    which K tile
  * \tparam Seqlenk_mask   bound the rows by `seqlen_k` (only the first tile needs it)
- * \tparam Clear_OOB_MN   zero the skipped *rows* rather than leaving them stale.
- *   False for K, whose out-of-range scores the mask overwrites anyway; true for
- *   V, where a stale NaN reaches the output through `P @ V` and no mask can
- *   intercept it.
  *
- * The **head-dim residue is always cleared**, independently of `Clear_OOB_MN`.
- * `head_dim` need only be a multiple of the 128-bit load width while the smem
- * layouts are built on the padded dim, so columns `[head_dim, kHeadDim)` are
- * never loaded -- and the QK gemm runs over the *padded* extent, so leaving
- * them stale feeds uninitialised shared memory straight into every score.
- * `copy_predicated` keeps these two as separate flags (`Clear_OOB_MN` /
- * `Clear_OOB_K`) for exactly this reason; conflating them here produced wrong
- * scores at head_dim 16, and did so for only one batch of two -- the signature
- * of reading shared memory that merely *happened* to be zero.
+ * **Everything skipped arrives as zeros**, through the ZFILL atom's own
+ * `src_size` rather than through a branch -- rows past `seqlen_k` or past the
+ * block table's width, and the head-dim residue alike.  V needs its rows
+ * zeroed (a stale NaN reaches the output through `P @ V`, where no mask can
+ * intercept it); K's out-of-range scores are masked, so zeros there are merely
+ * harmless.  The residue needs zeroing for both: `head_dim` need only be a
+ * multiple of the 128-bit load width while the smem layouts are built on the
+ * padded dim, and the QK gemm runs over the *padded* extent, so leaving those
+ * columns stale feeds uninitialised shared memory into every score -- which
+ * once produced wrong scores at head_dim 16 for one batch of two, the
+ * signature of reading shared memory that merely *happened* to be zero.
+ *
+ * A predicated-off copy's source address is still formed, so it has to be
+ * computable: an out-of-range row reads page 0 of the pool, never the table.
  */
-template <int kBlockN, int kHeadDim, bool Seqlenk_mask, bool Clear_OOB_MN, class TensorPool,
-          class TensorDst, class TiledCopy, class ThrCopy, class TensorCoord,
-          class TensorPred>
-CUTLASS_DEVICE void paged_gather_tile(TensorPool const& mPool, TensorDst& sDst,
+template <int kBlockN, int kHeadDim, bool Seqlenk_mask, class TensorPool, class TensorDst,
+          class TiledCopy, class ThrCopy, class TensorCoord, class TensorPred>
+CUTLASS_DEVICE void paged_gather_tile(TensorPool const& mPool, TensorDst&& sDst,
                                       int32_t const* const page_table,
                                       int64_t const page_table_stride, int const bidb,
                                       int const bidh_kv, int const n_block,
@@ -109,12 +109,8 @@ CUTLASS_DEVICE void paged_gather_tile(TensorPool const& mPool, TensorDst& sDst,
         CUTLASS_PRAGMA_UNROLL
         for (int k = 0; k < size<2>(tDst); ++k) {
             int const d0 = int(get<1>(tKVcKV(_0{}, _0{}, k)));
-            bool const k_ok = tKVpKV(k);
-            if (row_ok && k_ok) {
-                cute::copy(tiled_copy, gRow(_, d0 / kElemsPerLoad), tDst(_, m, k));
-            } else if (!k_ok || Clear_OOB_MN) {
-                cute::clear(tDst(_, m, k));
-            }
+            bool const ok = row_ok && bool(tKVpKV(k));
+            cute::copy(tiled_copy.with(ok), gRow(_, d0 / kElemsPerLoad), tDst(_, m, k));
         }
     }
 }

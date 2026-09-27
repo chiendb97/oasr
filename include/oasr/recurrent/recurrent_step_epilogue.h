@@ -26,14 +26,16 @@
 // Two things this does that the CuTeDSL lane does not
 // ---------------------------------------------------------------------------
 //
-// 1. **The global loads are issued before the staging barrier.**  The
-//    transition needs `input_gates` and `previous_c` from global memory and
-//    the affine from shared.  Issuing the two gmem loads *first* puts their
-//    latency behind the accumulator store and the `__syncthreads()` that
-//    follows it, instead of in front of the arithmetic.  They cost registers
-//    (at most `kSlotsPerThread * (kGates + 1)` halves -- 20 registers on the
-//    widest tile) and nothing else; the CuTeDSL lane issues them after the
-//    barrier and pays the latency exposed.
+// 1. **The global loads are issued before the mainloop.**  The transition
+//    needs `input_gates` and `previous_c` from global memory and the affine
+//    from shared, and the first two depend on nothing the K loop computes, so
+//    the kernel shell issues them before it (`load_inputs`) and their latency
+//    hides behind the whole loop.  They cost registers --
+//    `kSlotsPerThread * (kGates + 1)` halves -- which is why the two 128x128
+//    tiles, where that is 16-20 registers against a 128 cap, load them after
+//    the loop instead (`kPrefetchInputs`), behind the accumulator store and
+//    its barrier.  The CuTeDSL lane issues them after the barrier and pays the
+//    latency exposed.
 //
 // 2. **The staging buffer is padded by 8 floats per row, not 1.**  Both
 //    numbers avoid the write conflict the unpadded layout has; only this one
@@ -53,15 +55,10 @@
 
 #pragma once
 
-#include <cutlass/array.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-
-#include <cute/tensor.hpp>
-
 #include "cutlass_recurrent_step_configs.h"
 #include "recurrent_step_params.h"
-#include "recurrent_step_utils.h"
+
+#include <cutlass/array.h>
 
 namespace oasr {
 namespace recurrent {
@@ -165,39 +162,46 @@ struct CollectiveRecurrentStepEpilogue {
 
     using Params = RecurrentStepParams<Element>;
 
-    template <class FrgTensorC, class TiledMma, class SharedStorage>
-    CUTLASS_DEVICE void store(Params const& params, FrgTensorC const& acc,
-                              SharedStorage& shared_storage, TiledMma tiled_mma,
-                              int const thread_idx, int const m_block, int const n_block) {
+    //! Registers per thread the transition's global inputs occupy.
+    static constexpr int kInputRegs =
+        (kSlotsPerThread * (kGates + (kHasCell ? 1 : 0)) * int(sizeof(Element)) + 3) / 4;
+
+    /*! \brief Load the inputs before the mainloop rather than after it?
+     *
+     * They depend on nothing the mainloop computes, so issuing them first hides
+     * their latency behind the whole K loop: measured 1.04-1.10x on the
+     * latency-bound steps (hidden <= 1024, batch <= 64), where the epilogue's
+     * loads were most of what the K loop did not already cover.  But the values
+     * then stay live across the loop.  On the widest LSTM tile that is 20
+     * registers against a 512-thread CTA's 128-register cap, on a K loop long
+     * and tensor-bound enough that the loads were a rounding error anyway, and
+     * it read 0.992x.  So hoist only where it is cheap: at most 10 registers,
+     * which is every tile but the two 128x128 ones.
+     */
+    static constexpr bool kPrefetchInputs = kInputRegs <= 10;
+
+    //! The transition's global inputs for this thread's `(row, unit)` slots.
+    struct Inputs {
+        GateVec gates[kSlotsPerThread];
+        Element prev_c[kSlotsPerThread];
+    };
+
+    /*! \brief Issue the loads of `input_gates` and `previous_c` for this tile.
+     *
+     * Nothing the mainloop computes feeds them, so where `kPrefetchInputs`
+     * holds the kernel shell calls this *before* the mainloop and their latency
+     * hides behind the whole K loop; elsewhere it calls it after, which puts the
+     * latency behind the accumulator staging and its barrier only.  Only the
+     * loaded values are carried; the slot indices are recomputed in
+     * `store`, which costs nothing -- carrying them instead was measured at
+     * exactly the same register count, because ptxas rematerialises them
+     * either way.
+     */
+    CUTLASS_DEVICE Inputs load_inputs(Params const& params, int const thread_idx,
+                                      int const m_block, int const n_block) const {
         int const row0 = m_block * kBlockM;
         int const unit0 = n_block * kUnits;
-
-        // One hidden unit's gates, as an aligned vector.  8 bytes for an LSTM,
-        // which the shape contract's `stride % 8 == 0` guarantees is addressable.
-        auto load_gates = [&](int m, int hid) {
-            return *reinterpret_cast<GateVec const*>(params.ptr_gates + m * params.stride_gates +
-                                                     int64_t(hid) * kGates);
-        };
-        auto load_prev_c = [&](int m, int hid) -> Element {
-            if constexpr (kHasCell) {
-                return params.ptr_prev_c[m * params.stride_prev_c + hid];
-            } else {
-                (void)m;
-                (void)hid;
-                return Element(0);
-            }
-        };
-
-        // --- 1. issue the global loads first --------------------------------
-        // Nothing below depends on them until after the barrier, so their
-        // latency hides behind the accumulator store and the barrier itself.
-        // Only the loaded *values* cross the barrier; the slot indices are
-        // recomputed below, which costs nothing -- carrying them instead was
-        // measured at exactly the same register count, because ptxas
-        // rematerialises them either way.
-        GateVec gates_reg[kSlotsPerThread];
-        Element prev_c_reg[kSlotsPerThread];
-
+        Inputs in;
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < kSlotsPerThread; ++i) {
             int const slot = thread_idx + i * NumEpilogueThreads;
@@ -205,10 +209,25 @@ struct CollectiveRecurrentStepEpilogue {
             int const m = row0 + r;
             int const hid = unit0 + (slot - r * kUnits);
             if (m < params.M && hid < params.H) {
-                gates_reg[i] = load_gates(m, hid);
-                prev_c_reg[i] = load_prev_c(m, hid);
+                // One hidden unit's gates, as an aligned vector.  8 bytes for
+                // an LSTM, which the shape contract's `stride % 8 == 0`
+                // guarantees is addressable.
+                in.gates[i] = *reinterpret_cast<GateVec const*>(
+                    params.ptr_gates + m * params.stride_gates + int64_t(hid) * kGates);
+                if constexpr (kHasCell) {
+                    in.prev_c[i] = params.ptr_prev_c[m * params.stride_prev_c + hid];
+                }
             }
         }
+        return in;
+    }
+
+    template <class FrgTensorC, class TiledMma, class SharedStorage>
+    CUTLASS_DEVICE void store(Params const& params, FrgTensorC const& acc, Inputs const& in,
+                              SharedStorage& shared_storage, TiledMma tiled_mma,
+                              int const thread_idx, int const m_block, int const n_block) {
+        int const row0 = m_block * kBlockM;
+        int const unit0 = n_block * kUnits;
 
         // --- 2. stage the accumulator ---------------------------------------
         // The mainloop has drained its ring and barriered, which is what makes
@@ -260,10 +279,10 @@ struct CollectiveRecurrentStepEpilogue {
             }
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < kGates; ++j) {
-                g[j] += float(gates_reg[i][j]);
+                g[j] += float(in.gates[i][j]);
             }
 
-            float const prev_c = kHasCell ? float(prev_c_reg[i]) : 0.f;
+            float const prev_c = kHasCell ? float(in.prev_c[i]) : 0.f;
             float out_h = 0.f;
             float out_c = 0.f;
             Transition::apply(g, prev_c, out_h, out_c);

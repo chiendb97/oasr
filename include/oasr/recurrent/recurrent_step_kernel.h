@@ -11,9 +11,9 @@
 
 #pragma once
 
+#include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 
-#include <cute/tensor.hpp>
 #include <type_traits>
 
 #include "recurrent_step_params.h"
@@ -97,8 +97,20 @@ struct RecurrentStepKernel {
 
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
+        // The transition's global inputs depend on nothing the mainloop
+        // computes, so where it is cheap they are issued first and their
+        // latency hides behind the whole K loop; see
+        // `CollectiveRecurrentStepEpilogue::kPrefetchInputs`.
+        typename CollectiveEpilogue::Inputs inputs;
+        if constexpr (CollectiveEpilogue::kPrefetchInputs) {
+            inputs = epilogue.load_inputs(params, int(threadIdx.x), m_block, n_block);
+        }
         mainloop.mma(params, acc, int(threadIdx.x), m_block, n_block, shared_storage);
-        epilogue.store(params, acc, shared_storage, tiled_mma, int(threadIdx.x), m_block, n_block);
+        if constexpr (!CollectiveEpilogue::kPrefetchInputs) {
+            inputs = epilogue.load_inputs(params, int(threadIdx.x), m_block, n_block);
+        }
+        epilogue.store(params, acc, inputs, shared_storage, tiled_mma, int(threadIdx.x), m_block,
+                       n_block);
     }
 };
 

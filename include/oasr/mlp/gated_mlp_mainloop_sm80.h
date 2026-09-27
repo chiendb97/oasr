@@ -44,10 +44,6 @@
 
 #pragma once
 
-#include <cute/tensor.hpp>
-#include <cutlass/cutlass.h>
-#include <cutlass/numeric_types.h>
-
 #include "cutlass_gated_mlp_configs.h"
 #include "gated_mlp_params.h"
 #include "gated_mlp_utils.h"
@@ -93,7 +89,7 @@ struct CollectiveGatedMlpMainloopSm80 {
     // --- shared memory ----------------------------------------------------
     //! Chosen from the K tile: K is the contiguous axis of X (row-major) and
     //! of both weights (`nn.Linear`'s `(out, in)` layout).
-    using SmemLayoutAtom = typename GatedMlpSmemLayoutAtom<Element, kBlockK>::type;
+    using SmemLayoutAtom = typename cute_sm80::SmemLayoutAtomSwizzled<Element, kBlockK>::type;
     using SmemLayoutX = decltype(tile_to_shape(
         SmemLayoutAtom{}, make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<kStages>{})));
     using SmemLayoutW = decltype(tile_to_shape(
@@ -107,7 +103,8 @@ struct CollectiveGatedMlpMainloopSm80 {
 
     // --- copy atoms -------------------------------------------------------
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-    static constexpr int kSmemRowWidth = GatedMlpSmemLayoutAtom<Element, kBlockK>::kRowWidth;
+    static constexpr int kSmemRowWidth =
+        cute_sm80::SmemLayoutAtomSwizzled<Element, kBlockK>::kRowWidth;
     static constexpr int kGmemThreadsPerRow = kSmemRowWidth / kGmemElemsPerLoad;
     static_assert(kBlockK % kSmemRowWidth == 0);
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0);
@@ -224,15 +221,17 @@ struct CollectiveGatedMlpMainloopSm80 {
         // covers the whole tile, so group index stays equal to K-tile index.
         auto load_tile = [&](int const k_tile, int const stage) {
             int const max_k = params.K - k_tile * kBlockK - k_col_offset;
-            Tensor tXsX_cur = tXsX(_, _, _, stage);
-            Tensor tGsG_cur = tGsG(_, _, _, stage);
-            Tensor tUsU_cur = tUsU(_, _, _, stage);
-            copy_zfill_2d</*Is_even_MN=*/false, /*Is_even_K=*/false>(
-                gmem_tiled_copy, tXgX(_, _, _, k_tile), tXsX_cur, t0XcX, tXpX, max_k);
-            copy_zfill_2d</*Is_even_MN=*/false, /*Is_even_K=*/false>(
-                gmem_tiled_copy, tGgG(_, _, _, k_tile), tGsG_cur, t0WcW, tWpW, max_k);
-            copy_zfill_2d</*Is_even_MN=*/false, /*Is_even_K=*/false>(
-                gmem_tiled_copy, tUgU(_, _, _, k_tile), tUsU_cur, t0WcW, tWpW, max_k);
+            // The K predicate compares thread 0's compile-time column against a
+            // limit with this thread's own offset already folded in.
+            auto k_ok = [&](int k) { return int(get<1>(t0XcX(_0{}, _0{}, k))) < max_k; };
+            auto x_ok = [&](int m) { return bool(tXpX(m)); };
+            auto w_ok = [&](int m) { return bool(tWpW(m)); };
+            cute_sm80::copy_zfill(gmem_tiled_copy, tXgX(_, _, _, k_tile), tXsX(_, _, _, stage),
+                                  x_ok, k_ok);
+            cute_sm80::copy_zfill(gmem_tiled_copy, tGgG(_, _, _, k_tile), tGsG(_, _, _, stage),
+                                  w_ok, k_ok);
+            cute_sm80::copy_zfill(gmem_tiled_copy, tUgU(_, _, _, k_tile), tUsU(_, _, _, stage),
+                                  w_ok, k_ok);
         };
 
         // --- prologue ------------------------------------------------------

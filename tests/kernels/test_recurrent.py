@@ -1210,3 +1210,64 @@ class TestRoutedStepMemo:
             )
         finally:
             rc.set_mode(before)
+
+
+@pytest.mark.cuda
+class TestFusedStepLayout:
+    """The T=1 shortcut in ``lstm_gemm_layer`` must hand the fused step one *timestep*.
+
+    ``input_gates`` leaves the input projection in the caller's layout, so the
+    timestep is ``[0]`` time-major and ``[:, 0]`` batch-first.  Taking ``[0]`` of
+    a batch-first ``(B, 1, 4H)`` tensor hands over the first *batch row*, a
+    ``(1, 4H)`` view that the C++ lane refuses (``input_gates must be (M, 4 *
+    H)``).  Inside the fused band that failed every batch-first caller: Nemotron's
+    predictor is one, and at 64 concurrent streams the whole cohort was finalized
+    with an error (96.86% WER); offline it cost a failed micro-batch and a
+    one-row-at-a-time retry.  B=64, H=640 is that predictor's shape, and the
+    smallest batch at which ``oasr.layers.LSTM`` takes the tensor-core route at
+    T=1 for this width.
+    """
+
+    @pytest.mark.parametrize("layers", [1, 2])
+    @pytest.mark.parametrize("backend", ["cxx", "cute"])
+    @pytest.mark.parametrize("batch_first", [False, True])
+    def test_single_step_matches_cudnn(self, device, batch_first, backend, layers):
+        from oasr.jit import recurrent_cute as rc
+
+        batch, hidden_size = 64, 640
+        before = (rc.get_mode(), rc.get_backend())
+        try:
+            rc.set_mode("auto")
+            rc.set_backend(backend)
+            routed = rc.routed_step(
+                dtype_str="float16",
+                gate_count=4,
+                activation="lstm",
+                hidden=hidden_size,
+                batch=batch,
+            )
+            if routed is None or routed[0] != backend:
+                pytest.skip(
+                    f"the {backend} lane does not serve LSTM H={hidden_size} B={batch} here"
+                )
+            torch.manual_seed(11)
+            ours = LSTM(hidden_size, hidden_size, num_layers=layers, batch_first=batch_first)
+            ours = ours.to(device, torch.float16).eval()
+            reference = nn.LSTM(
+                hidden_size, hidden_size, num_layers=layers, batch_first=batch_first
+            )
+            reference = reference.to(device, torch.float16).eval()
+            _copy_to_reference(ours, reference)
+            shape = (batch, 1, hidden_size) if batch_first else (1, batch, hidden_size)
+            x = torch.randn(shape, device=device, dtype=torch.float16)
+            h = torch.randn(layers, batch, hidden_size, device=device, dtype=torch.float16)
+            c = torch.randn_like(h)
+            with torch.no_grad():
+                got_out, (got_h, got_c) = ours(x, (h, c))
+                want_out, (want_h, want_c) = reference(x, (h, c))
+        finally:
+            rc.set_mode(before[0])
+            rc.set_backend(before[1])
+        torch.testing.assert_close(got_out, want_out, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got_h, want_h, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(got_c, want_c, rtol=3e-2, atol=3e-2)

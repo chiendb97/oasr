@@ -430,8 +430,14 @@ def lstm_gemm_layer(
         # probe and compile all memoise behind one dict lookup in
         # ``recurrent_cute.routed_step``, so asking ``should_use`` here first only
         # paid for the table scan twice.
+        #
+        # The projection keeps the caller's layout, so the one timestep is
+        # ``[:, 0]`` batch-first and ``[0]`` time-major.  ``[0]`` of a batch-first
+        # ``(B, 1, 4H)`` is the first *batch row*: the C++ lane refuses that view,
+        # and inside the band every batch-first caller -- a transducer predictor
+        # at 64 concurrent streams -- failed its cohort.
         if _lstm_step_fused(
-            input_gates[0],
+            input_gates[:, 0] if batch_first else input_gates[0],
             initial_h,
             initial_c,
             packed_weight_hh,

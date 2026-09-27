@@ -262,6 +262,8 @@ extension cookbook for each axis.
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
+| `include/oasr/common/{cute_sm80,tile_rules}.h`, `oasr/jit/arch_facts.py` | The Ampere-class CuTe toolkit and tile rules the three C++ CuTe families (attention, gated MLP, recurrent step) share, and their Python mirror |
+| `include/oasr/attention/`, `oasr/jit/fmha.py` | The C++ CUTLASS/CuTe fused attention and its lane; `oasr/jit/attention.py` is the arbiter between it, the CuTeDSL one and SDPA |
 | `include/oasr/mlp/`, `oasr/jit/gated_mlp.py` | The C++ CUTLASS/CuTe fused gated MLP and its lane; `oasr/jit/mlp.py` is the arbiter between it and the CuTeDSL one |
 | `include/oasr/recurrent/recurrent_step_*.h`, `oasr/jit/recurrent_step.py` | The C++ CUTLASS/CuTe fused recurrent step and its lane; `oasr/jit/recurrent_cute.py` is the arbiter between it and the CuTeDSL one |
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
@@ -284,7 +286,7 @@ extension cookbook for each axis.
 |---|---|---|
 | Registry per extension axis | `oasr/models`, `oasr/engine/{decode,streaming_backend,batching}`, `oasr/tokenizers`, `oasr/features` | Subclass + register; selection is by configuration |
 | Narrow waist | `oasr/layers` | Every architecture composes the same layers; each layer owns a kernel path **and** a torch path |
-| Config / template / dispatch split | `include/oasr/<family>/` | `cutlass_*_configs.h`, `*_cutlass_template.h`, `*_cutlass.h` |
+| Config / template / dispatch split | `include/oasr/<family>/` | `cutlass_*_configs.h`, `*_cutlass_template.h`, `*_cutlass.h`; the CuTe families split the template into mainloop + epilogue collectives and dispatch from `*_launch_template.h` — one file layout for all three (`docs/kernels.md` § The C++ CuTe families) |
 | JIT on first call | `oasr/jit/` | Cache key covers sources, `include/`, nvcc flags and the CUTLASS version stamp |
 | Checkpoint-derived specs | `TokenizerSpec`, `FeatureSpec`, `DecodingDefaults` | Converters emit them; the engine materializes config from them |
 | Declared capability | `CAPABILITIES` + `require_capability` | An unserviceable checkpoint fails at engine construction, naming the missing members |
@@ -311,9 +313,10 @@ extension cookbook for each axis.
   and the CuTe families hand-order their includes because `cute/tensor.hpp` must precede
   any `cute/atom/*` or `cute/arch/*` header — the atoms' free functions are declared
   against what it pulls in. Sorting them is a parse error, not a style change; it cost 91
-  test failures once. `include/oasr/recurrent/cutlass_recurrent_step_configs.h` guards its
-  block with `// clang-format off`; the attention and gated-MLP equivalents do not, and are
-  safe only because nobody runs the tool there.
+  test failures once. The CuTe families now take that block from one place,
+  `include/oasr/common/cute_sm80.h`, which guards it with `// clang-format off`; a new
+  header that needs an individual `cute/atom/*` or `cute/arch/*` include should include
+  `cute_sm80.h` rather than reorder its own.
 
 ### Testing & measuring
 - **Assuming a green `pytest tests/` means coverage.** Without the external assets the

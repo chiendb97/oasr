@@ -167,7 +167,7 @@ struct Softmax {
      */
     template <bool Is_first, bool Check_inf = true, typename Tensor0>
     CUTLASS_DEVICE TensorT max_get_scale(Tensor0& acc_s) {
-        Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor scores = make_tensor(acc_s.data(), cute_sm80::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         TensorT scores_scale;
         if constexpr (Is_first) {
@@ -206,7 +206,7 @@ struct Softmax {
      */
     template <bool Is_first, typename Tensor0>
     CUTLASS_DEVICE void online_softmax(Tensor0& acc_s, TensorT const& scores_scale) {
-        Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
+        Tensor scores = make_tensor(acc_s.data(), cute_sm80::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size<0>(scores); ++mi) {
@@ -277,7 +277,7 @@ struct Softmax {
     template <typename Tensor1>
     CUTLASS_DEVICE void rescale_o(Tensor1& acc_o, TensorT const& scores_scale) {
         Tensor acc_o_rowcol =
-            make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
+            make_tensor(acc_o.data(), cute_sm80::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
         CUTLASS_PRAGMA_UNROLL
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {

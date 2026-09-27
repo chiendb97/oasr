@@ -20,10 +20,8 @@
 #pragma once
 
 #include <cuda_runtime.h>
-#include <cutlass/cutlass.h>
-#include <cutlass/device_kernel.h>
 
-#include <oasr/common/arch_dispatch.h>
+#include <oasr/common/cute_sm80.h>
 
 #include "cutlass_recurrent_step_configs.h"
 #include "recurrent_step_epilogue.h"
@@ -98,25 +96,10 @@ cudaError_t run_recurrent_step(RecurrentStepParams<Element> const& params, cudaS
     static_assert(Kernel::SharedStorageSize <= ArchTraits::kSmemBudgetBytes,
                   "this tile overflows the architecture's shared memory");
 
-    dim3 const grid = Kernel::get_grid_shape(params);
-    dim3 const block = Kernel::get_block_shape();
-    int const smem_size = Kernel::SharedStorageSize;
-
-    auto kernel = cutlass::device_kernel<Kernel>;
-    // The table says what the architecture offers; this asks what *this*
-    // device grants.  They agree on every part we ship, and when they do not
-    // the failure should name both numbers rather than surface as a driver
-    // error from inside `cudaFuncSetAttribute` -- which is exactly how a
-    // five-stage ring failed at launch with an empty message once.
-    if (smem_size > oasr::getDeviceMaxSharedMemoryOptin()) {
-        return cudaErrorInvalidValue;
-    }
-    cudaError_t status = oasr::optInSharedMemory(kernel, size_t(smem_size));
-    if (status != cudaSuccess) {
-        return status;
-    }
-    kernel<<<grid, block, smem_size, stream>>>(params);
-    return cudaGetLastError();
+    // The table says what the architecture offers; the launcher asks what
+    // *this* device grants before opting in -- a five-stage ring once failed
+    // at launch with an empty message by skipping exactly that.
+    return cute_sm80::launch_kernel<Kernel>(params, stream);
 }
 
 }  // namespace recurrent

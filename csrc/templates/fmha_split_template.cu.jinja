@@ -27,15 +27,6 @@ constexpr int kHeadDim = {{ head_dim }};
 constexpr bool kHasBias = {{ 'true' if has_bias else 'false' }};
 constexpr bool kPagedKV = {{ 'true' if paged_kv else 'false' }};
 
-#define CHECK_LAST_STRIDE_ONE(x)                                                        \
-    TVM_FFI_ICHECK_EQ((x).stride((x).ndim() - 1), 1)                                    \
-        << #x << " must have a contiguous last dimension; got stride "                  \
-        << (x).stride((x).ndim() - 1)
-
-int32_t const* opt_i32(Optional const& t) {
-    return t.has_value() ? static_cast<int32_t const*>(t.value().data_ptr()) : nullptr;
-}
-
 }  // namespace
 
 /*! \brief Split-KV fused attention.
@@ -68,10 +59,10 @@ void {{ func_name }}(TensorView output, TensorView o_partial, TensorView lse_par
     CHECK_DIM(4, k);
     CHECK_DIM(4, v);
     CHECK_DIM(4, output);
-    CHECK_LAST_STRIDE_ONE(q);
-    CHECK_LAST_STRIDE_ONE(k);
-    CHECK_LAST_STRIDE_ONE(v);
-    CHECK_LAST_STRIDE_ONE(output);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
     CHECK_DEVICE(q, k);
     CHECK_DEVICE(q, v);
     CHECK_DEVICE(q, output);
@@ -111,7 +102,7 @@ void {{ func_name }}(TensorView output, TensorView o_partial, TensorView lse_par
     TVM_FFI_ICHECK(block_table.has_value()) << "paged variant requires a block_table";
     TVM_FFI_ICHECK(cache_seqlens.has_value())
         << "paged attention requires cache_seqlens to bound the KV extent";
-    args.ptr_pagetable = opt_i32(block_table);
+    args.ptr_pagetable = oasr::OptionalDataPtr<int32_t const>(block_table);
     args.shape_pagetable = {int(block_table.value().size(0)),
                             int(block_table.value().size(1))};
     args.stride_pagetable = {block_table.value().stride(0), cute::_1{}};
@@ -130,7 +121,7 @@ void {{ func_name }}(TensorView output, TensorView o_partial, TensorView lse_par
     {
         TensorView const b = bias.value();
         CHECK_DIM(4, b);
-        CHECK_LAST_STRIDE_ONE(b);
+        CHECK_LAST_DIM_CONTIGUOUS_INPUT(b);
         CHECK_DEVICE(q, b);
         args.ptr_bias = static_cast<Element const*>(b.data_ptr());
         args.shape_bias = {int(b.size(2)), int(b.size(3)), int(b.size(1)), int(b.size(0))};
@@ -140,8 +131,8 @@ void {{ func_name }}(TensorView output, TensorView o_partial, TensorView lse_par
     TVM_FFI_ICHECK(!bias.has_value()) << "this variant was compiled without a bias";
 {% endif %}
 
-    args.seqused_k = opt_i32(cache_seqlens);
-    args.seqstarts_k = opt_i32(cache_seqstarts);
+    args.seqused_k = oasr::OptionalDataPtr<int32_t const>(cache_seqlens);
+    args.seqstarts_k = oasr::OptionalDataPtr<int32_t const>(cache_seqstarts);
     args.softmax_scale = float(softmax_scale);
     args.window_size_left = int(window_left);
     args.window_size_right = int(window_right);

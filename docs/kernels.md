@@ -29,18 +29,20 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 
 | Path | Contents |
 |---|---|
-| `include/oasr/common/` | Shared types (`types.h`), scalar/vector dtype conversion (`vec_dtypes.h`), warp/block reduction (`reduction.h`), SM dispatch (`arch_dispatch.h`), epilogue functors, and math utilities |
+| `include/oasr/common/` | Shared types (`types.h`), scalar/vector dtype conversion (`vec_dtypes.h`), warp/block reduction (`reduction.h`), SM dispatch (`arch_dispatch.h`), per-SM hardware facts (`arch_facts.h`), epilogue functors, and math utilities; plus the Ampere-class CuTe toolkit the three CuTe families share (`cute_sm80.h`) and its CuTe-free tile rules (`tile_rules.h`) — see [The C++ CuTe families](#the-c-cute-families) |
 | `include/oasr/activation.cuh` | Vectorized exact GELU, sigmoid, tanh, ReLU, GLU, Swish, and Swoosh activations; unary sigmoid/tanh/ReLU also consume regular padded row strides such as channel chunks without a copy |
 | `include/oasr/norm.cuh` + `norm_dispatch.inc` | LayerNorm, RMSNorm, fused add+LayerNorm/RMSNorm (with optional residual passthrough), BatchNorm1d, GroupNorm, fused norm+activation |
 | `include/oasr/conv/` | `conv1d.cuh` + `conv1d_dispatch.inc` (depthwise with asymmetric padding and optional FSMN mask/residual fusion, pointwise, causal); dense BTC Conv1D is the height-one specialization of the `conv2d.cuh` CUTLASS facade |
 | `include/oasr/pooling.cuh` | BTC AvgPool1D and MaxPool1D; vectorized 2×2 specialization, generic padding/ceil/count semantics, and a flat narrow-channel path for one-channel traces |
-| `include/oasr/recurrent/` | LSTM and tanh/ReLU RNN inference: fused GEMV/cohort kernels (`recurrent.cuh`), CUTLASS 2.x recurrent GEMM and state epilogues (`recurrent_cutlass.cuh`) with Stream-K/Split-K candidates, and the CUTLASS 3.x TMA warp-specialized path for SM90/SM100 (`recurrent_cutlass_sm90.cuh`) |
+| `include/oasr/recurrent/` | LSTM and tanh/ReLU RNN inference: fused GEMV/cohort kernels (`recurrent.cuh`), CUTLASS 2.x recurrent GEMM and state epilogues (`recurrent_cutlass.cuh`) with Stream-K/Split-K candidates, the CUTLASS 3.x TMA warp-specialized path for SM90/SM100 (`recurrent_cutlass_sm90.cuh`), and the CuTe fused recurrent step (`recurrent_step_*.h`) |
+| `include/oasr/attention/` | The CuTe fused multi-head attention (`fmha_*.h`, `cutlass_fmha_configs.h`) |
+| `include/oasr/mlp/` | The CuTe fused gated MLP (`gated_mlp_*.h`, `cutlass_gated_mlp_configs.h`) |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
 | `include/oasr/{softmax,topk,fft,features}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
 | `csrc/<family>.cu` | TVM-FFI launcher |
 | `csrc/<family>_jit_binding.cu` | JIT binding exports |
-| `csrc/tvm_ffi_utils.h` | DLPack dtype dispatch, validation macros (`CHECK_GEMM_ALIGNMENT`, `CHECK_CONTIGUOUS_INPUT`, `FLATTENED_ROWS`) |
+| `csrc/tvm_ffi_utils.h` | DLPack dtype dispatch, validation macros (`CHECK_GEMM_ALIGNMENT`, `CHECK_CONTIGUOUS_INPUT`, `CHECK_LAST_DIM_CONTIGUOUS_INPUT`, `CHECK_VECTOR_ALIGNED`, `FLATTENED_ROWS`), `OptionalDataPtr` |
 | `csrc/templates/` | Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`) |
 | `csrc/decoder/ctc/` | GPU CTC launcher + binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`); `ctc/cpu/` holds the CPU-side C++ decoders compiled into `_C.so` — greedy search, prefix beam search, WFST beam search (via k2), the streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils` |
 | `csrc/decoder/wfst/` | In-tree GPU WFST decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is **test-only** and lives separately under `csrc/tests/wfst/`, out of the production decoder library. |
@@ -65,6 +67,12 @@ Each CUTLASS kernel family splits config, template, and dispatch:
 Non-CUTLASS kernels (Conv1D, Norm, Activation) use `*_dispatch.inc` files with
 VecSize / block_size dispatch macros instead.
 
+The three CuTe families (attention, the gated MLP, the recurrent step) keep the
+same three roles but split the template into CUTLASS 3.x-style collectives: the
+config is `cutlass_*_configs.h`, the template is a mainloop + epilogue composed
+by an arch-free kernel shell, and the dispatch is `*_launch_template.h` — see
+[The C++ CuTe families](#the-c-cute-families).
+
 ### Dispatch modes
 
 | Kernel family | Mode | Config source | Source generation |
@@ -77,6 +85,7 @@ VecSize / block_size dispatch macros instead.
 | Activation | **dispatch** | `activation_dispatch.inc` | Direct compilation, VecSize macro |
 | Pooling | **direct** | `pooling.cuh` | 128-bit channel vectors in BTC layout; specialized 2×2, generic, and narrow-channel launches |
 | Recurrent | **direct + CUTLASS** | `recurrent/recurrent.cuh` + `recurrent/recurrent_cutlass{,_sm90}.cuh` | fused low-latency GEMV at small batch, shared-weight batch warps for cohorts, sequence-wide input projection, state epilogues, autotuned Stream-K/Split-K for wide states, and TMA warp-specialized collectives on SM90/SM100 |
+| Fused attention, gated MLP, recurrent step (C++ CuTe) | **jinja (per variant)** | `cutlass_{fmha,gated_mlp,recurrent_step}_configs.h` + the CuTe-free tile headers | Jinja renders one `.cu` per variant of a *cell*; the tile is derived (attention) or chosen from a compiled table (MLP, recurrent step) — see [The C++ CuTe families](#the-c-cute-families) |
 
 - **JIT mode** (`OASR_TARGET_SM` defined): a single SM instantiation, with an
   optional `JitGemmConfig` / `JitConv2dConfig` passed via `-D` flags.
@@ -212,6 +221,8 @@ autotuner.
 | `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`), nvcc flags, `cutlass_version_stamp` |
 | `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `pooling`, `recurrent`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
 | `oasr/jit/fmha.py` | Fused attention, C++ CUTLASS/CuTe lane — one module per `(sm, dtype, head_dim)` **cell**, holding all 17 feature variants |
+| `oasr/jit/gated_mlp.py`, `oasr/jit/recurrent_step.py` | The gated-MLP and recurrent-step C++ CUTLASS/CuTe lanes — one module per `(sm, dtype, activation)` / `(sm, dtype, kind)` cell |
+| `oasr/jit/arch_facts.py` | The Python mirror of `include/oasr/common/{arch_facts,tile_rules}.h` the three CuTe lanes' tile mirrors are built on |
 | `oasr/jit/attention.py` | The backend arbiter, **and** the CuTeDSL lane — different model, see below |
 | `oasr/compilation_context.py` | `CompilationContext` detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels |
 
@@ -469,11 +480,67 @@ which branches on `cudaStreamIsCapturing`.
 Routing policy and measurements: `.artifacts/fmha_tuning.md` (CuTeDSL) and
 `.artifacts/fmha_cpp_validation.md` (the C++ lane's falsifications and the A/B).
 
+### The C++ CuTe families
+
+Three kernel families are written in C++ CUTLASS/CuTe rather than CUTLASS 2.x
+device templates: fused attention, the fused gated MLP and the fused recurrent
+step. They share one layout, file for file, so a reader who knows one knows
+where everything is in the other two:
+
+| Role | attention | gated MLP | recurrent step |
+|---|---|---|---|
+| Which SMs are served, and the family's ceilings | `cutlass_fmha_configs.h` | `cutlass_gated_mlp_configs.h` | `cutlass_recurrent_step_configs.h` |
+| Tile choice, CuTe-free | `cutlass_fmha_configs.h` (derived) | `gated_mlp_tiles.h` (table) | `recurrent_step_tiles.h` (ladder) |
+| Arguments / params | `fmha_params.h` | `gated_mlp_params.h` | `recurrent_step_params.h` |
+| Family-only CuTe helpers | `fmha_utils.h`, plus softmax, mask, bias, block, seqlen, paged-KV, combine | `gated_mlp_utils.h` (the dual-B gemm) | — |
+| Mainloop collective | `fmha_mainloop_sm80.h` | `gated_mlp_mainloop_sm80.h` | `recurrent_step_mainloop_sm80.h` |
+| Epilogue collective | `fmha_epilogue.h` | `gated_mlp_epilogue.h` | `recurrent_step_epilogue.h` |
+| Kernel shell (arch-free) | `fmha_kernel.h` + `fmha_tile_scheduler.h` | `gated_mlp_kernel.h` | `recurrent_step_kernel.h` |
+| Launch template (the one file naming an arch) | `fmha_launch_template.h` | `gated_mlp_launch_template.h` | `recurrent_step_launch_template.h` |
+| TVM-FFI launcher, one TU per variant | `csrc/templates/fmha{,_split}_template.cu.jinja` | `gated_mlp_template.cu.jinja` | `recurrent_step_template.cu.jinja` |
+| Capability oracle (the static TU) | `csrc/fmha_jit_binding.cu` | `csrc/gated_mlp_jit_binding.cu` | `csrc/recurrent_step_jit_binding.cu` |
+| JIT generator + Python tile mirror | `oasr/jit/fmha.py` | `oasr/jit/gated_mlp.py` | `oasr/jit/recurrent_step.py` |
+| Arbiter over the C++ and CuTeDSL lanes | `oasr/jit/attention.py` | `oasr/jit/mlp.py` | `oasr/jit/recurrent_cute.py` |
+
+Names follow the files: `Collective<Family>MainloopSm80`,
+`Collective<Family>Epilogue`, `<Family>Kernel`, `<Family>Arch<SM>`,
+`run_<family>` — so a profile's kernel name says which family it is.
+
+What the three have in common lives in `include/oasr/common/`, not in three
+copies:
+
+- **`cute_sm80.h`** — the Ampere-class toolkit: `ArchAmpere<SM>`, the traits
+  base every `<Family>Arch<SM>` derives from (the `mma.sync` atom, the ZFILL
+  `cp.async`, `ldmatrix`, the budgets and the capability bools); the swizzled
+  shared-memory atom; the accumulator re-views; the packed down-conversion; the
+  zero-filling (`copy_zfill`) and skipping (`copy_if`) tiled copies; the two
+  warp-level gemm shapes with their refill hook; and `launch_kernel`, the one
+  launcher. The copies this replaced had drifted: the gated MLP found that
+  branching around an asynchronous copy costs three dead `LDS` per copy and
+  that attention's down-conversion returned a view of a dead local, and
+  neither fix had reached the other family.
+- **`tile_rules.h`** — the CuTe-free half: the swizzle-row rule, the warp
+  tiling and tiled-copy pass geometry every tile validator composes, and the
+  occupancy estimate. CuTe-free so the capability oracles build in seconds;
+  mirrored in Python by `oasr/jit/arch_facts.py`.
+
+What stays in a family directory is what is actually that family's: the online
+softmax, the masks, the bias read, the paged gather, the split-KV combine, the
+dual-B gemm, the recurrent state transition, and each family's decision of
+which architectures it serves.
+
+Three rules hold for all of them. Dispatch on `ArchTraits::kIsWarpSpecialized`
+/ `kHasTma`, never on `Tag::kMinComputeCapability >= 90` (true for sm_120,
+which has neither). Every tile choice is a pure function of shape and machine,
+never of CUDA-graph capture state (rule 11). And a new architecture is a new
+`<Family>Arch<SM>`, a new collective and one `conditional_t` arm in the launch
+template — nothing else moves.
+
 ### The C++ attention kernel (`include/oasr/attention/`)
 
 Fifteen headers, structured the way CUTLASS 3.x structures a collective:
-`CollectiveMainloopSm80` + `CollectiveEpilogue` + `SingleTileScheduler`,
-composed by `FmhaKernelSm80` — a shell that names no architecture and
+`CollectiveFmhaMainloopSm80` + `CollectiveFmhaEpilogue` + `SingleTileScheduler`,
+composed by `FmhaKernel` — a shell that names no architecture and
 touches no layout. `fmha_launch_template.h` is the **one** file that names
 one, so a Hopper or Blackwell lane is a second `FmhaArch<SM>`, a second
 collective and one more `conditional_t` arm; the arguments, the FFI signature
@@ -490,6 +557,22 @@ Two rules in that header are load-bearing rather than stylistic:
 `fmha_softmax.h`'s header comment carries the numerics contract — twelve
 numbered items, each one a place where FlashAttention's reference is wrong for
 OASR's masking semantics, with the failure each one prevents.
+
+Two implementation notes, because nothing in the C++ says them:
+
+- **Every load is branch-free but one.** Q, every deeper K/V tile and the paged
+  gather fold their predicates into the ZFILL `cp.async` (`cute_sm80::copy_zfill`);
+  the branching form had left 144–168 dead `LDS` and a `BSSY`/`BSYNC` pair per
+  copy in every variant. The exception is the dense *first* K tile, issued once
+  per CTA: its branches keep ptxas from hoisting later stages' address math
+  above the Q and first-K requests, which is the critical path of a CTA that
+  walks one or two K tiles (`copy_rows_or_clear` records the measurement).
+- **The bias is read at its point of use, in the right shape.** Rows past the
+  plane are branched around (they are register loads, so there is no
+  asynchronous copy to order against) and boundary tiles read column pairs. A
+  one-tile-ahead register prefetch was built and measured: it bought 3–4% on
+  streaming chunks and cost up to 6% on interior 2–4-tile CTAs, including a
+  realistic Conformer batch, so it is not shipped (`fmha_bias.h`).
 
 ### The C++ gated-MLP kernel (`include/oasr/mlp/`)
 
@@ -519,7 +602,7 @@ Two things it does that the CuTeDSL lane cannot:
 
 One implementation note is worth carrying, because nothing in the C++ says it.
 The K residue is predicated into the ZFILL `cp.async`'s own `src_size` operand
-(`copy_zfill_2d`), not into control flow. Written the obvious way —
+(`cute_sm80::copy_zfill`), not into control flow. Written the obvious way —
 `if (pred) copy(...) else clear(...)` — ptxas has to order a synchronous `STS`
 against an asynchronous `LDGSTS` to the same shared address, and it does that
 by bracketing every copy in `BSSY`/`BSYNC` and padding it with three dead
@@ -571,11 +654,13 @@ Three things it does that the CuTeDSL lane cannot:
 
 Two epilogue details are worth carrying, because nothing in the C++ says them:
 
-- **The global loads are issued before the staging barrier.** The transition
-  needs `input_gates` and `previous_c` from global memory and the affine from
-  shared; issuing the two gmem loads first puts their latency behind the
-  accumulator store and the `__syncthreads()` rather than in front of the
-  arithmetic.
+- **The global loads are issued before the mainloop.** The transition needs
+  `input_gates` and `previous_c` from global memory and the affine from shared;
+  the first two depend on nothing the K loop computes, so the kernel shell issues
+  them first (`load_inputs`) and their latency hides behind the whole loop —
+  1.04–1.10x on the latency-bound steps. The two 128x128 tiles, where the carried
+  values would be 16–20 registers against a 512-thread CTA's 128-register cap,
+  load them after the loop instead (`kPrefetchInputs`).
 - **The accumulator staging is padded by 8 floats per row, not 1.** Both avoid
   the MMA-C store's bank conflict; only 8 also keeps every row 16-byte aligned,
   so a cell's four gates come back in one `LDS.128` instead of four `LDS.32`.
