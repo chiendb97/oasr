@@ -1,0 +1,228 @@
+{
+ "schema": 2,
+ "family": "conv1d",
+ "arch": {
+  "family": 120,
+  "lane": "sm80_mma"
+ },
+ "validators": {
+  "hard": {
+   "schema": 2,
+   "family": "conv1d",
+   "arch_family": 120,
+   "lane": "sm80_mma"
+  },
+  "soft": {
+   "nvcc": "13.2.51",
+   "cutlass": "95e7c73a46ba3b4c",
+   "sku": {
+    "name": "NVIDIA GeForce RTX 5090",
+    "sms": 170,
+    "l2": 100663296
+   }
+  }
+ },
+ "provenance": {
+  "created": "2026-09-29T05:04:00+00:00",
+  "origin": "converted from _CONV1D_HEURISTIC_RULES_SM120 / _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120 in oasr/jit/conv.py at 3a06738",
+  "bench_protocol": 1
+ },
+ "configs": {
+  "b128x32x64_w32x32x64_s3": {
+   "kind": "cutlass",
+   "lane": "sm80_mma",
+   "tile": [
+    128,
+    32,
+    64
+   ],
+   "warp": [
+    32,
+    32,
+    64
+   ],
+   "stages": 3
+  },
+  "b128x64x64_w64x32x64_s3": {
+   "kind": "cutlass",
+   "lane": "sm80_mma",
+   "tile": [
+    128,
+    64,
+    64
+   ],
+   "warp": [
+    64,
+    32,
+    64
+   ],
+   "stages": 3
+  },
+  "b16x128x64_w16x32x64_s3": {
+   "kind": "cutlass",
+   "lane": "sm80_mma",
+   "tile": [
+    16,
+    128,
+    64
+   ],
+   "warp": [
+    16,
+    32,
+    64
+   ],
+   "stages": 3
+  },
+  "b32x128x64_w32x32x64_s3": {
+   "kind": "cutlass",
+   "lane": "sm80_mma",
+   "tile": [
+    32,
+    128,
+    64
+   ],
+   "warp": [
+    32,
+    32,
+    64
+   ],
+   "stages": 3
+  },
+  "b64x128x64_w32x64x64_s3": {
+   "kind": "cutlass",
+   "lane": "sm80_mma",
+   "tile": [
+    64,
+    128,
+    64
+   ],
+   "warp": [
+    32,
+    64,
+    64
+   ],
+   "stages": 3
+  }
+ },
+ "coverage_basis": [],
+ "entries": {
+  "conv1d|op=conv1d_activation|dt=bf16|Cin=512|Cout=512|k=3|pad=0|stride=1|dil=1": {
+   "points": {
+    "1x502": "b16x128x64_w16x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Predictor convolution with fused ReLU."
+   ]
+  },
+  "conv1d|op=conv1d_activation|dt=fp16|Cin=512|Cout=512|k=3|pad=0|stride=1|dil=1": {
+   "points": {
+    "1x502": "b16x128x64_w16x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Predictor convolution with fused ReLU."
+   ]
+  },
+  "conv1d|op=conv1d|dt=bf16|Cin=1280|Cout=1280|k=3|pad=1|stride=2|dil=1": {
+   "points": {
+    "1x3000": "b128x32x64_w32x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=bf16|Cin=128|Cout=1280|k=3|pad=1|stride=1|dil=1": {
+   "points": {
+    "1x3000": "b64x128x64_w32x64x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=bf16|Cin=384|Cout=384|k=3|pad=1|stride=2|dil=1": {
+   "points": {
+    "1x3000": "b128x32x64_w32x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=bf16|Cin=512|Cout=512|k=3|pad=0|stride=1|dil=1": {
+   "points": {
+    "1x502": "b16x128x64_w16x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=bf16|Cin=80|Cout=384|k=3|pad=1|stride=1|dil=1": {
+   "points": {
+    "1x3000": "b128x64x64_w64x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=fp16|Cin=1280|Cout=1280|k=3|pad=1|stride=2|dil=1": {
+   "points": {
+    "1x3000": "b128x32x64_w32x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=fp16|Cin=128|Cout=1280|k=3|pad=1|stride=1|dil=1": {
+   "points": {
+    "1x3000": "b64x128x64_w32x64x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=fp16|Cin=384|Cout=384|k=3|pad=1|stride=2|dil=1": {
+   "points": {
+    "1x3000": "b32x128x64_w32x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=fp16|Cin=512|Cout=512|k=3|pad=0|stride=1|dil=1": {
+   "points": {
+    "1x502": "b16x128x64_w16x32x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  },
+  "conv1d|op=conv1d|dt=fp16|Cin=80|Cout=384|k=3|pad=1|stride=1|dil=1": {
+   "points": {
+    "1x3000": "b64x128x64_w32x64x64_s3"
+   },
+   "source": "converted",
+   "notes": [
+    "Exact SM120 production shapes. Batch and sequence remain in the key because implicit-GEMM's M dimension changes the best block height.",
+    "(1, 3000, 80|384, 384, ...): fixed-window frontend, width 384; (1, 3000, 128|1280, 1280, ...): width 1280; (1, 502, 512, 512, 3, 0, ...): padded predictor convolution."
+   ]
+  }
+ }
+}

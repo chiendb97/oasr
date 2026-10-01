@@ -7,13 +7,17 @@ compiled into a single shared library per kernel family.  The autotuner
 selects which pre-compiled variant to call — no JIT during tuning.
 """
 
+import contextlib
 import itertools
+import logging
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from . import env
 from .core import _TARGET_SMS, JitSpec, _get_target_sm, gen_jit_spec
+
+logger = logging.getLogger("oasr.jit.gemm")
 
 # =============================================================================
 # Tile configuration helpers (SM<90)
@@ -580,32 +584,34 @@ def _build_splitk_parallel_configs(
     return seen
 
 
-#: Pipeline depths the two K-decomposition families are built at, per SM family.
+#: Pipeline depths each CUTLASS 2.x family's templates can be instantiated at.
 #:
-#: They mirror each architecture's own base stage list — Stream-K keeps the
-#: single depth it has always been curated at, parallel split-K the arch's full
-#: list — with one entry that is a hardware fact rather than a preference:
-#: **Turing has no 3-stage tensor-op GEMM at all.**  Compiled here, `sm_75` at
+#: The domain is a template fact; which depths a family *builds* is then its
+#: shared-memory budget's call (``_tile_is_buildable``), not a per-SM list.  The
+#: per-SM lists this replaced were how sm_86 and sm_89 -- 100 KiB, the same
+#: budget as sm_120 -- came to be offered only 3-stage variants while sm_120's
+#: rule table picks 4-stage ones in 12 of its 127 buckets.
+#:
+#: **Turing has no 3-stage tensor-op GEMM at all.**  Compiled here, ``sm_75`` at
 #: three or four stages fails identically to the plain path,
 #:
 #:     default_gemm_universal.h(214): error: incomplete type
 #:       "cutlass::gemm::kernel::DefaultGemmUniversal<...>"
 #:
-#: which is the same `kernel::DefaultGemm` 2-stage-only specialisation that makes
-#: `RecurrentArch<75>` set `kStages = 2`.  Measured for every (arch, depth, family)
-#: cell: 80/86/89/120 build at 2, 3 and 4; sm_75 builds at 2 and nothing else.
-#:
-#: A 2.x family with no entry raises `KeyError` at config-generation time, which
-#: is the intended failure: silently receiving no decompositions is how this
-#: became an sm_120-only feature in the first place.
-_SM_STREAMK_STAGES: Dict[int, List[int]] = {75: [2], 80: [3], 86: [3], 89: [3], 120: [3]}
-_SM_SPLITK_PARALLEL_STAGES: Dict[int, List[int]] = {
-    75: [2],
-    80: [3, 4],
-    86: [3],
-    89: [3],
-    120: [3, 4],
-}
+#: which is the same ``kernel::DefaultGemm`` 2-stage-only specialisation that
+#: makes ``RecurrentArch<75>`` set ``kStages = 2``.  Mirrored by
+#: ``oasr.tune.arch.STAGE_DOMAIN``.
+_STAGE_DOMAIN: Dict[int, List[int]] = {75: [2], 80: [3, 4], 86: [3, 4], 89: [3, 4], 120: [3, 4]}
+
+#: Pipeline depths the two K-decomposition families are built at, per SM family:
+#: derived, not curated.  Stream-K keeps the single depth it has always been built
+#: at (the shallowest multistage depth; Turing's two); parallel split-K takes the
+#: family's whole domain, shared memory deciding which tiles survive.  A 2.x
+#: family with no entry raises ``KeyError`` at config-generation time, which is
+#: the intended failure: silently receiving no decompositions is how this became
+#: an sm_120-only feature in the first place.
+_SM_STREAMK_STAGES: Dict[int, List[int]] = {sm: [d[0]] for sm, d in _STAGE_DOMAIN.items()}
+_SM_SPLITK_PARALLEL_STAGES: Dict[int, List[int]] = {sm: list(d) for sm, d in _STAGE_DOMAIN.items()}
 
 
 def _add_k_decompositions(
@@ -637,45 +643,29 @@ def _add_k_decompositions(
     return cfgs
 
 
-def _get_sm75_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM75 (Turing): kStages = 2 only, tiles from _GEMM_TILES.
+def _get_sm80_lane_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
+    """The CUTLASS 2.x (``mma.sync``) lane's space for family *sm* -- sm_75/80/86/89/120.
 
-    Two is not a preference, it is the whole specialisation: CUTLASS's
-    ``kernel::DefaultGemm`` for ``arch::Sm75`` + ``OpClassTensorOp`` exists at two
-    pipeline stages and no other count, so a three-stage variant does not fail to
-    *run*, it fails to compile --
+    One generator for every family on the lane.  What differs by family is
+    data: the template-legal pipeline depths (:data:`_STAGE_DOMAIN`) and the
+    shared-memory budget (:data:`_SM_MAX_SMEM_BYTES`), which together decide
+    which ``(tile, depth)`` pairs are buildable.  SM120 runs this lane because
+    the CUTLASS 3.x SM120 CollectiveBuilder supports only F8/F6/F4 MMA, so
+    FP16/BF16 GEMM there uses the Sm80 forward-compatible ``mma.sync``.
 
-        cutlass/gemm/device/gemm.h(264): error: incomplete type
-          "cutlass::gemm::kernel::DefaultGemm<... 3, 75 ...>"
-
-    -- and one unbuildable TU fails the whole module, so this list read ``[2, 3]``
-    and took `gemm`, `bmm`, `group_gemm` and `gemm_log_softmax` down together on
-    Turing.  The rest of the tree already knew: ``default_config_for_sm`` returns
-    ``kStages=2`` for sm_75 and says in its comment that this function "emits only
-    ``_s2`` variants", ``RecurrentArch<75>`` sets two for the same reason, and the
-    K-decompositions below are built at two for the same reason again.  Only this
-    one list had never been re-read against the constraint it was describing.
+    Turing's single two-stage depth is not a preference, it is the whole
+    specialisation (see :data:`_STAGE_DOMAIN`): one unbuildable TU fails the
+    whole module, so this list once read ``[2, 3]`` and took `gemm`, `bmm`,
+    `group_gemm` and `gemm_log_softmax` down together on Turing.
     """
-    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [2], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[75])
-    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[75])
+    smem = _SM_MAX_SMEM_BYTES[sm]
+    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, _STAGE_DOMAIN[sm], _SPLIT_K_LIST, smem)
+    return _add_k_decompositions(cfgs, sm, smem)
 
 
-def _get_sm80_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM80 (Ampere A100): kStages ∈ {3,4}, tiles from _GEMM_TILES."""
-    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[80])
-    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[80])
-
-
-def _get_sm86_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM86 (Ampere RTX 30-series): kStages=3, tiles from _GEMM_TILES."""
-    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[86])
-    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[86])
-
-
-def _get_sm89_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM89 (Ada Lovelace): kStages=3, tiles from _GEMM_TILES."""
-    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[89])
-    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[89])
+# Historical per-family entry points, now one generator.
+_get_sm75_configs = _get_sm80_configs = _get_sm86_configs = _get_sm80_lane_configs
+_get_sm89_configs = _get_sm120_configs = _get_sm80_lane_configs
 
 
 # =============================================================================
@@ -831,21 +821,6 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     return seen
 
 
-def _get_sm120_configs(sm: int) -> Dict[str, CutlassGemmConfig]:
-    """SM120 (GeForce Blackwell / RTX 50 series) configs.
-
-    The CUTLASS 3.x SM120 CollectiveBuilder supports only F8/F6/F4 MMA, so
-    FP16/BF16 GEMM on SM120 is routed through the CUTLASS 2.x tensor-op path
-    using the Sm80 forward-compatible instructions (mma.sync.aligned.m16n8k16).
-
-    Also includes Stream-K and parallel split-K variants (gemm family only —
-    see ``_render_all_variants`` and the backend registration, which confine
-    them to GEMM).
-    """
-    cfgs = _build_sm_lt90_configs(sm, _GEMM_TILES, [3, 4], _SPLIT_K_LIST, _SM_MAX_SMEM_BYTES[120])
-    return _add_k_decompositions(cfgs, sm, _SM_MAX_SMEM_BYTES[120])
-
-
 def get_all_autotune_configs(
     sm: int,
 ) -> Dict[str, Union[CutlassGemmConfig, CutlassGemmConfigSm90]]:
@@ -861,20 +836,12 @@ def get_all_autotune_configs(
     a target that is merely *unlisted* should say so, not inherit another
     architecture's tiles.
     """
-    if sm == 75:
-        return _get_sm75_configs(sm)  # type: ignore[return-value]
-    elif sm == 80:
-        return _get_sm80_configs(sm)  # type: ignore[return-value]
-    elif sm == 86:
-        return _get_sm86_configs(sm)  # type: ignore[return-value]
-    elif sm == 89:
-        return _get_sm89_configs(sm)  # type: ignore[return-value]
+    if sm in _STAGE_DOMAIN:
+        return _get_sm80_lane_configs(sm)  # type: ignore[return-value]
     elif sm == 90:
         return _get_sm90_configs(sm)  # type: ignore[return-value]
     elif sm == 100:
         return _get_sm100_configs(sm)  # type: ignore[return-value]
-    elif sm == 120:
-        return _get_sm120_configs(sm)  # type: ignore[return-value]
     raise ValueError(
         f"no GEMM config space for sm_{sm}; OASR compiles for "
         f"{', '.join(f'sm_{t}' for t in _TARGET_SMS)}"
@@ -899,6 +866,79 @@ def get_unique_compile_configs(
     return seen
 
 
+#: Build knob: which variants the *production* modules compile.
+#:
+#: ``tuned`` (default): the configs the tuning DB references for this arch
+#: (shipped and user tiers), the untuned default, and the coverage basis --
+#: typically well under half the space (the SM120 table references 17 of 35).
+#: ``all``: the whole tuning space, the historical behaviour.  The tuning
+#: modules (``gemm_tune`` ...) always compile the whole space, and are only built
+#: by a process that tunes or sweeps.
+_COMPILE_SET = os.environ.get("OASR_GEMM_COMPILE_SET", "tuned").strip().lower()
+
+#: The coverage basis of the CUTLASS 2.x lane, as ``(tile, warp, decomposition)``:
+#: one config per shape class (thin / small / mid / wide rows, a K-decomposition
+#: for deep-K thin shapes), so a signature nobody tuned still has a sensible
+#: compiled option for the cost-model fallback -- the alternative is a runtime
+#: compile on the step path.  Built at the family's shallowest pipeline depth.
+_LANE_BASIS_2X = (
+    ((16, 64, 64), (16, 32, 64), ""),
+    ((32, 64, 64), (16, 32, 64), ""),
+    ((64, 64, 64), (32, 32, 64), ""),
+    ((32, 128, 64), (32, 32, 64), ""),
+    ((64, 128, 64), (32, 64, 64), ""),
+    ((128, 256, 64), (64, 64, 64), ""),
+    ((16, 64, 64), (16, 32, 64), "pk"),
+    ((64, 128, 64), (32, 64, 64), "sk"),
+)
+
+
+def _basis_compile_names(sm: int) -> List[str]:
+    if sm not in _STAGE_DOMAIN:
+        return []
+    s0 = _STAGE_DOMAIN[sm][0]
+    out = []
+    for (bm, bn, bk), (wm, wn, wk), dec in _LANE_BASIS_2X:
+        name = f"sm{sm}_b{bm}x{bn}x{bk}_w{wm}x{wn}x{wk}_s{s0}" + (f"_{dec}" if dec else "")
+        out.append(name)
+    return out
+
+
+def _tuned_compile_names(sm: int) -> List[str]:
+    """Compile names of every config the tuning DB's tiers name for *sm*."""
+    from oasr.tune import database
+
+    names: List[str] = []
+    for _tier, tf in database.tiers("gemm", sm).ordered():
+        for cid in tf.referenced_configs():
+            try:
+                choice = gemm_config_from_params(tf.configs[cid], sm)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not isinstance(choice, str):
+                names.append(choice.compile_name)
+    return names
+
+
+def get_production_configs(
+    sm: int,
+) -> Dict[str, Union[CutlassGemmConfig, CutlassGemmConfigSm90]]:
+    """The configs the production GEMM modules compile for *sm* (keyed by ``compile_name``).
+
+    A subset of :func:`get_unique_compile_configs`: the tuning DB's references,
+    the default and the coverage basis (``OASR_GEMM_COMPILE_SET=all`` restores
+    the whole space).  The CUTLASS 3.x lanes have no tuned table yet and a small
+    space, so they keep all of it.
+    """
+    space = get_unique_compile_configs(sm)
+    if _COMPILE_SET == "all" or sm not in _STAGE_DOMAIN:
+        return space
+    keep = {default_config_for_sm(sm).compile_name}
+    keep.update(_basis_compile_names(sm))
+    keep.update(_tuned_compile_names(sm))
+    return {name: cfg for name, cfg in space.items() if name in keep}
+
+
 # =============================================================================
 # Helper: render all tile variants for a given template
 # =============================================================================
@@ -910,6 +950,7 @@ def _render_all_variants(
     family: str,
     *,
     with_activation: bool = False,
+    configs: Optional[Dict[str, Union["CutlassGemmConfig", "CutlassGemmConfigSm90"]]] = None,
 ) -> List:
     """Render Jinja templates for all unique tile configs.
 
@@ -929,7 +970,7 @@ def _render_all_variants(
     from .templates import render_template
 
     sm = _get_target_sm()
-    unique_configs = get_unique_compile_configs(sm)
+    unique_configs = configs if configs is not None else get_production_configs(sm)
     source_paths = []
 
     for config_name, cfg in unique_configs.items():
@@ -1042,27 +1083,64 @@ def _render_bmm_general_variants() -> List:
 # =============================================================================
 
 
-def gen_gemm_module() -> JitSpec:
-    """Generate JIT spec for GEMM with ALL tile variants in one module.
+def _level_configs(level: str):
+    """The variants a module of *level* renders.
+
+    The tuning module holds the tuning space **minus** the production set --
+    never a variant both modules have.  Two libraries instantiating the same
+    CUTLASS kernel share its template static members: GCC emits them as
+    ``STB_GNU_UNIQUE`` and the loader merges them process-wide, so
+    ``GemmUniversalBase``'s once-per-process ``device_ordinal_`` cache made the
+    second module skip ``cudaFuncSetAttribute`` for *its own* Stream-K kernel,
+    whose 73.7 KB of dynamic shared memory then failed to launch ("GEMM kernel
+    failed") -- measured, the moment both modules had run the same variant.
+    Lookups resolve production first, then tuning (``oasr.functionals.gemm``).
+    """
+    sm = _get_target_sm()
+    if level == "production":
+        cfgs = get_production_configs(sm)
+        _BUILT_PRODUCTION[sm] = frozenset(cfgs)
+        _COMPILED_NAMES.pop(sm, None)
+        return cfgs
+    prod = get_production_configs(sm)
+    return {n: c for n, c in get_unique_compile_configs(sm).items() if n not in prod}
+
+
+def _module_name(family: str, level: str) -> str:
+    return family if level == "production" else f"{family}_tune"
+
+
+def has_tuning_module() -> bool:
+    """Whether the tuning space holds any variant the production module lacks."""
+    return bool(_level_configs("tune"))
+
+
+def gen_gemm_module(level: str = "production") -> JitSpec:
+    """Generate JIT spec for GEMM: every variant of *level* in one module.
+
+    ``level="production"`` compiles :func:`get_production_configs` -- what the
+    tuning DB references, the default and the coverage basis; ``"tune"``
+    compiles the whole tuning space (:func:`get_unique_compile_configs`), for
+    the tuner, ``oasr.autotune()`` and the per-variant correctness sweeps.
 
     Each variant exports ``gemm_{config_name}`` and ``gemm_{config_name}_activation``
-    as TVM-FFI functions.  The autotuner selects which to call; the default path
-    uses ``GEMM_DEFAULT``.
+    as TVM-FFI functions.
     """
     source_paths = _render_all_variants(
         "gemm_cutlass_template.cu.jinja",
         "gemm_cutlass_template_sm90.cu.jinja",
         "gemm",
         with_activation=True,
+        configs=_level_configs(level),
     )
     # Plus the workspace-cache diagnostics (``ws_cache_keys`` /
     # ``ws_cache_bytes``).  One extra TU, not part of the rendered template,
     # which is compiled once per tile configuration.
     source_paths = source_paths + [env.OASR_CSRC_DIR / "gemm_ws_cache.cu"]
-    return gen_jit_spec("gemm", source_paths)
+    return gen_jit_spec(_module_name("gemm", level), source_paths)
 
 
-def gen_bmm_module() -> JitSpec:
+def gen_bmm_module(level: str = "production") -> JitSpec:
     """Generate JIT spec for BMM: the tuned tile variants plus the general lane.
 
     Each tile variant exports ``bmm_{config_name}``; those are the alignment-8
@@ -1075,20 +1153,25 @@ def gen_bmm_module() -> JitSpec:
         "bmm_cutlass_template.cu.jinja",
         "bmm_cutlass_template_sm90.cu.jinja",
         "bmm",
+        configs=_level_configs(level),
     )
-    source_paths = (
-        source_paths
-        + _render_bmm_general_variants()
-        + [
-            env.OASR_CSRC_DIR / "bmm.cu",
-            env.OASR_CSRC_DIR / "bmm_jit_binding.cu",
-        ]
-    )
-    return gen_jit_spec("bmm", source_paths)
+    if level == "production":
+        # The general lane lives in the production module only: a second copy
+        # in the tuning module would duplicate its CUTLASS instantiations (see
+        # ``_level_configs`` for why that is a correctness hazard, not waste).
+        source_paths = (
+            source_paths
+            + _render_bmm_general_variants()
+            + [
+                env.OASR_CSRC_DIR / "bmm.cu",
+                env.OASR_CSRC_DIR / "bmm_jit_binding.cu",
+            ]
+        )
+    return gen_jit_spec(_module_name("bmm", level), source_paths)
 
 
-def gen_group_gemm_module() -> JitSpec:
-    """Generate JIT spec for grouped GEMM with ALL tile variants in one module.
+def gen_group_gemm_module(level: str = "production") -> JitSpec:
+    """Generate JIT spec for grouped GEMM with every variant of *level* in one module.
 
     Each variant exports ``group_gemm_{config_name}`` as a TVM-FFI function.
     """
@@ -1096,8 +1179,9 @@ def gen_group_gemm_module() -> JitSpec:
         "group_gemm_cutlass_template.cu.jinja",
         "group_gemm_cutlass_template_sm90.cu.jinja",
         "group_gemm",
+        configs=_level_configs(level),
     )
-    return gen_jit_spec("group_gemm", source_paths)
+    return gen_jit_spec(_module_name("group_gemm", level), source_paths)
 
 
 def gen_gemm_log_softmax_module() -> JitSpec:
@@ -1195,1647 +1279,244 @@ def default_config_for_sm(sm: int) -> Union[CutlassGemmConfig, CutlassGemmConfig
 GEMM_DEFAULT: Union[CutlassGemmConfig, CutlassGemmConfigSm90] = default_config_for_sm(_sm)
 
 
-# SM120 production rules generated by ``scripts/tune_asr_gemm.py``.
-# Keys are exact ``(op, N, K)`` tuples; values are ascending ``(m_max, choice)``
-# entries with an optional catch-all. Misses use ``GEMM_DEFAULT`` and are counted
-# by ``rule_miss_report()`` because rules do not transfer across model widths.
-#
-# One table per SM family, registered in ``_GEMM_HEURISTIC_RULES`` below.  The
-# tuner already emits this literal named for the arch it measured
-# (``emit_rules`` writes ``_GEMM_HEURISTIC_RULES_SM<sm>``), so a second
-# architecture is a paste plus one registry line -- not an edit to
-# ``select_default_config``.
-_GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
-    # Thin-N contraction; a smaller tile avoids wasted columns.  Zipformer's
-    # ConvNeXt pointwise contraction (384 -> 128), whose M is
-    # ``batch * embed_frames * 19``.
-    #
-    # The M <= 8192 bucket used to be split, with M in (1024, 2048] assigned
-    # ``b128x16x64_w32x16x64_s4``.  That tile is unbuildable (see
-    # ``_epilogue_covers_warp``) and it was also *slower* than the tile on both
-    # sides of it -- graph-captured at N=128 K=384, ``b32x64x64_s4`` runs
-    # 2.87/2.97/3.22/3.52 us at M=1026/1254/1710/2014 against the thin tile's
-    # 3.36/3.34/3.78/4.13, so the bucket is merged rather than re-tuned.  A rule
-    # generated from timings alone could see neither problem, which is why
-    # tests/kernels/test_gemm_heuristic.py now asks this shape's selection
-    # whether the tile it picked is *addressable* and not only whether it is
-    # compiled.  The timings are a four-point measurement recorded in
-    # .artifacts/gemm_thin_n_tile_epilogue.md, not a test.
-    ("gemm", 128, 384): [
-        (
-            8192,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (None, GEMM_DEFAULT),
-    ],
-    ("gemm", 256, 256): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~416: cutlass 0.0061ms (2.00x vs default)
-        (
-            1024,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~896: cutlass 0.0062ms (1.99x vs default)
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~1992: cutlass 0.0082ms (1.50x vs default)
-        (None, "torch"),  # M~15872: torch 0.0205ms (1.10x vs default)
-    ],
-    ("gemm", 256, 2048): [
-        (64, "torch"),  # M~48: torch 0.0082ms (6.25x vs default)
-        (
-            128,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=8,
-                parallel_split_k=True,
-            ),
-        ),  # M~128: cutlass 0.0088ms (5.84x vs default)
-        (512, "torch"),  # M~416: torch 0.0102ms (5.00x vs default)
-        (
-            1024,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=2,
-            ),
-        ),  # M~896: cutlass 0.0143ms (3.57x vs default)
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=2,
-            ),
-        ),  # M~1992: cutlass 0.0205ms (2.50x vs default)
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=128,
-                block_k=64,
-                warp_m=32,
-                warp_n=64,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~15872: cutlass 0.0901ms (1.17x vs default)
-    ],
-    ("gemm", 256, 4864): [
-        (
-            16,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=8,
-                parallel_split_k=True,
-            ),
-        ),  # M~16: cutlass 0.0107ms (10.54x vs default)
-        (1024, "torch"),  # M~896: torch 0.0225ms (5.09x vs default)
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=128,
-                block_k=64,
-                warp_m=32,
-                warp_n=64,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-                stream_k=True,
-            ),
-        ),  # M~1992: cutlass 0.0370ms (3.10x vs default)
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=128,
-                block_n=128,
-                block_k=64,
-                warp_m=64,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=2,
-            ),
-        ),  # M~15872: cutlass 0.2112ms (1.25x vs default)
-    ],
-    # Width-384 projections. Small AR steps and unaligned vocabulary heads bypass
-    # these rules; boundaries cover measured fixed-window encoder batches.
-    ("gemm", 384, 384): [
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 128/256/1500: 8.2/8.2/9.6us (2.00x/2.00x/1.70x vs default)
-        (
-            4096,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 3000 (batch 2): 12.3us (1.50x vs default)
-        # M 6000 (batch 4) is the one cell where the 128x128 default really is
-        # the best tile of the candidate space — 18.4us vs 20.5 for cuBLAS.  The
-        # entry exists to *stop* this M reaching the catch-all, not to change it.
-        (8192, GEMM_DEFAULT),  # M 6000: 18.4us (1.11x vs torch)
-        (None, "torch"),  # M 12000/24000/48000/96000: 1.06x/1.11x/1.13x/1.14x
-    ],
-    # Deep-K projection: use the lower-overhead launcher at small M and the faster
-    # library backend once GPU work dominates dispatch cost.
-    ("gemm", 384, 1536): [
-        (256, "torch"),  # B=32/64 decoder prefill: 10.2/12.3us (4.60x/3.83x); GPU-bound
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 1500 (batch 1): 18.4us, == cuBLAS on GPU, ~5us/call cheaper to issue
-        (
-            4096,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 3000 (batch 2): 30.7us, == cuBLAS on GPU (1.60x vs default)
-        (8192, GEMM_DEFAULT),  # M 6000 (batch 4): 51.3us, best of the three
-        (None, "torch"),  # M 12000/24000/48000/96000: 1.05x/1.13x/1.09x/1.07x
-    ],
-    ("gemm", 512, 256): [
-        (
-            1024,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~780: cutlass 0.0082ms (1.50x vs default)
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~1680: cutlass 0.0082ms (1.49x vs default)
-        (
-            4096,
-            CutlassGemmConfig(
-                block_m=128,
-                block_n=64,
-                block_k=64,
-                warp_m=64,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~2104: cutlass 0.0096ms (1.27x vs default)
-        (16384, "torch"),  # M~10368: torch 0.0205ms (1.10x vs default)
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~16768: cutlass 0.0348ms (1.12x vs default)
-    ],
-    # whisper-tiny FF up-projection (see the (384, *) keys above).
-    ("gemm", 1536, 384): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 128/256: 8.2/8.2us (2.01x/2.00x vs default, 1.24x vs torch at 256)
-        # Boundary entry: at M=1500 the default ties cuBLAS (18.4us both) and the
-        # next rule's tile costs 20.5, so what this pins is the *edge*.
-        (2048, GEMM_DEFAULT),  # M 1500 (batch 1): 18.4us
-        (
-            16384,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 3000/6000/12000: 1.07x/1.15x/1.04x vs default
-        (None, "torch"),  # M 24000/48000/96000: 1.07x/1.06x/1.11x
-    ],
-    # LSTM/RNN gate projection: N = gates * hidden, K = hidden.  This key was a
-    # silent rule miss until 2026-08-23 -- ``oasr.tune.capture`` only rebound the
-    # ``oasr`` package attributes and the recurrent functional imports ``gemm``
-    # from its defining module, so the shape never appeared in a captured
-    # workload and the whole M range sat on GEMM_DEFAULT's 128x128 tile at 17us.
-    #
-    # Measured GPU-only (a 100-call loop captured in one CUDA graph, arms
-    # round-robined over 9 reps, sigma <= 0.05us; fp16 and bf16 agree to 3%).  A
-    # back-to-back launch loop -- what ``scripts/tune_asr_gemm.py`` measures --
-    # cannot resolve this: every arm here is faster than the ~9.6us it costs to
-    # *issue* a GEMM call, so the loop reads 10-20us for all of them and reported
-    # 2.0x where the truth is 4.6x, picking the wrong tile twice.
-    ("gemm", 2560, 640): [
-        (
-            128,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 64/128: 3.64/4.91us vs default 16.72/17.14 (4.6x/3.5x)
-        (
-            768,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M 256/384/512/640/768: 2.66x/1.74x/1.62x/1.23x/1.20x vs default.
-        # At M=512 cuBLAS is 2.7% ahead (10.36 vs 10.65) -- a tie, and encoding
-        # it would cost a boundary that can be wrong.  Above 768 the default's
-        # 128-row tiles finally fill and cuBLAS leads it by only 1.01-1.05x, under
-        # the 1.05x bar the tuner uses, so the catch-all stays.
-        (None, GEMM_DEFAULT),  # M 1024/2048/4096: 1.01x/1.05x/1.03x for cuBLAS
-    ],
-    ("gemm_activation", 2048, 256): [
-        (
-            64,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~48: cutlass 0.0062ms (1.98x vs default)
-        (
-            128,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~128: cutlass 0.0062ms (1.98x vs default)
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~176: cutlass 0.0082ms (1.50x vs default)
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~416: cutlass 0.0102ms (1.39x vs default)
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~15872: cutlass 0.1044ms (1.18x vs default)
-    ],
-    ("gemm_log_softmax", 5008, 256): [
-        (64, "fused"),  # M~48: cutlass_fused 0.0102ms (1.00x vs default)
-        (
-            128,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~128: cutlass 0.0123ms (1.17x vs default)
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),  # M~15872: cutlass 0.4054ms (1.80x vs default)
-    ],
-    # ── Zipformer widths, from the 2026-08-24 capture-driven sweep
-    # (scripts/tune_asr_gemm.py over 165 representative shapes captured from real
-    # checkpoints).  A coverage census found Zipformer running GEMM_DEFAULT on 49
-    # distinct (op, N, K) keys — every one of its own widths — against 1 for
-    # Conformer.  These are those keys.
-    #
-    # Each arm cleared the tuner's self-overlap gate: faster both back-to-back in
-    # one graph AND on a single replay, so none is a low-occupancy tile that only
-    # wins by overlapping with its own next launch.  Kernel-level 1.07-8.63x.
-    #
-    # End-to-end, offline batch 64, 64 LJSpeech utterances, 6 interleaved arms of
-    # 25 reps: 1.0192x on min, 1.0168x on p25, 1.0151x on median, transcripts
-    # identical.  Modest because the encoder is CPU-issue-bound — which is also
-    # why the sweep's other 16 keys were measured and NOT kept: conformer 1.003x,
-    # paraformer 1.006x, whisper 1.002x, nemotron 0.993-1.004x, all inside their
-    # own sigma, and the nemotron ones moved three commas for no gain.
-    ("gemm", 16, 48): [
-        (256, GEMM_DEFAULT),
-        (None, "torch"),
-    ],
-    ("gemm", 48, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 48, 256): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 48, 512): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 96, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=128,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=4,
-                parallel_split_k=True,
-            ),
-        ),
-    ],
-    ("gemm", 192, 48): [
-        (512, "torch"),
-        (None, GEMM_DEFAULT),
-    ],
-    ("gemm", 192, 144): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 192, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 192, 384): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 192, 512): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 192, 640): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 192, 2432): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=2,
-                parallel_split_k=True,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 256, 48): [
-        (256, "torch"),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 256, 192): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 256, 576): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 256, 768): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 256, 960): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 272, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 272, 256): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 272, 512): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 384, 128): [
-        (
-            2048,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (8192, GEMM_DEFAULT),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 384, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 432, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 48): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 384): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=128,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 512): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=16,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            1024,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=128,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 1152): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=128,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=4,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 1536): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 512, 1920): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 544, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 576, 256): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 640, 192): [
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (None, GEMM_DEFAULT),
-    ],
-    ("gemm", 768, 256): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            512,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=128,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 768, 576): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 768, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 768, 1536): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=2,
-                parallel_split_k=True,
-            ),
-        ),
-    ],
-    ("gemm", 768, 2048): [
-        (None, "torch"),
-    ],
-    ("gemm", 768, 2560): [
-        (None, "torch"),
-    ],
-    ("gemm", 960, 256): [
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 1024, 512): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 1152, 512): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 1536, 512): [
-        (
-            1024,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (None, GEMM_DEFAULT),
-    ],
-    ("gemm", 1536, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 1728, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 1920, 512): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 2048, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm", 2560, 768): [
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
-    ("gemm_log_softmax", 504, 768): [
-        (64, "fused"),
-        (
-            256,
-            CutlassGemmConfig(
-                block_m=32,
-                block_n=64,
-                block_k=64,
-                warp_m=16,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-        (
-            None,
-            CutlassGemmConfig(
-                block_m=64,
-                block_n=64,
-                block_k=64,
-                warp_m=32,
-                warp_n=32,
-                warp_k=64,
-                kStages=3,
-                kSmVersion=120,
-                split_k=1,
-            ),
-        ),
-    ],
+# =============================================================================
+# Tuning-DB codec -- a config as explicit parameters (oasr.tune.database)
+# =============================================================================
+
+#: The MMA lane each compiled SM family's GEMMs run on.  A tuning file records
+#: its lane as a hard validator: a table measured on one lane means nothing on
+#: another, whatever the SM number says.
+GEMM_LANE_BY_SM: Dict[int, str] = {
+    75: "sm80_mma",
+    80: "sm80_mma",
+    86: "sm80_mma",
+    89: "sm80_mma",
+    90: "sm90_wgmma",
+    100: "sm100_tcgen05",
+    120: "sm80_mma",
 }
 
-#: Tuned rule tables by compiled SM family (``oasr.jit.core._SM_FAMILY``).
+#: Non-config choices a rule can name, and the ids they are stored under.
+#: ``"default"`` decodes to *this process's* :data:`GEMM_DEFAULT` -- the object
+#: identity callers compare against -- not a parameter set.
+_SENTINEL_IDS = ("torch", "fused", "default")
+
+GemmChoice = Union[CutlassGemmConfig, CutlassGemmConfigSm90, str]
+
+
+def gemm_config_id(choice: GemmChoice) -> str:
+    """The stable, human-readable id a choice is stored under.
+
+    The config's ``name`` without its ``sm<N>_`` prefix: the prefix is the
+    file's arch, stated once in the file rather than on every id.
+    """
+    if isinstance(choice, str):
+        if choice not in ("torch", "fused"):
+            raise ValueError(f"unknown GEMM sentinel {choice!r}")
+        return choice
+    if choice is GEMM_DEFAULT:
+        return "default"
+    return choice.name.split("_", 1)[1]
+
+
+def gemm_config_to_params(choice: GemmChoice, *, sentinel_default: bool = True) -> Dict[str, Any]:
+    """A choice as the explicit parameter dict a tuning file stores.
+
+    ``sentinel_default=False`` spells :data:`GEMM_DEFAULT` out as its parameters
+    instead of the ``"default"`` sentinel -- what a measurement log wants, since
+    a cost model needs the tile, not the name.
+    """
+    if isinstance(choice, str) or (sentinel_default and choice is GEMM_DEFAULT):
+        return {"kind": gemm_config_id(choice)}
+    if isinstance(choice, CutlassGemmConfig):
+        return {
+            "kind": "cutlass",
+            "lane": "sm80_mma",
+            "tile": [choice.block_m, choice.block_n, choice.block_k],
+            "warp": [choice.warp_m, choice.warp_n, choice.warp_k],
+            "stages": choice.kStages,
+            "split_k": choice.split_k,
+            "stream_k": bool(choice.stream_k),
+            "parallel_split_k": bool(choice.parallel_split_k),
+        }
+    return {
+        "kind": "cutlass",
+        "lane": GEMM_LANE_BY_SM.get(choice.kSmVersion, "sm90_wgmma"),
+        "tile": [choice.tile_m, choice.tile_n, choice.tile_k],
+        "cluster": [choice.cluster_m, choice.cluster_n],
+        "pingpong": bool(choice.pingpong),
+        "persistent": bool(choice.is_dynamic_persistent),
+        "swap_ab": bool(choice.swap_ab),
+        "swizzle": choice.max_swizzle_size,
+        "tma_gather": bool(choice.use_tma_gather),
+        "sms": choice.kSMs,
+        "stages": choice.kStages,
+    }
+
+
+def gemm_config_from_params(params: Dict[str, Any], sm: int) -> GemmChoice:
+    """Inverse of :func:`gemm_config_to_params` for arch family *sm*."""
+    kind = params.get("kind")
+    if kind == "default":
+        return GEMM_DEFAULT
+    if kind in ("torch", "fused"):
+        return str(kind)
+    if kind != "cutlass":
+        raise ValueError(f"unknown GEMM config kind {kind!r}")
+    tile = [int(v) for v in params["tile"]]  # type: ignore[union-attr]
+    if params.get("lane") == "sm80_mma":
+        warp = [int(v) for v in params["warp"]]  # type: ignore[union-attr]
+        return CutlassGemmConfig(
+            block_m=tile[0],
+            block_n=tile[1],
+            block_k=tile[2],
+            warp_m=warp[0],
+            warp_n=warp[1],
+            warp_k=warp[2],
+            kStages=int(params["stages"]),  # type: ignore[arg-type]
+            kSmVersion=int(sm),
+            split_k=int(params.get("split_k", 1)),  # type: ignore[arg-type]
+            stream_k=bool(params.get("stream_k", False)),
+            parallel_split_k=bool(params.get("parallel_split_k", False)),
+        )
+    cluster = [int(v) for v in params.get("cluster", [1, 1])]  # type: ignore[union-attr]
+    return CutlassGemmConfigSm90(
+        tile_m=tile[0],
+        tile_n=tile[1],
+        tile_k=tile[2],
+        cluster_m=cluster[0],
+        cluster_n=cluster[1],
+        pingpong=bool(params.get("pingpong", False)),
+        is_dynamic_persistent=bool(params.get("persistent", False)),
+        swap_ab=bool(params.get("swap_ab", False)),
+        max_swizzle_size=int(params.get("swizzle", 8)),  # type: ignore[arg-type]
+        use_tma_gather=bool(params.get("tma_gather", False)),
+        kSMs=int(params.get("sms", 1)),  # type: ignore[arg-type]
+        kStages=int(params.get("stages", 3)),  # type: ignore[arg-type]
+        kSmVersion=int(sm),
+    )
+
+
+def gemm_impl_hash() -> str:
+    """Identity of the GEMM-family kernel implementation a tuning result measured.
+
+    The templates every variant is rendered from, plus the GEMM and shared
+    headers they include.  A soft validator (see ``oasr.tune.database``): a
+    change marks tuning files stale -- re-measure -- without discarding them.
+    """
+    from oasr.tune.database import hash_paths
+
+    paths = sorted(env.OASR_TEMPLATE_DIR.glob("*gemm*_template*.jinja"))
+    paths += sorted(env.OASR_TEMPLATE_DIR.glob("bmm_*_template*.jinja"))
+    for sub in ("gemm", "common"):
+        paths += sorted((env.OASR_INCLUDE_DIR / "oasr" / sub).rglob("*.h*"))
+    paths.append(env.OASR_CSRC_DIR / "gemm_log_softmax.cu")
+    return hash_paths(paths)
+
+
+def _gemm_soft_validators() -> Dict[str, Any]:
+    return {"impl_hash": gemm_impl_hash()}
+
+
+def _register_with_tuning_db() -> None:
+    from oasr.tune import database
+
+    database.register_soft_validator("gemm", _gemm_soft_validators)
+
+
+_register_with_tuning_db()
+
+
+def gemm_sig_key(op: str, N: int, K: int, dtype_class: str = "half") -> str:
+    """The tuning-DB key of a GEMM-family static signature.
+
+    ``dtype_class`` is ``"half"`` for an entry that serves fp16 and bf16 alike
+    -- every entry today: the rules were tuned in bf16 and verified to carry to
+    fp16 within ~1% -- or ``"fp16"`` / ``"bf16"`` for a dtype-specific one,
+    which the resolver prefers when both exist.
+    """
+    from oasr.tune.database import sig_key
+
+    return sig_key("gemm", op=op, dt=dtype_class, N=int(N), K=int(K))
+
+
+# =============================================================================
+# Shape-aware selection: measured rule tables, read from the tuning DB
+# =============================================================================
+#
+# The measured tables are data: ``oasr/tune/db/sm<family>/gemm.json`` is the
+# shipped *system* tier, and ``~/.cache/oasr/tune/v2/sm<family>/gemm.json`` the
+# *user* tier written by tuning runs on the machine that measured it, which wins
+# on conflict.  They used to be Python literals that ``scripts/tune_asr_gemm.py``
+# printed and somebody pasted here; ``oasr.tune.database`` has the format, the
+# validator rules and the reasons.
+#
+# A file entry is keyed by the static signature -- ``(op, N, K)`` and a dtype
+# class -- and its ascending ``(m_max, choice)`` regions are looked up by
+# rounding M *up*, exactly as the literal tables were.
+
+#: One arch's rules: ``(op, N, K) -> ascending [(m_max | None, choice), ...]``.
+_RuleTable = Dict[Tuple[str, int, int], list]
+
+
+def _table_from_file(tf, dtype_class: str) -> _RuleTable:
+    """The ``dtype_class`` rules of tuning file *tf* as a ``(op, N, K)`` table."""
+    from oasr.tune.database import parse_sig_key
+
+    table: _RuleTable = {}
+    decoded: Dict[str, GemmChoice] = {}
+    for key, entry in tf.entries.items():
+        family, fields = parse_sig_key(key)
+        if family != "gemm" or fields.get("dt") != dtype_class or not entry.regions:
+            continue
+        rules = []
+        for m_max, cid in entry.regions:
+            choice = decoded.get(cid)
+            if choice is None:
+                choice = decoded[cid] = gemm_config_from_params(tf.configs[cid], tf.arch_family)
+            rules.append((m_max, choice))
+        table[(fields["op"], int(fields["N"]), int(fields["K"]))] = rules
+    return table
+
+
+#: ``(epoch, sm) -> [(tier, {dtype_class: table}), ...]``, highest tier first.
+_TIER_VIEWS: Dict[Tuple[int, int], List[Tuple[str, Dict[str, _RuleTable]]]] = {}
+
+
+def _tier_views(sm: int) -> List[Tuple[str, Dict[str, _RuleTable]]]:
+    """The decoded user and system tables for arch family *sm*, this epoch."""
+    from oasr.tune import database
+
+    key = (database.epoch(), int(sm))
+    views = _TIER_VIEWS.get(key)
+    if views is not None:
+        return views
+    views = []
+    for tier, tf in database.tiers("gemm", int(sm)).ordered():
+        views.append((tier, {dt: _table_from_file(tf, dt) for dt in ("fp16", "bf16", "half")}))
+    _TIER_VIEWS.clear()  # only the current epoch is ever consulted
+    _TIER_VIEWS[key] = views
+    return views
+
+
+def _load_system_rules() -> Dict[int, _RuleTable]:
+    from oasr.tune import database
+
+    out: Dict[int, _RuleTable] = {}
+    for sm in _TARGET_SMS:
+        tf = database.tiers("gemm", sm).system
+        if tf is not None:
+            out[sm] = _table_from_file(tf, "half")
+    return out
+
+
+#: The shipped (system-tier) rule tables by compiled SM family
+#: (``oasr.jit.core._SM_FAMILY``) -- a *view* of ``oasr/tune/db/sm*/gemm.json``.
 #:
 #: The heuristic used to be gated on ``sm != 120`` in ``select_default_config``,
 #: which made "which architectures are tuned?" a control-flow question with one
-#: possible answer.  Here it is data, and the answer is this dict's keys.
+#: possible answer.  Here it is data, and the answer is this dict's keys (plus
+#: whatever a user-tier file adds on this machine).
 #:
 #: An architecture that is absent is neither an error nor a rule miss -- nobody
 #: has measured it, and ``GEMM_DEFAULT`` computes the right answer -- but it is
@@ -2848,11 +1529,67 @@ _GEMM_HEURISTIC_RULES_SM120: Dict[Tuple[str, int, int], list] = {
 #:
 #: Populating one is a measurement, not a guess.  Rules that were reasoned about
 #: rather than timed have shipped a 4.6x regression and an empty transcript in
-#: this file's history; ``scripts/tune_asr_gemm.py`` on the target card is the
-#: only supported way in.
-_GEMM_HEURISTIC_RULES: Dict[int, Dict[Tuple[str, int, int], list]] = {
-    120: _GEMM_HEURISTIC_RULES_SM120,
-}
+#: this file's history; ``oasr tune build`` (or ``scripts/tune_asr_gemm.py``) on
+#: the target card is the only supported way in.
+_GEMM_HEURISTIC_RULES: Dict[int, _RuleTable] = _load_system_rules()
+
+#: The SM120 table, kept under its historical name.
+_GEMM_HEURISTIC_RULES_SM120: _RuleTable = _GEMM_HEURISTIC_RULES.get(120, {})
+
+
+def _on_tuning_reload() -> None:
+    global _GEMM_HEURISTIC_RULES, _GEMM_HEURISTIC_RULES_SM120
+    _TIER_VIEWS.clear()
+    _MODEL_VIEWS.clear()
+    _GEMM_HEURISTIC_RULES = _load_system_rules()
+    _GEMM_HEURISTIC_RULES_SM120 = _GEMM_HEURISTIC_RULES.get(120, {})
+    _COMPILED_NAMES.clear()
+
+
+def _register_reload_hook() -> None:
+    from oasr.tune import database
+
+    database.register_reload_hook(_on_tuning_reload)
+
+
+_register_reload_hook()
+
+#: ``sm -> compile names`` a production dispatch can reach (see :func:`_is_compiled`).
+_COMPILED_NAMES: Dict[int, frozenset] = {}
+
+#: ``sm -> compile names`` the production GEMM module of this process was built
+#: with.  Frozen at generation: a later tuning-DB reload can name configs the
+#: loaded module does not contain, and those must not reach dispatch.
+_BUILT_PRODUCTION: Dict[int, frozenset] = {}
+
+#: Families whose tuning module (the whole space) this process has loaded.
+_TUNE_LOADED: set = set()
+
+
+def mark_tuning_module_loaded(sm: int) -> None:
+    """Every config of the tuning space is dispatchable from now on (the tuning
+    module is loaded); called by the functional layer when it loads it."""
+    _TUNE_LOADED.add(int(sm))
+    _COMPILED_NAMES.pop(int(sm), None)
+
+
+def _is_compiled(choice: GemmChoice, sm: int) -> bool:
+    """Can *choice* be dispatched on arch family *sm*?  Sentinels always can."""
+    if isinstance(choice, str) or choice is GEMM_DEFAULT:
+        return True
+    names = _COMPILED_NAMES.get(sm)
+    if names is None:
+        try:
+            built = _BUILT_PRODUCTION.get(sm)
+            found = set(built) if built is not None else set(get_production_configs(sm))
+            if sm in _TUNE_LOADED:
+                found |= set(get_unique_compile_configs(sm))
+            names = frozenset(found)
+        except ValueError:
+            names = frozenset()
+        _COMPILED_NAMES[sm] = names
+    return getattr(choice, "kSmVersion", sm) == sm and choice.compile_name in names
+
 
 # Half-precision dtype strings the rules apply to (the kernels + SMEM budgets
 # assume 2-byte operands; fp32 keeps GEMM_DEFAULT).
@@ -2990,20 +1727,176 @@ def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
     """
     if not _HEURISTIC_ENABLED or str(dtype) not in _HEURISTIC_DTYPES:
         return GEMM_DEFAULT
-    table = _GEMM_HEURISTIC_RULES.get(int(sm))
-    if table is None:
-        _ARCH_INACTIVE[int(sm)] = _ARCH_INACTIVE.get(int(sm), 0) + 1
+    from oasr.tune.database import record_tier
+
+    sm = int(sm)
+    views = _tier_views(sm)
+    if not views:
+        _ARCH_INACTIVE[sm] = _ARCH_INACTIVE.get(sm, 0) + 1
+        record_tier("gemm", op, "default")
         return GEMM_DEFAULT
-    rules = table.get((op, int(N), int(K)))
-    if rules is None:
-        key = (op, int(N), int(K))
+    key = (op, int(N), int(K))
+    dt = _DTYPE_CLASS[str(dtype)]
+    had_rules = False
+    for tier, tables in views:
+        rules = tables[dt].get(key) or tables["half"].get(key)
+        if rules is None:
+            continue
+        had_rules = True
+        for m_max, choice in rules:
+            if m_max is None or M <= m_max:
+                if _is_compiled(choice, sm):
+                    record_tier("gemm", op, tier)
+                    return choice
+                _note_uncompiled(tier, key, choice, sm)
+                break
+    if not had_rules:
         st = _RULE_MISSES.get(key)
         if st is None:
             _RULE_MISSES[key] = _RuleMiss(int(M))
         else:
             st.add(int(M))
-        return GEMM_DEFAULT
-    for m_max, choice in rules:
-        if m_max is None or M <= m_max:
+        choice = _model_choice(op, int(M), int(N), int(K), sm)
+        if choice is not None:
+            record_tier("gemm", op, "model")
             return choice
+    record_tier("gemm", op, "default")
     return GEMM_DEFAULT
+
+
+#: ``OASR_TUNE_MODEL_FALLBACK``: ``auto`` (default) ranks a shape no tuning entry
+#: covers with the cost model the arch's tuning file ships, when it ships one;
+#: ``0`` keeps every such shape on :data:`GEMM_DEFAULT` (the A/B and rollback).
+_MODEL_FALLBACK = os.environ.get("OASR_TUNE_MODEL_FALLBACK", "auto").strip().lower()
+
+#: A model pick must beat the default by this factor *in the model's own
+#: prediction* to replace it -- a predicted tie keeps today's behaviour.
+_MODEL_MIN_GAIN = 1.05
+
+#: ``(epoch, sm) -> (model | None, {op: {config_id: (params, choice)}})``.
+_MODEL_VIEWS: Dict[Tuple[int, int], tuple] = {}
+
+
+def _model_view(sm: int):
+    from oasr.tune import database
+
+    key = (database.epoch(), int(sm))
+    view = _MODEL_VIEWS.get(key)
+    if view is not None:
+        return view
+    from oasr.tune.cost_model import GemmCostModel
+
+    model = None
+    for _tier, tf in database.tiers("gemm", int(sm)).ordered():
+        d = (tf.model or {}).get("gemm")
+        if d:
+            model = GemmCostModel.from_json(d)
+            # The analytic structure generalises across widths; per-config
+            # calibration does not (leave-one-signature-out top-1 regret up to
+            # ~50% on small-K widths vs 0.4% geomean for the prior), so the
+            # runtime tier ranks with the prior.
+            model.coeffs = {}
+            if int(sm) == _get_target_sm():
+                with contextlib.suppress(Exception):
+                    import torch
+
+                    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+                    model.num_sms = int(props.multi_processor_count)
+            break
+    cands: Dict[str, Dict[str, tuple]] = {"gemm": {}, "gemm_activation": {}}
+    if model is not None and sm in _STAGE_DOMAIN:
+        for cfg in get_all_autotune_configs(sm).values():
+            if not _is_compiled(cfg, sm):
+                continue
+            params = gemm_config_to_params(cfg, sentinel_default=False)
+            cid = gemm_config_id(cfg) if cfg != GEMM_DEFAULT else "default"
+            choice = GEMM_DEFAULT if cfg == GEMM_DEFAULT else cfg
+            # Never serial split-K from an *unmeasured* tier: it round-trips the
+            # partials through the output dtype, one rounding per slice, which a
+            # measured entry is allowed only after the numerics gate -- the model
+            # tier has none, and bf16 at split 4 missed a 1e-2 tolerance on
+            # (64, 128, 256).  Parallel split-K reduces in fp32 and stays.
+            if getattr(cfg, "split_k", 1) > 1 and not getattr(cfg, "parallel_split_k", False):
+                continue
+            cands["gemm"][cid] = (params, choice)
+            cands["gemm_activation"][cid] = (params, choice)
+    view = (model, cands)
+    _MODEL_VIEWS.clear()
+    _MODEL_VIEWS[key] = view
+    return view
+
+
+def _model_choice(op: str, M: int, N: int, K: int, sm: int):
+    """The cost model's pick among compiled configs for an uncovered shape, or ``None``.
+
+    Only ``gemm`` / ``gemm_activation`` on the aligned lane: the CTC head's
+    fallback is the fused launcher the model does not describe, and the tuned
+    ``bmm`` lane is keyed without its batch count.  A pure function of the shape
+    and the snapshot, so capture and eager agree (rule 11).
+    """
+    if _MODEL_FALLBACK in ("0", "off", "false", "no") or op not in ("gemm", "gemm_activation"):
+        return None
+    if N % 8 or K % 8:
+        return None
+    model, cands = _model_view(sm)
+    if model is None or not cands.get(op):
+        return None
+    params = {cid: pc[0] for cid, pc in cands[op].items()}
+    ranked = model.rank(params, M, N, K)
+    if not ranked:
+        return None
+    cid, t = ranked[0]
+    t_default = model.predict_ms(
+        "default", gemm_config_to_params(default_config_for_sm(sm), sentinel_default=False), M, N, K
+    )
+    if not (t * _MODEL_MIN_GAIN <= t_default):
+        return None
+    return cands[op][cid][1]
+
+
+def covering_tier(op: str, M: int, N: int, K: int, dtype, sm: int) -> Optional[str]:
+    """The tuning tier (``"user"`` / ``"system"``) whose entry covers this shape, or ``None``.
+
+    Covered means an entry exists for the signature and one of its regions
+    contains M -- i.e. the shape would be served from measured data rather than
+    the cost model or the default.  ``dtype`` may be a torch dtype or its name.
+    """
+    name = str(dtype)
+    if not name.startswith("torch."):
+        name = f"torch.{name}"
+    if name not in _DTYPE_CLASS:
+        return None
+    key = (op, int(N), int(K))
+    for tier, tables in _tier_views(int(sm)):
+        rules = tables[_DTYPE_CLASS[name]].get(key) or tables["half"].get(key)
+        if rules and any(m_max is None or M <= m_max for m_max, _ in rules):
+            return tier
+    return None
+
+
+#: ``str(torch dtype) -> the dtype class a tuning-DB entry is keyed under``.
+_DTYPE_CLASS = {"torch.float16": "fp16", "torch.bfloat16": "bf16"}
+
+_UNCOMPILED_WARNED: set = set()
+
+
+def _note_uncompiled(tier: str, key, choice, sm: int) -> None:
+    """A rule named a config this process does not build: say so once, then fall through.
+
+    Reachable from the user tier -- a file tuned against a larger compile set,
+    say -- and never from a shipped file, which a test holds to its arch's
+    emitted set.  Serving it would raise ``AttributeError: Module has no
+    function`` at dispatch; skipping it silently would hide a tuning file that
+    no longer matches the build.
+    """
+    wkey = (tier, key, getattr(choice, "compile_name", choice), sm)
+    if wkey in _UNCOMPILED_WARNED:
+        return
+    _UNCOMPILED_WARNED.add(wkey)
+    logger.warning(
+        "GEMM %s-tier rule for %s names %s, which sm%d does not compile; falling through",
+        tier,
+        key,
+        getattr(choice, "compile_name", choice),
+        sm,
+    )

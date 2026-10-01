@@ -8,6 +8,8 @@ Usage::
     modal run ci/modal_app.py::fetch_assets                     # once, ~20 GiB
     modal run ci/modal_app.py::main --gpus L40S,H100,B200
     modal run ci/modal_app.py::main --gpus H100 --suites engine,models
+
+The GEMM tuning matrix is its own app, ``ci/modal_tune.py``.
 """
 
 from __future__ import annotations
@@ -132,7 +134,8 @@ app = modal.App(APP_NAME)
 assets_vol = modal.Volume.from_name("oasr-ci-assets", create_if_missing=True)
 # Kernels JIT-compile on first *call*; without a warm cache every run pays the
 # full compile (~683 MiB of artifacts on the reference box).
-jit_vol = modal.Volume.from_name("oasr-ci-jit-cache", create_if_missing=True)
+JIT_VOLUME = "oasr-ci-jit-cache"
+jit_vol = modal.Volume.from_name(JIT_VOLUME, create_if_missing=True)
 
 image = (
     # -devel, not -runtime: the JIT shells out to nvcc at run time.
@@ -267,8 +270,11 @@ def _asset_env() -> dict[str, str]:
     return env
 
 
-def _jit_dir() -> str:
-    """Per-architecture JIT cache prefix.
+def _jit_dir(cc: str | None = None) -> str:
+    """Per-architecture JIT cache prefix -- this device's, or capability *cc*'s.
+
+    *cc* ("9.0") is for a CPU container compiling ahead for an architecture
+    it does not have; it must name the same prefix the GPU run derives.
 
     The cache *key* already separates architectures — ``_default_cuda_cflags``
     puts ``-gencode=...sm_XX`` into the flags ``JitSpec._content_hash`` hashes —
@@ -276,6 +282,8 @@ def _jit_dir() -> str:
     five GPUs all committing under one prefix is five concurrent writers to the
     same paths, and a per-arch prefix makes each sweep's cache its own.
     """
+    if cc is not None:
+        return f"{JIT_MOUNT}/sm{cc.replace('.', '')}"
     try:
         import torch
 

@@ -51,25 +51,26 @@ _GEMM_DEFAULT = GEMM_DEFAULT
 # ---------------------------------------------------------------------------
 
 
-@functools.cache
+# The tuning modules: every variant of the tuning space, which is what the
+# tactics above enumerate.  The production modules compile only the tuned subset.
+
+
 def _get_gemm_module():
-    from oasr.jit.gemm import gen_gemm_module
+    from oasr.functionals.gemm import _get_gemm_tune_module
 
-    return gen_gemm_module().build_and_load()
+    return _get_gemm_tune_module()
 
 
-@functools.cache
 def _get_bmm_module():
-    from oasr.jit.gemm import gen_bmm_module
+    from oasr.functionals.gemm import _get_bmm_tune_module
 
-    return gen_bmm_module().build_and_load()
+    return _get_bmm_tune_module()
 
 
-@functools.cache
 def _get_group_gemm_module():
-    from oasr.jit.gemm import gen_group_gemm_module
+    from oasr.functionals.gemm import _get_group_gemm_tune_module
 
-    return gen_group_gemm_module().build_and_load()
+    return _get_group_gemm_tune_module()
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,47 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TuningConfig:
+    """Kernel-selection tuning at engine construction (``oasr.tune``).
+
+    ``mode``:
+
+    * ``"off"`` (default) -- read the tuning DB, never measure.
+    * ``"prewarm"`` -- after the model loads and **before any graph capture**,
+      find the must-tune shapes the tuning DB does not cover on this GPU (from
+      ``census``, or an offline census probed on the engine itself), measure them
+      within ``budget_s`` GPU seconds, write the user tier and reload -- so every
+      captured graph is built under the new selections.
+    * ``"background"`` -- never measures in-process; ``ASREngine.export_tuning_misses``
+      writes what production missed for ``oasr tune build`` to consume elsewhere.
+
+    ``strict`` makes a must-tune shape that resolves below the tuning DB (to the
+    cost model or the default) an error at construction -- for CI and benchmarks,
+    which should never measure a fallback by accident.
+    """
+
+    mode: str = "off"
+    budget_s: float = 120.0
+    #: A ``ShapeSet`` JSON (``oasr tune census``); required for streaming prewarm.
+    census: Optional[str] = None
+    strict: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("off", "prewarm", "background"):
+            raise ValueError(f"TuningConfig.mode must be off|prewarm|background, got {self.mode!r}")
+
+    @classmethod
+    def coerce(cls, value) -> "TuningConfig":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        raise TypeError(f"tuning must be a TuningConfig or a mapping, got {type(value).__name__}")
+
+
+@dataclass
 class EngineConfig:
     """Unified configuration for the ASR inference engine.
 
@@ -350,12 +391,16 @@ class EngineConfig:
     # requests use ordinary heap memory; ``0`` disables pinned allocation.
     max_pinned_audio_seconds: float = 300.0
 
+    # Kernel-selection tuning at construction; see TuningConfig.
+    tuning: Any = None
+
     _model_config: Optional[BaseModelConfig] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # Accept a plain mapping (the Rust front-end passes one) so a serialized
         # engine config round-trips without the caller importing VadConfig.
         self.vad = VadConfig.coerce(self.vad)
+        self.tuning = TuningConfig.coerce(self.tuning)
         if self.service_mode not in ("streaming", "offline"):
             raise ValueError(
                 f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"

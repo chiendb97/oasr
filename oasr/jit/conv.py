@@ -5,7 +5,7 @@
 import itertools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from . import env
 from .core import _TARGET_SMS, JitSpec, _get_target_sm, gen_jit_spec
@@ -372,18 +372,55 @@ else:
     )
 
 
-def _sm120_conv1d_config(
-    block_m: int, block_n: int, warp_m: int, warp_n: int
-) -> CutlassConv2dConfig:
-    return CutlassConv2dConfig(
-        block_m=block_m,
-        block_n=block_n,
-        block_k=64,
-        warp_m=warp_m,
-        warp_n=warp_n,
-        warp_k=64,
-        kStages=3,
-        kSmVersion=120,
+def conv_config_to_params(
+    cfg: Union[CutlassConv2dConfig, CutlassConv2dConfigSm90],
+) -> Dict[str, Any]:
+    """A Conv2D/Conv1D config as the explicit parameter dict a tuning file stores."""
+    if isinstance(cfg, CutlassConv2dConfig):
+        return {
+            "kind": "cutlass",
+            "lane": "sm80_mma",
+            "tile": [cfg.block_m, cfg.block_n, cfg.block_k],
+            "warp": [cfg.warp_m, cfg.warp_n, cfg.warp_k],
+            "stages": cfg.kStages,
+        }
+    return {
+        "kind": "cutlass",
+        "lane": "sm90_wgmma" if cfg.kSmVersion == 90 else "sm100_tcgen05",
+        "tile": [cfg.tile_m, cfg.tile_n, cfg.tile_k],
+        "cluster": [cfg.cluster_m, cfg.cluster_n],
+        "stages": cfg.kStages,
+    }
+
+
+def conv_config_from_params(
+    params: Dict[str, Any], sm: int
+) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
+    """Inverse of :func:`conv_config_to_params` for arch family *sm*."""
+    if params.get("kind") == "default":
+        return CONV2D_DEFAULT
+    tile = [int(v) for v in params["tile"]]  # type: ignore[union-attr]
+    if params.get("lane") == "sm80_mma":
+        warp = [int(v) for v in params["warp"]]  # type: ignore[union-attr]
+        return CutlassConv2dConfig(
+            block_m=tile[0],
+            block_n=tile[1],
+            block_k=tile[2],
+            warp_m=warp[0],
+            warp_n=warp[1],
+            warp_k=warp[2],
+            kStages=int(params["stages"]),  # type: ignore[arg-type]
+            kSmVersion=int(sm),
+        )
+    cluster = [int(v) for v in params.get("cluster", [1, 1])]  # type: ignore[union-attr]
+    return CutlassConv2dConfigSm90(
+        tile_m=tile[0],
+        tile_n=tile[1],
+        tile_k=tile[2],
+        cluster_m=cluster[0],
+        cluster_n=cluster[1],
+        kStages=int(params.get("stages", 3)),  # type: ignore[arg-type]
+        kSmVersion=int(sm),
     )
 
 
@@ -392,56 +429,160 @@ _Conv1dRuleTable = Dict[
     str, Dict[Tuple[int, ...], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
 ]
 
-# Exact SM120 production shapes. Batch and sequence remain in the key because
-# implicit-GEMM's M dimension changes the best block height.  Named for the arch
-# it was measured on; a second one is a new literal plus a registry line below.
-_CONV1D_HEURISTIC_RULES_SM120: _Conv1dRuleTable = {
-    "torch.float16": {
-        # Fixed-window frontend, width 384.
-        (1, 3000, 80, 384, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
-        (1, 3000, 384, 384, 3, 1, 2, 1): _sm120_conv1d_config(32, 128, 32, 32),
-        # Fixed-window frontend, width 1280.
-        (1, 3000, 128, 1280, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
-        (1, 3000, 1280, 1280, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
-        # Padded predictor convolution.
-        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
-    },
-    "torch.bfloat16": {
-        (1, 3000, 80, 384, 3, 1, 1, 1): _sm120_conv1d_config(128, 64, 64, 32),
-        (1, 3000, 384, 384, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
-        (1, 3000, 128, 1280, 3, 1, 1, 1): _sm120_conv1d_config(64, 128, 32, 64),
-        (1, 3000, 1280, 1280, 3, 1, 2, 1): _sm120_conv1d_config(128, 32, 32, 32),
-        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
-    },
-}
-
-_CONV1D_ACTIVATION_HEURISTIC_RULES_SM120: _Conv1dRuleTable = {
-    # Predictor convolution with fused ReLU.
-    "torch.float16": {
-        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
-    },
-    "torch.bfloat16": {
-        (1, 502, 512, 512, 3, 0, 1, 1): _sm120_conv1d_config(16, 128, 16, 32),
-    },
-}
+_DT_TO_TORCH = {"fp16": "torch.float16", "bf16": "torch.bfloat16"}
 
 
-#: The Conv1D tables by compiled SM family, the same shape as
+def _conv1d_table_from_file(tf, op: str) -> _Conv1dRuleTable:
+    """The exact-shape ``op`` rules of tuning file *tf*, keyed as the selectors ask.
+
+    A Conv1D entry's static signature is ``(Cin, Cout, k, pad, stride, dil)``
+    and its measured ``(B, T)`` points are exact: implicit GEMM's M is
+    ``B * T_out``, and the tables were measured at the production shapes only.
+    """
+    from oasr.tune.database import parse_sig_key
+
+    table: _Conv1dRuleTable = {}
+    decoded: Dict[str, Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]] = {}
+    for key, entry in tf.entries.items():
+        family, f = parse_sig_key(key)
+        if family != "conv1d" or f.get("op") != op or f.get("dt") not in _DT_TO_TORCH:
+            continue
+        by_shape = table.setdefault(_DT_TO_TORCH[f["dt"]], {})
+        static = (
+            int(f["Cin"]),
+            int(f["Cout"]),
+            int(f["k"]),
+            int(f["pad"]),
+            int(f["stride"]),
+            int(f["dil"]),
+        )
+        for point, cid in entry.points.items():
+            b, t = (int(v) for v in point.split("x"))
+            cfg = decoded.get(cid)
+            if cfg is None:
+                cfg = decoded[cid] = conv_config_from_params(tf.configs[cid], tf.arch_family)
+            by_shape[(b, t) + static] = cfg
+    return table
+
+
+def _conv1d_regions_from_file(tf, op: str) -> Dict[str, Dict[Tuple[int, ...], list]]:
+    """``dtype -> (Cin, Cout, k, pad, stride, dil) -> [(m_hi, cfg)]`` region rules.
+
+    The generalisation of the exact points: implicit GEMM's M is ``B * T_out``,
+    so a region over M serves every ``(B, T)`` with the same product range --
+    batch-2 Whisper frames included -- once somebody measures one.
+    """
+    from oasr.tune.database import parse_sig_key
+
+    out: Dict[str, Dict[Tuple[int, ...], list]] = {}
+    for key, entry in tf.entries.items():
+        family, f = parse_sig_key(key)
+        if family != "conv1d" or f.get("op") != op or not entry.regions:
+            continue
+        if f.get("dt") not in _DT_TO_TORCH:
+            continue
+        static = (
+            int(f["Cin"]),
+            int(f["Cout"]),
+            int(f["k"]),
+            int(f["pad"]),
+            int(f["stride"]),
+            int(f["dil"]),
+        )
+        out.setdefault(_DT_TO_TORCH[f["dt"]], {})[static] = [
+            (hi, conv_config_from_params(tf.configs[cid], tf.arch_family))
+            for hi, cid in entry.regions
+        ]
+    return out
+
+
+def conv1d_out_frames(
+    seq_len: int, kernel_size: int, padding: int, stride: int, dilation: int
+) -> int:
+    return (seq_len + 2 * padding - dilation * (kernel_size - 1) - 1) // stride + 1
+
+
+def _load_conv1d_system_rules(op: str) -> Dict[int, _Conv1dRuleTable]:
+    from oasr.tune import database
+
+    out: Dict[int, _Conv1dRuleTable] = {}
+    for sm in _TARGET_SMS:
+        tf = database.tiers("conv1d", sm).system
+        if tf is not None:
+            out[sm] = _conv1d_table_from_file(tf, op)
+    return out
+
+
+#: The shipped Conv1D tables by compiled SM family -- views of
+#: ``oasr/tune/db/sm*/conv1d.json`` -- the same shape as
 #: ``jit.gemm._GEMM_HEURISTIC_RULES`` and for the same reason: which
 #: architectures are measured is data, not an ``if sm != 120`` in the selector.
 #:
 #: An architecture with no entry takes :data:`CONV2D_DEFAULT` for every call.
-#: Unlike GEMM this is not reported per shape — there is no conv miss table —
+#: Unlike GEMM this is not reported per shape -- there is no conv miss table --
 #: so the arch-level fall-through is counted in :data:`_ARCH_INACTIVE` and
 #: surfaced through ``oasr.layers._backend.format_gap_report``, which is the one
 #: place that already answers "what did not reach a tuned kernel?".
-_CONV1D_HEURISTIC_RULES: Dict[int, _Conv1dRuleTable] = {
-    120: _CONV1D_HEURISTIC_RULES_SM120,
-}
+_CONV1D_HEURISTIC_RULES: Dict[int, _Conv1dRuleTable] = _load_conv1d_system_rules("conv1d")
+_CONV1D_ACTIVATION_HEURISTIC_RULES: Dict[int, _Conv1dRuleTable] = _load_conv1d_system_rules(
+    "conv1d_activation"
+)
+_CONV1D_HEURISTIC_RULES_SM120 = _CONV1D_HEURISTIC_RULES.get(120, {})
+_CONV1D_ACTIVATION_HEURISTIC_RULES_SM120 = _CONV1D_ACTIVATION_HEURISTIC_RULES.get(120, {})
 
-_CONV1D_ACTIVATION_HEURISTIC_RULES: Dict[int, _Conv1dRuleTable] = {
-    120: _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120,
-}
+#: ``(epoch, sm) -> [(tier, {op: table}), ...]``, highest tier first.
+_CONV1D_TIER_VIEWS: Dict[Tuple[int, int], list] = {}
+
+
+def _conv1d_tier_views(sm: int) -> list:
+    from oasr.tune import database
+
+    key = (database.epoch(), int(sm))
+    views = _CONV1D_TIER_VIEWS.get(key)
+    if views is None:
+        views = [
+            (
+                tier,
+                {
+                    op: (_conv1d_table_from_file(tf, op), _conv1d_regions_from_file(tf, op))
+                    for op in ("conv1d", "conv1d_activation")
+                },
+            )
+            for tier, tf in database.tiers("conv1d", int(sm)).ordered()
+        ]
+        _CONV1D_TIER_VIEWS.clear()
+        _CONV1D_TIER_VIEWS[key] = views
+    return views
+
+
+def _on_tuning_reload() -> None:
+    global _CONV1D_HEURISTIC_RULES, _CONV1D_ACTIVATION_HEURISTIC_RULES
+    global _CONV1D_HEURISTIC_RULES_SM120, _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120
+    _CONV1D_TIER_VIEWS.clear()
+    _CONV1D_HEURISTIC_RULES = _load_conv1d_system_rules("conv1d")
+    _CONV1D_ACTIVATION_HEURISTIC_RULES = _load_conv1d_system_rules("conv1d_activation")
+    _CONV1D_HEURISTIC_RULES_SM120 = _CONV1D_HEURISTIC_RULES.get(120, {})
+    _CONV1D_ACTIVATION_HEURISTIC_RULES_SM120 = _CONV1D_ACTIVATION_HEURISTIC_RULES.get(120, {})
+
+
+def _register_with_tuning_db() -> None:
+    from oasr.tune import database
+
+    database.register_reload_hook(_on_tuning_reload)
+    database.register_soft_validator("conv1d", lambda: {"impl_hash": conv_impl_hash()})
+
+
+def conv_impl_hash() -> str:
+    """Identity of the Conv2D/Conv1D kernel implementation a tuning result measured."""
+    from oasr.tune.database import hash_paths
+
+    paths = sorted(env.OASR_TEMPLATE_DIR.glob("conv2d_*_template*.jinja"))
+    for sub in ("conv", "common"):
+        paths += sorted((env.OASR_INCLUDE_DIR / "oasr" / sub).rglob("*.h*"))
+    return hash_paths(paths)
+
+
+_register_with_tuning_db()
 
 #: SM family -> Conv1D lookups that found no rule table for it.  One entry per
 #: architecture: a missing table is one gap covering every shape.
@@ -459,19 +600,35 @@ def reset_heuristic_stats() -> None:
 
 
 def _select_conv1d_rule(
-    rules_by_sm: Dict[int, _Conv1dRuleTable],
+    op: str,
     shape: Tuple[int, ...],
     dtype,
     sm: int,
 ) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
-    rules_by_dtype = rules_by_sm.get(int(sm))
-    if rules_by_dtype is None:
+    from oasr.tune.database import record_tier
+
+    views = _conv1d_tier_views(int(sm))
+    if not views:
         _ARCH_INACTIVE[int(sm)] = _ARCH_INACTIVE.get(int(sm), 0) + 1
         return CONV2D_DEFAULT
-    rules = rules_by_dtype.get(str(dtype))
-    if rules is None:
-        return CONV2D_DEFAULT
-    return rules.get(tuple(int(value) for value in shape), CONV2D_DEFAULT)
+    key = tuple(int(value) for value in shape)
+    B, T, Cin, Cout, k, pad, stride, dil = key
+    m = B * conv1d_out_frames(T, k, pad, stride, dil)
+    for tier, tables in views:
+        points, regions = tables[op]
+        cfg: Optional[Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]]
+        cfg = points.get(str(dtype), {}).get(key)
+        if cfg is not None:
+            record_tier("conv1d", op, tier)
+            return cfg
+        rules = regions.get(str(dtype), {}).get((Cin, Cout, k, pad, stride, dil))
+        if rules:
+            for m_hi, cfg in rules:
+                if m_hi is None or m <= m_hi:
+                    record_tier("conv1d", op, tier)
+                    return cfg
+    record_tier("conv1d", op, "default")
+    return CONV2D_DEFAULT
 
 
 def select_default_conv1d_config(
@@ -496,7 +653,7 @@ def select_default_conv1d_config(
     additional shapes.
     """
     return _select_conv1d_rule(
-        _CONV1D_HEURISTIC_RULES,
+        "conv1d",
         (batch, seq_len, in_channels, out_channels, kernel_size, padding, stride, dilation),
         dtype,
         sm,
@@ -517,7 +674,7 @@ def select_default_conv1d_activation_config(
 ) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
     """Pick a measured fused-activation Conv1D tile, with a safe fallback."""
     return _select_conv1d_rule(
-        _CONV1D_ACTIVATION_HEURISTIC_RULES,
+        "conv1d_activation",
         (batch, seq_len, in_channels, out_channels, kernel_size, padding, stride, dilation),
         dtype,
         sm,

@@ -116,9 +116,82 @@ class TestBenchProtocol:
     """
 
     def test_the_capture_loop_is_deep_enough_to_resolve_a_launch(self):
-        """A one-iteration capture cannot separate a kernel from its launch."""
+        """A one-iteration capture cannot separate a kernel from its launch.
+
+        The protocol lives in ``oasr.tune.bench`` now, shared with
+        ``oasr.autotune()``.  Inductor measured one call per graph replay ranking
+        candidates *worse* than eager timing (Spearman 0.69 vs 0.77) and >= 5
+        calls reaching 0.94-0.95, hence a floor well above one.
+        """
+        from oasr.tune.bench import BenchPolicy
+
+        policy = BenchPolicy()
+        assert policy.min_calls >= 5
+        assert min(policy.stage_rounds) >= 3
         assert tune._GRAPH_ITERS > 1
         assert tune._GRAPH_REPS >= 3
+
+
+class TestContention:
+    """``bench`` flags a measurement taken next to another process on the device."""
+
+    @staticmethod
+    def _procs(*pids):
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(pid=p) for p in pids]
+
+    def test_on_bare_metal_this_process_is_not_a_neighbour(self):
+        from oasr.tune.bench import _other_processes
+
+        assert _other_processes(self._procs(7), pid=7) == 0
+        assert _other_processes(self._procs(7, 9), pid=7) == 1
+
+    def test_in_a_container_this_process_is_listed_under_a_host_pid(self):
+        """NVML reports host-namespace PIDs: on Modal, every row of a tuning run was
+        flagged contended on a dedicated GPU because the build counted itself."""
+        from oasr.tune.bench import _other_processes
+
+        assert _other_processes(self._procs(4242), pid=12) == 0
+        assert _other_processes(self._procs(4242, 5150), pid=12) == 1
+        assert _other_processes([], pid=12) == 0
+
+
+class TestEmitDb:
+    """The same decisions as the literal, written as a tuning-DB entry."""
+
+    def _plan(self, results, rep):
+        key = (rep.op, rep.M, rep.N, rep.K, rep.dtype, rep.batch)
+        return {key: results}, [rep]
+
+    def test_a_measured_win_becomes_a_region_with_evidence(self):
+        from oasr.jit.gemm import gemm_sig_key
+
+        per, reps = self._plan(_results(1.0, 1.0, 2.0, 2.0, block_m=32), _rep(m_max=None))
+        tf = tune.emit_db(per, reps, 120, min_speedup=1.05)
+        entry = tf.entries[gemm_sig_key("gemm", 256, 256)]
+        assert entry.regions == [(None, "b32x64x64_w32x32x64_s3")]
+        assert tf.configs["b32x64x64_w32x32x64_s3"]["tile"] == [32, 64, 64]
+        assert entry.evidence and entry.source == "aot"
+
+    def test_an_all_fallback_signature_is_not_written(self):
+        from oasr.jit.gemm import gemm_sig_key
+
+        per, reps = self._plan(_results(1.99, 1.99, 2.0, 2.0, block_m=32), _rep(m_max=None))
+        tf = tune.emit_db(per, reps, 120, min_speedup=1.05)
+        assert gemm_sig_key("gemm", 256, 256) not in tf.entries
+
+    def test_entries_the_sweep_did_not_measure_are_kept(self):
+        from oasr.jit.gemm import gemm_sig_key
+        from oasr.tune import database
+
+        base = database.new_file("gemm", 120, "sm80_mma")
+        base.configs["torch"] = {"kind": "torch"}
+        other = gemm_sig_key("gemm", 999, 999)
+        base.entries[other] = database.Entry(regions=[(None, "torch")])
+        per, reps = self._plan(_results(1.0, 1.0, 2.0, 2.0, block_m=32), _rep(m_max=None))
+        tf = tune.emit_db(per, reps, 120, min_speedup=1.05, base=base)
+        assert other in tf.entries and gemm_sig_key("gemm", 256, 256) in tf.entries
 
 
 class TestMLadder:

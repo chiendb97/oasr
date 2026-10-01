@@ -9,6 +9,7 @@
 # Reference: flashinfer/autotuner.py
 
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -64,6 +65,34 @@ def _json_to_tactic(val):
 # =============================================================================
 
 
+def _rebucket_v1_entries(entries: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-key a version-1 cache (exact shapes) onto the bucketed keys lookups use.
+
+    Where several exact shapes land in one bucket, the largest measured shape
+    wins: a result is only ever applied at or below the size it was measured at.
+    """
+    from .shapes import bucket_shape_sig
+
+    out: Dict[str, Any] = {}
+    best_size: Dict[str, Tuple[int, ...]] = {}
+    for key_str, value in entries.items():
+        try:
+            key = ProfileKey.from_str(key_str)
+        except (ValueError, TypeError):
+            out[key_str] = value
+            continue
+        bucketed = ProfileKey(
+            op_key=key.op_key,
+            shape_sig=bucket_shape_sig(key.op_key.family, key.op_key.op, key.shape_sig),
+            dtype=key.dtype,
+            device_sm=key.device_sm,
+        ).to_str()
+        if bucketed not in best_size or key.shape_sig > best_size[bucketed]:
+            best_size[bucketed] = key.shape_sig
+            out[bucketed] = value
+    return out
+
+
 def _collect_metadata() -> Dict[str, str]:
     """Collect environment metadata that can affect tactic-to-kernel mappings."""
     meta: Dict[str, str] = {}
@@ -88,6 +117,15 @@ def _collect_metadata() -> Dict[str, str]:
     except Exception:
         pass
     return meta
+
+
+def _same_call(call: Callable) -> Callable[[int], Callable]:
+    """An :class:`~oasr.tune.bench.Arm` ``make_call`` that ignores the copy index.
+
+    The registry's runners take their operands as arguments, so every graph node
+    replays the same buffers -- the autotuner times the caller's own tensors.
+    """
+    return lambda _i: call
 
 
 # =============================================================================
@@ -354,6 +392,64 @@ def _bench_cuda_events(
     return median, timings[0], timings[-1]
 
 
+def _publish_to_tuning_db(profile_key: "ProfileKey", best: "TuneResult", results) -> None:
+    """Record a GEMM-family winner in the user tier (``oasr.tune.database``).
+
+    That is what makes a tuning run pay off outside ``autotune()``: the
+    production selector reads the user tier first.  Keyed at the exact dtype it
+    was measured in, at the bucket of M it was measured for.
+    """
+    op_key = profile_key.op_key
+    if op_key.family != "gemm" or op_key.op not in (
+        "gemm",
+        "gemm_activation",
+        "gemm_log_softmax",
+        "bmm",
+    ):
+        return
+    if profile_key.dtype not in ("float16", "bfloat16"):
+        return
+    try:
+        import oasr.jit.gemm as jg
+        from oasr.tune import database
+        from oasr.tune.gemm_tune import choice_of
+
+        sm = profile_key.device_sm
+        from oasr.jit.core import _SM_FAMILY
+
+        family_sm = _SM_FAMILY.get(sm, sm)
+        if op_key.op == "bmm":
+            _batch, m, n, k = profile_key.shape_sig
+        else:
+            m, n, k = profile_key.shape_sig
+        choice = choice_of(best.tactic, family_sm)
+        cid = jg.gemm_config_id(choice)
+        dt = "fp16" if profile_key.dtype == "float16" else "bf16"
+        timings = {
+            (
+                r.tactic.backend
+                if r.tactic.backend != "cutlass"
+                else jg.gemm_config_id(choice_of(r.tactic, family_sm))
+            ): [round(r.median_ms, 6)]
+            for r in results[:5]
+            if r.status == "ok"
+        }
+        database.record_point(
+            "gemm",
+            family_sm,
+            jg.GEMM_LANE_BY_SM.get(family_sm, "sm80_mma"),
+            jg.gemm_sig_key(op_key.op, n, k, dt),
+            m,
+            cid,
+            jg.gemm_config_to_params(choice),
+            timings,
+        )
+    except Exception as exc:  # noqa: BLE001 -- publishing must never break a tuning run
+        logger.debug(
+            "[Autotuner]: could not publish %s to the tuning DB: %s", profile_key.to_str(), exc
+        )
+
+
 # =============================================================================
 # AutoTuner — singleton, FlashInfer-style
 # =============================================================================
@@ -399,6 +495,10 @@ class AutoTuner:
 
         # Statistics tracking
         self.stats = AutoTunerStatistics()
+
+        # Write GEMM-family winners into the tuning DB's user tier, where the
+        # production (non-autotuned) dispatch reads them too.
+        self.publish = True
 
         # Backend registry
         self._registry = _global_registry
@@ -480,9 +580,15 @@ class AutoTuner:
             device: CUDA device.
             runner_args: Positional arguments to pass to the runner.
         """
+        from .shapes import bucket_shape_sig
+
+        # Dynamic dimensions (M for a GEMM, batch and length for a conv) key by
+        # bucket, not by value: an exact key re-profiled every candidate for
+        # every new M, on the call path.  The bucket rounds up, so a result is
+        # only applied at or below the size it was measured at.
         profile_key = ProfileKey(
             op_key=op_key,
-            shape_sig=shape_sig,
+            shape_sig=bucket_shape_sig(op_key.family, op_key.op, shape_sig),
             dtype=_dtype_str(dtype),
             device_sm=_device_sm(device),
         )
@@ -515,36 +621,17 @@ class AutoTuner:
     # -----------------------------------------------------------------
 
     def _profile_single_kernel(self, tactic: Tactic, runner: Callable, args: tuple) -> TuneResult:
-        """Benchmark a single tactic by timing its execution."""
+        """Eager CUDA-event timing of one tactic -- the fallback protocol.
+
+        Used only when an op cannot be graph-captured at all (every candidate
+        failed capture): graph-captured loops are the protocol
+        (:mod:`oasr.tune.bench`), because eager timing cannot resolve a kernel
+        faster than its own issue cost.
+        """
         try:
-            # Try triton.testing.do_bench first (more accurate)
-            try:
-                from triton.testing import do_bench
-
-                ms = do_bench(
-                    lambda: runner(*args),
-                    warmup=self.warmup,
-                    rep=self.repeat,
-                    return_mode="median",
-                )
-                return TuneResult(
-                    tactic=tactic,
-                    median_ms=ms,
-                    min_ms=ms,
-                    max_ms=ms,
-                    status="ok",
-                )
-            except ImportError:
-                pass
-
-            # Fallback: CUDA events
             median, min_ms, max_ms = _bench_cuda_events(runner, args, self.warmup, self.repeat)
             return TuneResult(
-                tactic=tactic,
-                median_ms=median,
-                min_ms=min_ms,
-                max_ms=max_ms,
-                status="ok",
+                tactic=tactic, median_ms=median, min_ms=min_ms, max_ms=max_ms, status="ok"
             )
         except Exception as exc:
             logger.debug("Tactic %s failed: %s", tactic, exc)
@@ -563,10 +650,19 @@ class AutoTuner:
         candidates: List[BackendEntry],
         args: tuple,
     ) -> List[TuneResult]:
-        """Profile all candidates and return results sorted by median_ms."""
+        """Profile all candidates and return results sorted by median_ms.
+
+        Measured with :func:`oasr.tune.bench.measure` -- graph-captured loops,
+        interleaved rounds, successive halving -- on the live arguments.  An op
+        none of whose candidates can be captured is timed eagerly instead.
+        """
+        from . import bench
+
         op_str = f"{op_key.family}.{op_key.op}"
         results: List[TuneResult] = []
-        for entry in candidates:
+        arms = []
+        runners: Dict[str, Tuple[BackendEntry, Callable]] = {}
+        for i, entry in enumerate(candidates):
             try:
                 runner = entry.get_runner()
             except Exception as exc:
@@ -585,15 +681,42 @@ class AutoTuner:
                     )
                 )
                 continue
-            result = self._profile_single_kernel(entry.tactic, runner, args)
-            results.append(result)
-            if result.status == "ok":
-                logger.info("  %s: %.4f ms", entry.tactic.backend, result.median_ms)
+            name = f"c{i}"
+            runners[name] = (entry, runner)
+            arms.append(
+                bench.Arm(
+                    name,
+                    _same_call(functools.partial(runner, *args)),
+                    forced=entry.is_fallback,
+                    payload=entry,
+                )
+            )
+        measured, _cond = bench.measure(arms)
+        if arms and all(m.status != "ok" for m in measured.values()):
+            logger.info("[Autotuner]: %s is not graph-capturable; timing eagerly", op_str)
+            for entry, runner in runners.values():
+                results.append(self._profile_single_kernel(entry.tactic, runner, args))
+        else:
+            for name, m in measured.items():
+                entry = runners[name][0]
+                ok = m.status == "ok"
+                results.append(
+                    TuneResult(
+                        tactic=entry.tactic,
+                        median_ms=m.median_ms if ok else float("inf"),
+                        min_ms=min(m.samples) if (ok and m.samples) else float("inf"),
+                        max_ms=max(m.samples) if (ok and m.samples) else float("inf"),
+                        status="ok" if ok else "error",
+                        error_msg=m.error,
+                    )
+                )
+        for r in results:
+            if r.status == "ok":
+                logger.info("  %s: %.4f ms", r.tactic.backend, r.median_ms)
             else:
                 self.stats.failed_profiling_count[op_str] = (
                     self.stats.failed_profiling_count.get(op_str, 0) + 1
                 )
-                logger.debug("  %s: FAILED (%s)", entry.tactic.backend, result.error_msg)
         results.sort(key=lambda r: r.median_ms)
         return results
 
@@ -656,6 +779,8 @@ class AutoTuner:
                     best.median_ms,
                     profile_key.to_str(),
                 )
+                if self.publish:
+                    _publish_to_tuning_db(profile_key, best, results)
                 return best.tactic
 
             logger.warning(
@@ -765,7 +890,7 @@ class AutoTuner:
         try:
             data = {
                 _METADATA_KEY: original_metadata or current_meta,
-                "version": 1,
+                "version": 2,
                 "entries": dict(sorted(entries.items())),
             }
             with os.fdopen(fd, "w") as f:
@@ -824,6 +949,16 @@ class AutoTuner:
                 for k in current_meta
                 if saved_meta.get(k) not in (current_meta.get(k), "*", None)
             }
+            if "sm" in mismatches:
+                # Hard: a tactic tuned on another architecture is not a choice
+                # here at all -- it may name a kernel this build does not have.
+                logger.warning(
+                    "[Autotuner]: Ignoring cache file %s: tuned on sm%s, running on sm%s.",
+                    path,
+                    mismatches["sm"][0],
+                    mismatches["sm"][1],
+                )
+                return False
             if mismatches:
                 details = ", ".join(
                     f"{k}: saved={old} vs current={new}" for k, (old, new) in mismatches.items()
@@ -839,6 +974,9 @@ class AutoTuner:
         # Handle legacy format (no "entries" wrapper)
         if not entries and "version" not in data:
             entries = {k: v for k, v in data.items() if k not in (_METADATA_KEY, "env")}
+
+        if int(data.get("version", 1)) < 2:
+            entries = _rebucket_v1_entries(entries)
 
         with self._lock:
             self._file_configs.clear()
@@ -913,6 +1051,7 @@ def autotune(
     warmup: int = 25,
     rep: int = 100,
     log_level: str = "INFO",
+    publish: bool = True,
 ):
     """Context manager for autotuning with optional file-based caching.
 
@@ -923,9 +1062,13 @@ def autotune(
             On entry, configs are loaded from this file (if it exists).
             On exit, configs are saved back to this file (only when
             ``tune_mode=True`` and new results were profiled).
-        warmup: Number of warmup iterations for profiling.
-        rep: Number of measurement iterations for profiling.
+        warmup: Warm-up iterations for the eager fallback timing (ops that
+            cannot be graph-captured); the graph protocol sizes itself.
+        rep: Measurement iterations for the eager fallback timing.
         log_level: Logging verbosity for ``oasr.tune`` logger.
+        publish: Also write GEMM-family winners into the tuning DB's user tier
+            (``~/.cache/oasr/tune``), where the production dispatch reads them
+            after the context exits -- the point of tuning a deployment once.
 
     Examples::
 
@@ -943,6 +1086,8 @@ def autotune(
     logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
     cache_valid = True
+    prev_publish = tuner.publish
+    tuner.publish = publish
     if cache is not None:
         with tuner._lock:
             tuner._file_configs.clear()
@@ -978,6 +1123,9 @@ def autotune(
                 tuner.save_configs(cache)
             except OSError as exc:
                 logger.warning("[Autotuner]: Failed to save cache: %s", exc)
+        if tune_mode and not tuner.is_tuning_mode:
+            _flush_tuning_db()
+        tuner.publish = prev_publish
 
         logger.setLevel(prev_log_level)
 
@@ -1050,12 +1198,23 @@ def enable_autotune(
         tuner.load_configs(_active_cache_path)
 
 
+def _flush_tuning_db() -> None:
+    try:
+        from . import database
+
+        for path in database.flush_user():
+            logger.info("[Autotuner]: wrote tuned GEMM rules to %s", path)
+    except OSError as exc:
+        logger.warning("[Autotuner]: Failed to write the tuning DB user tier: %s", exc)
+
+
 def disable_autotune(save_cache: bool = True) -> None:
     """Disable autotuning globally.
 
     Args:
         save_cache: If ``True`` and a cache path was provided to
                     ``enable_autotune()``, save profiled configs to disk.
+                    Pending tuning-DB results are written either way.
     """
     global _enabled, _active_cache_path
 
@@ -1064,6 +1223,7 @@ def disable_autotune(save_cache: bool = True) -> None:
             AutoTuner.get().save_configs(_active_cache_path)
         except OSError as exc:
             logger.warning("[Autotuner]: Failed to save cache: %s", exc)
+    _flush_tuning_db()
 
     _enabled = False
     _active_cache_path = None

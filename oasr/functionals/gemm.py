@@ -40,6 +40,63 @@ def _get_group_gemm_module():
     return gen_group_gemm_module().build_and_load()
 
 
+def _mark_tune_loaded() -> None:
+    _jit_gemm.mark_tuning_module_loaded(_target_sm())
+
+
+class _TwoModules:
+    """Attribute lookup across the production module and the tuning module.
+
+    The tuning module holds only the variants production lacks (see
+    ``oasr.jit.gemm._level_configs`` for why never both), so a tuning-space
+    variant is found in exactly one of them.  Non-variant attributes (the
+    workspace-cache diagnostics) resolve from production; the cache itself is
+    one process-wide state either way (a ``STB_GNU_UNIQUE`` static).
+    """
+
+    def __init__(self, production, tuning):
+        self._production = production
+        self._tuning = tuning
+
+    def __getattr__(self, name):
+        fn = getattr(self._production, name, None)
+        if fn is None and self._tuning is not None:
+            fn = getattr(self._tuning, name, None)
+        if fn is None:
+            raise AttributeError(name)
+        return fn
+
+
+def _load_tuning(gen, production):
+    import oasr.jit.gemm as jg
+
+    tuning = gen("tune").build_and_load() if jg.has_tuning_module() else None
+    _mark_tune_loaded()
+    return _TwoModules(production, tuning)
+
+
+@functools.cache
+def _get_gemm_tune_module():
+    """Every GEMM variant of the tuning space (production + ``gemm_tune``)."""
+    from oasr.jit.gemm import gen_gemm_module
+
+    return _load_tuning(gen_gemm_module, _get_gemm_module())
+
+
+@functools.cache
+def _get_bmm_tune_module():
+    from oasr.jit.gemm import gen_bmm_module
+
+    return _load_tuning(gen_bmm_module, _get_bmm_module())
+
+
+@functools.cache
+def _get_group_gemm_tune_module():
+    from oasr.jit.gemm import gen_group_gemm_module
+
+    return _load_tuning(gen_group_gemm_module, _get_group_gemm_module())
+
+
 @functools.cache
 def _get_gemm_log_softmax_module():
     from oasr.jit.gemm import gen_gemm_log_softmax_module
@@ -111,9 +168,31 @@ def _gemm_io(A: torch.Tensor, N: int, out: Optional[torch.Tensor]):
 @functools.cache
 def _gemm_fn(compile_name: str, activation: bool):
     """Resolve a compiled GEMM variant by ``compile_name`` (cached → a stable
-    callable per shape, which keeps CUDA-graph capture/replay deterministic)."""
+    callable per shape, which keeps CUDA-graph capture/replay deterministic).
+
+    The production module first; a variant only the tuning space has resolves
+    from the tuning module, and only once this process has loaded it (a tuner
+    or ``oasr.autotune()`` did) -- production never compiles it on demand.
+    """
     suffix = "_activation" if activation else ""
-    return getattr(_get_gemm_module(), f"gemm_{compile_name}{suffix}")
+    name = f"gemm_{compile_name}{suffix}"
+    fn = getattr(_get_gemm_module(), name, None)
+    if fn is None and _target_sm() in _jit_gemm._TUNE_LOADED:
+        fn = getattr(_get_gemm_tune_module(), name, None)
+    if fn is None:
+        raise AttributeError(f"no compiled GEMM variant {name}")
+    return fn
+
+
+def _tune_gemm_fn(compile_name: str, activation: bool):
+    """A tuning-space GEMM variant, loading the tuning module if needed."""
+    suffix = "_activation" if activation else ""
+    return getattr(_get_gemm_tune_module(), f"gemm_{compile_name}{suffix}")
+
+
+def _tune_bmm_fn(compile_name: str):
+    """A tuning-space BMM variant, loading the tuning module if needed."""
+    return getattr(_get_bmm_tune_module(), f"bmm_{compile_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +232,20 @@ _PLANS: dict = {}
 _PLAN_CACHE_MAX = 4096
 
 _PLAN_WARNED: set = set()
+
+
+def _clear_plans() -> None:
+    """Drop every memoised plan: a tuning-DB reload may change any selection."""
+    _PLANS.clear()
+
+
+def _register_reload_hook() -> None:
+    from oasr.tune import database
+
+    database.register_reload_hook(_clear_plans)
+
+
+_register_reload_hook()
 
 
 def _plan(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tuple:
@@ -259,7 +352,13 @@ def _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M) -> None:
 @functools.cache
 def _bmm_fn(compile_name: str):
     """Resolve a compiled BMM variant by ``compile_name`` (cached, graph-safe)."""
-    return getattr(_get_bmm_module(), f"bmm_{compile_name}")
+    name = f"bmm_{compile_name}"
+    fn = getattr(_get_bmm_module(), name, None)
+    if fn is None and _target_sm() in _jit_gemm._TUNE_LOADED:
+        fn = getattr(_get_bmm_tune_module(), name, None)
+    if fn is None:
+        raise AttributeError(f"no compiled BMM variant {name}")
+    return fn
 
 
 @functools.cache

@@ -1115,6 +1115,13 @@ def _split_count(*, B: int, H: int, T_q: int, T_k: int, D: int, causal: bool, lo
         return 1
     m_blocks = -(-T_q // tile.block_m)
     n_blocks = -(-T_k // tile.block_n)
+    # SMs, not SMs x resident CTAs.  FlashAttention-2 feeds its rule ``2 x SMs``
+    # and an occupancy-aware count reads as the obvious generalisation, but it
+    # was measured and is worse here: at head_dim 32 (three 28 KB CTAs per SM on
+    # an RTX 5090) the slot count made the rule split 7 -> 16 ways and ran
+    # 0.895x geomean over 40 decode/streaming shapes (0.57x-1.31x).  This rule's
+    # thresholds were calibrated against the SM count; re-calibrate them before
+    # changing what they are compared against.
     return num_splits(B * H * m_blocks, n_blocks, _multiprocessor_count())
 
 

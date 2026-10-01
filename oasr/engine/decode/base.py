@@ -601,6 +601,23 @@ class DecodeStrategy(ABC):
         """Release per-request decode state on finalize/abort.  Default: no-op."""
         return None
 
+    #: Attributes a family may hold a CUDA-graph cache in (each with ``release()``).
+    _GRAPH_CACHE_ATTRS = ("_graphs", "_pred_graphs", "_loop_graphs")
+
+    def release_graphs(self) -> None:
+        """Release every captured decode graph this family holds.
+
+        A captured graph replays the kernels chosen when it was captured, so a
+        tuning-DB reload (``ASREngine.reload_tuning``) must drop them to make the
+        new selections take effect -- otherwise eager and replayed decode steps
+        would run different GEMMs, which rule 11 forbids.  They re-capture lazily.
+        """
+        for name in self._GRAPH_CACHE_ATTRS:
+            cache = getattr(self, name, None)
+            release = getattr(cache, "release", None)
+            if callable(release):
+                release()
+
     def prewarm_streaming(self, batch_sizes: Sequence[int], frames: int) -> None:
         """Capture this family's per-width decode graphs ahead of traffic.
 

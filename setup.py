@@ -322,5 +322,7 @@ setup(
 
     # Include package data
     include_package_data=True,
+    # The shipped tuning DB (oasr.tune.database's system tier).
+    package_data={"oasr.tune": ["db/*/*.json", "db/README.md"]},
     zip_safe=False,
 )

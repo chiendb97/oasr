@@ -19,8 +19,15 @@ run mean something (see ``tests/assets.py`` and ``docs/ci.md``):
 import os
 import sys
 
-import pytest
-import torch
+# A developer's own tuning results (the user tier of ``oasr.tune.database``,
+# ``~/.cache/oasr/tune``) override the shipped rule tables, so a test that pins
+# what the shipped table selects would observe whatever that box last tuned.
+# Set before anything imports ``oasr``: the tiers are read on first lookup.
+# Tests that exercise the user tier point it at a temp dir explicitly.
+os.environ.setdefault("OASR_TUNE_USER_DB", "off")
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
 
 sys.path.insert(0, "python")
 

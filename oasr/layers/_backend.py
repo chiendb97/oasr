@@ -256,11 +256,33 @@ def format_gap_report() -> str:
     except Exception:  # noqa: BLE001 — diagnostics must never break the caller
         misses = {}
     if misses:
-        lines.append("  GEMM shapes with no tuned rule (ran on the fallback tile):")
+        lines.append(
+            "  GEMM shapes with no tuned rule (ran on the cost model's pick or the fallback tile):"
+        )
         for (op, N, K), (calls, m_lo, m_hi) in sorted(misses.items(), key=lambda kv: -kv[1][0]):
             span = f"{m_lo}" if m_lo == m_hi else f"{m_lo}..{m_hi}"
             lines.append(f"    {op:<18} N={N:<6} K={K:<6} x{calls:<7} M={span}")
-        lines.append("    tune with → scripts/tune_asr_gemm.py (see oasr/jit/gemm.py)")
+        lines.append(
+            "    tune with → oasr tune export-misses + oasr tune build "
+            "(or scripts/tune_asr_gemm.py)"
+        )
+    # Which tier of the tuning DB served the shapes that *were* resolved: the
+    # user tier (this machine's own tuning), the shipped one, the cost model
+    # (an uncovered width), or the untuned default.
+    try:
+        from oasr.tune.database import tier_counts
+
+        tiers = tier_counts()
+    except Exception:  # noqa: BLE001 — diagnostics must never break the caller
+        tiers = {}
+    if tiers:
+        by_tier: Dict[str, int] = {}
+        for (_family, _op, tier), n in tiers.items():
+            by_tier[tier] = by_tier.get(tier, 0) + n
+        parts = ", ".join(
+            f"{t}={by_tier[t]}" for t in ("user", "system", "model", "default") if by_tier.get(t)
+        )
+        lines.append(f"  tuned-kernel selection by tier (distinct shapes): {parts}")
     # And a fourth thing, one level up from an untuned *width*: an untuned
     # *architecture*, where the table is not consulted at all and every shape
     # takes the fallback tile.  It reads as silence in every other counter --
@@ -281,7 +303,10 @@ def format_gap_report() -> str:
         for label, counts in inactive.items():
             for sm, calls in sorted(counts.items()):
                 lines.append(f"    {label:<18} sm{sm:<5} x{calls}")
-        lines.append("    tune this card with → scripts/tune_asr_gemm.py")
+        lines.append(
+            "    tune this card with → oasr tune census + oasr tune build "
+            "(or scripts/tune_asr_gemm.py)"
+        )
     # And a fifth: a table that *was* tuned, on somebody else's GPU.  A fixed
     # (hidden, batch) cut-off encodes a crossover between a weight-streaming
     # kernel and a library GEMM, and that crossover is a function of SM count and
