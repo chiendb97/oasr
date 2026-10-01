@@ -316,17 +316,29 @@ object.
 - the torch/cuBLAS backend (`oasr/functionals/gemm_torch.py`);
 - or, for the CTC head only, the legacy single-call fused launcher.
 
-The rules come from measured sweeps (`scripts/tune_asr_gemm.py`) and are keyed on
-the exact `(op, N, K)`, so **the table is per model width**. A shape with no
-rule falls through to the fixed `GEMM_DEFAULT` tile; the fall-through is counted
-and reportable via `jit.gemm.rule_miss_report()` — which is both the coverage
-check and the shape list to feed the tuner.
+The rules are **data** — the tuning database (`oasr/tune/database.py`, format
+and policy in [autotuning.md](autotuning.md#the-tuning-database)). One file per
+`(arch family, kernel family)`: the shipped *system* tier
+(`oasr/tune/db/sm120/gemm.json`, `…/conv1d.json`), and a *user* tier in
+`~/.cache/oasr/tune/v2/` written by tuning runs on the machine that measured
+them, which wins per signature. An entry is keyed by the static signature
+(`gemm|op=gemm|dt=half|N=512|K=256`) and its ascending `(m_hi, config)` regions
+are looked up by rounding M **up**, so a config only serves sizes at or below the
+largest one it was measured at.
 
-**And per architecture.** `jit.gemm._GEMM_HEURISTIC_RULES` maps an SM family to
-that family's table, and Conv1D's `jit.conv._CONV1D_HEURISTIC_RULES` does the
-same; the tuner already emits its literal named for the card it measured
-(`_GEMM_HEURISTIC_RULES_SM<sm>`), so tuning a second architecture is a paste plus
-a registry line, not an edit to the selector. Only **SM120** is measured today.
+The lookup chain is user → system → **cost model** → `GEMM_DEFAULT`, each tier
+counted (`oasr.tune.database.tier_counts()`, `format_gap_report()`). The model
+tier ranks the *compiled* configs with the analytic model the arch's tuning file
+ships (`oasr/tune/cost_model.py`) for an aligned `gemm`/`gemm_activation` shape
+no entry covers, and only replaces the default when it predicts at least a 5%
+gain (`OASR_TUNE_MODEL_FALLBACK=0` disables it). A shape with no entry is still a
+**rule miss** — counted by `jit.gemm.rule_miss_report()`, exported for re-tuning
+by `oasr tune export-misses`.
+
+**Per architecture.** `jit.gemm._GEMM_HEURISTIC_RULES` is a view of the system
+tier keyed by SM family (and `jit.conv._CONV1D_HEURISTIC_RULES` likewise); an
+arch with no file is tuned by `oasr tune build` on that card, not by an edit to
+the selector. Only **SM120** is measured today.
 
 An architecture with no table is not an error — `GEMM_DEFAULT` computes the right
 answer — but it is the largest gap the heuristic can have, because it is *every*
@@ -341,6 +353,18 @@ would name every GEMM the process issued) and reported by both
 GEMM heuristic inactive on sm80: no tuned rule table (tuned: sm120), so all 8
 shape lookup(s) used GEMM_DEFAULT. Tune this card with scripts/tune_asr_gemm.py.
 ```
+
+**The production module compiles the tuned subset.** `get_production_configs(sm)`
+is what the tuning DB references for the arch (both tiers), the default and a
+small coverage basis — 20 of 35 variants on sm120, 9 of 43 on sm80; the tuning
+modules (`gemm_tune`, `bmm_tune`, `group_gemm_tune`) compile the whole space
+(`get_unique_compile_configs`) and are only built by a process that tunes or
+sweeps. `OASR_GEMM_COMPILE_SET=all` restores the old single-module behaviour.
+The candidate space itself is one generator per MMA lane: every CUTLASS 2.x
+family (sm_75/80/86/89/120) gets the lane's tiles at every pipeline depth its
+template can take *and* its shared memory fits — which is how sm_86/sm_89, with
+sm_120's 100 KiB budget, came to be offered the 4-stage tiles sm_120's table
+uses.
 
 Adding a table is a *measurement*. Rules that were reasoned about rather than
 timed have shipped a 4.6x regression and an empty transcript here; the entries a
@@ -367,8 +391,8 @@ Three rules are structural rather than tuned:
   there: a capture-dependent branch makes the graph pick a different kernel than
   eager, and the resulting one-ulp fp16 difference has produced different tokens.
 
-`OASR_GEMM_HEURISTIC=0` disables the whole thing. Measurements and re-tuning
-recipe: `.artifacts/gemm_tuning.md`.
+`OASR_GEMM_HEURISTIC=0` disables the whole thing. Tuning a card:
+`oasr tune census` + `oasr tune build` ([autotuning.md](autotuning.md)).
 
 ### The BMM general lane
 
@@ -788,10 +812,11 @@ the default path is JIT-on-first-call.
 
 ## Autotuning
 
-`oasr/tune/` is a separate mechanism from the shape-aware heuristic: a backend
-registry, profiler, persistent JSON cache and `TileConfig` search, driven by the
-`oasr.autotune()` context manager or the `enable_autotune()` / `disable_autotune()`
-toggles. See [autotuning.md](autotuning.md).
+`oasr/tune/` produces what the shape-aware selection reads: the census of shapes
+a deployment runs, one benchmark protocol (`oasr/tune/bench.py`), the cost
+model, the region partitioner and the tuning database, driven by `oasr tune
+census|build|evaluate|diff|status` and by the `oasr.autotune()` context manager,
+whose GEMM winners land in the user tier. See [autotuning.md](autotuning.md).
 
 ## Adding a kernel family
 

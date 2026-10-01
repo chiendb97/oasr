@@ -4,8 +4,12 @@
 """Benchmark registered GEMM candidates for representative ASR shapes.
 
 Shapes come from a captured workload or the analytic fallback, are bucketed by
-work weight, and produce selection rules. Candidate timings hide dispatch cost,
-so near ties require end-to-end validation and ``--min-speedup`` filtering.
+work weight, and produce selection rules -- written into the tuning DB
+(``--emit-db user`` for this machine, ``--emit-db system`` for the shipped file).
+Measurement is ``oasr.tune.bench``'s protocol, shared with ``oasr.autotune()``.
+Candidate timings hide dispatch cost, so near ties require end-to-end validation
+and ``--min-speedup`` filtering.  ``oasr tune build`` supersedes this for shapes
+derived from an engine configuration.
 """
 
 from __future__ import annotations
@@ -177,204 +181,79 @@ def _oasr_op_for(op_name: str) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Real benchmarking over the registered candidate set
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# The protocol itself lives in ``oasr.tune.bench`` (shared with ``oasr.autotune()``
+# and ``oasr tune build``) and the GEMM driver in ``oasr.tune.gemm_tune``: graph-
+# captured N-call loops, a single-replay self-overlap gate, operand-copy rotation
+# for honest L2 state, interleaved rounds with successive halving, and a numerics
+# gate on every candidate.  What used to be here -- the one-shared-graph-pool and
+# one-side-stream rules, the 64-call loop, the min-of-7 estimator -- is there now.
 
-
-#: Calls captured per graph for the loop measurement.  A graph launch costs about
-#: 2.6 us, so at 64 calls it adds ~0.04 us to each -- about 1% of the fastest arm
-#: seen at ASR sizes (3.6 us) and less for everything slower.
-_GRAPH_ITERS = 64
-
-#: Event-timed replays per arm.  The estimator is the *minimum*: on an idle GPU
-#: noise is additive, so the minimum is the cleanest estimate of the kernel and
-#: the median only adds whatever else the box was doing.
-_GRAPH_REPS = 7
-
-#: One graph memory pool for every capture in the sweep.
-#:
-#: A ``CUDAGraph`` with no pool gets its own, and the pool is not returned
-#: promptly when the graph is dropped; a sweep captures twice per candidate,
-#: ~30 candidates per shape, hundreds of shapes.  Sharing is safe here because
-#: captures are strictly sequential: each graph is captured, replayed and dropped
-#: before the next is captured.
-#:
-#: Fewer pools is strictly better, but this is not what made the first sweeps run
-#: out of memory -- a control run that captured and dropped 40 graphs per config
-#: held reserved memory flat at 22.0 MiB across every variation.  The 30 GiB was
-#: the workspace cache; see ``_side_stream``.
-_POOL = None
-
-
-def _graph_pool():
-    global _POOL
-    if _POOL is None:
-        import torch
-
-        _POOL = torch.cuda.graph_pool_handle()
-    return _POOL
-
-
-#: One side stream for every warm-up in the sweep.
-#:
-#: Not one per capture.  OASR's split-K / Stream-K workspace cache
-#: (``include/oasr/common/workspace_cache.h``) is keyed on ``(device, stream,
-#: pool)`` and never frees, so a stream per capture spread the sweep's workspaces
-#: over every key the cache could hold and kept all of them: 30 GiB of
-#: non-PyTorch memory over a 121-shape sweep, dying on a 66 MiB allocation while
-#: PyTorch itself held 1 GiB.
-#:
-#: Note what the key count is NOT: ``torch.cuda.Stream()`` hands out one of a
-#: POOL of 32 handles per device and cycles, so "a stream per capture" never made
-#: more than 32 keys.  What grew was the bytes behind each -- a parallel split-K
-#: workspace is ``M*N*4*split``, so one 4096x5008 shape is 328 MiB per key.  The
-#: cache now bounds those bytes, but the tuner still should not be spreading its
-#: workspaces over 32 keys to begin with.
-_SIDE_STREAM = None
-
-
-def _side_stream():
-    global _SIDE_STREAM
-    if _SIDE_STREAM is None:
-        import torch
-
-        _SIDE_STREAM = torch.cuda.Stream()
-    return _SIDE_STREAM
-
-
-def _capture(fn, iters: int):
-    """Capture ``iters`` back-to-back calls into one CUDA graph.
-
-    The warm-up runs on a side stream first because a capture on the default
-    stream inherits whatever the allocator did on it, and PyTorch requires the
-    side-stream warm-up before ``torch.cuda.graph``.
-    """
-    import torch
-
-    side = _side_stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
-        for _ in range(3):
-            fn()
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, pool=_graph_pool()):
-        for _ in range(iters):
-            fn()
-    torch.cuda.synchronize()
-    for _ in range(2):
-        graph.replay()
-    torch.cuda.synchronize()
-    return graph
-
-
-def _replay_ms(graph, iters: int) -> float:
-    import torch
-
-    samples = []
-    for _ in range(_GRAPH_REPS):
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record()
-        graph.replay()
-        e.record()
-        torch.cuda.synchronize()
-        samples.append(s.elapsed_time(e) / iters)
-    return float(min(samples))
-
-
-def _bench(fn, warmup: int, rep: int) -> Tuple[float, float]:
-    """``(loop_ms, solo_ms)`` per call, both measured through CUDA graphs.
-
-    Two numbers, because neither alone is trustworthy at these sizes.
-
-    ``loop_ms`` -- ``_GRAPH_ITERS`` calls captured in one graph.  This is the
-    number to rank on: it charges no host issue cost and keeps L2 in the state a
-    real inner loop leaves it in.
-
-    ``solo_ms`` -- one call per graph replay.  Back-to-back *independent* launches
-    can overlap on the GPU, which flatters a low-occupancy configuration that
-    would never overlap inside a real layer (a thin tile at small M is 20 CTAs on
-    170 SMs).  A single-call replay cannot overlap with itself.  Every arm carries
-    the same graph-launch constant here, which is additive: it compresses the
-    ratio (2.6 us against a 3.6 us kernel is most of the number) so this must not
-    be *ranked* on, but adding a constant to both sides cannot flip which is
-    larger -- so the *sign* is trustworthy, and that is all the gate needs.  A
-    configuration that beats the fallback on ``loop_ms`` and loses on ``solo_ms``
-    won only by self-overlap, and :func:`emit_rules` refuses it.
-
-    What this replaces: ``triton.do_bench``, an eager back-to-back loop that also
-    wipes L2 between iterations.  Every arm at ASR sizes is faster than the
-    ~9.6 us it costs to *issue* a GEMM call, so that loop read 10-20 us for all of
-    them -- it reported 2.00x where the truth was 4.6x on the LSTM gate projection
-    and picked a tile 22% slower than the best.
-    """
-    import gc
-
-    import torch
-
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    graph = _capture(fn, _GRAPH_ITERS)
-    loop_ms = _replay_ms(graph, _GRAPH_ITERS)
-    # Drop it before capturing the next: the shared pool is only reusable when at
-    # most one graph is holding it.
-    del graph
-    gc.collect()
-    graph = _capture(fn, 1)
-    solo_ms = _replay_ms(graph, 1)
-    del graph
-    gc.collect()
-    return loop_ms, solo_ms
-
-
-def _alloc_args(shape: RepShape):
-    import torch
-
-    dt = getattr(torch, shape.dtype)
-    dev = "cuda"
-    M, N, K, batch = shape.M, shape.N, shape.K, shape.batch
-    if shape.op == "bmm":
-        A = torch.randn(batch, M, K, device=dev, dtype=dt)
-        B = torch.randn(batch, N, K, device=dev, dtype=dt)
-        out = torch.empty(batch, M, N, device=dev, dtype=dt)
-        return out, A, B
-    A = torch.randn(M, K, device=dev, dtype=dt)
-    B = torch.randn(N, K, device=dev, dtype=dt)
-    C = torch.randn(N, device=dev, dtype=dt)
-    out = torch.empty(M, N, device=dev, dtype=dt)
-    if shape.op == "gemm_activation":
-        return out, A, B, C, _ACTIVATION_SWISH
-    # gemm and gemm_log_softmax share the (out, A, B, C) runner signature
-    return out, A, B, C
-
-
-def _reference_output(shape: RepShape, args):
-    """fp32 reference for the numerics guard (None → no check for this op)."""
-    import torch
-    import torch.nn.functional as F
-
-    if shape.op == "bmm":
-        out, A, B = args
-        return torch.matmul(A.float(), B.float().transpose(-1, -2))
-    out, A, B, C = args[:4]
-    ref = torch.addmm(C.float(), A.float(), B.float().t())
-    if shape.op == "gemm_activation":
-        return F.silu(ref)
-    if shape.op == "gemm_log_softmax":
-        return F.log_softmax(ref, dim=-1)
-    return ref
+#: Lower bounds the protocol guarantees (kept as the script's documented floor;
+#: ``BenchPolicy`` holds the values in force).  A one-call capture cannot separate
+#: a kernel from its launch, and three rounds is the least a median means anything.
+_GRAPH_ITERS = 8
+_GRAPH_REPS = 3
 
 
 class TacticResult:
     """One tactic's timings.  ``median_ms`` is the loop measurement (the ranking
-    number); ``solo_ms`` is the single-replay one (see :func:`_bench`)."""
+    number); ``solo_ms`` is the single-replay one (see ``oasr.tune.bench``)."""
 
-    def __init__(self, tactic, median_ms, is_default, solo_ms=None):
+    def __init__(
+        self, tactic, median_ms, is_default, solo_ms=None, sigma_ms=0.0, issue_us=None, name=None
+    ):
         self.tactic = tactic
         self.median_ms = median_ms
         self.is_default = is_default
         self.solo_ms = median_ms if solo_ms is None else solo_ms
+        self.sigma_ms = sigma_ms
+        self.issue_us = issue_us
+        self.name = name
+
+
+def _working_set_bytes(reps: List[RepShape]) -> int:
+    """Per-forward weight bytes of the captured model: every distinct (op, N, K) once."""
+    seen = {}
+    for r in reps:
+        width = 2 if r.dtype in ("float16", "bfloat16") else 4
+        seen[(r.op, r.N, r.K)] = r.N * r.K * width * (r.batch if r.op == "bmm" else 1)
+    return sum(seen.values())
+
+
+def benchmark_shape(
+    shape: RepShape, warmup: int = 0, rep: int = 0, working_set_bytes: Optional[int] = None
+) -> Optional[List[TacticResult]]:
+    """Every registered candidate for *shape*, measured and sorted fastest first.
+
+    ``warmup`` / ``rep`` are accepted for command-line compatibility and ignored:
+    the protocol decides its own round counts (successive halving, adaptive stop).
+    """
+    from oasr.tune import gemm_tune
+
+    case = gemm_tune.GemmCase(shape.op, shape.M, shape.N, shape.K, shape.dtype, shape.batch)
+    try:
+        res = gemm_tune.benchmark_case(case, working_set_bytes=working_set_bytes)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[tune] {shape}: benchmark failed: {exc}", file=sys.stderr)
+        return None
+    for name, why in sorted(res.rejected.items()):
+        print(f"[tune]   rejected {name}: {why}", file=sys.stderr)
+    out: List[TacticResult] = []
+    for name, m in res.results.items():
+        entry = res.entries.get(name)
+        if entry is None:
+            continue
+        ms = m.median_ms if (m.status == "ok" and m.eliminated_at is None) else float("inf")
+        if m.status == "ok" and m.eliminated_at is not None:
+            ms = m.median_ms  # eliminated arms keep their stage-0/1 estimate for the report
+        out.append(
+            TacticResult(
+                entry.tactic, ms, entry.is_fallback, m.solo_ms, m.sigma_ms, m.issue_us, name
+            )
+        )
+    out.sort(key=lambda r: r.median_ms)
+    return out
 
 
 def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "TacticResult":
@@ -418,63 +297,6 @@ def _pick_winner(results: List["TacticResult"], tie_tol: float = 0.05) -> "Tacti
     return min(band, key=key)
 
 
-def benchmark_shape(shape: RepShape, warmup: int, rep: int) -> Optional[List[TacticResult]]:
-    import gc
-
-    import torch
-
-    from oasr.tune.autotuner import OpKey, _ensure_backends_registered, _global_registry
-
-    _ensure_backends_registered()
-    op_key = OpKey("gemm", shape.op)
-    candidates = _global_registry.get_candidates(op_key)
-    if not candidates:
-        return None
-    args = _alloc_args(shape)
-    ref = _reference_output(shape, args)
-
-    # Numerics guard: a tactic whose max abs error exceeds 4× the torch
-    # backend's own low-precision error is disqualified (e.g. very deep serial
-    # split-K accumulates partials in the output dtype).
-    torch_err = None
-    for entry in candidates:
-        if entry.tactic.backend == "torch":
-            try:
-                entry.get_runner()(*args)
-                torch.cuda.synchronize()
-                torch_err = (args[0].float() - ref).abs().max().item()
-            except Exception:
-                pass
-            break
-
-    results: List[TacticResult] = []
-    for entry in candidates:
-        try:
-            runner = entry.get_runner()
-            runner(*args)
-            torch.cuda.synchronize()
-            if torch_err is not None:
-                err = (args[0].float() - ref).abs().max().item()
-                if err > max(4.0 * torch_err, 1e-3):
-                    continue  # numerically disqualified
-            # Bind `runner` at definition time: it is a loop variable, and the
-            # late-binding form only happens to work because _bench calls back
-            # synchronously within this iteration.
-            ms, solo = _bench(lambda r=runner: r(*args), warmup, rep)
-        except Exception:
-            ms = solo = float("inf")
-        results.append(TacticResult(entry.tactic, ms, entry.is_fallback, solo))
-    results.sort(key=lambda r: r.median_ms)
-    # Release this shape's operands and whatever the captures pooled before the
-    # next shape allocates its own: a full sweep is hundreds of shapes.  Rebound
-    # rather than ``del``'d, because the timing lambdas above close over ``args``
-    # and unbinding the name makes that a static undefined-name error.
-    args = ref = None  # type: ignore[assignment]
-    gc.collect()
-    torch.cuda.empty_cache()
-    return results
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Rule emission
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,47 +325,39 @@ def _choice_literal(tactic, sm: int, is_default: bool) -> str:
     return _cutlass_literal(tactic, sm)
 
 
-def emit_rules(
+def plan_rules(
     per_shape: Dict[Tuple, List[TacticResult]],
     reps: List[RepShape],
-    sm: int,
     min_speedup: float = 1.05,
-) -> str:
-    """Build the _GEMM_HEURISTIC_RULES_SM<sm> Python literal from sweep winners.
+) -> Dict[Tuple[str, int, int], List[Tuple]]:
+    """Per ``(op, N, K)``: ascending ``(m_max, winner | None, comment, results)``.
 
-    A bucket whose winner is not at least *min_speedup* faster than the fallback
-    keeps the fallback, so it collapses into a neighbour instead of becoming a
-    rule.  Two reasons, both learned from the whisper-tiny run:
+    ``winner`` is ``None`` where the bucket keeps the fallback.  A bucket whose
+    winner is not at least *min_speedup* faster than the fallback keeps the
+    fallback, so it collapses into a neighbour instead of becoming a rule.  Two
+    reasons, both learned from the whisper-tiny run:
 
     * ``_pick_winner`` can return a tactic **slower than the fallback**.  Its
       tie-break prefers a smaller tile within 5% of the measured best, and the
       fallback is often *in* that band — one emitted bucket read ``0.96x vs
       default``, i.e. a rule that made things worse.
-    * every arm is measured once here, so adjacent buckets came back alternating
-      torch / cutlass / default at 1.02-1.08x.  Re-measuring those pairs with the
-      arms interleaved showed them to be ties.  Encoding a tie costs a compiled
-      variant and a boundary that can be wrong, and buys nothing.
+    * adjacent buckets came back alternating torch / cutlass / default at
+      1.02-1.08x.  Re-measuring those pairs with the arms interleaved showed
+      them to be ties.  Encoding a tie costs a compiled variant and a boundary
+      that can be wrong, and buys nothing.
 
-    A third gate came from the protocol change (see :func:`_bench`): a win must
-    hold on the *single-replay* timing as well as the loop timing.  Back-to-back
-    independent launches can overlap on the GPU, which flatters a low-occupancy
-    tile that would never overlap inside a real layer, and self-overlap is not a
-    speedup a model can spend.
+    A third gate: a win must hold on the *single-replay* timing as well as the
+    loop timing.  Back-to-back independent launches can overlap on the GPU,
+    which flatters a low-occupancy tile that would never overlap inside a real
+    layer, and self-overlap is not a speedup a model can spend.
     """
-    # Group reps by (op, N, K) and order by m_max (None last).
     by_key: Dict[Tuple[str, int, int], List[RepShape]] = defaultdict(list)
     for r in reps:
         by_key[(r.op, r.N, r.K)].append(r)
-
-    lines = [f"_GEMM_HEURISTIC_RULES_SM{sm}: Dict[Tuple[str, int, int], list] = {{"]
+    plan: Dict[Tuple[str, int, int], List[Tuple]] = {}
     for (op, N, K), grp in sorted(by_key.items()):
         grp.sort(key=lambda r: (r.m_max is None, r.m_max or 0))
-        # The literal a rule-less lookup falls back to (see select_default_config
-        # / _dispatch_gemm_log_softmax): the fused launcher for the CTC head,
-        # GEMM_DEFAULT for everything else.
-        fallback_literal = '"fused"' if op == "gemm_log_softmax" else "GEMM_DEFAULT"
-        rule_entries = []  # (m_max | None, choice_literal, comment)
-        all_default = True
+        rules = []
         for r in grp:
             res = per_shape.get((r.op, r.M, r.N, r.K, r.dtype, r.batch))
             if not res:
@@ -575,32 +389,59 @@ def emit_rules(
                     f"{winner.tactic.backend} only {speedup:.2f}x vs default "
                     f"(< {min_speedup:.2f}x) — keeping the fallback"
                 )
-                rule_entries.append(
+                rules.append(
                     (
                         r.m_max,
-                        fallback_literal,
+                        None,
                         f"M~{r.M}: fallback ({winner.tactic.backend} was only "
                         f"{speedup:.2f}x vs default)",
+                        res,
                     )
                 )
                 continue
-            choice = _choice_literal(winner.tactic, sm, winner.is_default)
-            if choice != fallback_literal:
-                all_default = False
-            rule_entries.append(
+            rules.append(
                 (
                     r.m_max,
-                    choice,
+                    winner,
                     f"M~{r.M}: {winner.tactic.backend} {winner.median_ms:.4f}ms "
                     f"({speedup:.2f}x vs default)",
+                    res,
                 )
             )
-        if all_default or not rule_entries:
+        plan[(op, N, K)] = rules
+    return plan
+
+
+def emit_rules(
+    per_shape: Dict[Tuple, List[TacticResult]],
+    reps: List[RepShape],
+    sm: int,
+    min_speedup: float = 1.05,
+) -> str:
+    """The sweep's rules as a Python literal, for reading in a review.
+
+    Production no longer reads a literal -- the rules live in the tuning DB
+    (``--emit-db``) -- but a literal is the most compact thing to read, and the
+    decisions are the same ones :func:`plan_rules` makes for the DB.
+    """
+    lines = [f"_GEMM_HEURISTIC_RULES_SM{sm}: Dict[Tuple[str, int, int], list] = {{"]
+    for (op, N, K), rules in plan_rules(per_shape, reps, min_speedup).items():
+        # The literal a rule-less lookup falls back to (see select_default_config
+        # / _dispatch_gemm_log_softmax): the fused launcher for the CTC head,
+        # GEMM_DEFAULT for everything else.
+        fallback_literal = '"fused"' if op == "gemm_log_softmax" else "GEMM_DEFAULT"
+        entries = []
+        for m_max, winner, comment, _res in rules:
+            choice = (
+                fallback_literal
+                if winner is None
+                else _choice_literal(winner.tactic, sm, winner.is_default)
+            )
+            entries.append((m_max, choice, comment))
+        if not entries or all(c == fallback_literal for _, c, _ in entries):
             continue  # every bucket == the fallback → omit the rule entirely
-        # Collapse runs of identical choice (ascending m_max): a later, larger
-        # threshold subsumes earlier same-choice buckets.
         merged = []
-        for m_max, choice, comment in rule_entries:
+        for m_max, choice, comment in entries:
             if merged and merged[-1][1] == choice:
                 merged[-1] = (m_max, choice, comment)
             else:
@@ -612,6 +453,62 @@ def emit_rules(
         lines.append("    ],")
     lines.append("}")
     return "\n".join(lines)
+
+
+def emit_db(
+    per_shape: Dict[Tuple, List[TacticResult]],
+    reps: List[RepShape],
+    sm: int,
+    min_speedup: float = 1.05,
+    base=None,
+):
+    """The sweep's rules as a tuning file (``oasr.tune.database``), merged into *base*.
+
+    Each ``(op, N, K)`` becomes one entry; every bucket's measured arms are its
+    evidence.  Entries in *base* for signatures this sweep did not measure are
+    kept, so a sweep of one model's widths does not erase another's.
+    """
+    import oasr.jit.gemm as jg
+    from oasr.tune import bench, database
+    from oasr.tune.gemm_tune import choice_of
+
+    tf = base if base is not None else database.new_file("gemm", sm, jg.GEMM_LANE_BY_SM[sm])
+    tf.validators["soft"] = database.current_soft_validators("gemm")
+    tf.provenance["bench_protocol"] = bench.PROTOCOL_VERSION
+    tf.provenance["tool"] = "scripts/tune_asr_gemm.py"
+    for (op, N, K), rules in plan_rules(per_shape, reps, min_speedup).items():
+        fallback = "fused" if op == "gemm_log_softmax" else "default"
+        regions: List[Tuple] = []
+        evidence: Dict[str, dict] = {}
+        notes: List[str] = []
+        dtype_class = "half"
+        for m_max, winner, comment, res in rules:
+            if winner is None:
+                cid = fallback
+                params = {"kind": fallback}
+            else:
+                choice = choice_of(winner.tactic, sm)
+                cid = jg.gemm_config_id(choice)
+                params = jg.gemm_config_to_params(choice)
+            tf.configs[cid] = params
+            if regions and regions[-1][1] == cid:
+                regions[-1] = (m_max, cid)
+            else:
+                regions.append((m_max, cid))
+            notes.append(comment)
+            rep_m = comment.split(":", 1)[0].replace("M~", "M=")
+            evidence[rep_m] = {
+                (t.name or t.tactic.backend): [round(t.median_ms, 6), round(t.sigma_ms, 6)]
+                for t in res[:5] + [t for t in res if t.is_default][:1]
+                if t.median_ms < float("inf")
+            }
+        if not regions or all(c == fallback for _, c in regions):
+            tf.entries.pop(jg.gemm_sig_key(op, N, K, dtype_class), None)
+            continue
+        tf.entries[jg.gemm_sig_key(op, N, K, dtype_class)] = database.Entry(
+            regions=regions, evidence=evidence, source="aot", notes=notes
+        )
+    return tf
 
 
 def print_report(per_shape, reps, sm) -> None:
@@ -673,10 +570,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.97,
         help="keep top FLOP buckets until this fraction of group FLOPs is covered",
     )
-    p.add_argument("--warmup", type=int, default=25)
-    p.add_argument("--rep", type=int, default=100)
+    p.add_argument("--warmup", type=int, default=25, help="ignored (the protocol decides)")
+    p.add_argument("--rep", type=int, default=100, help="ignored (the protocol decides)")
     p.add_argument(
-        "--emit-rules", metavar="FILE", help="write the _GEMM_HEURISTIC_RULES Python literal here"
+        "--emit-rules",
+        metavar="FILE",
+        help="also write the rules as a Python literal (review only)",
+    )
+    p.add_argument(
+        "--emit-db",
+        metavar="PATH",
+        help="write the rules into a tuning file: a path, or 'user' for this machine's user "
+        "tier (read by production dispatch), or 'system' for the shipped file of this arch",
+    )
+    p.add_argument(
+        "--working-set-mb",
+        type=float,
+        default=None,
+        help="the served model's per-forward weight MiB, for the L2 policy (default: the sum "
+        "of the captured shapes' weights)",
     )
     p.add_argument(
         "--min-speedup",
@@ -732,10 +644,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # died at shape 140 looked exactly like a run that had hung at shape 2, and
     # diagnosing which cost an hour.
     per_shape: Dict[Tuple, List[TacticResult]] = {}
+    working_set = (
+        int(args.working_set_mb * 2**20)
+        if args.working_set_mb is not None
+        else _working_set_bytes(reps)
+    )
+    print(f"[tune] weight working set {working_set / 2**20:.1f} MiB", file=sys.stderr)
     t_start = time.perf_counter()
     for i, r in enumerate(reps, 1):
         t_shape = time.perf_counter()
-        res = benchmark_shape(r, args.warmup, args.rep)
+        res = benchmark_shape(r, working_set_bytes=working_set)
         if res:
             per_shape[(r.op, r.M, r.N, r.K, r.dtype, r.batch)] = res
         elapsed = time.perf_counter() - t_start
@@ -754,12 +672,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(rules)
     if args.emit_rules:
         with open(args.emit_rules, "w") as f:
-            f.write("# Auto-generated by scripts/tune_asr_gemm.py — paste into oasr/jit/gemm.py\n")
-            f.write("# Then register it, or nothing consults it:\n")
-            f.write(f"#     _GEMM_HEURISTIC_RULES[{sm}] = _GEMM_HEURISTIC_RULES_SM{sm}\n")
+            f.write(
+                "# Generated by scripts/tune_asr_gemm.py -- for review; production reads the "
+                "tuning DB (--emit-db)\n"
+            )
             f.write(rules + "\n")
         print(f"\n[tune] wrote rules to {args.emit_rules}")
-        print(f"[tune] register it in oasr/jit/gemm.py: _GEMM_HEURISTIC_RULES[{sm}] = ...")
+    if args.emit_db:
+        from pathlib import Path
+
+        from oasr.tune import database
+
+        if args.emit_db == "user":
+            path = database.user_path(sm, "gemm")
+            if path is None:
+                print("[tune] the user tier is disabled (OASR_TUNE_USER_DB=off)", file=sys.stderr)
+                return 2
+        elif args.emit_db == "system":
+            path = database.system_path(sm, "gemm")
+        else:
+            path = Path(args.emit_db)
+        base = database.load_file(path, "gemm", sm) if path.is_file() else None
+        tf = emit_db(per_shape, reps, sm, args.min_speedup, base=base)
+        database.save_file(tf, path)
+        print(f"\n[tune] wrote {len(tf.entries)} entries to {path}")
     return 0
 
 

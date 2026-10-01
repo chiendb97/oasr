@@ -284,6 +284,11 @@ class ASREngine:
         # Construct only the selected mode's executor; processors remain shared.
         self._executor: Executor = self._build_executor(config)
 
+        # Tune uncovered kernel shapes *before* anything below captures a graph:
+        # a captured graph replays the kernels selected when it was captured, so
+        # a selection has to be final by then (AGENTS rule 11, oasr.tune I2).
+        self._apply_tuning(config)
+
         # Best-effort prewarming covers common batch sizes and early cache buckets
         # so live streams avoid lazy graph-capture stalls. Other shapes stay lazy.
         if (
@@ -1376,6 +1381,114 @@ class ASREngine:
             self._model_runner.recover_capture_state()
         except Exception:  # pragma: no cover - defensive
             logger.debug("capture-state recovery failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Kernel-selection tuning (oasr.tune)
+    # ------------------------------------------------------------------
+
+    def _tuning_census(self, config: EngineConfig):
+        """The census ``TuningConfig`` names, or an offline one probed on this engine."""
+        from oasr.tune import census as census_mod
+
+        tc = config.tuning
+        if tc.census:
+            return census_mod.ShapeSet.load(tc.census)
+        if config.service_mode != "offline":
+            return None
+        return census_mod.census(self, config, census_mod.TrafficModel())
+
+    def _apply_tuning(self, config: EngineConfig) -> None:
+        tc = config.tuning
+        if self._device.type != "cuda" or (tc.mode != "prewarm" and not tc.strict):
+            return
+        ss = self._tuning_census(config)
+        if ss is None:
+            logger.warning(
+                "tuning.mode=%r needs tuning.census for a %s engine; skipping",
+                tc.mode,
+                config.service_mode,
+            )
+            return
+        import oasr.jit.gemm as jg
+        from oasr.jit.core import _get_target_sm
+
+        sm = _get_target_sm()
+
+        def uncovered(points):
+            return [
+                p
+                for p in points
+                if p.must and jg.covering_tier(p.op, p.M, p.N, p.K, p.dtype, sm) is None
+            ]
+
+        missing = uncovered(ss.points)
+        if tc.mode == "prewarm" and missing:
+            from oasr.tune import database
+            from oasr.tune.build import BuildOptions, build_gemm
+            from oasr.tune.census import ShapeSet
+
+            sigs = {p.sig for p in missing}
+            todo = ShapeSet(
+                [p for p in ss.points if p.sig in sigs], ss.working_set_bytes, dict(ss.provenance)
+            )
+            path = database.user_path(sm, "gemm")
+            if path is None:
+                logger.warning("tuning.mode='prewarm' but the user tier is disabled; skipping")
+            else:
+                base = database.load_file(path, "gemm", sm) if path.is_file() else None
+                logger.info(
+                    "tuning %d uncovered signature(s) within %.0f s before capture",
+                    len(sigs),
+                    tc.budget_s,
+                )
+                tf = build_gemm(
+                    todo, sm=sm, base=base, opts=BuildOptions(budget_s=float(tc.budget_s))
+                )
+                database.save_file(tf, path)
+                database.reload()
+                missing = uncovered(ss.points)
+        if tc.strict and missing:
+            shown = ", ".join(f"{p.op}(N={p.N},K={p.K},M={p.M})" for p in missing[:8])
+            raise RuntimeError(
+                f"tuning.strict: {len(missing)} must-tune shape(s) have no tuning entry on "
+                f"sm{sm}: {shown}{' ...' if len(missing) > 8 else ''}. Run `oasr tune build`."
+            )
+
+    def reload_tuning(self) -> int:
+        """Start a new tuning epoch: re-read the tuning DB and drop every captured graph.
+
+        The only point at which a kernel selection can change inside a running
+        engine.  Captured graphs (offline encoder, streaming encoder, decode
+        steps) replay what they captured, so they are released and re-capture
+        lazily under the new selections.  Returns the new epoch number.
+        """
+        from oasr.tune import database
+
+        with self._lock:
+            epoch = database.reload()
+            self._model_runner.release_graphs()
+            release = getattr(self._output_processor.strategy, "release_graphs", None)
+            if callable(release):
+                release()
+        return epoch
+
+    def tuning_report(self) -> str:
+        """Which tuning tier served this process's kernel selections, and what missed."""
+        from oasr.jit.gemm import rule_miss_report
+        from oasr.tune.database import tuning_report
+
+        return tuning_report() + "\n" + rule_miss_report()
+
+    def export_tuning_misses(self, path: str) -> int:
+        """Write this process's untuned GEMM shapes as census points for ``oasr tune build``."""
+        import json
+
+        from oasr.tune.telemetry import export_misses
+
+        data = export_misses()
+        with open(path, "w") as f:
+            json.dump(data, f, indent=1)
+        return len(data["points"])
 
     def _prewarm_offline(self) -> None:
         """Run one dummy offline batch per preferred size to absorb one-time

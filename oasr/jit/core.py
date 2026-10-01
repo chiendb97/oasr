@@ -8,6 +8,7 @@ Mirrors FlashInfer's JIT architecture:
 - ``JitSpec`` / ``JinjaJitSpec`` for specifying compilation units
 """
 
+import functools
 import hashlib
 import logging
 import os
@@ -249,6 +250,13 @@ _PROJECT_HEADER_ROOTS = (
 )
 
 
+@functools.lru_cache(maxsize=1)
+def _nvcc_identity() -> str:
+    from .cpp_ext import get_nvcc_build
+
+    return f"nvcc-{get_nvcc_build()}"
+
+
 def _project_headers():
     for root, suffixes in _PROJECT_HEADER_ROOTS:
         if not root.is_dir():
@@ -305,6 +313,11 @@ class JitSpec:
         for inc, version_h in env.cutlass_version_stamp():
             h.update(inc.encode())
             h.update(version_h)
+        # And the compiler: ptxas register allocation -- and with it which tile
+        # wins -- moves between patch releases, and a toolkit upgrade otherwise
+        # keeps loading libraries the old nvcc built (and the tuning results
+        # measured on them).
+        h.update(_nvcc_identity().encode())
         return h.hexdigest()[:16]
 
     def _get_lib_dir(self) -> Path:
@@ -316,8 +329,8 @@ class JitSpec:
         """Get the path to the compiled shared library."""
         return self._get_lib_dir() / f"{self.name}.so"
 
-    def _compile(self, lib_path: str) -> None:
-        """Compile sources into a shared library using Ninja."""
+    def _compile(self, lib_path: str, jobs: Optional[int] = None) -> None:
+        """Compile sources into a shared library using Ninja (``jobs`` parallel)."""
         require_known_cuda_arch(f"module {self.name!r}")
         lib_path = Path(lib_path)
         build_dir = lib_path.parent
@@ -335,7 +348,7 @@ class JitSpec:
         write_if_different(ninja_file, ninja_content)
 
         verbose = logger.isEnabledFor(logging.DEBUG)
-        run_ninja(workdir=build_dir, ninja_file=ninja_file, verbose=verbose)
+        run_ninja(workdir=build_dir, ninja_file=ninja_file, verbose=verbose, jobs=jobs)
 
     def build_and_load(self):
         """Build if needed (with file-lock protection), then load the module.

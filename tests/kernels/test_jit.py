@@ -1388,3 +1388,83 @@ class TestSm100BatchedAndGroupedGemm:
         primary = _struct_body(src, "GemmScheduleSelector")
         assert "KernelPtrArrayTmaWarpSpecializedCooperative" in primary
         assert "PtrArrayTmaWarpSpecializedCooperative" in primary
+
+
+class TestCompilerIdentityIsInTheCacheKey:
+    """A toolkit upgrade must not keep loading libraries the old nvcc built.
+
+    The content hash covered sources, headers, flags and the CUTLASS stamp but
+    not the compiler, so a CUDA upgrade kept serving old binaries -- and the
+    tuning results measured on them -- until someone cleared the cache by hand.
+    """
+
+    def test_a_different_nvcc_is_a_different_hash(self, monkeypatch, tmp_path):
+        import oasr.jit.core as core
+
+        src = tmp_path / "k.cu"
+        src.write_text("// empty\n")
+        spec = core.JitSpec(name="identity_probe", sources=[src])
+        monkeypatch.setattr(core, "_nvcc_identity", lambda: "nvcc-13.2.51")
+        a = spec._content_hash()
+        monkeypatch.setattr(core, "_nvcc_identity", lambda: "nvcc-13.3.0")
+        b = spec._content_hash()
+        assert a != b
+
+
+class TestProductionCompileSet:
+    """Production modules compile what the tuning DB references, not the whole space."""
+
+    @pytest.mark.parametrize("sm", [75, 80, 86, 89, 120])
+    def test_production_is_a_subset_holding_the_default(self, sm):
+        from oasr.jit.gemm import (
+            default_config_for_sm,
+            get_production_configs,
+            get_unique_compile_configs,
+        )
+
+        prod = get_production_configs(sm)
+        assert set(prod) <= set(get_unique_compile_configs(sm))
+        assert default_config_for_sm(sm).compile_name in prod
+
+    def test_every_shipped_rule_is_in_the_production_set(self):
+        from oasr.jit.gemm import _GEMM_HEURISTIC_RULES, GEMM_DEFAULT, get_production_configs
+
+        for sm, table in _GEMM_HEURISTIC_RULES.items():
+            prod = get_production_configs(sm)
+            for key, rules in table.items():
+                for _m, choice in rules:
+                    if isinstance(choice, str) or choice is GEMM_DEFAULT:
+                        continue
+                    assert choice.compile_name in prod, f"sm{sm} {key}: {choice.compile_name}"
+
+    @pytest.mark.parametrize("sm", [75, 80, 86, 89, 120])
+    def test_no_variant_is_in_both_modules(self, sm, monkeypatch):
+        """The tuning module holds the space *minus* production, never an overlap.
+
+        Two libraries instantiating one CUTLASS kernel share its template static
+        members (``STB_GNU_UNIQUE``), and ``GemmUniversalBase``'s cached
+        ``device_ordinal_`` then made the second library skip
+        ``cudaFuncSetAttribute`` for its own Stream-K kernel, which failed to
+        launch -- an order-dependent failure of the fp32 sweep.
+        """
+        import oasr.jit.gemm as jg
+
+        monkeypatch.setattr(jg, "_get_target_sm", lambda: sm)
+        prod = set(jg._level_configs("production"))
+        tune = set(jg._level_configs("tune"))
+        assert not (prod & tune)
+        assert prod | tune == set(jg.get_unique_compile_configs(sm))
+
+    def test_the_all_knob_restores_the_whole_space(self, monkeypatch):
+        import oasr.jit.gemm as jg
+
+        monkeypatch.setattr(jg, "_COMPILE_SET", "all")
+        assert set(jg.get_production_configs(120)) == set(jg.get_unique_compile_configs(120))
+
+    @pytest.mark.parametrize("sm", [86, 89])
+    def test_the_100k_ampere_ada_parts_get_four_stage_tiles(self, sm):
+        """sm_86/89 share sm_120's 100 KiB budget; a per-SM stage list once denied
+        them every 4-stage winner sm_120's table picks."""
+        from oasr.jit.gemm import get_unique_compile_configs
+
+        assert any(c.kStages == 4 for c in get_unique_compile_configs(sm).values())

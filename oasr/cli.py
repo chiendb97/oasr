@@ -105,6 +105,13 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     p.set_defaults(func=_cmd_convert)
+
+    p = sub.add_parser(
+        "tune",
+        help="census, build and inspect the kernel tuning database (see `oasr tune -h`)",
+        add_help=False,
+    )
+    p.set_defaults(func=_cmd_tune)
     return parser
 
 
@@ -280,13 +287,21 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_tune(args: argparse.Namespace) -> int:
+    from oasr.tune.cli import main as tune_main
+
+    return tune_main(args.rest)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     # `serve` and `convert` are pass-throughs: parse only the subcommand name
     # and hand the rest over untouched, so their own `--help` and flags work.
-    if argv and argv[0] in ("serve", "convert"):
+    if argv and argv[0] in ("serve", "convert", "tune"):
         args = argparse.Namespace(rest=argv[1:])
+        if argv[0] == "tune":
+            return _cmd_tune(args)
         return _cmd_serve(args) if argv[0] == "serve" else _cmd_convert(args)
     args = parser.parse_args(argv)
     try:

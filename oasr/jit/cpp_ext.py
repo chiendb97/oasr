@@ -78,6 +78,28 @@ def get_cuda_path() -> str:
 
 
 @functools.cache
+def get_nvcc_build() -> str:
+    """The full nvcc identity, ``"13.2.51"`` -- release plus build, not just major.minor.
+
+    A tuning result and a compiled library both depend on the exact compiler:
+    ptxas register allocation moves between patch releases, and with it which
+    tile wins.  ``"unknown"`` when no nvcc can be run (CPU-only installs).
+    """
+    try:
+        nvcc = os.environ.get("OASR_NVCC") or os.path.join(get_cuda_path(), "bin/nvcc")
+        txt = subprocess.check_output([nvcc, "--version"], text=True)
+        m = re.search(r"V(\d+\.\d+\.\d+)", txt)
+        if m:
+            return m.group(1)
+        m = re.search(r"release (\d+\.\d+)", txt)
+        if m:
+            return m.group(1)
+    except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError, OSError):
+        pass
+    return "unknown"
+
+
+@functools.cache
 def get_cuda_version() -> str:
     """Return CUDA version string (e.g. ``"12.4"``)."""
     try:
@@ -335,7 +357,9 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool = False) -> None:
+def run_ninja(
+    workdir: Path, ninja_file: Path, verbose: bool = False, jobs: Optional[int] = None
+) -> None:
     """Execute a Ninja build.
 
     Parameters
@@ -346,6 +370,10 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool = False) -> None:
         Path to the ``build.ninja`` file.
     verbose : bool
         If True, print Ninja output to stdout.
+    jobs : int, optional
+        Parallel jobs for this build; defaults to ``MAX_JOBS`` (else ninja's own).
+        Explicit so concurrent builds in one process can split a core budget,
+        which one process-wide environment variable cannot express.
     """
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
@@ -356,7 +384,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool = False) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = jobs if jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

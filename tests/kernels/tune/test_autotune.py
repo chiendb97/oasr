@@ -414,8 +414,56 @@ class TestConfigPersistence:
                 "oasr.tune.autotuner._collect_metadata",
                 return_value={"sm": "80", "cuda_version": "12.4", "oasr_version": "0.1.0"},
             ):
-                tuner.load_configs(str(path))
+                loaded = tuner.load_configs(str(path))
         assert any("sm" in r.message for r in caplog.records)
+        # An architecture mismatch is a hard one: the tactics may name kernels
+        # this build does not have, so the file is not loaded at all.
+        assert loaded is False
+
+    def test_soft_env_mismatch_warns_and_loads(self, tmp_path, caplog):
+        path = tmp_path / "cache.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "_metadata": {"sm": "80", "cuda_version": "11.0"},
+                    "entries": {"gemm|gemm||(128,256,64)|float16|sm80": {"backend": "torch"}},
+                }
+            )
+        )
+        import logging
+
+        tuner = AutoTuner(warmup=1, repeat=1)
+        tuner._registry = BackendRegistry()
+        with caplog.at_level(logging.WARNING, logger="oasr.tune"):
+            with patch(
+                "oasr.tune.autotuner._collect_metadata",
+                return_value={"sm": "80", "cuda_version": "12.4", "oasr_version": "0.1.0"},
+            ):
+                assert tuner.load_configs(str(path)) is True
+        assert any("cuda_version" in r.message for r in caplog.records)
+        assert tuner._file_configs
+
+    def test_a_version_1_cache_is_rebucketed(self, tmp_path):
+        """v1 files keyed exact shapes; lookups now key the bucket of M."""
+        path = tmp_path / "cache.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": {
+                        "gemm|gemm||(113,256,64)|float16|sm80": {"backend": "torch"},
+                        "gemm|gemm||(120,256,64)|float16|sm80": {"backend": "cutlass"},
+                    },
+                }
+            )
+        )
+        tuner = AutoTuner(warmup=1, repeat=1)
+        tuner._registry = BackendRegistry()
+        tuner.load_configs(str(path))
+        # 113 and 120 both round up to the 120 bucket; the larger measured one wins.
+        assert list(tuner._file_configs) == ["gemm|gemm||(120,256,64)|float16|sm80"]
+        assert tuner._file_configs["gemm|gemm||(120,256,64)|float16|sm80"].backend == "cutlass"
 
 
 # =========================================================================
@@ -468,7 +516,7 @@ class TestAutotuneContextManager:
         assert path.exists()
         with open(path) as f:
             data = json.load(f)
-        assert data["version"] == 1
+        assert data["version"] == 2
         assert "_metadata" in data
 
 

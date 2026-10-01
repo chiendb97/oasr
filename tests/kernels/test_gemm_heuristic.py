@@ -509,7 +509,7 @@ class TestGemmLogSoftmaxDispatch:
         og = importlib.import_module("oasr.functionals.gemm")
         cfg = next(
             c
-            for c in get_unique_compile_configs(_SM).values()
+            for c in jg.get_production_configs(_SM).values()
             if not getattr(c, "stream_k", False) and not getattr(c, "parallel_split_k", False)
         )
         monkeypatch.setattr(jg, "select_default_config", lambda *a, **k: cfg)
@@ -553,7 +553,7 @@ class TestBmmDispatch:
 
         cfg = next(
             c
-            for c in get_unique_compile_configs(_SM).values()
+            for c in jg.get_production_configs(_SM).values()
             if not getattr(c, "stream_k", False)
             and not getattr(c, "parallel_split_k", False)
             and c.compile_name != GEMM_DEFAULT.compile_name

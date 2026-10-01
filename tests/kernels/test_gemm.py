@@ -27,7 +27,15 @@ import torch.nn.functional as F
 from helpers import assert_dest_passing, assert_graph_replay
 
 import oasr
-from oasr.functionals.gemm import _bmm_fn, _gemm_fn, _get_gemm_module
+
+# The per-variant sweeps and the split-K tests exercise the whole *tuning* space
+# (``get_unique_compile_configs``), which lives in the tuning module; the
+# production module compiles only the tuned subset (``get_production_configs``).
+from oasr.functionals.gemm import (  # noqa: E402
+    _get_gemm_tune_module as _get_gemm_module,
+    _tune_bmm_fn as _bmm_fn,
+    _tune_gemm_fn as _gemm_fn,
+)
 from oasr.jit.core import _get_target_sm
 from oasr.jit.gemm import CutlassGemmConfig, get_unique_compile_configs
 
