@@ -47,6 +47,9 @@ STAGE_DOMAIN: Dict[int, Tuple[int, ...]] = {
     86: (3, 4),
     89: (3, 4),
     120: (3, 4),
+    # The mma.sync half of the mixed GEMM spaces (oasr.jit.gemm._MIXED_LANE_SMS).
+    90: (3, 4),
+    100: (3, 4),
 }
 
 

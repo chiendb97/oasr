@@ -425,6 +425,14 @@ def _default_cuda_cflags() -> List[str]:
     return [
         "-std=c++17",
         "-O3",
+        # Release asserts, as CUTLASS's own builds compile.  Without it CuTe's
+        # device-side assert()s become __assertfail calls inside the mainloop,
+        # and ptxas serialises every wgmma across a function call ("C7510:
+        # wgmma pipeline crossing function boundary") -- all ten kernels of
+        # every SM90 GEMM variant, the plain ones included (measured
+        # 2026-10-01: 10 warnings per TU, 0 with -DNDEBUG).  OASR's own sources
+        # contain no assert(); this only drops the libraries' debug checks.
+        "-DNDEBUG",
         "--use_fast_math",
         "-DENABLE_BF16",
         f"-DOASR_TARGET_SM={target_sm}",

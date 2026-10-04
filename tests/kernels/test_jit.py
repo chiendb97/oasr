@@ -462,7 +462,7 @@ class TestTileSpaceIsBuildable:
         from oasr.jit.conv import get_unique_conv2d_compile_configs
         from oasr.jit.gemm import TileShape, _epilogue_covers_warp, get_unique_compile_configs
 
-        for sm in (75, 80, 86, 89, 120):
+        for sm in (75, 80, 86, 89, 90, 100, 120):
             spaces = {
                 "gemm": get_unique_compile_configs(sm),
                 "conv2d": get_unique_conv2d_compile_configs(sm),
@@ -524,9 +524,11 @@ class TestTileSpaceIsBuildable:
 # ---------------------------------------------------------------------------
 
 
-#: The architectures served by the CUTLASS 2.x lane.  SM90 and SM100 take the 3.x
-#: collective builders, whose mainloop pipelines K itself.
+#: The architectures served by the CUTLASS 2.x lane alone.  SM90 and SM100 build
+#: their GEMMs from the 3.x collective builders *and* this lane
+#: (``oasr.jit.gemm._MIXED_LANE_SMS``); the K-decompositions live on its half.
 _SM_2X = (75, 80, 86, 89, 120)
+_SM_MIXED = (90, 100)
 
 
 class TestKDecompositionsAreArchUniform:
@@ -559,13 +561,23 @@ class TestKDecompositionsAreArchUniform:
         assert sk, f"sm_{sm} has no Stream-K variant in its compile set"
         assert pk, f"sm_{sm} has no parallel split-K variant in its compile set"
 
-    @pytest.mark.parametrize("sm", [90, 100])
-    def test_the_3x_arches_get_neither(self, sm):
-        """Not an oversight there: the 3.x collective mainloop pipelines K itself,
-        and the SM90+ template has no Stream-K path to render one into."""
-        configs = self._space(sm)
-        assert not [c for c in configs.values() if getattr(c, "stream_k", False)]
-        assert not [c for c in configs.values() if getattr(c, "parallel_split_k", False)]
+    @pytest.mark.parametrize("sm", _SM_MIXED)
+    def test_the_mixed_arches_decompose_on_their_mma_half(self, sm):
+        """Deep-K small-M shapes ran 2-3.2x behind cuBLAS on H100 with no K split
+        anywhere in the 3.x space; the mma.sync half carries the 2.x Stream-K and
+        parallel split-K.  The 3.x lane has none: CUTLASS's Stream-K scheduler was
+        built and measured there (2026-10-01, 76 points per arch) and won nowhere --
+        its deterministic split-K ran 1.3x behind the unsplit kernel."""
+        from oasr.jit.gemm import CutlassGemmConfig, get_all_autotune_configs
+
+        space = get_all_autotune_configs(sm).values()
+        dec = [
+            c
+            for c in space
+            if getattr(c, "stream_k", False) or getattr(c, "parallel_split_k", False)
+        ]
+        assert any(c.stream_k for c in dec) and any(c.parallel_split_k for c in dec)
+        assert all(isinstance(c, CutlassGemmConfig) for c in dec)
 
     def test_turing_builds_them_at_two_pipeline_stages_only(self):
         """Measured, not assumed: sm_75 at three or four stages fails with
@@ -581,17 +593,17 @@ class TestKDecompositionsAreArchUniform:
                     f"Turing's kernel::DefaultGemm has no such specialisation"
                 )
 
-    def test_the_stage_tables_cover_exactly_the_2x_families(self):
+    def test_the_stage_tables_cover_exactly_the_mma_families(self):
         """A family missing from either table raises ``KeyError`` when its config
         space is generated — deliberately, because silently receiving no
         decompositions is how this became SM120-only.  An extra key is dead data
         that nothing will ever read."""
         from oasr.jit.gemm import _SM_SPLITK_PARALLEL_STAGES, _SM_STREAMK_STAGES
 
-        assert set(_SM_STREAMK_STAGES) == set(_SM_2X)
-        assert set(_SM_SPLITK_PARALLEL_STAGES) == set(_SM_2X)
+        assert set(_SM_STREAMK_STAGES) == set(_SM_2X) | set(_SM_MIXED)
+        assert set(_SM_SPLITK_PARALLEL_STAGES) == set(_SM_2X) | set(_SM_MIXED)
 
-    @pytest.mark.parametrize("sm", _SM_2X)
+    @pytest.mark.parametrize("sm", _SM_2X + _SM_MIXED)
     def test_gemm_activation_has_a_valid_split_k(self, sm):
         """The consequence with teeth.
 
@@ -613,7 +625,7 @@ class TestKDecompositionsAreArchUniform:
             f"serial split-K is refused for gemm_activation by construction"
         )
 
-    @pytest.mark.parametrize("sm", _SM_2X)
+    @pytest.mark.parametrize("sm", _SM_2X + _SM_MIXED)
     def test_the_build_knobs_are_global(self, sm, monkeypatch):
         """``OASR_GEMM_STREAMK=0`` / ``OASR_GEMM_SPLITK_PARALLEL=0`` must take
         effect on every architecture, which is what ``AGENTS.md`` promises.  They
@@ -1231,9 +1243,9 @@ class TestSm100GemmTileSpace:
     """
 
     def test_every_emitted_tile_satisfies_the_cutlass_constraints(self):
-        from oasr.jit.gemm import _sm100_gemm_tile_ok, get_unique_compile_configs
+        from oasr.jit.gemm import _sm100_gemm_tile_ok, get_unique_compile_configs, is_native_lane
 
-        cfgs = get_unique_compile_configs(100)
+        cfgs = {n: c for n, c in get_unique_compile_configs(100).items() if is_native_lane(c, 100)}
         assert cfgs
         for name, cfg in cfgs.items():
             assert _sm100_gemm_tile_ok(cfg.tile_m, cfg.tile_n, cfg.kSMs), name
@@ -1279,7 +1291,9 @@ class TestSm100GemmTileSpace:
         # …and the 256-row tiles the doubling broke are in the space.
         from oasr.jit.gemm import get_unique_compile_configs
 
-        m256 = [c for c in get_unique_compile_configs(100).values() if c.tile_m == 256]
+        m256 = [
+            c for c in get_unique_compile_configs(100).values() if getattr(c, "tile_m", 0) == 256
+        ]
         assert m256, "every 256-row SM100 tile was filtered out"
         assert all(c.kSMs == 2 for c in m256), "a 256-row MMA tile needs the 2-SM atom"
 
@@ -1288,11 +1302,12 @@ class TestSm100GemmTileSpace:
 
         Pinned because the fix touched a struct both architectures share.
         """
-        from oasr.jit.gemm import get_unique_compile_configs
+        from oasr.jit.gemm import get_unique_compile_configs, is_native_lane
 
-        cfgs = get_unique_compile_configs(90)
-        assert len(cfgs) == 16
-        assert all(c.kSMs == 1 for c in cfgs.values())
+        native = [c for c in get_unique_compile_configs(90).values() if is_native_lane(c, 90)]
+        # 16 clustered + 5 small 1x1 tiles at K-tile 64 + the 2 small-tile pilot winners
+        assert len(native) == 23
+        assert all(c.kSMs == 1 for c in native)
 
 
 def _struct_body(src: str, name: str) -> str:
@@ -1437,7 +1452,7 @@ class TestProductionCompileSet:
                         continue
                     assert choice.compile_name in prod, f"sm{sm} {key}: {choice.compile_name}"
 
-    @pytest.mark.parametrize("sm", [75, 80, 86, 89, 120])
+    @pytest.mark.parametrize("sm", [75, 80, 86, 89, 90, 100, 120])
     def test_no_variant_is_in_both_modules(self, sm, monkeypatch):
         """The tuning module holds the space *minus* production, never an overlap.
 
@@ -1468,3 +1483,95 @@ class TestProductionCompileSet:
         from oasr.jit.gemm import get_unique_compile_configs
 
         assert any(c.kStages == 4 for c in get_unique_compile_configs(sm).values())
+
+
+class TestMixedGemmLane:
+    """SM90/SM100 GEMM: the native 3.x lane plus the CUTLASS 2.x ``mma.sync`` one.
+
+    The 11-model census measured the best 3.x config 1.86x (H100) / 1.43x (B200)
+    slower than cuBLAS, which won 1170 / 1126 of 1234 points: 128/256-wide tiles
+    at K-tile 128 and no split-K cannot serve N or K of 48-512 at small M.  The
+    2.x lane can -- it is what OASR tuned to cuBLAS parity elsewhere -- and
+    ``mma.sync`` runs on both.  Pure Python, like the tile-space tests above.
+    """
+
+    @pytest.mark.parametrize("sm", _SM_MIXED)
+    def test_the_space_holds_both_lanes(self, sm):
+        from oasr.jit.gemm import CutlassGemmConfig, CutlassGemmConfigSm90, get_all_autotune_configs
+
+        space = get_all_autotune_configs(sm).values()
+        assert any(isinstance(c, CutlassGemmConfig) for c in space)
+        assert any(isinstance(c, CutlassGemmConfigSm90) for c in space)
+        assert all(c.kSmVersion == sm for c in space)
+
+    @pytest.mark.parametrize("sm", _SM_MIXED)
+    def test_the_native_lane_has_small_tiles(self, sm):
+        """64-wide, K-tile 64, one CTA per cluster: the shapes the census is made of."""
+        from oasr.jit.gemm import get_unique_compile_configs, is_native_lane
+
+        small = [
+            c
+            for c in get_unique_compile_configs(sm).values()
+            if is_native_lane(c, sm) and c.tile_k == 64 and (c.cluster_m, c.cluster_n) == (1, 1)
+        ]
+        assert any(c.tile_m == 64 for c in small) and any(c.tile_n == 64 for c in small)
+
+    @pytest.mark.parametrize("sm", _SM_MIXED)
+    @pytest.mark.parametrize("level", ["production", "tune"])
+    def test_bmm_and_grouped_gemm_keep_the_native_lane(self, sm, level, monkeypatch):
+        """Their modules render ``native_only`` and register no mma.sync tactic."""
+        import oasr.jit.gemm as jg
+
+        monkeypatch.setattr(jg, "_get_target_sm", lambda: sm)
+        native = jg._level_configs(level, native_only=True)
+        assert native and all(jg.is_native_lane(c, sm) for c in native.values())
+        everything = jg._level_configs(level)
+        assert set(native) == {n for n, c in everything.items() if jg.is_native_lane(c, sm)}
+
+    @pytest.mark.parametrize("sm", _SM_MIXED)
+    def test_the_mma_half_renders_with_the_sm80_tag(self, sm, monkeypatch, tmp_path):
+        """``CutlassArch<90>`` / ``<100>`` are the 3.x tags (no InstructionShape), so
+        the 2.x template must instantiate the Sm80 kernels; the 3.x one keeps the
+        family's own."""
+        import oasr.jit.gemm as jg
+
+        monkeypatch.setattr(jg, "_get_target_sm", lambda: sm)
+        monkeypatch.setattr(jg.env, "OASR_GEN_SRC_DIR", tmp_path)
+        space = jg.get_unique_compile_configs(sm)
+        mma = next(n for n, c in space.items() if not jg.is_native_lane(c, sm))
+        native = next(n for n, c in space.items() if jg.is_native_lane(c, sm))
+        paths = jg._render_all_variants(
+            "gemm_cutlass_template.cu.jinja",
+            "gemm_cutlass_template_sm90.cu.jinja",
+            "gemm",
+            with_activation=True,
+            configs={mma: space[mma], native: space[native]},
+        )
+        text = {p.name: p.read_text() for p in paths}
+        mma_src = text[f"gemm_sm{sm}_{mma}.cu"]
+        native_src = text[f"gemm_sm{sm}_{native}.cu"]
+        assert "CutlassGemmConfig<" in mma_src and ", 80>;" in mma_src
+        assert "CutlassGemmConfigSm90<" in native_src and f"{sm}," in native_src
+
+    @pytest.mark.parametrize("sm", _SM_MIXED)
+    def test_the_codec_round_trips_both_lanes(self, sm):
+        """A tuning file on a mixed family names configs of both lanes; each must
+        decode to the config it was written from (the lane is per config)."""
+        import oasr.jit.gemm as jg
+
+        for cfg in jg.get_all_autotune_configs(sm).values():
+            params = jg.gemm_config_to_params(cfg, sentinel_default=False)
+            assert jg.gemm_config_from_params(params, sm) == cfg, cfg.name
+
+
+class TestReleaseFlags:
+    """The JIT compiles CUTLASS the way CUTLASS's own release builds do."""
+
+    def test_device_asserts_are_compiled_out(self):
+        """Without ``-DNDEBUG`` CuTe's device ``assert()``s are ``__assertfail``
+        calls inside the GEMM mainloop, and ptxas serialises every wgmma across a
+        function call (C7510): all ten kernels of every SM90 variant, measured on
+        a cross-compile.  OASR's own sources contain no ``assert()``."""
+        from oasr.jit import core
+
+        assert "-DNDEBUG" in core._default_cuda_cflags()

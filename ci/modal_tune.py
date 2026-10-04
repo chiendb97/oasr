@@ -367,12 +367,31 @@ def tune_arch(
     }
 
 
-def _poll(call):
-    """``call``'s result if it has one now, else ``None`` (never blocks)."""
+#: Consecutive polling errors before a stage counts as failed.  A transient
+#: "Deadline exceeded" from the control plane once read as a failed compile and
+#: abandoned a run whose compile had succeeded (2026-10-02).
+_POLL_TOLERANCE = 5
+
+
+def _poll(call, errors: dict, key: str):
+    """``call``'s result if it has one now, else ``None`` (never blocks).
+
+    Raises only after ``_POLL_TOLERANCE`` consecutive errors -- a remote failure
+    repeats on every poll, a network blip does not.
+    """
     try:
-        return call.get(timeout=0)
+        res = call.get(timeout=0)
     except (TimeoutError, modal.exception.TimeoutError):
+        errors[key] = 0
         return None
+    except Exception as exc:  # noqa: BLE001 -- counted, re-raised when persistent
+        errors[key] = errors.get(key, 0) + 1
+        if errors[key] >= _POLL_TOLERANCE:
+            raise
+        print(f"  [poll] {key}: {type(exc).__name__}: {exc} (retrying)", flush=True)
+        return None
+    errors[key] = 0
+    return res
 
 
 @app.local_entrypoint()
@@ -465,10 +484,11 @@ def main(
     runs: dict = {}
     reports: dict = {}
     t0 = time.time()
+    poll_errors: dict = {}
     while pre or runs:
         for g in list(pre):
             try:
-                rep = _poll(pre[g])
+                rep = _poll(pre[g], poll_errors, f"compile:{g}")
             except Exception as exc:  # the container itself failed
                 rep = {"returncode": -1, "modules": [], "error": str(exc)}
             if rep is None:
@@ -492,7 +512,7 @@ def main(
             )
         for g in list(runs):
             try:
-                res = _poll(runs[g])
+                res = _poll(runs[g], poll_errors, f"measure:{g}")
             except Exception as exc:  # one arch failing must not hide the others
                 print(f"  {g}: measure FAILED {exc}")
                 del runs[g]
