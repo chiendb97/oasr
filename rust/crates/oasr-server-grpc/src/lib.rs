@@ -14,6 +14,9 @@
 pub mod grpc_metrics;
 pub mod speech;
 
+// async_trait adds redundant #[must_use] attributes to tonic's generated
+// service methods. Keep the allowance scoped to generated protobuf code.
+#[allow(clippy::double_must_use)]
 pub mod pb {
     tonic::include_proto!("oasr.speech.v1");
 }
