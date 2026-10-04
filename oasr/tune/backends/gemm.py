@@ -26,6 +26,7 @@ from oasr.jit.gemm import (
     get_all_autotune_configs,
     get_unique_compile_configs,
     group_gemm_func_name,
+    is_native_lane,
 )
 from oasr.tune.autotuner import BackendEntry, OpKey, Tactic, _global_registry
 
@@ -170,6 +171,9 @@ for _cfg in _all_autotune_configs.values():
     # neither, and its launcher takes no runtime split-K argument.
     if getattr(_cfg, "stream_k", False) or getattr(_cfg, "parallel_split_k", False):
         continue
+    # Its module renders the native lane only (the mixed space is GEMM's).
+    if not is_native_lane(_cfg, _sm):
+        continue
     if getattr(_cfg, "split_k", 1) != 1:
         continue
     _tactic = Tactic("cutlass", config=_cfg.to_tactic_config())
@@ -207,6 +211,9 @@ for _cfg in _all_autotune_configs.values():
     # Stream-K / parallel split-K are GEMM-only template paths; group_gemm has
     # neither, and its launcher takes no runtime split-K argument.
     if getattr(_cfg, "stream_k", False) or getattr(_cfg, "parallel_split_k", False):
+        continue
+    # Its module renders the native lane only (the mixed space is GEMM's).
+    if not is_native_lane(_cfg, _sm):
         continue
     if getattr(_cfg, "split_k", 1) != 1:
         continue

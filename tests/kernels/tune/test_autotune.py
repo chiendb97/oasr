@@ -674,3 +674,23 @@ class TestGemmShapeCapture:
 
         stats = self._record(call)
         assert ("gemm", 256, 64) in stats, f"the LSTM gate projection is invisible: {sorted(stats)}"
+
+
+@pytest.mark.cuda
+class TestBenchSeparator:
+    """``bench.measure`` charges every arm the same neighbour, then subtracts it."""
+
+    def test_the_separator_cost_is_not_charged_to_the_arm(self):
+        """No kernel here launches with programmatic dependent launch, so putting
+        a separator between calls must not move a measurement.  The arm is as
+        small as the separator, so charging its cost would read ~2x."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        from oasr.tune import bench
+
+        x = torch.zeros(64, device="cuda")
+        arm = bench.Arm("tiny", lambda i: (lambda: x.add_(1.0)))
+        on = bench.measure([arm], bench.BenchPolicy(separator=True), record_conditions=False)
+        off = bench.measure([arm], bench.BenchPolicy(separator=False), record_conditions=False)
+        t_on, t_off = on[0]["tiny"].median_ms, off[0]["tiny"].median_ms
+        assert t_on == pytest.approx(t_off, rel=0.35), (t_on, t_off)

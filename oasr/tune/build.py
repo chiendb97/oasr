@@ -216,16 +216,16 @@ def _pruned(entries, op: str, M: int, N: int, K: int, models, k: int):
         by_name.setdefault(name, e)
         if not isinstance(choice, str):
             params[name] = jg.gemm_config_to_params(choice, sentinel_default=False)
+    from oasr.tune.cost_model import features_of
+
     keep = {"default", "fused", "torch"}
-    ranked_any = False
+    # What no model describes -- the CUTLASS 3.x configs have no cost structure
+    # yet -- is measured, never pruned: a mixed space (sm90/sm100: 3.x + the
+    # mma.sync lane) ranks only its 2.x half, and keeping the top-k of *that*
+    # would silently drop every native kernel.
+    keep.update(n for n, prm in params.items() if features_of(prm) is None)
     for model in models:
-        top = model.top_k(params, M, N, K, k)
-        ranked_any |= bool(top)
-        keep.update(top)
-    if not ranked_any:
-        # No model describes this lane (the CUTLASS 3.x configs have no cost
-        # structure yet): measure everything rather than only the forced arms.
-        return entries
+        keep.update(model.top_k(params, M, N, K, k))
     return [e for n, e in by_name.items() if n in keep]
 
 

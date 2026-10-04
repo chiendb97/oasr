@@ -407,7 +407,29 @@ _SM_MAX_SMEM_BYTES: Dict[int, int] = {
     # path using the Sm80 tensor-op specialisations (see CutlassArch<120>).
     # Use the Sm80 shared-memory budget for stage calculations.
     120: 100 * 1024,
+    # Hopper and Blackwell data-center, for their CUTLASS 2.x (mma.sync) half of
+    # the mixed space (:data:`_MIXED_LANE_SMS`): 227 KiB opt-in per block.
+    90: 227 * 1024,
+    100: 227 * 1024,
 }
+
+#: SM families whose GEMM space is their native CUTLASS 3.x lane (TMA + wgmma /
+#: tcgen05) **plus** the CUTLASS 2.x ``mma.sync`` lane, rendered with the Sm80
+#: arch tag and compiled for the family's own target (``mma.sync``, ``cp.async``
+#: and ``ldmatrix`` all run on sm_90a and sm_100f).
+#:
+#: Measured on the 11-model ASR census (2026-10-01, 1234 points per arch): the
+#: best 3.x config was **1.86x** slower than cuBLAS on H100 and **1.43x** on
+#: B200 (geomean), 2.3-2.5x at M 128-512, and cuBLAS won 1170 and 1126 of the
+#: points.  The 3.x space is 128/256-wide tiles at K-tile 128 with no split-K,
+#: so an N=48 or K=48 GEMM does 2.7x its work and a deep-K small-M one runs a
+#: handful of CTAs; the 2.x lane is what OASR already tuned to cuBLAS parity on
+#: those shapes (thin-N tiles, serial / parallel split-K, Stream-K).  The tuner
+#: picks per region; neither lane is preferred.
+#:
+#: Only the GEMM family takes the mixed space.  BMM and grouped GEMM keep the
+#: native lane (:func:`is_native_lane`), so their modules are unchanged.
+_MIXED_LANE_SMS: Tuple[int, ...] = (90, 100)
 
 
 def _build_sm_lt90_configs(
@@ -601,7 +623,16 @@ def _build_splitk_parallel_configs(
 #: which is the same ``kernel::DefaultGemm`` 2-stage-only specialisation that
 #: makes ``RecurrentArch<75>`` set ``kStages = 2``.  Mirrored by
 #: ``oasr.tune.arch.STAGE_DOMAIN``.
-_STAGE_DOMAIN: Dict[int, List[int]] = {75: [2], 80: [3, 4], 86: [3, 4], 89: [3, 4], 120: [3, 4]}
+_STAGE_DOMAIN: Dict[int, List[int]] = {
+    75: [2],
+    80: [3, 4],
+    86: [3, 4],
+    89: [3, 4],
+    120: [3, 4],
+    # The mma.sync half of the mixed families (_MIXED_LANE_SMS).
+    90: [3, 4],
+    100: [3, 4],
+}
 
 #: Pipeline depths the two K-decomposition families are built at, per SM family:
 #: derived, not curated.  Stream-K keeps the single depth it has always been built
@@ -713,14 +744,26 @@ def _get_sm90_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
     ]
     cluster_vals = [(1, 2), (2, 1)]
 
+    # Small tiles at K-tile 64, one CTA per cluster: the ASR census is small-M,
+    # thin-N and shallow-K (N or K of 48-512 at M 128-4096), where every tile
+    # above is 2.7x padded work on K=48 and a 1x2 cluster halves the CTAs a
+    # small grid has.  Pingpong at 64 rows (each consumer warpgroup owns a whole
+    # tile); cooperative needs two warpgroups' worth of rows, so it starts at 128.
+    small = [(64, 64, True), (64, 128, True), (64, 256, True), (128, 64, False), (128, 128, False)]
+    combos = list(itertools.product(tile_mn_vals, cluster_vals, [tile_k]))
+    combos += [(t, (1, 1), 64) for t in small]
+    # The two winners of a ten-tile H100 pilot (2026-10-02: clusters 2x1/1x2 on
+    # every small tile, K-tile 128 on the pingpong ones): best at 14 of 76 points,
+    # the other eight at 4 -- a 64x64 tile with a 1x2 cluster (TMA multicast of
+    # A) and at K-tile 128, which halves the mainloop trips of a shallow K.
+    combos += [((64, 64, True), (1, 2), 64), ((64, 64, True), (1, 1), 128)]
+
     seen: Dict[str, CutlassGemmConfigSm90] = {}
-    for (tile_m, tile_n, pingpong), (cluster_m, cluster_n) in itertools.product(
-        tile_mn_vals, cluster_vals
-    ):
+    for (tile_m, tile_n, pingpong), (cluster_m, cluster_n), tk in combos:
         cfg = CutlassGemmConfigSm90(
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
+            tile_k=tk,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             pingpong=pingpong,
@@ -792,9 +835,17 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
         + [(256, n, (2, 2)) for n in tile_n_vals]
         + [(256, 512, (2, 1))]
     )
+    combos = [(m, n, c, tile_k) for m, n, c in tile_mn_cluster_vals]
+    # Small 1-SM tiles at K-tile 64 (see _get_sm90_configs): the 1-SM tcgen05
+    # atom takes M=64, and K=64 halves the padding a shallow-K GEMM pays.
+    combos += [(m, n, (1, 1), 64) for m in (64, 128) for n in (64, 128, 256)]
+    # 32-wide tiles, what cuBLAS runs at these sizes on B200
+    # (``nvjet_sm100_tst_64x32_..._2cta``): N=48/96/128/192 GEMMs pad a 64-wide
+    # tile by up to 33%, and a 32-wide one doubles a thin output's CTA count.
+    combos += [(64, 32, (1, 1), 64), (128, 32, (1, 1), 64), (128, 32, (2, 1), 128)]
 
     seen: Dict[str, CutlassGemmConfigSm90] = {}
-    for tile_m, tile_n, (cluster_m, cluster_n) in tile_mn_cluster_vals:
+    for tile_m, tile_n, (cluster_m, cluster_n), tk in combos:
         # kSMs=2 selects the 2-SM co-operative *schedule* when cluster_m >= 2.
         # It does not scale the tile; see CutlassGemmConfigSm90's comment.
         kSMs = 2 if cluster_m >= 2 else 1
@@ -803,7 +854,7 @@ def _get_sm100_configs(sm: int) -> Dict[str, CutlassGemmConfigSm90]:
         cfg = CutlassGemmConfigSm90(
             tile_m=tile_m,
             tile_n=tile_n,
-            tile_k=tile_k,
+            tile_k=tk,
             cluster_m=cluster_m,
             cluster_n=cluster_n,
             pingpong=False,
@@ -836,16 +887,26 @@ def get_all_autotune_configs(
     a target that is merely *unlisted* should say so, not inherit another
     architecture's tiles.
     """
+    if sm in _MIXED_LANE_SMS:
+        native: Dict[str, Union[CutlassGemmConfig, CutlassGemmConfigSm90]] = {}
+        native.update(_get_sm90_configs(sm) if sm == 90 else _get_sm100_configs(sm))
+        return {**native, **_get_sm80_lane_configs(sm)}
     if sm in _STAGE_DOMAIN:
         return _get_sm80_lane_configs(sm)  # type: ignore[return-value]
-    elif sm == 90:
-        return _get_sm90_configs(sm)  # type: ignore[return-value]
-    elif sm == 100:
-        return _get_sm100_configs(sm)  # type: ignore[return-value]
     raise ValueError(
         f"no GEMM config space for sm_{sm}; OASR compiles for "
         f"{', '.join(f'sm_{t}' for t in _TARGET_SMS)}"
     )
+
+
+def is_native_lane(cfg: Union[CutlassGemmConfig, CutlassGemmConfigSm90, str], sm: int) -> bool:
+    """Whether *cfg* runs on *sm*'s native MMA lane.
+
+    Everything does, except the CUTLASS 2.x half of a mixed family's GEMM space
+    (:data:`_MIXED_LANE_SMS`).  BMM and grouped GEMM render and register only
+    native configs.
+    """
+    return sm not in _MIXED_LANE_SMS or not isinstance(cfg, CutlassGemmConfig)
 
 
 def get_unique_compile_configs(
@@ -927,8 +988,10 @@ def get_production_configs(
 
     A subset of :func:`get_unique_compile_configs`: the tuning DB's references,
     the default and the coverage basis (``OASR_GEMM_COMPILE_SET=all`` restores
-    the whole space).  The CUTLASS 3.x lanes have no tuned table yet and a small
-    space, so they keep all of it.
+    the whole space).  The mixed families follow the same rule -- their 3.x
+    variants are the slowest TUs OASR builds (~4.5 GiB of nvcc each), so a
+    production module compiling all of them for a table that names a handful is
+    the cost this subset exists to avoid.
     """
     space = get_unique_compile_configs(sm)
     if _COMPILE_SET == "all" or sm not in _STAGE_DOMAIN:
@@ -995,7 +1058,7 @@ def _render_all_variants(
         func_name = f"{family}_{config_name}"
         variant_file_name = f"{family}_sm{sm}_{config_name}"
 
-        if sm in [75, 80, 86, 89, 120]:
+        if isinstance(cfg, CutlassGemmConfig):
             rendered = render_template(
                 template_name,
                 op_name=variant_file_name,
@@ -1007,7 +1070,9 @@ def _render_all_variants(
                 warp_n=cfg.warp_n,
                 warp_k=cfg.warp_k,
                 stages=cfg.kStages,
-                sm_version=sm,
+                # The C++ arch tag: a mixed family's mma.sync configs are the
+                # Sm80 kernels, built for this family's target.
+                sm_version=80 if sm in _MIXED_LANE_SMS else sm,
                 stream_k=getattr(cfg, "stream_k", False),
                 parallel_split_k=getattr(cfg, "parallel_split_k", False),
                 with_activation=with_activation,
@@ -1083,7 +1148,7 @@ def _render_bmm_general_variants() -> List:
 # =============================================================================
 
 
-def _level_configs(level: str):
+def _level_configs(level: str, *, native_only: bool = False):
     """The variants a module of *level* renders.
 
     The tuning module holds the tuning space **minus** the production set --
@@ -1099,11 +1164,17 @@ def _level_configs(level: str):
     sm = _get_target_sm()
     if level == "production":
         cfgs = get_production_configs(sm)
+        if native_only:  # BMM / grouped GEMM: not the GEMM family's dispatch record
+            return {n: c for n, c in cfgs.items() if is_native_lane(c, sm)}
         _BUILT_PRODUCTION[sm] = frozenset(cfgs)
         _COMPILED_NAMES.pop(sm, None)
         return cfgs
     prod = get_production_configs(sm)
-    return {n: c for n, c in get_unique_compile_configs(sm).items() if n not in prod}
+    return {
+        n: c
+        for n, c in get_unique_compile_configs(sm).items()
+        if n not in prod and (is_native_lane(c, sm) or not native_only)
+    }
 
 
 def _module_name(family: str, level: str) -> str:
@@ -1153,7 +1224,7 @@ def gen_bmm_module(level: str = "production") -> JitSpec:
         "bmm_cutlass_template.cu.jinja",
         "bmm_cutlass_template_sm90.cu.jinja",
         "bmm",
-        configs=_level_configs(level),
+        configs=_level_configs(level, native_only=True),
     )
     if level == "production":
         # The general lane lives in the production module only: a second copy
@@ -1179,7 +1250,7 @@ def gen_group_gemm_module(level: str = "production") -> JitSpec:
         "group_gemm_cutlass_template.cu.jinja",
         "group_gemm_cutlass_template_sm90.cu.jinja",
         "group_gemm",
-        configs=_level_configs(level),
+        configs=_level_configs(level, native_only=True),
     )
     return gen_jit_spec(_module_name("group_gemm", level), source_paths)
 

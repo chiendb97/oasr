@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 397,
+  "total": 384,
   "files": {
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
@@ -45,7 +45,6 @@
     "oasr/jit/conv.py": 11,
     "oasr/jit/core.py": 2,
     "oasr/jit/cpp_ext.py": 1,
-    "oasr/jit/gemm.py": 13,
     "oasr/layers/attention/attention.py": 1,
     "oasr/layers/conv.py": 5,
     "oasr/layers/ctc.py": 2,

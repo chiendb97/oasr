@@ -230,6 +230,13 @@ Compiled modules are cached in `~/.cache/oasr/jit/`, keyed on a hash that covers
 the sources, the `include/` tree, the nvcc flags, **and** the CUTLASS version
 stamp.
 
+The default flags (`core._default_cuda_cflags`) include `-DNDEBUG`, which is
+how CUTLASS's own release builds compile. Without it, CuTe's device-side
+`assert()`s become `__assertfail` calls inside the GEMM mainloop, and ptxas
+serialises every wgmma across a function call. A build log shows that as
+`C7510: wgmma pipeline crossing function boundary`; every SM90 GEMM kernel had
+it. OASR's own sources contain no `assert()`.
+
 Fused attention has **two** kernel lanes and one arbiter over them.
 
 `oasr/jit/attention.py` is the arbiter: `select_backend()`, `set_backend_mode()`,
@@ -313,6 +320,14 @@ object.
 
 - a CUTLASS variant — default tile, serial split-K, parallel split-K (`pk`), or
   Stream-K;
+- on SM90 and SM100, from either of two lanes. The native one is CUTLASS 3.x:
+  TMA plus wgmma (SM90) or tcgen05 (SM100). It includes small 64-row and 64-wide
+  tiles at K-tile 64 with 1×1 clusters. The other is the CUTLASS 2.x `mma.sync`
+  space, with its split-K and Stream-K, rendered with the Sm80 arch tag
+  (`jit.gemm._MIXED_LANE_SMS`). Only the GEMM family takes both lanes; BMM and
+  grouped GEMM stay native (`is_native_lane`). CUTLASS's 3.x Stream-K
+  scheduler was built and measured, and it won nowhere: its deterministic
+  split-K ran about 1.3× behind the unsplit kernel;
 - the torch/cuBLAS backend (`oasr/functionals/gemm_torch.py`);
 - or, for the CTC head only, the legacy single-call fused launcher.
 

@@ -314,3 +314,61 @@ class TestThinCensus:
         assert _points_digest(pts, BuildOptions(thin=True)) != full
         # ...and adding the knob left every existing (unthinned) checkpoint valid.
         assert _points_digest(pts, BuildOptions(thin=False)) == full
+
+
+class TestPruning:
+    """``build._pruned``: which candidates a point measures."""
+
+    def test_what_no_model_ranks_is_measured(self, monkeypatch):
+        """A mixed space (sm90: 3.x + mma.sync) is half rankable: the cost model
+        describes only the 2.x lane.  Its top-k must not crowd out the native
+        kernels, which no model can rank yet."""
+        import oasr.jit.gemm as jg
+        from oasr.tune import build, gemm_tune
+
+        space = jg.get_all_autotune_configs(90)
+        mma = [c for c in space.values() if not jg.is_native_lane(c, 90)]
+        native = [c for c in space.values() if jg.is_native_lane(c, 90)]
+        entries = [SimpleNamespace(tactic=c) for c in mma + native] + [
+            SimpleNamespace(tactic="torch")
+        ]
+        monkeypatch.setattr(gemm_tune, "choice_of", lambda t: t)
+        monkeypatch.setattr(
+            gemm_tune, "choice_name", lambda c: c if isinstance(c, str) else jg.gemm_config_id(c)
+        )
+
+        class TopOne:
+            def top_k(self, params, M, N, K, k):
+                from oasr.tune.cost_model import features_of
+
+                return [n for n, p in params.items() if features_of(p) is not None][:k]
+
+        kept = build._pruned(entries, "gemm", 256, 256, 256, [TopOne()], 1)
+        names = {gemm_tune.choice_name(e.tactic) for e in kept}
+        assert {jg.gemm_config_id(c) for c in native} <= names
+        assert len(names & {jg.gemm_config_id(c) for c in mma}) == 1
+        assert "torch" in names
+
+
+class TestTacticRoundTrip:
+    """A registered tactic must name the config it was registered from.
+
+    ``gemm_tune.choice_of`` rebuilds the config from ``Tactic.config``; when it
+    dropped the 3.x ``stream_k`` / ``split_k`` fields, every split factor of a
+    Stream-K kernel collapsed into one name and the two whose base tile also
+    exists without Stream-K deduplicated away -- the first H100/B200 pilot
+    measured none of them.
+    """
+
+    @pytest.mark.parametrize("sm", [80, 90, 100, 120])
+    def test_every_config_survives_its_tactic(self, sm):
+        import oasr.jit.gemm as jg
+        from oasr.tune import gemm_tune
+        from oasr.tune.autotuner import Tactic
+
+        names = set()
+        for cfg in jg.get_all_autotune_configs(sm).values():
+            back = gemm_tune.choice_of(Tactic("cutlass", config=cfg.to_tactic_config()), sm)
+            assert back == cfg or (back is jg.GEMM_DEFAULT and cfg == jg.default_config_for_sm(sm))
+            names.add(gemm_tune.choice_name(back) if back is not jg.GEMM_DEFAULT else cfg.name)
+        assert len(names) == len(jg.get_all_autotune_configs(sm))

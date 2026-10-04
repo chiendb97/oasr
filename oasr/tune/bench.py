@@ -19,6 +19,11 @@ What the protocol does, and why each step is there:
    [8, 64]); the replay time / N is the per-call GPU time.  Inductor measured
    that one call per replay ranks *worse* than eager timing (Spearman 0.69 vs
    0.77) while >= 5 calls reach 0.94-0.95, which is why the floor is 8.
+   Each call is followed by a tiny unrelated kernel whose own cost is measured
+   and subtracted (``separator``): a served GEMM sits between norms and
+   activations, and a library kernel launched with programmatic dependent
+   launch overlaps only a cooperating predecessor -- back-to-back copies of
+   itself, which is what an unseparated loop measures.
 3. **Rotates operand copies when L2 would lie** (:func:`l2_copies`): the caller
    passes a ``make_call(i)`` bound to copy ``i``, and the graph cycles copies so
    the weights are cold when the model's working set exceeds L2 -- but stay warm
@@ -69,7 +74,8 @@ __all__ = [
 
 #: Bumped whenever a change to this module could move a measured number.
 #: Recorded in every tuning file's provenance (``bench_protocol``).
-PROTOCOL_VERSION = 2
+#: 3: a separator kernel between the calls of every timed graph (``separator``).
+PROTOCOL_VERSION = 3
 
 
 class StickyDeviceError(RuntimeError):
@@ -102,6 +108,16 @@ class BenchPolicy:
     max_rotation_calls: int = 256
     #: Fixed shuffle seed, so a re-run interleaves identically.
     seed: int = 0
+    #: Put a tiny unrelated kernel after every call in a timed graph and subtract
+    #: its measured cost.  In a served graph a GEMM's neighbours are norms,
+    #: activations and adds; back-to-back copies of one library kernel are not.
+    #: cuBLAS's Blackwell kernels (``nvjet_sm100_*``) launch with programmatic
+    #: dependent launch and overlap a cooperating predecessor: back-to-back they
+    #: measured 1.7-2.3 us on B200, behind one ordinary kernel 0.62-0.66 us
+    #: more, while OASR's kernels moved by 0.02 us -- so the back-to-back loop
+    #: credited cuBLAS with ~0.65 us per call it cannot have in a model.
+    separator: bool = True
+    separator_reps: int = 7
 
 
 @dataclass
@@ -358,6 +374,26 @@ def _replay_ms(graph: torch.cuda.CUDAGraph, calls: int) -> float:
     return float(s.elapsed_time(e)) / calls
 
 
+_SEPARATOR_BUF: Dict[int, torch.Tensor] = {}
+
+
+def _separator() -> Callable[[], Any]:
+    """One tiny kernel with no programmatic-launch attribute (a 1-element add)."""
+    dev = torch.cuda.current_device()
+    buf = _SEPARATOR_BUF.get(dev)
+    if buf is None:
+        buf = _SEPARATOR_BUF[dev] = torch.zeros(1, device="cuda")
+    return lambda: buf.add_(1.0)
+
+
+def _then(call: Callable[[], Any], after: Callable[[], Any]) -> Callable[[], Any]:
+    def both():
+        call()
+        after()
+
+    return both
+
+
 def _robust(samples: Sequence[float]) -> Tuple[float, float]:
     med = statistics.median(samples)
     mad = statistics.median(abs(x - med) for x in samples) if len(samples) > 1 else 0.0
@@ -416,10 +452,20 @@ def measure(
     if copies > 1:
         calls = max(calls, min(int(copies), policy.max_rotation_calls))
 
+    sep = _separator() if policy.separator else None
+    sep_ms = 0.0
+    if sep is not None:
+        g_sep = _capture([sep] * calls, policy.warmup_calls)
+        sep_ms = min(_replay_ms(g_sep, calls) for _ in range(policy.separator_reps))
+        del g_sep
+
     graphs: Dict[str, torch.cuda.CUDAGraph] = {}
     for a in list(alive):
         try:
-            graphs[a.name] = _capture([a.make_call(i) for i in range(calls)], policy.warmup_calls)
+            seq = [a.make_call(i) for i in range(calls)]
+            if sep is not None:
+                seq = [_then(c, sep) for c in seq]
+            graphs[a.name] = _capture(seq, policy.warmup_calls)
             results[a.name].calls_per_graph = calls
         except StickyDeviceError:
             raise
@@ -437,7 +483,7 @@ def measure(
             order = list(alive)
             rng.shuffle(order)
             for a in order:
-                results[a.name].samples.append(_replay_ms(graphs[a.name], calls))
+                results[a.name].samples.append(_replay_ms(graphs[a.name], calls) - sep_ms)
             if last and r >= 2:
                 finite = [_robust(results[a.name].samples) for a in alive]
                 if all(m > 0 and s / m <= policy.stop_stdrel for m, s in finite):

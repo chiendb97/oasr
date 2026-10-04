@@ -182,9 +182,13 @@ reviewed change, never automatic.
 `oasr.autotune()` and the calibration:
 
 1. Refuses to run inside a CUDA-graph capture.
-2. Each arm is a CUDA graph of N ≥ 8 back-to-back calls (one call per replay
-   ranks *worse* than eager timing — Inductor PR #196413), plus a single-replay
-   gate against self-overlap.
+2. Each arm is a CUDA graph of N ≥ 8 calls (one call per replay ranks *worse*
+   than eager timing — Inductor PR #196413), plus a single-replay gate against
+   self-overlap. A tiny unrelated kernel follows every call, and its separately
+   measured cost is subtracted. Back-to-back copies of one cuBLAS kernel
+   overlap each other through programmatic dependent launch, but a GEMM between
+   a norm and an activation cannot. On B200 the unseparated loop credited
+   cuBLAS with about 0.65 µs per call that it does not get inside a model.
 3. Weights are rotated through enough copies to be cold when the served model's
    weight working set exceeds L2 — and stay warm when it does not.
 4. Arms are interleaved in shuffled rounds; the estimator is the median, σ is
