@@ -97,6 +97,15 @@ model.
     [`docs/vad.md`](docs/vad.md).
 15. **Do not commit or push unless asked.** Create the branch and the files, then
     hand off.
+16. **Run the applicable lint checks after every modification.** Do not defer
+    lint validation until the end of the task. For Python edits, run
+    `black --check`, `isort --check-only`, and `ruff check` on the changed files.
+    For Rust edits, run `cargo fmt --check` and
+    `cargo clippy --all-targets -- -D warnings` from `rust/`; lint `oasr-core`
+    separately with `cargo clippy -p oasr-core --lib -- -D warnings` when it is
+    affected (never use `--workspace`). Run `git diff --check` after every edit,
+    including documentation and configuration changes. Fix any lint failures
+    introduced by the modification and rerun the checks before proceeding.
 
 ---
 
