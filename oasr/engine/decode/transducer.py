@@ -67,9 +67,10 @@ from .base import DecodeStrategy, register_decode_strategy, wants_speech_activit
 from .options import option
 from .transducer_beam import (
     BeamState,
-    beam_search_chunk,
+    beam_search_frames,
+    fold_chunk,
     init_beam_state,
-    select_rows,
+    split_rows,
     stack_states,
 )
 
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
     from oasr.models.base import BaseAsrModel
     from oasr.models.decoders.base import Joiner, TransducerPredictor
 
+    from ..beam_graph import BeamLoopGraphCache
     from ..config import EngineConfig
     from ..greedy_graph import GreedyLoopGraphCache
     from ..predictor_graph import PredictorStepGraphCache
@@ -214,10 +216,11 @@ class TransducerOptions:
     loop_graphs: bool = option(
         True,
         doc=(
-            "Replay the greedy loop from CUDA graphs, one graph per "
-            f"{_TERMINATION_CHECK_STRIDE} iterations (greedy, no word timings; "
-            "needs use_transducer_cuda_graphs).  False keeps the eager loop, whose "
-            "only captured piece is the predictor step."
+            "Replay the decode loop from CUDA graphs, one graph per "
+            f"{_TERMINATION_CHECK_STRIDE} iterations: the greedy loop (no word timings) "
+            "and, with beam_size > 1, the beam search's frame loop.  Needs "
+            "use_transducer_cuda_graphs.  False keeps the eager loops, whose only "
+            "captured piece is the greedy predictor step."
         ),
     )
 
@@ -319,6 +322,14 @@ class TransducerDecodeStrategy(DecodeStrategy):
         # oasr/engine/greedy_graph.py.
         self._loop_graphs: Optional["GreedyLoopGraphCache"] = None
         self._loop_graphs_enabled = self._pred_graphs_enabled and bool(self.options.loop_graphs)
+        # Beam search's frame loop, replayed the same way (oasr/engine/beam_graph.py).
+        self._beam_graphs: Optional["BeamLoopGraphCache"] = None
+        self._beam_graphs_enabled = bool(
+            getattr(config, "use_cuda_graphs", False)
+            and getattr(config, "use_transducer_cuda_graphs", False)
+            and self._beam > 1
+            and self.options.loop_graphs
+        )
         # The fused kernel's view of the model, laid out on first use and again
         # whenever a source parameter changes (``_fused_versions``).  Gated on
         # greedy only: beam search keeps its own (B, k, ctx) state.
@@ -537,6 +548,46 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 unroll=_TERMINATION_CHECK_STRIDE,
             )
         return self._loop_graphs
+
+    def _beam_loop_graphs(self) -> Optional["BeamLoopGraphCache"]:
+        """The beam-search loop graph cache, built on first use.  ``None`` if off."""
+        if not self._beam_graphs_enabled:
+            return None
+        if self._beam_graphs is None:
+            from oasr.engine.beam_graph import BeamLoopGraphCache
+
+            self._beam_graphs = BeamLoopGraphCache(self._model, unroll=_TERMINATION_CHECK_STRIDE)
+        return self._beam_graphs
+
+    @torch.no_grad()
+    def _beam_search(
+        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor, state: BeamState
+    ) -> BeamState:
+        """One chunk of beam search from ``state``: replayed when it can be, else eager.
+
+        Both arms run the same step op for op and fold the chunk's back-pointers
+        with the same :func:`fold_chunk`, so the result does not depend on which
+        one served it.
+        """
+        if int(enc_out.size(1)) == 0:
+            return state
+        joiner, _decoder = self._surface()
+        enc_proj = joiner.encoder_proj(enc_out)  # type: ignore[operator]
+        lengths = enc_lengths.to(device=enc_proj.device, dtype=torch.long)
+        graphs = self._beam_loop_graphs()
+        if graphs is not None:
+            res = graphs.run(enc_proj, lengths, state.context, state.scores)
+            if res is not None:
+                context, scores, parents, labels = res
+                return fold_chunk(
+                    context,
+                    scores,
+                    state.prefixes,
+                    parents,
+                    labels,
+                    int(cast(int, self._model.blank_id)),
+                )
+        return beam_search_frames(self._model, enc_proj, lengths, state)
 
     def _fused_surface(self) -> Optional["StatelessGreedyWeights"]:
         """The fused kernel's weights; ``None`` if this model's surface does not
@@ -814,9 +865,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
         family (``OutputProcessor.fill_nbest_texts`` then detokenizes and trims
         to what the request asked for).
         """
-        B, T = enc_out.size(0), enc_out.size(1)
-        state = init_beam_state(self._model.decoder, B, self._beam, enc_out.device, capacity=T)
-        state = beam_search_chunk(self._model, enc_out, enc_lengths, state)
+        B = enc_out.size(0)
+        state = init_beam_state(self._model.decoder, B, self._beam, enc_out.device)
+        state = self._beam_search(enc_out, enc_lengths, state)
         rows, scores = state.hypotheses()
         return [
             RequestOutput(
@@ -843,7 +894,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
 
     @torch.no_grad()
     def prewarm_streaming(self, batch_sizes: Sequence[int], frames: int) -> None:
-        """Capture the greedy-loop graph for every streaming width up front.
+        """Capture the decode-loop graph (greedy or beam) for every streaming width up front.
 
         A stream's chunk is always ``frames`` encoder frames, so the loop graph's
         key is just the cohort width, and it walks ``1..max_batch_size`` as streams
@@ -852,8 +903,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
         mid-run.  All rows are passed with length zero, so each warm-up call is one
         inert replay after its capture.
         """
-        graphs = self._greedy_loop_graphs()
-        if graphs is None:
+        greedy = self._greedy_loop_graphs()
+        beam = self._beam_loop_graphs()
+        if greedy is None and beam is None:
             return
         joiner, _decoder = self._surface()
         weight = next(joiner.parameters())
@@ -861,9 +913,13 @@ class TransducerDecodeStrategy(DecodeStrategy):
         for b in sorted({int(b) for b in batch_sizes if int(b) >= 1}):
             enc = torch.zeros(b, int(frames), width, dtype=weight.dtype, device=weight.device)
             enc_proj = joiner.encoder_proj(enc)  # type: ignore[operator]
-            state, dec_proj = self._init_state(b, weight.device)
             lengths = torch.zeros(b, dtype=torch.long, device=weight.device)
-            graphs.run(enc_proj, lengths, state, dec_proj, max_steps=_TERMINATION_CHECK_STRIDE)
+            if greedy is not None:
+                state, dec_proj = self._init_state(b, weight.device)
+                greedy.run(enc_proj, lengths, state, dec_proj, max_steps=_TERMINATION_CHECK_STRIDE)
+            if beam is not None:
+                st = init_beam_state(self._model.decoder, b, self._beam, weight.device)
+                beam.run(enc_proj, lengths, st.context, st.scores)
 
     def _session(self, request_id: str, device: torch.device) -> _Session:
         s = self._sessions.get(request_id)
@@ -966,12 +1022,15 @@ class TransducerDecodeStrategy(DecodeStrategy):
                 for s in sessions
             ]
         )
-        state = beam_search_chunk(self._model, enc, lengths, state)
+        state = self._beam_search(enc, lengths, state)
         rows, scores = state.hypotheses()
-        for b, s in enumerate(sessions):
-            s.beam = select_rows(state, torch.tensor([b], device=enc.device))
-            s.nbest = (rows[b], scores[b])
-            s.hyp = list(rows[b][0])
+        # Views of the batched state, not per-stream copies: the next tick's
+        # ``stack_states`` copies them out, so this costs no launch and no
+        # per-stream host->device index.
+        for s, row_state, row, row_scores in zip(sessions, split_rows(state), rows, scores):
+            s.beam = row_state
+            s.nbest = (row, row_scores)
+            s.hyp = list(row[0])
 
     def decode_streaming_chunk(self, request: Request, enc_out: torch.Tensor) -> RequestOutput:
         outs = self.decode_streaming_batch([request], {request.request_id: enc_out})

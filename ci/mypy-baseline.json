@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 384,
+  "total": 383,
   "files": {
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
@@ -25,7 +25,7 @@
     "oasr/engine/decode/llm.py": 15,
     "oasr/engine/decode/paraformer.py": 7,
     "oasr/engine/decode/rescoring.py": 15,
-    "oasr/engine/decode/transducer.py": 6,
+    "oasr/engine/decode/transducer.py": 5,
     "oasr/engine/engine.py": 19,
     "oasr/engine/executor/offline.py": 3,
     "oasr/engine/generation/sampling.py": 1,

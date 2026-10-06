@@ -2,17 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batched modified beam search with at most one symbol per frame.
 
-A fixed ``(B, beam)`` grid keeps tokens and reordering on the device. Blank
-writes do not advance the token length, so the next emitted token overwrites
-them. Beam size one must exactly match one-symbol greedy decoding. Equivalent
+A fixed ``(B, beam)`` grid keeps scoring and reordering on the device.  Each frame
+records, per slot, the slot it was extended from and the label it took (blank when
+it emitted nothing); the token sequences are recovered once per chunk by walking
+those back-pointers from the final slots.  This replaced a ``(B, beam, cap)``
+token buffer that every frame gathered onto the new parents, scattered into and
+masked -- a cost that grew with the utterance and kept the buffer's growth on the
+host.  Recording is the same handful of ``(B, beam)`` writes at any length, which
+is also what lets a whole block of frames replay from one CUDA graph
+(``oasr/engine/beam_graph.py``).
+
+Beam size one must exactly match one-symbol greedy decoding.  Equivalent
 hypotheses are not merged.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 
 #: Score assigned to the ``k - 1`` initially-dead beam slots.  A large finite
@@ -22,29 +31,24 @@ import torch
 #: silently poisons a whole utterance's beam.
 _DEAD_SCORE = -1.0e30
 
-#: Growth granularity for the device-side token buffer, in tokens.  Streaming
-#: cannot know the final length up front, so the buffer grows geometrically with
-#: this floor rather than once per chunk.
-_TOKEN_CAP_GROWTH = 128
-
 
 @dataclass
 class BeamState:
-    """``(B, k)`` live hypotheses, all device-side.
+    """``(B, k)`` live hypotheses between chunks.
 
     Threaded through :func:`beam_search_chunk` so offline (one call over the
-    whole utterance) and streaming (one call per chunk) share the same core —
+    whole utterance) and streaming (one call per chunk) share the same core --
     the same arrangement the greedy path uses for its label window.
     """
 
-    #: ``(B, k, context_size)`` int64 predictor label windows.
+    #: ``(B, k, context_size)`` int64 predictor label windows (device).
     context: torch.Tensor
-    #: ``(B, k)`` float32 accumulated log-probabilities.
+    #: ``(B, k)`` float32 accumulated log-probabilities (device).
     scores: torch.Tensor
-    #: ``(B, k, cap)`` int64 emitted tokens, left-aligned.
-    tokens: torch.Tensor
-    #: ``(B, k)`` int64 count of valid entries in ``tokens``.
-    tok_len: torch.Tensor
+    #: ``[B][k]`` tokens each slot emitted before the current chunk (host).  A
+    #: chunk's back-pointers are folded into these when it ends, so the device
+    #: state stays the same size however long a stream runs.
+    prefixes: List[List[List[int]]]
 
     @property
     def batch(self) -> int:
@@ -54,129 +58,137 @@ class BeamState:
     def beam(self) -> int:
         return int(self.context.size(1))
 
-    def ensure_capacity(self, extra: int) -> None:
-        """Grow ``tokens`` so ``extra`` more emissions per hypothesis fit."""
-        need = int(self.tok_len.max().item()) + int(extra)
-        cap = int(self.tokens.size(2))
-        if need <= cap:
-            return
-        grow = max(need, cap * 2, _TOKEN_CAP_GROWTH)
-        pad = torch.zeros(
-            self.batch,
-            self.beam,
-            grow - cap,
-            dtype=self.tokens.dtype,
-            device=self.tokens.device,
-        )
-        self.tokens = torch.cat([self.tokens, pad], dim=2)
-
     def hypotheses(self) -> Tuple[List[List[List[int]]], List[List[float]]]:
-        """Read back per-utterance hypotheses, best first.
-
-        Returns ``(tokens[B][k][*], scores[B][k])``.  One host sync for the whole
-        beam — the same discipline as the greedy loop's single readback.
-        """
-        order = self.scores.argsort(dim=1, descending=True)  # (B, k)
-        toks = self.tokens.gather(1, order.unsqueeze(-1).expand(-1, -1, self.tokens.size(2)))
-        lens = self.tok_len.gather(1, order)
-        scores = self.scores.gather(1, order)
-        toks_h = toks.tolist()
-        lens_h = lens.tolist()
-        out = [[toks_h[b][j][: lens_h[b][j]] for j in range(self.beam)] for b in range(self.batch)]
-        return out, scores.tolist()
+        """Per-utterance hypotheses, best first: ``(tokens[B][k][*], scores[B][k])``."""
+        order = self.scores.argsort(dim=1, descending=True).tolist()
+        scores = self.scores.tolist()
+        rows = [[list(self.prefixes[b][j]) for j in order[b]] for b in range(self.batch)]
+        return rows, [[scores[b][j] for j in order[b]] for b in range(self.batch)]
 
 
-def init_beam_state(
-    decoder,
-    batch: int,
-    beam: int,
-    device: torch.device,
-    capacity: int = 0,
-) -> BeamState:
+def init_beam_state(decoder, batch: int, beam: int, device: torch.device) -> BeamState:
     """One live hypothesis (the empty one) per utterance, the rest dead."""
     context = decoder.init_state(batch * beam, device).view(batch, beam, -1)
     scores = torch.full((batch, beam), _DEAD_SCORE, dtype=torch.float32, device=device)
     scores[:, 0] = 0.0
-    cap = max(int(capacity), _TOKEN_CAP_GROWTH)
     return BeamState(
         context=context.contiguous(),
         scores=scores,
-        tokens=torch.zeros(batch, beam, cap, dtype=torch.long, device=device),
-        tok_len=torch.zeros(batch, beam, dtype=torch.long, device=device),
+        prefixes=[[[] for _ in range(beam)] for _ in range(batch)],
     )
 
 
 def beam_search_step(
     model,
     enc_proj_t: torch.Tensor,
-    state: BeamState,
+    context: torch.Tensor,
+    scores: torch.Tensor,
     active: torch.Tensor,
-) -> BeamState:
+    stay: torch.Tensor,
+    blank_label: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Advance every live hypothesis by one encoder frame.
 
     Parameters
     ----------
     enc_proj_t : Tensor
         ``(B, J)`` joiner-projected encoder frame.
+    context, scores : Tensor
+        The beam before the frame: ``(B, k, ctx)`` label windows, ``(B, k)`` scores.
     active : Tensor
-        ``(B,)`` bool — utterances whose frame ``t`` is within their length.
-        Inactive rows are left completely untouched (score, window and tokens),
-        so a short utterance in a mixed batch is not penalised by the padding
-        frames the batch forced it to carry.
+        ``(B,)`` bool -- utterances whose frame ``t`` is within their length.
+        Inactive rows are left completely untouched and record "every slot is
+        its own parent, emitting blank", so a short utterance in a mixed batch is
+        not penalised by the padding frames the batch forced it to carry, and
+        walking back through those frames is a no-op.
+    stay, blank_label : Tensor
+        ``(B, k)`` constants an inactive row records: ``arange(k)`` and ``blank``.
+        Passed in, not built here, so a captured graph reads buffers that outlive
+        the capture.
+
+    Returns ``(context, scores, parent, label)``: the beam after the frame and,
+    for each new slot, the slot it extended and the label it took.
 
     Hypothesis merging is deliberately absent.  Two beam entries can spell the
-    same sequence — a parent taking blank keeps sequence ``A`` while a shorter
-    parent ``B`` extended by ``y`` also spells ``A`` when ``A == B + [y]`` —
+    same sequence -- a parent taking blank keeps sequence ``A`` while a shorter
+    parent ``B`` extended by ``y`` also spells ``A`` when ``A == B + [y]`` --
     and icefall log-adds those scores.  Merging needs a per-frame sequence
-    comparison across the beam, which is precisely the Θ(T²) host-side work the
-    device-side token buffer exists to avoid.  The cost of skipping it is a beam
-    slot occasionally spent on a duplicate, i.e. an effectively narrower beam,
-    never a wrong hypothesis.  Revisit with a rolling sequence hash if a real
-    checkpoint shows a WER gap.
+    comparison across the beam, which the device-side grid exists to avoid.  The
+    cost of skipping it is a beam slot occasionally spent on a duplicate, i.e. an
+    effectively narrower beam, never a wrong hypothesis.  Revisit with a rolling
+    sequence hash if a real checkpoint shows a WER gap.
     """
     joiner = model.joiner
     decoder = model.decoder
     blank = int(model.blank_id)
 
-    B, k = state.batch, state.beam
-    ctx = int(state.context.size(2))
+    B, k, ctx = (int(d) for d in context.shape)
 
-    dec_out = decoder(state.context.reshape(B * k, ctx))
+    dec_out = decoder(context.reshape(B * k, ctx))
     dec_proj = joiner.decoder_proj(dec_out)  # (B*k, J)
     enc_rep = enc_proj_t.unsqueeze(1).expand(B, k, enc_proj_t.size(-1)).reshape(B * k, -1)
     logits = joiner(enc_rep, dec_proj, project_input=False)  # (B*k, V)
     vocab = int(logits.size(-1))
     log_probs = torch.log_softmax(logits.float(), dim=-1).view(B, k, vocab)
 
-    total = state.scores.unsqueeze(-1) + log_probs  # (B, k, V)
+    total = scores.unsqueeze(-1) + log_probs  # (B, k, V)
     top_scores, top_idx = total.view(B, k * vocab).topk(k, dim=-1)  # (B, k)
     parent = torch.div(top_idx, vocab, rounding_mode="floor")  # (B, k)
-    token = top_idx - parent * vocab  # (B, k)
+    label = top_idx - parent * vocab  # (B, k)
 
-    # Reorder the parents' state into the new beam.
-    new_context = state.context.gather(1, parent.unsqueeze(-1).expand(B, k, ctx))
-    cap = int(state.tokens.size(2))
-    new_tokens = state.tokens.gather(1, parent.unsqueeze(-1).expand(B, k, cap))
-    new_len = state.tok_len.gather(1, parent)
-
-    # Blank keeps the parent's label window; a real token shifts it in.
-    is_blank = token == blank
-    shifted = torch.cat([new_context[:, :, 1:], token.unsqueeze(-1)], dim=2)
+    # Reorder the parents' windows into the new beam; blank keeps the parent's
+    # window, a real token shifts it in.
+    new_context = context.gather(1, parent.unsqueeze(-1).expand(B, k, ctx))
+    is_blank = label == blank
+    shifted = torch.cat([new_context[:, :, 1:], label.unsqueeze(-1)], dim=2)
     new_context = torch.where(is_blank.unsqueeze(-1), new_context, shifted)
 
-    # Unconditional append (see the module docstring): a blank writes at
-    # ``new_len`` and does not advance it, so the slot is reused.
-    new_tokens = new_tokens.scatter(
-        2, new_len.clamp(max=cap - 1).unsqueeze(-1), token.unsqueeze(-1)
-    )
-    new_len = new_len + (~is_blank).long()
-
     keep = active.view(B, 1)
-    return BeamState(
-        context=torch.where(keep.unsqueeze(-1), new_context, state.context),
-        scores=torch.where(keep, top_scores, state.scores),
-        tokens=torch.where(keep.unsqueeze(-1), new_tokens, state.tokens),
-        tok_len=torch.where(keep, new_len, state.tok_len),
+    return (
+        torch.where(keep.unsqueeze(-1), new_context, context),
+        torch.where(keep, top_scores, scores),
+        torch.where(keep, parent, stay),
+        torch.where(keep, label, blank_label),
+    )
+
+
+def step_constants(batch: int, beam: int, blank: int, device: torch.device):
+    """``(stay, blank_label)`` for :func:`beam_search_step`."""
+    stay = torch.arange(beam, device=device).expand(batch, beam).contiguous()
+    blank_label = torch.full((batch, beam), int(blank), dtype=torch.long, device=device)
+    return stay, blank_label
+
+
+@torch.no_grad()
+def beam_search_frames(
+    model,
+    enc_proj: torch.Tensor,
+    lengths: torch.Tensor,
+    state: BeamState,
+) -> BeamState:
+    """Advance ``state`` over every frame of a joiner-projected chunk, eagerly."""
+    device = enc_proj.device
+    T = int(enc_proj.size(1))
+    if T == 0:
+        return state
+    lengths = lengths.to(device=device, dtype=torch.long)
+    stay, blank_label = step_constants(state.batch, state.beam, int(model.blank_id), device)
+    context, scores = state.context, state.scores
+    parents: List[torch.Tensor] = []
+    labels: List[torch.Tensor] = []
+    for t in range(T):
+        context, scores, parent, label = beam_search_step(
+            model, enc_proj[:, t], context, scores, t < lengths, stay, blank_label
+        )
+        parents.append(parent)
+        labels.append(label)
+    return fold_chunk(
+        context,
+        scores,
+        state.prefixes,
+        torch.stack(parents, dim=0),
+        torch.stack(labels, dim=0),
+        int(model.blank_id),
     )
 
 
@@ -192,66 +204,118 @@ def beam_search_chunk(
     ``lengths`` is per-row valid frames *within this chunk*, so the same call
     serves an offline utterance and one streaming chunk.
     """
-    device = enc_out.device
-    T = int(enc_out.size(1))
-    if T == 0:
+    if int(enc_out.size(1)) == 0:
         return state
-    lengths = lengths.to(device=device, dtype=torch.long)
-    # At most one emission per frame, so this chunk can add at most T tokens.
-    state.ensure_capacity(T)
     enc_proj = model.joiner.encoder_proj(enc_out)  # (B, T, J)
-    for t in range(T):
-        state = beam_search_step(model, enc_proj[:, t], state, active=t < lengths)
-    return state
+    return beam_search_frames(model, enc_proj, lengths, state)
 
 
-def select_rows(state: BeamState, rows: torch.Tensor) -> BeamState:
-    """Keep only ``rows`` of the batch (streaming regroups per tick)."""
+def fold_chunk(
+    context: torch.Tensor,
+    scores: torch.Tensor,
+    prefixes: Sequence[Sequence[List[int]]],
+    parents: torch.Tensor,
+    labels: torch.Tensor,
+    blank: int,
+) -> BeamState:
+    """Close a chunk: walk its back-pointers into each slot's token prefix.
+
+    ``parents`` / ``labels`` are frame-major ``(n, B, k)``: at frame ``t`` new
+    slot ``j`` extended slot ``parents[t, b, j]`` with ``labels[t, b, j]``.
+    Walking from each final slot to frame 0 gives the chunk's labels in order and
+    the slot the hypothesis occupied when the chunk began, whose prefix it extends.
+
+    One device->host copy per chunk, and a host walk vectorized over the ``B x k``
+    grid -- ``n`` steps of array indexing, never per token.
+    """
+    n, B, k = (int(d) for d in parents.shape)
+    if n == 0:
+        return BeamState(context=context, scores=scores, prefixes=[list(p) for p in prefixes])
+    hyps = B * k
+    # Back-pointers as absolute indices into the flattened (B * k) grid, so each
+    # frame of the walk is two 1-D gathers rather than a 2-D fancy index.  The
+    # offset is added where the history lives -- one kernel on the device, not a
+    # pass over the copy on the host -- and both planes cross in one transfer.
+    row_base = torch.arange(0, hyps, k, device=parents.device).view(1, B, 1)
+    history = torch.stack((parents + row_base, labels)).cpu().numpy().reshape(2, n, hyps)
+    parent, lab = history[0], history[1]
+    base = np.repeat(np.arange(0, hyps, k), k)
+    slot = np.arange(hyps)
+    path = np.empty((n, hyps), dtype=lab.dtype)
+    for t in range(n - 1, -1, -1):
+        path[t] = lab[t, slot]
+        slot = parent[t, slot]
+    root = (slot - base).tolist()  # the slot each hypothesis held when the chunk began
+    # Every hypothesis's emitted labels in one compaction and one ``tolist``,
+    # then cut by count: per hypothesis this is a list slice, not an array op.
+    tokens = path.T  # (B * k, n)
+    emitted = tokens != blank
+    flat = tokens[emitted].tolist()
+    ends = np.cumsum(emitted.sum(axis=1)).tolist()
+    starts = [0] + ends[:-1]
+    folded = [
+        [prefixes[b][root[h]] + flat[starts[h] : ends[h]] for h in range(b * k, (b + 1) * k)]
+        for b in range(B)
+    ]
+    return BeamState(context=context, scores=scores, prefixes=folded)
+
+
+def select_rows(state: BeamState, rows: Union[torch.Tensor, Sequence[int]]) -> BeamState:
+    """Keep only ``rows`` of the batch (copies; see :func:`split_rows` for views)."""
+    if isinstance(rows, torch.Tensor):
+        index = rows.to(device=state.context.device, dtype=torch.long)
+        keep = index.tolist()
+    else:
+        keep = [int(r) for r in rows]
+        index = torch.tensor(keep, dtype=torch.long, device=state.context.device)
     return BeamState(
-        context=state.context.index_select(0, rows),
-        scores=state.scores.index_select(0, rows),
-        tokens=state.tokens.index_select(0, rows),
-        tok_len=state.tok_len.index_select(0, rows),
+        context=state.context.index_select(0, index),
+        scores=state.scores.index_select(0, index),
+        prefixes=[list(map(list, state.prefixes[r])) for r in keep],
     )
 
 
-def stack_states(states: List[BeamState]) -> Optional[BeamState]:
+def split_rows(state: BeamState) -> List[BeamState]:
+    """One ``(1, k, ...)`` state per row, as views -- no copy, no launch.
+
+    Streaming hands each stream its row after every chunk; the views keep the
+    batched tensors alive until the next :func:`stack_states` copies them out.
+    """
+    return [
+        BeamState(
+            context=state.context[b : b + 1],
+            scores=state.scores[b : b + 1],
+            prefixes=[state.prefixes[b]],
+        )
+        for b in range(state.batch)
+    ]
+
+
+def stack_states(states: List[BeamState]) -> BeamState:
     """Stack per-stream ``(1, k, ...)`` states into one batched state.
 
     Streaming groups streams by chunk length per tick, so the group's membership
-    changes every tick; the token buffers are padded to the widest before the
-    concatenation.
+    changes every tick.  The device half is two small concatenations; the token
+    prefixes stay on the host.
     """
     if not states:
-        return None
-    cap = max(int(s.tokens.size(2)) for s in states)
-    toks = []
-    for s in states:
-        c = int(s.tokens.size(2))
-        if c < cap:
-            pad = torch.zeros(
-                s.tokens.size(0),
-                s.tokens.size(1),
-                cap - c,
-                dtype=s.tokens.dtype,
-                device=s.tokens.device,
-            )
-            toks.append(torch.cat([s.tokens, pad], dim=2))
-        else:
-            toks.append(s.tokens)
+        raise ValueError("stack_states needs at least one state")
     return BeamState(
         context=torch.cat([s.context for s in states], dim=0),
         scores=torch.cat([s.scores for s in states], dim=0),
-        tokens=torch.cat(toks, dim=0),
-        tok_len=torch.cat([s.tok_len for s in states], dim=0),
+        prefixes=[row for s in states for row in s.prefixes],
     )
 
 
 __all__ = [
     "BeamState",
     "beam_search_chunk",
+    "beam_search_frames",
     "beam_search_step",
+    "fold_chunk",
     "init_beam_state",
     "select_rows",
+    "split_rows",
     "stack_states",
+    "step_constants",
 ]
