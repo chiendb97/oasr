@@ -332,7 +332,7 @@ worth understanding before adding a third.
 
 | | File | Hypotheses live | Why |
 |---|---|---|---|
-| Frame-synchronous (transducer) | `decode/transducer_beam.py` | on the **device**, in a `(B, k, cap)` buffer | one beam step per encoder frame, so a host-side list-of-lists reorder would be Θ(T²) |
+| Frame-synchronous (transducer) | `decode/transducer_beam.py` | scores and label windows on the **device**; per-frame back-pointers, walked on the host once per chunk | one beam step per encoder frame, so a host-side list-of-lists reorder would be Θ(T²) |
 | Label-synchronous (AED, LLM) | `decode/incremental_beam.py` — `ArBeamGroup` | as host lists | an AR step is a full decoder forward, so `k` list copies are free next to it |
 
 The label-synchronous one needs **no new model method**: `select(state, idx)` is
@@ -351,6 +351,24 @@ The transducer strategy is the exception that says so: `beam_size > 1` is refuse
 at construction for a *recurrent* predictor, because modified beam search
 gather-reorders states in one `(B, k, ctx)` buffer, which only expresses a label
 window. See [models.md](models.md#the-transducer-predictor-state-is-opaque).
+
+The transducer beam records, per frame and slot, only the slot it extended and the
+label it took; `fold_chunk` walks those back-pointers once per chunk (offline: once
+per utterance) into each slot's token prefix. A frame is therefore the same handful
+of `(B, k)` writes at any utterance length, where the previous `(B, k, cap)` token
+buffer was gathered onto the new parents, scattered into and masked every frame.
+Streaming keeps the prefixes on the host between chunks, so a stream's device state
+stays `(1, k, ctx)` however long it runs.
+
+Every op of a step is fixed-shape for a given `(B, k)` and no step needs a host
+decision, so `TransducerOptions.loop_graphs` replays the frame loop from CUDA graphs
+16 frames at a time (`oasr/engine/beam_graph.py`), with the same exact-width keys and
+power-of-two frame capacities as the greedy loop graphs. Replay and eager are
+bit-identical in every hypothesis and score. The eager loop was host-bound: 33
+launches per frame, the GPU 10% busy, and the wall time flat from `B = 64` to
+`B = 256`. Measured on the icefall transducer (RTX 5090, `B = 64`, `k = 4`, 256
+frames), the decode went from 118 ms to 15 ms. In-process on LJSpeech-200, `k = 4`
+went from 533x to 2,059x real time against greedy's 2,414x, with WER unchanged.
 
 Transducer greedy is `beam_size=1` by construction and caps per-frame emissions
 with `EngineConfig.transducer_max_sym_per_frame`.

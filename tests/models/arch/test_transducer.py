@@ -674,7 +674,7 @@ class TestTransducerBeamSearch:
         lengths = torch.tensor([T, T - 5, T - 11, T][:B], device="cuda")
         return enc, lengths
 
-    def _strategy(self, model, beam, max_sym):
+    def _strategy(self, model, beam, max_sym, graphs=False):
         from oasr.engine.decode.transducer import TransducerDecodeStrategy
 
         cfg = SimpleNamespace(
@@ -682,6 +682,8 @@ class TestTransducerBeamSearch:
             transducer_max_sym_per_frame=max_sym,
             decode_options={"beam_size": beam},
             partial_decode_interval=1,
+            use_cuda_graphs=graphs,
+            use_transducer_cuda_graphs=graphs,
         )
         detok = SimpleNamespace(
             detokenize=lambda ids: " ".join(map(str, ids)),
@@ -693,7 +695,7 @@ class TestTransducerBeamSearch:
     def _beam_rows(self, model, enc, lengths, beam):
         from oasr.engine.decode.transducer_beam import beam_search_chunk, init_beam_state
 
-        st = init_beam_state(model.decoder, enc.size(0), beam, enc.device, capacity=enc.size(1))
+        st = init_beam_state(model.decoder, enc.size(0), beam, enc.device)
         st = beam_search_chunk(model, enc, lengths, st)
         return st.hypotheses()
 
@@ -790,6 +792,160 @@ class TestTransducerBeamSearch:
         streamed = [s.hypotheses()[0][0] for s in per_stream]
         for b in range(B):
             assert streamed[b] == offline[b], f"stream/offline beam differ on row {b}"
+
+    # -- back-pointers ---------------------------------------------------
+
+    def test_fold_chunk_walks_back_pointers_into_root_prefixes(self):
+        """A history small enough to check on paper: one utterance, two slots.
+
+        frame 0: slot0 = old0 + 5,  slot1 = old0 + blank  ->  [1, 5]  [1]
+        frame 1: slot0 = f0[1] + 7, slot1 = f0[0] + blank ->  [1, 7]  [1, 5]
+        frame 2: slot0 = f1[1] + blank, slot1 = f1[0] + 9 ->  [1, 5]  [1, 7, 9]
+
+        Both final hypotheses descend from old slot 0, so old slot 1's prefix is
+        dropped -- the case a walk that ignored the root slot would get wrong.
+        """
+        from oasr.engine.decode.transducer_beam import fold_chunk
+
+        parents = torch.tensor([[[0, 0]], [[1, 0]], [[1, 0]]])  # frame-major (n, B, k)
+        labels = torch.tensor([[[5, 0]], [[7, 0]], [[0, 9]]])
+        st = fold_chunk(
+            torch.zeros(1, 2, 2, dtype=torch.long),
+            torch.zeros(1, 2),
+            [[[1], [2]]],
+            parents,
+            labels,
+            blank=0,
+        )
+        assert st.prefixes == [[[1, 5], [1, 7, 9]]]
+
+    @pytest.mark.parametrize("blank_bias", [2.0, 0.5, -1.0])
+    def test_back_pointers_rebuild_what_a_token_list_beam_keeps(self, model, blank_bias):
+        """The walk against the most direct bookkeeping there is.
+
+        The reference runs the same :func:`beam_search_step` arithmetic but keeps
+        every slot's tokens as a host list, extended from its parent each frame;
+        the production path records (parent, label) per frame and rebuilds the
+        lists once.  They must agree list for list -- through ragged lengths, so
+        frames where some rows are inactive are walked too.
+        """
+        from oasr.engine.decode.transducer_beam import (
+            beam_search_step,
+            init_beam_state,
+            step_constants,
+        )
+
+        self._set_blank_bias(model, blank_bias)
+        enc, lengths = self._enc(model)
+        B, T, k = enc.size(0), enc.size(1), 4
+        blank = int(model.blank_id)
+        with torch.no_grad():
+            enc_proj = model.joiner.encoder_proj(enc)
+            st = init_beam_state(model.decoder, B, k, enc.device)
+            stay, blank_label = step_constants(B, k, blank, enc.device)
+            context, scores = st.context, st.scores
+            lists = [[[] for _ in range(k)] for _ in range(B)]
+            for t in range(T):
+                context, scores, parent, label = beam_search_step(
+                    model, enc_proj[:, t], context, scores, t < lengths, stay, blank_label
+                )
+                par, lab = parent.tolist(), label.tolist()
+                lists = [
+                    [
+                        lists[b][par[b][j]] + ([lab[b][j]] if lab[b][j] != blank else [])
+                        for j in range(k)
+                    ]
+                    for b in range(B)
+                ]
+            order = scores.argsort(dim=1, descending=True).tolist()
+        got, _ = self._beam_rows(model, enc, lengths, beam=k)
+        assert got == [[lists[b][j] for j in order[b]] for b in range(B)]
+
+    # -- the replayed frame loop ------------------------------------------
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    @pytest.mark.parametrize("batch,frames,beam", [(1, 9, 2), (5, 41, 4), (3, 70, 8)])
+    def test_graphed_beam_is_bit_identical_to_eager(self, dtype, batch, frames, beam):
+        """The replayed loop is the eager step op for op, so every hypothesis and
+        every score must be *equal*.
+
+        Half precision, so the captured predictor and joiner are OASR kernels
+        launched through TVM-FFI rather than torch fallbacks.  Ragged lengths put
+        rows past their end while others decode; ``frames=70`` crosses the
+        smallest capacity rung (64), and ``frames=9`` leaves most of one replay
+        past the chunk -- frames that must be inert for every row.
+        """
+        from helpers.transducer import exact_transducer, integer_frames
+
+        model = exact_transducer(dtype, blank_bias=8.0, seed=frames)
+        enc = integer_frames(batch, frames, dtype, seed=batch * frames)
+        lengths = torch.tensor(
+            [frames - (7 * i) % max(1, frames // 2) for i in range(batch)], device="cuda"
+        )
+        eager = self._strategy(model, beam=beam, max_sym=1)
+        graphed = self._strategy(model, beam=beam, max_sym=1, graphs=True)
+        with torch.no_grad():
+            want = eager.decode_offline(enc, lengths)
+            got = graphed.decode_offline(enc, lengths)
+        assert eager._beam_graphs is None
+        assert graphed._beam_graphs is not None and graphed._beam_graphs.stats()["hits"] == 1
+        assert [o.tokens for o in got] == [o.tokens for o in want]
+        assert [o.scores for o in got] == [o.scores for o in want]
+
+    def test_graphed_streaming_beam_matches_offline_beam(self):
+        """Chunks replayed per tick, stacked and split per stream, still equal one
+        offline pass -- the last chunk shorter, served by the same capture."""
+        from helpers.transducer import exact_transducer, integer_frames
+
+        model = exact_transducer(torch.bfloat16, blank_bias=8.0, seed=3)
+        B, T, chunk = 3, 41, 16
+        enc = integer_frames(B, T, torch.bfloat16, seed=7)
+        strat = self._strategy(model, beam=4, max_sym=1, graphs=True)
+        reqs = [SimpleNamespace(request_id=f"s{b}") for b in range(B)]
+        for req in reqs:
+            strat.create_session(req)
+        with torch.no_grad():
+            for start in range(0, T, chunk):
+                strat.decode_streaming_batch(
+                    reqs,
+                    {
+                        r.request_id: enc[b : b + 1, start : start + chunk]
+                        for b, r in enumerate(reqs)
+                    },
+                )
+            streamed = [strat.finalize(r).tokens for r in reqs]
+            offline = self._strategy(model, beam=4, max_sym=1).decode_offline(
+                enc, torch.full((B,), T, device="cuda")
+            )
+        assert strat._beam_graphs is not None and strat._beam_graphs.stats()["hits"] == 3
+        assert streamed == [o.tokens for o in offline]
+
+    def test_beam_graph_capture_budget_declines_rather_than_growing(self):
+        from helpers.transducer import exact_transducer, integer_frames
+
+        from oasr.engine.beam_graph import BeamLoopGraphCache
+        from oasr.engine.decode.transducer_beam import init_beam_state
+
+        model = exact_transducer(torch.bfloat16)
+        cache = BeamLoopGraphCache(model, unroll=16, max_captures=1)
+        with torch.no_grad():
+            for B, served in ((2, True), (3, False)):
+                st = init_beam_state(model.decoder, B, 2, torch.device("cuda"))
+                enc_proj = model.joiner.encoder_proj(integer_frames(B, 5, torch.bfloat16))
+                lengths = torch.full((B,), 5, device="cuda")
+                got = cache.run(enc_proj, lengths, st.context, st.scores)
+                assert (got is not None) is served, f"B={B}"
+        assert cache.num_captured == 1 and cache.stats()["fallbacks"] == 1
+
+    def test_beam_graph_unroll_must_fit_the_frame_capacity(self):
+        """A replay count is ``ceil(T / unroll)``, which must never run past the
+        smallest capacity rung's buffers."""
+        from helpers.transducer import exact_transducer
+
+        from oasr.engine.beam_graph import BeamLoopGraphCache
+
+        with pytest.raises(ValueError, match="unroll"):
+            BeamLoopGraphCache(exact_transducer(torch.bfloat16), unroll=24)
 
 
 # --------------------------------------------------------------------------- #
