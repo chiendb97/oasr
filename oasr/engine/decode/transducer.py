@@ -33,12 +33,31 @@ snapshots read back in one sync at loop end.  Loop *control* costs one host sync
 per iteration (the predictor-recompute gate) plus one per
 ``_TERMINATION_CHECK_STRIDE`` iterations; see that constant for why the second
 one is amortized and the first is not.
+
+**The fused path.**  When the predictor and joiner declare the tensors a fused
+step reads (:meth:`TransducerPredictor.stateless_tensors` /
+:meth:`Joiner.additive_tensors` -- icefall's stateless predictor and additive
+joiner do; a recurrent predictor does not), the whole loop is one kernel launch,
+:func:`oasr.transducer_greedy_decode`, and the host waits once per batch.  The
+loop below, graph-replayed or eager, is what every other surface runs, and what a
+batch whose emissions overflow the kernel's buffer falls back to.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 
 import torch
 
@@ -55,6 +74,7 @@ from .transducer_beam import (
 )
 
 if TYPE_CHECKING:
+    from oasr.functionals.transducer import StatelessGreedyResult, StatelessGreedyWeights
     from oasr.models.base import BaseAsrModel
     from oasr.models.decoders.base import Joiner, TransducerPredictor
 
@@ -127,6 +147,53 @@ class _Session:
         return self.detok.get("text", "")
 
 
+class _FusedReadback:
+    """One device->host copy of a fused decode's results, parsed on demand.
+
+    ``counts``, ``tokens`` (and ``frames`` when tracking) are concatenated on the
+    device and copied in one non-blocking transfer into page-locked memory; the
+    posteriors, a different dtype, take a second.  :meth:`result` waits on the
+    copy and slices each row to its own emission count with numpy, so the only
+    per-token Python is building the lists the caller returns.
+    """
+
+    def __init__(self, res: "StatelessGreedyResult", track: bool) -> None:
+        self._cap = int(res.tokens.size(1))
+        self._track = track
+        parts = [res.counts[:, None], res.tokens] + ([res.frames] if track else [])
+        blob = torch.cat(parts, dim=1)
+        self._host = torch.empty(blob.shape, dtype=blob.dtype, pin_memory=True)
+        self._host.copy_(blob, non_blocking=True)
+        self._probs: Optional[torch.Tensor] = None
+        if track:
+            assert res.probs is not None
+            self._probs = torch.empty(res.probs.shape, dtype=res.probs.dtype, pin_memory=True)
+            self._probs.copy_(res.probs, non_blocking=True)
+        self._done = torch.cuda.Event()
+        self._done.record()
+
+    def result(
+        self,
+    ) -> Optional[Tuple[List[List[int]], List[List[Tuple[int, float]]]]]:
+        """``(hyps, marks)``, or ``None`` when a row overflowed the buffer."""
+        self._done.synchronize()
+        arr = self._host.numpy()
+        counts = arr[:, 0]
+        if counts.size and int(counts.max()) > self._cap:
+            return None
+        cap = self._cap
+        hyps = [arr[b, 1 : 1 + int(n)].tolist() for b, n in enumerate(counts)]
+        marks: List[List[Tuple[int, float]]] = []
+        if self._track:
+            assert self._probs is not None
+            probs = self._probs.numpy()
+            for b, n in enumerate(counts):
+                n = int(n)
+                frames = arr[b, 1 + cap : 1 + cap + n].tolist()
+                marks.append(list(zip(frames, probs[b, :n].tolist())))
+        return hyps, marks
+
+
 @dataclass(frozen=True)
 class TransducerOptions:
     """Options for the frame-synchronous transducer greedy decode."""
@@ -151,6 +218,27 @@ class TransducerOptions:
             f"{_TERMINATION_CHECK_STRIDE} iterations (greedy, no word timings; "
             "needs use_transducer_cuda_graphs).  False keeps the eager loop, whose "
             "only captured piece is the predictor step."
+        ),
+    )
+
+    fused: bool = option(
+        True,
+        doc=(
+            "Decode a greedy batch with one fused kernel launch "
+            "(oasr.transducer_greedy_decode) when the model's predictor and joiner "
+            "declare the tensors it reads -- a stateless label-window predictor and "
+            "an additive joiner, in half precision.  False keeps the op-by-op loop "
+            "(loop_graphs decides how that one runs)."
+        ),
+    )
+
+    side_stream: bool = option(
+        True,
+        doc=(
+            "Issue a queued offline fused decode on a side stream, so it runs beside "
+            "the next batch's encoder rather than in front of it: the kernel occupies "
+            "one CTA per row and leaves the rest of the GPU idle.  False keeps it on "
+            "the forward's stream."
         ),
     )
 
@@ -231,6 +319,18 @@ class TransducerDecodeStrategy(DecodeStrategy):
         # oasr/engine/greedy_graph.py.
         self._loop_graphs: Optional["GreedyLoopGraphCache"] = None
         self._loop_graphs_enabled = self._pred_graphs_enabled and bool(self.options.loop_graphs)
+        # The fused kernel's view of the model, laid out on first use and again
+        # whenever a source parameter changes (``_fused_versions``).  Gated on
+        # greedy only: beam search keeps its own (B, k, ctx) state.
+        self._fused_weights: Optional["StatelessGreedyWeights"] = None
+        self._fused_versions: Tuple[int, ...] = ()
+        self._fused_enabled = self._beam <= 1 and bool(self.options.fused)
+        #: Where :meth:`decode_offline_async` issues the fused decode; created on
+        #: first use, once, so it never strands a cuBLAS workspace per call.
+        self._side_stream: Optional[torch.cuda.Stream] = None
+        #: Accounting for the fused path: batches it decoded, batches it handed
+        #: to the loop (unsupported dtype/shape), and emission-buffer overflows.
+        self.fused_stats = {"hits": 0, "fallbacks": 0, "overflows": 0}
         if self._beam > 1 and model is not None:
             # Beam search keeps every hypothesis's state in one ``(B, k, ctx)``
             # buffer and reorders it onto the new parents with a ``gather``
@@ -282,6 +382,15 @@ class TransducerDecodeStrategy(DecodeStrategy):
         # Project the encoder output once; per step only the predictor is re-run.
         enc_proj = joiner.encoder_proj(enc_out)  # (B, T, J)
         max_steps = int(T) * (max_sym + 1) + B + 1  # termination safety bound
+
+        fused = self._fused_launch(enc_proj, lengths, state, dec_proj, track)
+        if fused is not None:
+            read = _FusedReadback(fused, track)
+            parsed = read.result()
+            if parsed is not None:
+                hyps_f, marks_f = parsed
+                return hyps_f, marks_f, fused.window, fused.dec_proj
+            self.fused_stats["overflows"] += 1
 
         if not track:
             # The whole loop from graph replays when it can be served; the eager
@@ -429,6 +538,98 @@ class TransducerDecodeStrategy(DecodeStrategy):
             )
         return self._loop_graphs
 
+    def _fused_surface(self) -> Optional["StatelessGreedyWeights"]:
+        """The fused kernel's weights; ``None`` if this model's surface does not
+        declare them (then never asked again).
+
+        Laid out once and reused -- unless a source parameter has been written
+        since (its ``_version`` moved: a ``load_state_dict``, a ``copy_``), in
+        which case the K-major copies are rebuilt rather than decoding with the
+        weights the model had when they were made.
+        """
+        if not self._fused_enabled:
+            return None
+        joiner, decoder = self._surface()
+        pred = getattr(decoder, "stateless_tensors", lambda: None)()
+        join = getattr(joiner, "additive_tensors", lambda: None)()
+        if pred is None or join is None:
+            self._fused_enabled = False
+            return None
+        sources = (
+            join.output_weight,
+            join.output_bias,
+            join.decoder_proj_weight,
+            join.decoder_proj_bias,
+            pred.embedding,
+            pred.conv_weight,
+        )
+        versions = tuple(-1 if t is None else int(t._version) for t in sources)
+        if self._fused_weights is None or versions != self._fused_versions:
+            from oasr.functionals.transducer import StatelessGreedyWeights
+
+            self._fused_weights = StatelessGreedyWeights.prepare(
+                output_weight=join.output_weight,
+                output_bias=join.output_bias,
+                vocab=join.vocab_size,
+                activation=join.activation,
+                embedding=pred.embedding,
+                conv_weight=pred.conv_weight,
+                context=pred.context_size,
+                group=pred.group_size,
+                decoder_proj_weight=join.decoder_proj_weight,
+                decoder_proj_bias=join.decoder_proj_bias,
+                blank=pred.blank_id,
+            )
+            self._fused_versions = versions
+        return self._fused_weights
+
+    def _fused_launch(
+        self,
+        enc_proj: torch.Tensor,
+        lengths: torch.Tensor,
+        state: Any,
+        dec_proj: torch.Tensor,
+        track: bool,
+    ) -> Optional["StatelessGreedyResult"]:
+        """Queue the fused greedy decode, or ``None`` when it cannot serve this call.
+
+        Nothing is read back here; :class:`_FusedReadback` does that, so an
+        asynchronous caller can queue the next forward first.
+        """
+        if not self._fused_enabled:
+            return None
+        # The cheap disqualifiers first, so a CPU or fp32 run never lays out
+        # weights it cannot use.
+        if not (
+            enc_proj.is_cuda
+            and enc_proj.dtype in (torch.float16, torch.bfloat16)
+            and dec_proj.dtype == enc_proj.dtype
+            and isinstance(state, torch.Tensor)
+            and state.dtype == torch.int64
+            and state.dim() == 2
+        ):
+            self.fused_stats["fallbacks"] += 1
+            return None
+        weights = self._fused_surface()
+        if weights is None:
+            return None
+        if not weights.supports(enc_proj):
+            self.fused_stats["fallbacks"] += 1
+            return None
+        from oasr.functionals.transducer import transducer_greedy_decode
+
+        self.fused_stats["hits"] += 1
+        res: "StatelessGreedyResult" = transducer_greedy_decode(
+            enc_proj,
+            lengths.to(device=enc_proj.device, dtype=torch.long),
+            state.contiguous(),
+            dec_proj.contiguous(),
+            weights,
+            max_sym=self._max_sym,
+            track=track,
+        )
+        return res
+
     def _surface(self) -> Tuple["Joiner", "TransducerPredictor"]:
         """``(joiner, predictor)`` with their real types.
 
@@ -485,6 +686,88 @@ class TransducerDecodeStrategy(DecodeStrategy):
                     self.attach_emission_alignment(out, hyps[b], frames, probs)
             self._attach_emission_activity(outputs, marks, enc_out, enc_lengths, requests)
         return outputs
+
+    def _decode_stream(self, device: torch.device) -> Optional[torch.cuda.Stream]:
+        """The side stream :meth:`decode_offline_async` issues on, or ``None`` when off."""
+        if not self.options.side_stream:
+            return None
+        if self._side_stream is None:
+            self._side_stream = torch.cuda.Stream(device=device)
+        return self._side_stream
+
+    def _fused_issue(
+        self, enc_proj: torch.Tensor, enc_lengths: torch.Tensor
+    ) -> Optional[_FusedReadback]:
+        """Queue a fresh batch's fused decode and its read-back on the current stream."""
+        state, dec_proj = self._init_state(enc_proj.size(0), enc_proj.device)
+        res = self._fused_launch(enc_proj, enc_lengths, state, dec_proj, False)
+        return None if res is None else _FusedReadback(res, False)
+
+    @torch.no_grad()
+    def decode_offline_async(
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        requests: Optional[List[Request]] = None,
+    ) -> Optional[Callable[[], List[RequestOutput]]]:
+        """The fused decode with its read-back queued rather than waited on.
+
+        Only the fused path can do this -- it is one launch plus one copy, so
+        everything up to the read-back is already on the stream when this
+        returns -- and only for a batch that asked for neither word timings nor
+        speech activity (``requests is None``), which decode synchronously.  A
+        batch that overflows the kernel's emission buffer is re-decoded by
+        :meth:`decode_offline` inside the returned call, so the result is the
+        same either way.
+
+        With ``side_stream`` the decode and its read-back are issued on a side
+        stream.  The kernel keeps one CTA per row resident for the whole decode
+        (64 of a 5090's 170 SMs at ``B=64``) and the rest of the GPU idles behind
+        it; on the side stream the executor's next forward, queued on the main
+        stream a tick later, fills those SMs instead.  The side stream waits for
+        everything the main stream has queued -- the encoder and the
+        ``encoder_proj`` this call adds -- and the allocator is told the side
+        stream reads ``enc_proj`` and ``enc_lengths``, so the next forward cannot
+        be handed their blocks while the kernel still reads them.
+        """
+        if requests is not None or self._beam > 1 or not self._fused_enabled:
+            return None
+        if not (enc_out.is_cuda and enc_out.dtype in (torch.float16, torch.bfloat16)):
+            return None
+        joiner, _decoder = self._surface()
+        enc_proj = joiner.encoder_proj(enc_out)  # type: ignore[operator]
+        side = self._decode_stream(enc_out.device)
+        if side is None:
+            read = self._fused_issue(enc_proj, enc_lengths)
+        else:
+            side.wait_stream(torch.cuda.current_stream(enc_out.device))
+            with torch.cuda.stream(side):
+                read = self._fused_issue(enc_proj, enc_lengths)
+            enc_proj.record_stream(side)
+            enc_lengths.record_stream(side)
+        if read is None:
+            return None
+        # The weights ride with the read-back until it is consumed: a re-laid-out
+        # set must not free the tensors a side-stream kernel is still reading.
+        pending: Tuple[_FusedReadback, Any] = (read, self._fused_weights)
+
+        def collect() -> List[RequestOutput]:
+            parsed = pending[0].result()
+            if parsed is None:
+                self.fused_stats["overflows"] += 1
+                return self.decode_offline(enc_out, enc_lengths, requests)
+            hyps, _marks = parsed
+            return [
+                RequestOutput(
+                    request_id="",
+                    text=self._detok.detokenize(h),
+                    tokens=[h],
+                    finished=True,
+                )
+                for h in hyps
+            ]
+
+        return collect
 
     def _attach_emission_activity(
         self,

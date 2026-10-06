@@ -16,7 +16,7 @@ import torch
 from oasr.layers import ColumnParallelLinear, Linear, Tanh
 from oasr.models.base import align_out_features
 
-from ..decoders.base import Joiner
+from ..decoders.base import AdditiveJoinerTensors, Joiner
 
 
 class TransducerJoiner(Joiner):
@@ -33,6 +33,21 @@ class TransducerJoiner(Joiner):
         self.vocab_size = vocab_size
         self.output_linear = Linear(joiner_dim, align_out_features(vocab_size))
         self.tanh = Tanh()
+
+    def additive_tensors(self) -> AdditiveJoinerTensors:
+        """The output head and decoder projection the fused greedy decode reads.
+
+        ``output_linear`` is passed padded (its alignment rows carry a hugely
+        negative bias and sit past ``vocab_size``, so they are never candidates).
+        """
+        return AdditiveJoinerTensors(
+            output_weight=self.output_linear.weight,
+            output_bias=self.output_linear.bias,
+            vocab_size=self.vocab_size,
+            activation="tanh",
+            decoder_proj_weight=self.decoder_proj.weight,
+            decoder_proj_bias=self.decoder_proj.bias,
+        )
 
     def forward(
         self,

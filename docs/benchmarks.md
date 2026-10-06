@@ -309,6 +309,22 @@ python benchmarks/run.py --family accuracy \
 - `--service-mode` on `bench_service.py` is **auto-derived** from
   `--subroutines` (offline / whisper / grpc_offline → `offline`; streaming /
   grpc_streaming → `streaming`). Mixed subroutine sets are rejected.
+- An **explicit-only architecture needs `--architecture`** (e.g.
+  `--architecture transducer`): the harness passes it to the spawned server
+  through `--engine-config`. Without it an icefall pruned-RNNT directory sniffs
+  as `zipformer` and every request fails.
+- gRPC requests carry **no `language_code`** unless `--language-code` is given.
+  Only a family with a language control (Whisper, speech-LLM) accepts one; the
+  others reject it at admission, so the old fixed `en-US` failed every gRPC
+  request on them. Pass `--language-code en-US` for Whisper to keep its old
+  behaviour.
+- The client is **one asyncio process** (request bodies are encoded before the
+  clock starts). On a fast model it, not the server, is the ceiling — about
+  2,400x RTFx over HTTP on an RTX 5090 against a server that sustains several
+  times that. To measure the server itself, drive it from several client
+  processes. Clients that reconnect in bursts also need the server's
+  `--listen-backlog` (default 4096; it was 128): past the accept queue each new
+  connection waits out a 1 s SYN retransmit.
 - `--num-workers > 1` is rejected — `oasr-server` is now one-process-per-GPU.
   For multi-GPU, launch N `oasr-server` processes manually with distinct
   `--http-bind`/`--grpc-bind` + `CUDA_VISIBLE_DEVICES`.

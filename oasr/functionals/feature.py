@@ -25,7 +25,8 @@ Feature building blocks, several of which chain through :func:`oasr.rfft_power`:
 from __future__ import annotations
 
 import functools
-from typing import Optional
+import weakref
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -223,6 +224,35 @@ def fbank_preprocess(
     return out
 
 
+#: Per-mel-matrix nonzero spans, keyed by tensor identity: ``id -> (weakref,
+#: version, spans)``.  The weakref check is what keeps a recycled ``id`` from
+#: handing one matrix's spans to another.
+_MEL_SPANS: Dict[int, Tuple["weakref.ReferenceType[torch.Tensor]", int, torch.Tensor]] = {}
+
+
+def _mel_spans(mel_mat: torch.Tensor) -> torch.Tensor:
+    """``(num_mel, 2)`` int32 ``[first nonzero bin, one past the last]`` per filter.
+
+    Computed on the device once per filterbank and reused: both callers hold
+    their matrix in an ``lru_cache``, so this is one small reduction per process,
+    not per batch.  An all-zero filter gets ``[0, 0]`` and sums nothing, exactly
+    as the dense loop summed zeros.
+    """
+    entry = _MEL_SPANS.get(id(mel_mat))
+    if entry is not None and entry[0]() is mel_mat and entry[1] == mel_mat._version:
+        return entry[2]
+    nz = mel_mat != 0
+    n = int(mel_mat.size(1))
+    any_nz = nz.any(dim=1)
+    first = torch.where(any_nz, nz.int().argmax(dim=1), 0)
+    last = torch.where(any_nz, n - nz.flip(1).int().argmax(dim=1), 0)
+    spans = torch.stack([first, last], dim=1).to(torch.int32).contiguous()
+    if len(_MEL_SPANS) >= 64:
+        _MEL_SPANS.clear()
+    _MEL_SPANS[id(mel_mat)] = (weakref.ref(mel_mat), mel_mat._version, spans)
+    return spans
+
+
 @oasr_api
 def mel_log(
     power: torch.Tensor,
@@ -287,13 +317,15 @@ def mel_log(
         if frame_lengths is None
         else frame_lengths.to(device=power.device, dtype=torch.int32).contiguous()
     )
+    mel_mat = mel_mat.contiguous()
     _get_features_module().mel_log(
         out,
         power.contiguous(),
-        mel_mat.contiguous(),
+        mel_mat,
         float(log_floor),
         float(log_offset),
         lens,
+        _mel_spans(mel_mat),
     )
     return out
 

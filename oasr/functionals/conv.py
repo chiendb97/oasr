@@ -78,16 +78,18 @@ def _is_pointwise_conv2d(
     )
 
 
-def _default_conv2d_fn():
-    from oasr.jit.conv import CONV2D_DEFAULT, conv2d_func_name
+@functools.cache
+def _conv2d_fn(out_channels: int):
+    """The un-tuned CUTLASS Conv2D launcher for a layer with ``out_channels`` outputs."""
+    cfg = _jit_conv.select_default_conv2d_config(out_channels, _target_sm())
+    return getattr(_get_conv2d_module(), _jit_conv.conv2d_func_name(cfg))
 
-    return getattr(_get_conv2d_module(), conv2d_func_name(CONV2D_DEFAULT))
 
-
-def _default_conv2d_activation_fn():
-    from oasr.jit.conv import CONV2D_DEFAULT, conv2d_activation_func_name
-
-    return getattr(_get_conv2d_module(), conv2d_activation_func_name(CONV2D_DEFAULT))
+@functools.cache
+def _conv2d_activation_fn(out_channels: int):
+    """:func:`_conv2d_fn`'s fused-activation twin (same tile, same selection)."""
+    cfg = _jit_conv.select_default_conv2d_config(out_channels, _target_sm())
+    return getattr(_get_conv2d_module(), _jit_conv.conv2d_activation_func_name(cfg))
 
 
 def _default_conv1d_fn():
@@ -556,7 +558,7 @@ def conv2d(
             out, input, filter, bias, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w
         )
     else:
-        _default_conv2d_fn()(
+        _conv2d_fn(K)(
             out, input, filter, bias, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w
         )
     return out
@@ -777,7 +779,7 @@ def conv2d_activation(
             dilation_w,
         )
     else:
-        _default_conv2d_activation_fn()(
+        _conv2d_activation_fn(K)(
             out,
             input,
             filter,

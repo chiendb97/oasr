@@ -140,6 +140,55 @@ class TestMelLog:
         expected = math.log(1e-10)
         assert torch.allclose(out, torch.full_like(out, expected), rtol=1e-4)
 
+    @pytest.mark.parametrize("with_lengths", [False, True])
+    def test_nonzero_spans_are_bit_identical_to_the_dense_sum(self, with_lengths):
+        """``mel_log`` sums each filter over its nonzero span only; the dense kernel
+        (no span table) is the oracle, and they must agree bit for bit."""
+        from oasr.functionals import feature as feature_fn
+        from oasr.layers.feature import kaldi_mel_banks
+
+        torch.manual_seed(3)
+        mel_mat = kaldi_mel_banks(80, 512, 16000, 20.0, 0.0, torch.device("cuda"))
+        # A zero filter; a span crossing a lane boundary at both ends; and one
+        # many lanes wide, where each lane sums several bins over a power that
+        # spans six orders of magnitude, so a dropped or reordered term moves the
+        # result.  (Rotating which lane owns which residue class does not: the
+        # xor-butterfly reduction is invariant under lane rotation, so that is
+        # not a defect this test needs to catch -- a truncated span is.)
+        mel_mat = mel_mat.clone()
+        mel_mat[5] = 0.0
+        mel_mat[6, 31:66] = 0.25
+        mel_mat[7, 3:153] = torch.rand(150, device="cuda")
+        power = torch.rand(3, 50, 257, device="cuda", dtype=torch.float32)
+        power = power * torch.logspace(-3, 3, 257, device="cuda")
+        lengths = torch.tensor([50, 17, 0], device="cuda") if with_lengths else None
+
+        spans = feature_fn._mel_spans(mel_mat)
+        assert spans[5].tolist() == [0, 0]
+        dense = torch.empty(3, 50, 80, device="cuda")
+        feature_fn._get_features_module().mel_log(
+            dense,
+            power,
+            mel_mat.contiguous(),
+            1.1920929e-07,
+            0.0,
+            None if lengths is None else lengths.to(torch.int32),
+            None,
+        )
+        got = mel_log(power, mel_mat, frame_lengths=lengths)
+        assert torch.equal(got, dense)
+
+    def test_span_cache_follows_in_place_edits(self):
+        """The span table is cached per matrix; a write to the matrix must not
+        leave the old spans in place."""
+        from oasr.functionals import feature as feature_fn
+
+        mel_mat = torch.zeros(4, 64, device="cuda")
+        mel_mat[:, 10:20] = 1.0
+        assert feature_fn._mel_spans(mel_mat)[0].tolist() == [10, 20]
+        mel_mat[0, 40:50] = 1.0
+        assert feature_fn._mel_spans(mel_mat)[0].tolist() == [10, 50]
+
 
 @CUDA
 class TestDctLifter:

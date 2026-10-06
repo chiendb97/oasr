@@ -13,12 +13,15 @@ from oasr.jit.conv import (
     _CONV1D_ACTIVATION_HEURISTIC_RULES,
     _CONV1D_HEURISTIC_RULES,
     CONV2D_DEFAULT,
+    CutlassConv2dConfig,
+    conv2d_activation_func_name,
     conv2d_func_name,
     get_unique_conv2d_compile_configs,
     heuristic_inactive,
     reset_heuristic_stats,
     select_default_conv1d_activation_config,
     select_default_conv1d_config,
+    select_default_conv2d_config,
 )
 from oasr.jit.core import _TARGET_SMS, _get_target_sm
 
@@ -359,6 +362,60 @@ class TestConv2D:
         Q = (W + 2 * pad_w - dilation_w * (S - 1) - 1) // stride_w + 1
         assert output.shape == (N, P, Q, K)
 
+    def test_untuned_tile_is_the_narrowest_covering_n_extent(self):
+        """``select_default_conv2d_config`` may only narrow the default's N tile.
+
+        Same M and K extents and stage count, so the grid and the accumulation
+        order are the default's; and the narrowest compiled N extent that still
+        covers the output channels, so no CTA computes columns it discards.
+        """
+        sm = _get_target_sm()
+        default = CONV2D_DEFAULT
+        if not isinstance(default, CutlassConv2dConfig):
+            pytest.skip("a CUTLASS 3.x architecture keeps its default tile")
+        mainloop = (default.block_m, default.block_k, default.warp_k, default.kStages)
+        widths = sorted(
+            {
+                cfg.block_n
+                for cfg in get_unique_conv2d_compile_configs(sm).values()
+                if (cfg.block_m, cfg.block_k, cfg.warp_k, cfg.kStages) == mainloop
+            }
+        )
+        for k in (1, 8, 16, 31, 32, 33, 48, 64, 65, 96, 128, 129, 512):
+            cfg = select_default_conv2d_config(k, sm)
+            assert cfg.compile_name in get_unique_conv2d_compile_configs(sm)
+            assert (cfg.block_m, cfg.block_k, cfg.warp_k, cfg.kStages) == mainloop
+            covering = [n for n in widths if k <= n < default.block_n]
+            if covering:
+                assert cfg.block_n == covering[0], f"K={k}: block_n {cfg.block_n}"
+            else:
+                assert cfg is default, f"K={k}: {cfg.compile_name}"
+
+    @pytest.mark.parametrize("K", [8, 32, 64])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_untuned_tile_is_bit_identical_to_the_default(self, K, dtype):
+        """Narrowing the N tile is a pure speed choice (Zipformer's ``8 -> 32``
+        encoder_embed conv: 3.0x), so the default tile is an exact oracle."""
+        if select_default_conv2d_config(K, _get_target_sm()) is CONV2D_DEFAULT:
+            pytest.skip(f"no narrower compiled tile covers K={K} on this architecture")
+        torch.manual_seed(0)
+        x = torch.randn(3, 41, 80, 8, device="cuda", dtype=dtype)
+        w = torch.randn(K, 3, 3, 8, device="cuda", dtype=dtype) * 0.1
+        b = torch.randn(K, device="cuda", dtype=dtype)
+        module = _get_conv2d_module()
+
+        got = oasr.conv2d(x, w, b, stride_h=2, stride_w=2)
+        want = torch.full_like(got, float("nan"))
+        getattr(module, conv2d_func_name(CONV2D_DEFAULT))(want, x, w, b, 0, 0, 2, 2, 1, 1)
+        assert torch.equal(got, want)
+
+        got = oasr.conv2d_activation(x, w, b, activation_type=0, stride_h=2, stride_w=2)
+        want = torch.full_like(got, float("nan"))
+        getattr(module, conv2d_activation_func_name(CONV2D_DEFAULT))(
+            want, x, w, b, 0, 0, 0, 2, 2, 1, 1
+        )
+        assert torch.equal(got, want)
+
 
 class TestGroupedConv2D:
     """Grouped/depthwise direct NHWC kernel and 1x1 GEMM specialization."""
@@ -390,6 +447,45 @@ class TestGroupedConv2D:
 
         torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
         assert got.is_contiguous()
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "N,H,W,C,pad_h,pad_w",
+        [
+            (2, 14, 19, 128, 3, 3),  # Zipformer's ConvNeXt, offline
+            (2, 14, 19, 128, 0, 3),  # ... streaming (left context is cached, not padded)
+            (1, 11, 40, 64, 3, 3),  # more than one 32-column tile
+            (3, 9, 5, 40, 3, 3),  # a channel group running past the last channel
+        ],
+    )
+    def test_tiled_depthwise_7x7(self, dtype, N, H, W, C, pad_h, pad_w):
+        """The shared-memory tiled path (stride-1, undilated 7x7 depthwise)."""
+        x = torch.randn(N, H, W, C, device="cuda", dtype=dtype)
+        weight = torch.randn(C, 7, 7, 1, device="cuda", dtype=dtype)
+        bias = torch.randn(C, device="cuda", dtype=dtype)
+        got = oasr.conv2d(x, weight, bias, pad_h, pad_w, 1, 1, groups=C)
+        ref = F.conv2d(
+            x.permute(0, 3, 1, 2).float(),
+            weight.permute(0, 3, 1, 2).float(),
+            bias.float(),
+            padding=(pad_h, pad_w),
+            groups=C,
+        ).permute(0, 2, 3, 1)
+        torch.testing.assert_close(got.float(), ref, rtol=2e-2, atol=5e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_tiled_depthwise_staging_paths_agree(self, dtype):
+        """A misaligned input takes the element-wise staging; the result must be
+        bit-identical to the 16-byte staging of the same values."""
+        x = torch.randn(2, 12, 19, 128, device="cuda", dtype=dtype)
+        weight = torch.randn(128, 7, 7, 1, device="cuda", dtype=dtype)
+        bias = torch.randn(128, device="cuda", dtype=dtype)
+        backing = torch.empty(x.numel() + 1, device="cuda", dtype=dtype)
+        shifted = backing[1:].view_as(x)  # 2-byte offset: not 16-byte aligned
+        shifted.copy_(x)
+        aligned = oasr.conv2d(x, weight, bias, 3, 3, 1, 1, groups=128)
+        unaligned = oasr.conv2d(shifted, weight, bias, 3, 3, 1, 1, groups=128)
+        assert torch.equal(aligned, unaligned)
 
     @pytest.mark.parametrize(
         "activation,fn",

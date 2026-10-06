@@ -29,6 +29,7 @@ The engine treats it opaquely.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, ClassVar, List, Optional, Sequence, Tuple
 
 import torch
@@ -40,6 +41,43 @@ from ..base import DecodeType
 #: Concrete decoders pick the representation (RNN hidden tuple, paged-KV handle,
 #: ``None`` for a stateless predictor).  The engine never inspects it.
 DecoderState = Any
+
+
+@dataclass(frozen=True)
+class StatelessPredictorTensors:
+    """What a fused greedy step reads from a label-window (stateless) predictor.
+
+    The prediction is ``relu(conv(embedding[window]))``: an embedding lookup of
+    the last ``context_size`` labels, a convolution over that window down to one
+    frame (none when ``context_size == 1``), and a ReLU.  ``conv_weight`` is the
+    layer's own parameter in the layout its kernel reads -- ``(D, 1, context,
+    group)`` KRSC for a grouped convolution, ``(context, 1, D)`` for a depthwise
+    one (``group_size == 1``) -- so nothing is copied or re-laid-out to expose it.
+    """
+
+    embedding: torch.Tensor  # (V, D)
+    conv_weight: Optional[torch.Tensor]
+    context_size: int
+    group_size: int  # input channels per conv group; 1 == depthwise
+    blank_id: int
+
+
+@dataclass(frozen=True)
+class AdditiveJoinerTensors:
+    """What a fused greedy step reads from an additive joiner.
+
+    ``logits = output(act(enc + decoder_proj(prediction)))``, with the encoder
+    side projected once per utterance outside the step.  ``output_weight`` may be
+    alignment-padded past ``vocab_size``; only the first ``vocab_size`` rows are
+    candidates.
+    """
+
+    output_weight: torch.Tensor  # (V_pad, J)
+    output_bias: Optional[torch.Tensor]
+    vocab_size: int
+    activation: str  # "tanh" | "relu"
+    decoder_proj_weight: torch.Tensor  # (J, D)
+    decoder_proj_bias: Optional[torch.Tensor]
 
 
 class BaseDecoder(nn.Module, ABC):
@@ -176,6 +214,18 @@ class TransducerPredictor(BaseDecoder):
         :meth:`stack_states`)."""
         raise NotImplementedError
 
+    def stateless_tensors(self) -> Optional[StatelessPredictorTensors]:
+        """The tensors a fused greedy decode reads, or ``None``.
+
+        Declared, not probed: a predictor returns them only when its prediction
+        is exactly ``relu(conv(embedding[window]))`` over a label-window state,
+        which is the computation the fused kernel re-implements.  ``None`` (the
+        default, and every recurrent predictor) keeps the strategy on the
+        op-by-op loop, which drives :meth:`advance` / :meth:`predict` and so
+        serves any predictor.
+        """
+        return None
+
 
 class PredictionNetwork(nn.Module, ABC):
     """Transducer label predictor expressed as a plain step function.
@@ -209,3 +259,12 @@ class Joiner(nn.Module, ABC):
     def forward(self, encoder_out: torch.Tensor, prediction_out: torch.Tensor) -> torch.Tensor:
         """``(B, D_enc)`` ⊕ ``(B, D_pred)`` → ``(B, V)`` logits."""
         raise NotImplementedError
+
+    def additive_tensors(self) -> Optional[AdditiveJoinerTensors]:
+        """The tensors a fused greedy decode reads, or ``None``.
+
+        Only a joiner that is exactly ``output(act(enc + decoder_proj(pred)))``
+        returns them; anything else keeps the op-by-op loop.  See
+        :meth:`TransducerPredictor.stateless_tensors`.
+        """
+        return None

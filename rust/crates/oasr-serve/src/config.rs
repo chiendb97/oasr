@@ -313,6 +313,13 @@ pub struct Cli {
     pub http_bind: SocketAddr,
     #[arg(long, default_value = "0.0.0.0:50051")]
     pub grpc_bind: SocketAddr,
+    /// Accept-queue depth of both listeners (the `listen(2)` backlog; the
+    /// kernel caps it at `net.core.somaxconn`).  tokio's and std's `bind` use
+    /// 128, and a burst of new connections past that drops SYNs, which a client
+    /// retries only after Linux's 1 s initial retransmission timeout: 256
+    /// clients connecting at once cost ~200 of their requests a full second.
+    #[arg(long, default_value_t = 4096)]
+    pub listen_backlog: u32,
     #[arg(long, default_value_t = 256)]
     pub max_concurrent_requests: u32,
     /// Largest audio payload one request may carry, in MiB.  Drives **both**
@@ -944,6 +951,17 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.get("engine_workers").is_none());
+    }
+
+    /// Sized for a client fleet reconnecting at once rather than std's 128,
+    /// and a serving-side knob the engine never sees.
+    #[test]
+    fn the_listen_backlog_outsizes_a_connection_burst() {
+        assert_eq!(cli(&[]).listen_backlog, 4096);
+        assert_eq!(cli(&["--listen-backlog", "512"]).listen_backlog, 512);
+        let cfg: Value =
+            serde_json::from_str(&cli(&[]).build_engine_config_json().unwrap()).unwrap();
+        assert!(cfg.get("listen_backlog").is_none());
     }
 
     #[test]

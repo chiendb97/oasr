@@ -18,6 +18,7 @@ mod config;
 
 pub use config::Cli;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -271,8 +272,7 @@ async fn serve(cli: Cli) -> Result<()> {
         },
     );
     let http_bind = cli.http_bind;
-    let http_listener = tokio::net::TcpListener::bind(http_bind)
-        .await
+    let http_listener = bind_listener(http_bind, cli.listen_backlog)
         .with_context(|| format!("bind http {http_bind}"))?;
     info!("HTTP listening on http://{http_bind}");
     let http_handle = tokio::spawn(async move {
@@ -287,6 +287,7 @@ async fn serve(cli: Cli) -> Result<()> {
 
     // ---- gRPC server (Speech + standard Health) ----
     let grpc_bind = cli.grpc_bind;
+    let grpc_backlog = cli.listen_backlog;
     let grpc_pool = Arc::clone(&pool);
     let grpc_idle = cli.stream_idle_timeout();
     let grpc_max_message = cli.max_audio_bytes();
@@ -359,10 +360,25 @@ async fn serve(cli: Cli) -> Result<()> {
         if let Some(n) = grpc_conn_limit {
             builder = builder.concurrency_limit_per_connection(n);
         }
+        // An incoming stream drops the builder's TCP options, so they are
+        // restated: `Server::builder()` sets nodelay and no keepalive.
+        let incoming = bind_listener(grpc_bind, grpc_backlog)
+            .map_err(|e| e.to_string())
+            .and_then(|listener| {
+                tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+                    .map_err(|e| e.to_string())
+            });
+        let incoming = match incoming {
+            Ok(incoming) => incoming,
+            Err(e) => {
+                error!("bind grpc {grpc_bind}: {e}");
+                return;
+            }
+        };
         let serve = builder
             .add_service(speech)
             .add_service(health_service)
-            .serve_with_shutdown(grpc_bind, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = grpc_shutdown_rx.recv().await;
             });
         if let Err(e) = serve.await {
@@ -403,6 +419,27 @@ async fn serve(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+/// Bind `addr` with an explicit accept backlog (`--listen-backlog`).
+///
+/// `tokio::net::TcpListener::bind` (through mio) and tonic's
+/// `serve_with_shutdown(addr)` (through std) both listen with a backlog of 128.
+/// Past it the kernel drops a connection's SYN, and the client resends it only
+/// after the 1 s initial retransmission timeout -- so a burst of new
+/// connections, which a client fleet reconnecting at once produces, turned into
+/// a second of latency for whichever requests did not fit.
+fn bind_listener(addr: SocketAddr, backlog: u32) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // What std and mio set before binding: a restarted server rebinds at once
+    // rather than waiting out the previous process's TIME_WAIT sockets.
+    #[cfg(unix)]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(backlog)
+}
+
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
@@ -417,5 +454,27 @@ async fn wait_for_signal() {
     #[cfg(not(unix))]
     {
         let _ = signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpStream};
+
+    /// More connections than a 128-deep queue holds, none of them accepted yet.
+    /// Past the backlog the kernel drops the SYN and the client retries it a
+    /// second later, so a 128-deep listener fails the timeout below.
+    #[tokio::test]
+    async fn a_connection_burst_fits_the_accept_queue() {
+        let listener = bind_listener((Ipv4Addr::LOCALHOST, 0).into(), 512).expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let streams: Vec<TcpStream> = (0..300)
+            .map(|i| {
+                TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+                    .unwrap_or_else(|e| panic!("connection {i} was not queued: {e}"))
+            })
+            .collect();
+        assert_eq!(streams.len(), 300);
     }
 }

@@ -24,7 +24,7 @@ import torch
 
 from oasr.layers import Conv2d, DepthwiseConv1d, Embedding, Relu
 
-from ..decoders.base import TransducerPredictor
+from ..decoders.base import StatelessPredictorTensors, TransducerPredictor
 
 
 class StatelessDecoder(TransducerPredictor):
@@ -132,6 +132,22 @@ class StatelessDecoder(TransducerPredictor):
 
     def stack_states(self, states: Sequence[torch.Tensor]) -> torch.Tensor:
         return torch.cat(list(states), dim=0)
+
+    def stateless_tensors(self) -> StatelessPredictorTensors:
+        """The embedding and window convolution, exactly as :meth:`forward` uses them.
+
+        Both convolution branches already hold the layout their kernels read --
+        ``DepthwiseConv1d`` keeps ``(K, 1, C)``, the grouped ``Conv2d`` keeps KRSC
+        ``(C, 1, K, group)`` -- which is the layout the fused greedy decode reads.
+        """
+        conv_weight = self.conv.weight if self.context_size > 1 else None
+        return StatelessPredictorTensors(
+            embedding=self.embedding.weight,
+            conv_weight=conv_weight,
+            context_size=self.context_size,
+            group_size=self.conv_group_size,
+            blank_id=self.blank_id,
+        )
 
     def unstack_states(self, state: torch.Tensor) -> List[torch.Tensor]:
         return [state[b : b + 1] for b in range(state.size(0))]

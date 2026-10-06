@@ -34,6 +34,7 @@ KERNEL_FAMILIES: Dict[str, str] = {
     "recurrent": "benchmarks.kernels.recurrent",
     "mlp": "benchmarks.kernels.mlp",
     "composite": "benchmarks.kernels.composite",
+    "transducer": "benchmarks.kernels.transducer",
     "feature": "benchmarks.features.frontend",
 }
 
