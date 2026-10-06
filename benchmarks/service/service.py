@@ -229,6 +229,16 @@ def _spawn_server(args: argparse.Namespace) -> ServerHandle:
         cmd.extend(["--decoder-type", args.decoder_type])
     if args.fst_path is not None:
         cmd.extend(["--fst-path", str(args.fst_path)])
+    engine_config: Optional[str] = None
+    if args.architecture is not None:
+        # oasr-server has no flag for it; the engine-config JSON carries it.
+        import json
+        import tempfile
+
+        fd, engine_config = tempfile.mkstemp(prefix="bench_service_", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"architecture": args.architecture}, f)
+        cmd.extend(["--engine-config", engine_config])
 
     print(f"[bench] spawning: {' '.join(cmd)}", flush=True)
     env = os.environ.copy()
@@ -247,19 +257,24 @@ def _spawn_server(args: argparse.Namespace) -> ServerHandle:
 
     http_url = f"http://{http_bind}"
     deadline = time.time() + args.ready_timeout_s
-    while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(f"{http_url}/readyz", timeout=2) as resp:
-                if resp.status == 200:
-                    print("[bench] server ready", flush=True)
-                    return ServerHandle(
-                        proc=proc, http_url=http_url, grpc_addr=grpc_bind, spawned=True
-                    )
-        except (urllib.error.URLError, ConnectionError, TimeoutError):
-            pass
-        if proc.poll() is not None:
-            raise SystemExit(f"oasr-server exited prematurely (rc={proc.returncode})")
-        time.sleep(1.0)
+    try:
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"{http_url}/readyz", timeout=2) as resp:
+                    if resp.status == 200:
+                        print("[bench] server ready", flush=True)
+                        return ServerHandle(
+                            proc=proc, http_url=http_url, grpc_addr=grpc_bind, spawned=True
+                        )
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                pass
+            if proc.poll() is not None:
+                raise SystemExit(f"oasr-server exited prematurely (rc={proc.returncode})")
+            time.sleep(1.0)
+    finally:
+        # Read at startup, so it is no longer needed once the server is up.
+        if engine_config is not None:
+            os.unlink(engine_config)
     proc.terminate()
     raise SystemExit(f"server did not become ready within {args.ready_timeout_s}s")
 
@@ -374,12 +389,16 @@ async def _bench_offline(
     enc_name = _WIRE_TO_ENCODING[wire_encoding]
     stats = RunStats(name=f"offline (POST /v1/speech:recognize, encoding={enc_name})")
     sem = asyncio.Semaphore(concurrency)
+    # Every body is encoded before the clock starts.  The client is one asyncio
+    # thread, and converting each request's samples inside the timed loop made
+    # the run measure its own numpy work: it capped near 320 req/s against a
+    # server that sustains several times that.
+    bodies = [_to_wire_bytes(s.samples, wire_encoding, s.wav_bytes) for s in samples]
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as client:
 
-        async def one(sample: Sample) -> None:
+        async def one(sample: Sample, raw: bytes) -> None:
             async with sem:
-                raw = _to_wire_bytes(sample.samples, wire_encoding, sample.wav_bytes)
                 params = {"encoding": enc_name, "sample_rate": sample.sample_rate}
                 start = time.perf_counter()
                 try:
@@ -404,7 +423,7 @@ async def _bench_offline(
                     stats.n_fail += 1
 
         t0 = time.perf_counter()
-        await asyncio.gather(*(one(s) for s in samples))
+        await asyncio.gather(*(one(s, b) for s, b in zip(samples, bodies)))
         stats.wall_s = time.perf_counter() - t0
     return stats
 
@@ -433,10 +452,17 @@ def _load_grpc_stubs(proto_path: Path):
         ) from e
     _ = shutil  # silence linter — kept for parity with grpc_stream.py
     out = Path(tempfile.mkdtemp(prefix="oasr-bench-grpc-"))
+    # `python -m grpc_tools.protoc` adds the bundled well-known types to the
+    # include path; calling `protoc.main` directly does not, and the schema
+    # imports google/protobuf/duration.proto.
+    import grpc_tools
+
+    well_known = Path(grpc_tools.__file__).resolve().parent / "_proto"
     rc = protoc.main(
         [
             "protoc",
             f"--proto_path={proto_path.parent}",
+            f"--proto_path={well_known}",
             f"--python_out={out}",
             f"--grpc_python_out={out}",
             str(proto_path),
@@ -460,12 +486,26 @@ async def _bench_grpc_offline(
     samples: List[Sample],
     concurrency: int,
     proto_path: Path,
+    language_code: str = "",
 ) -> RunStats:
     import grpc
 
     pb, pb_grpc = _load_grpc_stubs(proto_path)
     stats = RunStats(name="grpc-offline (Recognize unary, LINEAR32F PCM)")
     sem = asyncio.Semaphore(concurrency)
+    # Built before the clock starts, for the reason _bench_offline encodes first.
+    requests = [
+        pb.RecognizeRequest(
+            config=pb.RecognitionConfig(
+                encoding=pb.RecognitionConfig.LINEAR32F,
+                sample_rate_hertz=sample.sample_rate,
+                language_code=language_code,
+                priority=0,
+            ),
+            audio=pb.RecognitionAudio(content=sample.samples.astype("<f4").tobytes()),
+        )
+        for sample in samples
+    ]
 
     # Disable gRPC's HTTP proxy honoring — the env may carry an
     # ``http_proxy`` that's irrelevant for the localhost frontend.
@@ -473,18 +513,8 @@ async def _bench_grpc_offline(
     async with grpc.aio.insecure_channel(grpc_addr, options=channel_options) as channel:
         stub = pb_grpc.SpeechStub(channel)
 
-        async def one(sample: Sample) -> None:
+        async def one(sample: Sample, req) -> None:
             async with sem:
-                cfg = pb.RecognitionConfig(
-                    encoding=pb.RecognitionConfig.LINEAR32F,
-                    sample_rate_hertz=sample.sample_rate,
-                    language_code="en-US",
-                    priority=0,
-                )
-                audio = pb.RecognitionAudio(
-                    content=sample.samples.astype("<f4").tobytes(),
-                )
-                req = pb.RecognizeRequest(config=cfg, audio=audio)
                 start = time.perf_counter()
                 try:
                     await stub.Recognize(req, timeout=600.0)
@@ -504,7 +534,7 @@ async def _bench_grpc_offline(
                     stats.n_fail += 1
 
         t0 = time.perf_counter()
-        await asyncio.gather(*(one(s) for s in samples))
+        await asyncio.gather(*(one(s, r) for s, r in zip(samples, requests)))
         stats.wall_s = time.perf_counter() - t0
     return stats
 
@@ -521,6 +551,7 @@ async def _bench_grpc_streaming(
     chunk_ms: int,
     proto_path: Path,
     pace_realtime: bool,
+    language_code: str = "",
 ) -> RunStats:
     import grpc
 
@@ -546,7 +577,7 @@ async def _bench_grpc_streaming(
                     cfg = pb.RecognitionConfig(
                         encoding=pb.RecognitionConfig.LINEAR32F,
                         sample_rate_hertz=sample.sample_rate,
-                        language_code="en-US",
+                        language_code=language_code,
                         priority=0,
                     )
                     yield pb.StreamingRecognizeRequest(
@@ -658,7 +689,7 @@ def parse_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--proto",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "rust" / "proto" / "oasr_speech_v1.proto",
+        default=Path(__file__).resolve().parents[2] / "rust" / "proto" / "oasr_speech_v1.proto",
         help="Path to the gRPC schema (only used by grpc_* subroutines).",
     )
     p.add_argument(
@@ -682,6 +713,13 @@ def parse_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=_envint("CHUNK_MS", 640),
         help="gRPC bidi chunk size in milliseconds " "(reads $CHUNK_MS if set; default 640)",
+    )
+    p.add_argument(
+        "--language-code",
+        default="",
+        help="gRPC RecognitionConfig.language_code (default: unset).  Only a family "
+        "with a language control (Whisper, speech-LLM) accepts one -- the others reject "
+        "it at admission, so a fixed en-US failed every request on them.",
     )
     p.add_argument(
         "--realtime",
@@ -723,6 +761,13 @@ def parse_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Encoder chunk size (frames) for the engine (default: engine config)",
+    )
+    p.add_argument(
+        "--architecture",
+        default=None,
+        help="Force a registered architecture on the spawned server -- required for an "
+        "explicit-only one: an icefall pruned-RNNT dir otherwise sniffs as zipformer and "
+        "every request fails (--architecture transducer).",
     )
     p.add_argument(
         "--decoder-type",
@@ -891,6 +936,7 @@ def _drive(args: argparse.Namespace):
                         samples,
                         args.concurrency,
                         args.proto,
+                        args.language_code,
                     )
                 )
             elif sub == "grpc_streaming":
@@ -902,6 +948,7 @@ def _drive(args: argparse.Namespace):
                         args.chunk_ms,
                         args.proto,
                         bool(args.realtime),
+                        args.language_code,
                     )
                 )
             else:

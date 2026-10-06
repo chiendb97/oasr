@@ -50,6 +50,7 @@ def gen_all_modules() -> List:
     from oasr.jit.recurrent_step import gen_recurrent_step_modules
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
+    from oasr.jit.transducer import gen_transducer_module
 
     # Fused attention, the fused gated MLP and the fused recurrent step are the
     # three families whose module count depends on what shipped models *use*,
@@ -77,6 +78,7 @@ def gen_all_modules() -> List:
         gen_topk_module(),
         gen_fft_module(),
         gen_features_module(),
+        gen_transducer_module(),
     ]
     modules += gen_fmha_modules()
     modules += gen_gated_mlp_modules()

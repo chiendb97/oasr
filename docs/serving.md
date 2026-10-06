@@ -1071,6 +1071,7 @@ the defaults that bit hardest were the ones nobody had written down.
 | `--stream-idle-timeout-secs` | `300` | Aborts a streaming RPC that goes this long with no inbound audio (before half-close) or no decode event (after). `0` disables. Deliberately *not* a blanket gRPC deadline — that would cut off healthy long-lived streams; a live stream can only be bounded by inactivity. |
 | `--max-inflight-connections` | `4 x --max-concurrent-requests` | Requests either listener processes at once; the rest queue (and are eventually cut off by the timeout). Bounds how many multi-MiB bodies are resident. `/healthz`, `/readyz` and `/metrics` are **exempt** — a saturated server must still answer its own probes. `0` disables. |
 | `--shutdown-grace-secs` | `10` | How long in-flight requests get to finish after SIGTERM/SIGINT before the listeners are dropped. |
+| `--listen-backlog` | `4096` | Accept-queue depth of both listeners (`listen(2)`; the kernel caps it at `net.core.somaxconn`). tokio's and std's `bind` use 128, and past it the kernel drops a new connection's SYN, which the client resends only after Linux's 1 s initial retransmission timeout — so a burst of reconnecting clients bigger than the queue turned into a second of latency for whichever requests did not fit. |
 
 The dispatcher's command channel is derived from `--max-concurrent-requests`
 (2x, floor 64) rather than fixed, because every queued `CreateOffline` envelope

@@ -100,6 +100,11 @@ from .functionals.recurrent import (
 )
 from .functionals.softmax import log_softmax, masked_softmax, softmax
 from .functionals.topk import topk
+from .functionals.transducer import (
+    StatelessGreedyResult,
+    StatelessGreedyWeights,
+    transducer_greedy_decode,
+)
 from .layers import (
     LSTM,
     RNN,
@@ -268,6 +273,9 @@ __all__ = [
     "masked_softmax",
     "softmax",
     "topk",
+    "transducer_greedy_decode",
+    "StatelessGreedyResult",
+    "StatelessGreedyWeights",
     "rfft",
     "rfft_power",
     # Recurrent modules

@@ -303,9 +303,19 @@ inline cudaError_t FbankPreprocess(const float* frames, const float* window, flo
 // guard remain separate because supported frontends use different silence
 // scales. Invalid frames are zeroed after log; otherwise padded silence becomes
 // a large negative feature value.
+//
+// `spans` (optional, `(num_mel, 2)` int32: first nonzero bin, one past the last)
+// restricts each filter's dot product to where it is nonzero.  A triangular mel
+// filter covers a few dozen of the 257 bins, so the dense loop spent ~95% of its
+// loads and FMAs on zeros -- and re-read the whole 82 KB matrix for every frame,
+// which made it L2-bound (0.7 ms on a 64 x 1000-frame batch).  Each lane still
+// visits only the bins congruent to it mod 32, in increasing order, and the warp
+// reduction is unchanged, so the sum is bit-identical to the dense one: a
+// skipped term is fma(0, p, acc) == acc for the finite power a spectrum holds.
 __global__ inline void MelLogKernel(const float* __restrict__ power,
                                     const float* __restrict__ mel_mat,
                                     const int32_t* __restrict__ frame_lengths,
+                                    const int32_t* __restrict__ spans,
                                     float* __restrict__ output, int num_freq, int num_mel,
                                     int frames_per_row, float log_floor, float log_offset) {
     extern __shared__ float spec[];
@@ -337,8 +347,16 @@ __global__ inline void MelLogKernel(const float* __restrict__ power,
 
     for (int b = wid; b < num_mel; b += n_warps) {
         const float* fb = mel_mat + static_cast<int64_t>(b) * num_freq;
+        int begin = 0, end = num_freq;
+        if (spans != nullptr) {
+            begin = spans[2 * b];
+            end = spans[2 * b + 1];
+        }
+        // The first i >= begin with i == lane (mod 32): the dense loop's own
+        // sequence for this lane, entered where the filter becomes nonzero.
+        const int first = begin + ((lane - begin) % WARP_SIZE + WARP_SIZE) % WARP_SIZE;
         float acc = 0.0f;
-        for (int i = lane; i < num_freq; i += WARP_SIZE) {
+        for (int i = first; i < end; i += WARP_SIZE) {
             acc += fb[i] * spec[i];
         }
         acc = oasr::reduction::warpReduceSum(acc);
@@ -352,14 +370,14 @@ __global__ inline void MelLogKernel(const float* __restrict__ power,
 }
 
 inline cudaError_t MelLog(const float* power, const float* mel_mat, const int32_t* frame_lengths,
-                          float* output, int total_frames, int num_freq, int num_mel,
-                          int frames_per_row, float log_floor, float log_offset,
+                          const int32_t* spans, float* output, int total_frames, int num_freq,
+                          int num_mel, int frames_per_row, float log_floor, float log_offset,
                           cudaStream_t stream) {
     const int threads = 128;  // 4 warps
     const size_t smem_bytes = static_cast<size_t>(num_freq) * sizeof(float);
     MelLogKernel<<<total_frames, threads, smem_bytes, stream>>>(
-        power, mel_mat, frame_lengths, output, num_freq, num_mel, frames_per_row, log_floor,
-        log_offset);
+        power, mel_mat, frame_lengths, spans, output, num_freq, num_mel, frames_per_row,
+        log_floor, log_offset);
     return cudaGetLastError();
 }
 

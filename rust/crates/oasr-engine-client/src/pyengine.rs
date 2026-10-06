@@ -255,19 +255,42 @@ impl PyEngine {
         if specs.is_empty() {
             return Ok(Vec::new());
         }
-        let list = PyList::empty_bound(py);
+        // Every offline payload's destination first -- an engine-owned pinned
+        // tensor, or a fresh numpy array -- then all the copies at once, then the
+        // specs.  The copies are the dispatcher's largest admission cost (~27 MB
+        // per 64-request tick at saturation, 4.5 ms single-threaded, all of it
+        // inside the tick that holds the GIL), and none of them touches Python,
+        // so they are spread across threads.
+        let mut dests: Vec<Option<Bound<'py, PyAny>>> = Vec::with_capacity(specs.len());
+        let mut jobs: Vec<PayloadCopy<'_>> = Vec::new();
         for spec in specs {
+            match spec {
+                AdmitSpec::Offline { audio, .. } => {
+                    let n = audio.len() / std::mem::size_of::<f32>();
+                    let (obj, dst) = offline_audio_dest(py, bound, n)?;
+                    jobs.push(PayloadCopy {
+                        dst: DstPtr(dst),
+                        src: &audio[..n * std::mem::size_of::<f32>()],
+                    });
+                    dests.push(Some(obj));
+                }
+                AdmitSpec::Streaming { .. } => dests.push(None),
+            }
+        }
+        copy_payloads(&jobs);
+
+        let list = PyList::empty_bound(py);
+        for (spec, dest) in specs.iter().zip(dests) {
             let d = PyDict::new_bound(py);
             match spec {
                 AdmitSpec::Offline {
                     rid,
-                    audio,
                     sample_rate,
                     priority,
                     decoding,
+                    ..
                 } => {
-                    let arr = offline_audio_to_py(py, bound, audio)?;
-                    d.set_item("audio", arr)?;
+                    d.set_item("audio", dest)?;
                     d.set_item("request_id", rid.as_str())?;
                     d.set_item("sample_rate", *sample_rate)?;
                     d.set_item("streaming", false)?;
@@ -742,6 +765,108 @@ fn offline_audio_to_py<'py>(
         }
     }
     Ok(audio_bytes_to_numpy(py, audio)?.into_any())
+}
+
+/// Where one offline payload lands, without copying it yet: the object to hand
+/// the engine and a pointer to its `n` f32 elements.
+///
+/// The same preference as [`offline_audio_to_py`] -- an engine-owned pinned
+/// tensor (returned as the tensor, so its allocator tracks in-flight copies),
+/// else a fresh numpy array -- split from the copy so a batch can allocate
+/// every destination under the GIL and then fill them all in parallel.
+fn offline_audio_dest<'py>(
+    py: Python<'py>,
+    engine: &Bound<'py, PyAny>,
+    n: usize,
+) -> PyResult<(Bound<'py, PyAny>, *mut f32)> {
+    use std::sync::atomic::Ordering;
+
+    if n > 0 && !PINNED_AUDIO_OFF.load(Ordering::Relaxed) {
+        match engine.call_method1("new_audio_buffer", (n,)) {
+            Ok(buf) if !buf.is_none() => {
+                let view = buf.call_method0("numpy")?;
+                let arr: &Bound<'py, PyArray1<f32>> = view.downcast()?;
+                let dst = contiguous_f32_ptr(arr, n)?;
+                return Ok((buf, dst));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                PINNED_AUDIO_OFF.store(true, Ordering::Relaxed);
+                tracing::debug!(error = %e, "engine has no pinned audio buffers; using heap arrays");
+            }
+        }
+    }
+    // SAFETY: uninitialized only until `copy_payloads` writes all `n` elements,
+    // which happens before the array is handed to Python; f32 has no drop glue.
+    let arr = unsafe { PyArray1::<f32>::new_bound(py, n, false) };
+    let dst = contiguous_f32_ptr(&arr, n)?;
+    Ok((arr.into_any(), dst))
+}
+
+/// The data pointer of a 1-D f32 array that must hold exactly `n` contiguous
+/// elements -- the invariant the parallel copy relies on, checked rather than
+/// assumed for the same reason [`fill_f32_array`] checks it.
+fn contiguous_f32_ptr(arr: &Bound<'_, PyArray1<f32>>, n: usize) -> PyResult<*mut f32> {
+    // SAFETY: only the length and the base pointer are read here; the slice is
+    // dropped before the pointer is used.
+    let slice = unsafe { arr.as_slice_mut() }
+        .map_err(|e| PyRuntimeError::new_err(format!("audio array is not contiguous: {e}")))?;
+    if slice.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "audio buffer holds {} samples, payload has {n}",
+            slice.len()
+        )));
+    }
+    Ok(slice.as_mut_ptr())
+}
+
+/// A destination pointer that may cross into a copy thread.
+#[derive(Clone, Copy)]
+struct DstPtr(*mut f32);
+
+// SAFETY: each pointer addresses a distinct, freshly allocated buffer that only
+// its own copy job writes, and the scoped threads join before the buffers are
+// handed to Python (see `copy_payloads`).
+unsafe impl Send for DstPtr {}
+unsafe impl Sync for DstPtr {}
+
+/// One payload copy: `src` (little-endian f32 bytes) into `dst`, which holds
+/// exactly `src.len() / 4` elements.
+struct PayloadCopy<'a> {
+    dst: DstPtr,
+    src: &'a [u8],
+}
+
+/// Below this many bytes per batch the copies run inline: a scoped thread costs
+/// tens of microseconds to spawn, which a single request's copy does not repay.
+const PARALLEL_COPY_MIN_BYTES: usize = 4 << 20;
+/// Copy threads per batch.  Single-threaded memcpy into pinned memory measured
+/// ~6 GB/s; a handful of threads is enough to reach memory bandwidth.
+const MAX_COPY_THREADS: usize = 8;
+
+fn copy_one(job: &PayloadCopy<'_>) {
+    // SAFETY: `dst` holds `src.len() / 4` f32 elements (checked by
+    // `contiguous_f32_ptr`), `src` is exactly that many elements, and the two are
+    // distinct allocations.  x86 is little-endian, so the bytes are the floats.
+    unsafe {
+        std::ptr::copy_nonoverlapping(job.src.as_ptr(), job.dst.0.cast::<u8>(), job.src.len());
+    }
+}
+
+/// Fill every destination, in parallel when the batch is large enough to repay
+/// the threads.  Returns after every copy has completed.
+fn copy_payloads(jobs: &[PayloadCopy<'_>]) {
+    let total: usize = jobs.iter().map(|j| j.src.len()).sum();
+    let threads = jobs.len().min(MAX_COPY_THREADS);
+    if threads <= 1 || total < PARALLEL_COPY_MIN_BYTES {
+        jobs.iter().for_each(copy_one);
+        return;
+    }
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            scope.spawn(move || jobs.iter().skip(t).step_by(threads).for_each(copy_one));
+        }
+    });
 }
 
 /// Decode raw little-endian f32 audio bytes into a writable numpy array on

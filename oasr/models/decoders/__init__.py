@@ -14,7 +14,15 @@ rescoring + AED generation).  See ``oasr/engine/decode/`` for the matching
 decode strategies.
 """
 
-from .base import BaseDecoder, DecoderState, Joiner, PredictionNetwork, TransducerPredictor
+from .base import (
+    AdditiveJoinerTensors,
+    BaseDecoder,
+    DecoderState,
+    Joiner,
+    PredictionNetwork,
+    StatelessPredictorTensors,
+    TransducerPredictor,
+)
 from .transformer_decoder import (
     BiTransformerDecoder,
     TransformerDecoder,
@@ -24,11 +32,13 @@ from .transformer_decoder import (
 )
 
 __all__ = [
+    "AdditiveJoinerTensors",
     "BaseDecoder",
     "BiTransformerDecoder",
     "DecoderState",
     "Joiner",
     "PredictionNetwork",
+    "StatelessPredictorTensors",
     "TransducerPredictor",
     "TransformerDecoder",
     "TransformerDecoderConfig",

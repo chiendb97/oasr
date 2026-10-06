@@ -681,6 +681,59 @@ def select_default_conv1d_activation_config(
     )
 
 
+#: ``(out_channels, sm) -> config`` for :func:`select_default_conv2d_config`.
+_CONV2D_N_FIT: Dict[Tuple[int, int], Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]] = {}
+
+
+def select_default_conv2d_config(
+    out_channels: int, sm: int
+) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
+    """The un-tuned dense Conv2D tile: the narrowest N extent that covers ``out_channels``.
+
+    Conv2D has no measured table, and every un-tuned call used to take
+    :data:`CONV2D_DEFAULT`'s 128-wide N tile.  A layer with few output channels
+    then computes 128 columns to keep a handful -- Zipformer's encoder_embed
+    ``8 -> 32`` conv kept 32 -- on the same grid (one N tile either way), so
+    each CTA did four times the MMA and filter-load work it needed.
+
+    A compiled tile that differs from the default *only* in a narrower N extent
+    still covering ``out_channels`` does a strict subset of that work on the
+    same grid, so choosing it is dominance rather than a measurement.  It is
+    also bit-identical: the candidates share the default's ``block_k ==
+    warp_k``, so every output accumulates its K extent in the same order.  On
+    an RTX 5090 (bf16, 96 shapes over batch, input channels, stride and
+    ``out_channels``): 2.0-3.2x at ``out_channels <= 32``, 1.6-1.8x at 64, and
+    the default itself from 128 up.
+
+    A CUTLASS 3.x architecture (SM90/SM100) keeps its default: its tile space
+    is a different kernel family, and nothing here was measured on it.
+    """
+    key = (int(out_channels), int(sm))
+    cfg = _CONV2D_N_FIT.get(key)
+    if cfg is None:
+        cfg = _CONV2D_N_FIT[key] = _conv2d_n_fit(*key)
+    return cfg
+
+
+def _conv2d_n_fit(
+    out_channels: int, sm: int
+) -> Union[CutlassConv2dConfig, CutlassConv2dConfigSm90]:
+    default = CONV2D_DEFAULT
+    if not isinstance(default, CutlassConv2dConfig) or default.kSmVersion != sm:
+        return default
+    same_mainloop = (default.block_m, default.block_k, default.warp_k, default.kStages)
+    narrower = [
+        cfg
+        for cfg in get_unique_conv2d_compile_configs(sm).values()
+        if isinstance(cfg, CutlassConv2dConfig)
+        and (cfg.block_m, cfg.block_k, cfg.warp_k, cfg.kStages) == same_mainloop
+        and out_channels <= cfg.block_n < default.block_n
+    ]
+    if not narrower:
+        return default
+    return min(narrower, key=lambda cfg: (cfg.block_n, cfg.compile_name))
+
+
 # =============================================================================
 # Conv1D module (static sources, no variants)
 # =============================================================================

@@ -58,7 +58,7 @@ Each has a default that keeps a family that ignores it exactly as it was.
 
 | Hook | Default | Implemented by | What it buys |
 |---|---|---|---|
-| `decode_offline_async(enc, lens, requests)` | `None` (decode synchronously) | `ctc_cuda` | The read-back is queued into pinned memory behind an event; the offline executor collects it next tick, behind that tick's forward. 1.09–1.17× on Conformer offline. A batch asking for word timings or speech activity decodes synchronously. |
+| `decode_offline_async(enc, lens, requests)` | `None` (decode synchronously) | `ctc_cuda`, `transducer` (fused greedy) | The read-back is queued into pinned memory behind an event; the offline executor collects it next tick, behind that tick's forward. 1.09–1.17× on Conformer offline. A batch asking for word timings or speech activity decodes synchronously. |
 | `finalize_batch(requests)` | a loop over `finalize` | `ctc_cuda` | Every stream that ends in one tick is read back together — one batched kernel and one device→host copy instead of three synchronising copies per stream. |
 | `prewarm_streaming(batch_sizes, frames)` | nothing | `transducer` | Captures per-width decode graphs at construction, so none lands on a live tick. |
 
@@ -78,6 +78,37 @@ projection — and **3.46×** on the icefall transducer offline, 1.51× on Nemot
 (whose encoder is a larger share), 1.16× on Nemotron streaming. Word timings
 (`track=True`, a per-iteration host decision) and beam search keep the eager
 loop, whose predictor step is still captured by `PredictorStepGraphCache`.
+
+### The transducer greedy decode is one kernel
+
+When the model's surface declares the tensors it reads, greedy decoding skips the
+loop entirely: `oasr.transducer_greedy_decode`
+(`include/oasr/transducer/greedy_decode.cuh`) runs the whole frame-synchronous
+search in **one launch per batch** — one CTA per row, the joiner GEMV, `argmax`,
+the emit/advance bookkeeping and the predictor step all on the device, with one
+device→host copy at the end. The predictor declares itself through
+`TransducerPredictor.stateless_tensors()` (a label-window embedding + grouped
+conv, as icefall's stateless decoder) and the joiner through
+`Joiner.additive_tensors()` (`output(act(enc_proj + dec_proj))`, tanh or ReLU);
+either returning `None` — an LSTM predictor, a non-additive joint — keeps the
+loop above. Half precision only.
+
+* `TransducerOptions.fused` (default on). Offline, streaming and
+  `decode_offline_async` all take it; a batch whose emissions overflow the
+  kernel's buffer (`2 * frames + 32` tokens per row) is re-decoded by the loop
+  rather than truncated. Word timings and speech activity ride along (`track`).
+  Hypotheses, frames and final predictor state are **bit-identical** to the
+  loop on data whose sums are exact (`tests/helpers/transducer.py`); on real
+  weights the GEMVs accumulate in a different order, so a near-tie can flip —
+  the LJSpeech WER is unchanged.
+* `TransducerOptions.side_stream` (default on). The kernel keeps one CTA per row
+  resident for the whole decode, so at `B=64` on a 170-SM card most of the GPU
+  idles behind it. `decode_offline_async` issues it on a side stream that waits
+  for the main one, and the executor's next forward fills the idle SMs. The
+  side stream reads `enc_proj` and the lengths after the call returns, so both
+  are `record_stream`-ed; `tests/decoders/test_transducer_fused.py` congests the
+  main stream on purpose to keep both orderings honest. It only pays when a
+  second batch is waiting — neutral with one batch in flight.
 
 ## Per-family options
 

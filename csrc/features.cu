@@ -152,7 +152,7 @@ void fbank_preprocess(TensorView output, TensorView frames, TensorView window, d
 //   output        : (..., num_mel)           float32
 // ---------------------------------------------------------------------------
 void mel_log(TensorView output, TensorView power, TensorView mel_mat, double log_floor,
-             double log_offset, Optional frame_lengths_opt) {
+             double log_offset, Optional frame_lengths_opt, Optional spans_opt) {
     CHECK_INPUT(power);
     CHECK_INPUT(mel_mat);
     CHECK_INPUT(output);
@@ -195,11 +195,23 @@ void mel_log(TensorView output, TensorView power, TensorView mel_mat, double log
         frames_per_row = static_cast<int>(power.size(1));
     }
 
+    const int32_t* spans_ptr = nullptr;
+    if (spans_opt.has_value()) {
+        const TensorView spans = spans_opt.value();
+        CHECK_INPUT(spans);
+        CHECK_CONTIGUOUS_INPUT(spans);
+        check_int32(spans, "spans");
+        TVM_FFI_ICHECK(spans.ndim() == 2 && spans.size(0) == num_mel && spans.size(1) == 2)
+            << "spans must be (num_mel, 2) int32";
+        spans_ptr = static_cast<const int32_t*>(spans.data_ptr());
+    }
+
     cudaStream_t stream = get_stream(power.device());
     cudaError_t status = features::MelLog(
         static_cast<const float*>(power.data_ptr()), static_cast<const float*>(mel_mat.data_ptr()),
-        frame_lengths_ptr, static_cast<float*>(output.data_ptr()), total_frames, num_freq, num_mel,
-        frames_per_row, static_cast<float>(log_floor), static_cast<float>(log_offset), stream);
+        frame_lengths_ptr, spans_ptr, static_cast<float*>(output.data_ptr()), total_frames,
+        num_freq, num_mel, frames_per_row, static_cast<float>(log_floor),
+        static_cast<float>(log_offset), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "mel_log kernel failed: " << cudaGetErrorString(status);
 }
@@ -327,11 +339,11 @@ void whisper_logmel(TensorView output, TensorView row_max, TensorView spectrum, 
 
     cudaStream_t stream = get_stream(spectrum.device());
     cudaError_t status = features::WhisperLogMel(
-        static_cast<const float*>(spectrum.data_ptr()), static_cast<const float*>(mel_mat.data_ptr()),
-        static_cast<float*>(output.data_ptr()), static_cast<float*>(row_max.data_ptr()), batch,
-        num_frames, num_freq, num_mel, static_cast<float>(log_floor),
-        static_cast<float>(max_floor), static_cast<float>(offset), static_cast<float>(scale),
-        is_complex, stream);
+        static_cast<const float*>(spectrum.data_ptr()),
+        static_cast<const float*>(mel_mat.data_ptr()), static_cast<float*>(output.data_ptr()),
+        static_cast<float*>(row_max.data_ptr()), batch, num_frames, num_freq, num_mel,
+        static_cast<float>(log_floor), static_cast<float>(max_floor), static_cast<float>(offset),
+        static_cast<float>(scale), is_complex, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "whisper_logmel kernel failed: " << cudaGetErrorString(status);
 }
