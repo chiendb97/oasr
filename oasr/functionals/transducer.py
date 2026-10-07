@@ -21,18 +21,22 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
 from oasr.api_logging import oasr_api
 
 __all__ = [
+    "BEAM_TOPK_MAX_BEAM",
+    "BEAM_TOPK_MAX_VOCAB",
     "GEMV_TILE",
     "K_STAGE",
     "JOINER_ACTIVATIONS",
     "StatelessGreedyResult",
     "StatelessGreedyWeights",
+    "transducer_beam_topk",
+    "transducer_beam_topk_supports",
     "transducer_greedy_decode",
     "transducer_greedy_capacity",
 ]
@@ -257,3 +261,76 @@ def transducer_greedy_decode(
         int(rows_per_cta),
     )
     return out
+
+
+#: The fused beam step's scope.  The vocabulary bound is the range of torch's
+#: warp log-softmax, which the kernel reproduces bit for bit; the beam bound is
+#: the kernel's shared-memory candidate grid (``k x k``).
+BEAM_TOPK_MAX_VOCAB = 1024
+BEAM_TOPK_MAX_BEAM = 32
+
+
+def transducer_beam_topk_supports(logits: torch.Tensor, beam: int) -> bool:
+    """Whether :func:`transducer_beam_topk` serves a frame of this shape."""
+    vocab = int(logits.size(-1))
+    return (
+        logits.is_cuda
+        and logits.dtype in (torch.float16, torch.bfloat16)
+        and logits.dim() == 2
+        and logits.stride(-1) == 1
+        and 1 <= int(beam) <= BEAM_TOPK_MAX_BEAM
+        and int(beam) <= vocab <= BEAM_TOPK_MAX_VOCAB
+    )
+
+
+@oasr_api
+def transducer_beam_topk(
+    logits: torch.Tensor,
+    scores: torch.Tensor,
+    context: torch.Tensor,
+    active: torch.Tensor,
+    blank: int,
+    *,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One modified-beam-search frame after the joiner, in one launch.
+
+    Fuses ``log_softmax(logits.float())``, the add onto each hypothesis's score,
+    the top ``k`` over the beam's ``k * V`` candidates, their split into
+    ``(parent, label)``, the mask for rows past their utterance and the reorder of
+    the predictor label windows -- the tail of
+    :func:`oasr.engine.decode.transducer_beam.beam_search_step`.
+
+    Args:
+        logits: ``(B * k, V)`` joiner logits, fp16/bf16; rows may be strided.
+        scores: ``(B, k)`` float32 hypothesis scores.
+        context: ``(B, k, ctx)`` int64 label windows.
+        active: ``(B,)`` bool -- rows whose frame lies inside the utterance.
+        blank: the blank label.
+        out: optional ``(context, scores, parent, label)`` destinations.
+
+    Returns:
+        ``(context, scores, parent, label)`` for the new beam: ``(B, k, ctx)``
+        int64, ``(B, k)`` float32 and two ``(B, k)`` int64.  An inactive row keeps
+        its windows and scores and records ``parent[j] = j``, ``label = blank``.
+
+    The scores are bit-identical to the torch composition (``V <= 1024``, the
+    range of torch's warp log-softmax).  Candidates are ranked by score, then by
+    lower ``j * V + v``: ``torch.topk`` keeps the same set but may order a tie
+    *inside* the selected ``k`` differently.  See
+    ``include/oasr/transducer/beam_topk.cuh``.
+    """
+    B, k = (int(d) for d in scores.shape)
+    if out is None:
+        device = scores.device
+        out = (
+            torch.empty(tuple(context.shape), dtype=torch.long, device=device),
+            torch.empty(B, k, dtype=torch.float32, device=device),
+            torch.empty(B, k, dtype=torch.long, device=device),
+            torch.empty(B, k, dtype=torch.long, device=device),
+        )
+    context_out, scores_out, parent_out, label_out = out
+    _get_transducer_module().transducer_beam_topk(
+        context_out, scores_out, parent_out, label_out, logits, scores, context, active, int(blank)
+    )
+    return context_out, scores_out, parent_out, label_out

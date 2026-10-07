@@ -85,6 +85,8 @@ class BeamLoopGraphCache:
     unroll :
         Frames per replay.  Must divide the smallest frame capacity, so a call's
         whole-replay frame count never runs past its buffers.
+    fused :
+        Passed to :func:`beam_search_step`: the frame's selection as one kernel.
     max_captures :
         Ceiling on live captures; past it :meth:`run` returns ``None`` and the
         caller runs eager.
@@ -95,6 +97,7 @@ class BeamLoopGraphCache:
         model: Any,
         *,
         unroll: int,
+        fused: bool = True,
         max_captures: int = 48,
         pool: Optional[Tuple[int, int]] = None,
     ) -> None:
@@ -102,6 +105,7 @@ class BeamLoopGraphCache:
             raise ValueError(f"unroll={unroll} must divide the minimum frame capacity {_MIN_T_CAP}")
         self._model = model
         self._unroll = int(unroll)
+        self._fused = bool(fused)
         self._max_captures = int(max_captures)
         self._pool: Optional[Tuple[int, int]] = (
             pool if pool is not None else torch.cuda.graph_pool_handle()
@@ -210,7 +214,14 @@ class BeamLoopGraphCache:
             t = c.t + i
             enc_t = c.enc.index_select(1, t.clamp(max=t_last)).squeeze(1)
             context, scores, parent, label = beam_search_step(
-                self._model, enc_t, context, scores, t < c.lengths, c.stay, c.blank_label
+                self._model,
+                enc_t,
+                context,
+                scores,
+                t < c.lengths,
+                c.stay,
+                c.blank_label,
+                self._fused,
             )
             parents.append(parent)
             labels.append(label)

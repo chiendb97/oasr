@@ -1,8 +1,8 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Transducer greedy decode -- ``oasr/functionals/transducer.py``.
+"""Transducer decode kernels -- ``oasr/functionals/transducer.py``.
 
-Three arms decode the same batch on the same model:
+``greedy``: three arms decode the same batch on the same model:
 
 * ``cuda``  -- :func:`oasr.transducer_greedy_decode`, the fused one-launch kernel;
 * ``graph`` -- the strategy's op-by-op loop replayed from CUDA graphs, 16 steps per
@@ -20,6 +20,12 @@ The blank bias is calibrated so that about four steps in five are blank at the
 starting state, which is close to what a real BPE transducer does (~0.2 emissions
 per encoder frame); the decode's cost is its step count, so a model that emitted
 everywhere or nowhere would measure a different workload.
+
+``beam_topk``: one modified-beam-search frame's selection after the joiner --
+``cuda`` is :func:`oasr.transducer_beam_topk`, ``torch`` the composition it
+replaces in ``beam_search_step`` (float cast, ``log_softmax``, score add,
+``topk``, the parent/label split, the window reorder and the masks).  Each arm
+returns the new scores, which the kernel reproduces bit for bit.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ import torch
 
 from benchmarks.core.driver import Work, params_of
 
-SUBROUTINES = ["greedy"]
+SUBROUTINES = ["greedy", "beam_topk"]
 
 #: Shapes of the icefall Zipformer transducer (joiner/decoder 512, BPE-500,
 #: context 2, group 4).  ``frames`` 250 is a ~10 s utterance at 25 Hz; 16 is a
@@ -44,10 +50,16 @@ DEFAULT_CONFIGS: Dict[str, list] = {
         {"batch": 64, "frames": 250, "joiner": 512, "decoder": 512, "vocab": 500},
         {"batch": 64, "frames": 16, "joiner": 512, "decoder": 512, "vocab": 500},
     ],
+    # One frame of the icefall transducer's beam (BPE-500, context 2).
+    "beam_topk": [
+        {"batch": 64, "beam": 4, "vocab": 500, "context": 2},
+        {"batch": 64, "beam": 8, "vocab": 500, "context": 2},
+        {"batch": 256, "beam": 8, "vocab": 500, "context": 2},
+    ],
 }
 
 REF_BACKEND = "torch"
-TOLERANCES = {"greedy": (0.0, 0.0)}
+TOLERANCES = {"greedy": (0.0, 0.0), "beam_topk": (0.0, 0.0)}
 NON_GATING_BACKENDS = frozenset({"cuda"})
 
 _CONTEXT = 2
@@ -61,9 +73,17 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--joiner", type=int, default=None, help="Joiner dim")
     parser.add_argument("--decoder", type=int, default=None, help="Predictor dim")
     parser.add_argument("--vocab", type=int, default=None, help="Vocabulary size")
+    parser.add_argument("--beam", type=int, default=None, help="Beam size (beam_topk)")
+    parser.add_argument("--context", type=int, default=None, help="Label window (beam_topk)")
 
 
 def resolve_configs(args: argparse.Namespace, subroutine: str) -> list:
+    if subroutine == "beam_topk":
+        beam_dims = (args.batch, args.beam, args.vocab, args.context)
+        if all(v is not None for v in beam_dims):
+            b, k, v, c = beam_dims
+            return [{"batch": b, "beam": k, "vocab": v, "context": c}]
+        return DEFAULT_CONFIGS[subroutine]
     dims = (args.batch, args.frames, args.joiner, args.decoder, args.vocab)
     if all(v is not None for v in dims):
         b, t, j, d, v = dims
@@ -123,12 +143,49 @@ def _strategy(model, **cfg: Any):
     return TransducerDecodeStrategy(config, Detokenizer(None, None), model)
 
 
+def _beam_topk_fns(cfg: dict, dtype: torch.dtype) -> Dict[str, Callable[[], Any]]:
+    import oasr
+
+    B, k, V, ctx = cfg["batch"], cfg["beam"], cfg["vocab"], cfg["context"]
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    # The joiner slices a padded projection, so the rows are strided.
+    pad = (V + 7) // 8 * 8 + 8
+    logits = (torch.randn(B * k, pad, device="cuda", generator=gen) * 3).to(dtype)[:, :V]
+    scores = torch.randn(B, k, device="cuda", generator=gen) * 5
+    context = torch.randint(0, V, (B, k, ctx), device="cuda", generator=gen)
+    active = torch.ones(B, dtype=torch.bool, device="cuda")
+    stay = torch.arange(k, device="cuda").expand(B, k)
+    blank = 0
+
+    def fused() -> torch.Tensor:
+        return oasr.transducer_beam_topk(logits, scores, context, active, blank)[1]
+
+    def composed() -> torch.Tensor:
+        log_probs = torch.log_softmax(logits.float(), dim=-1).view(B, k, V)
+        total = scores.unsqueeze(-1) + log_probs
+        top_scores, top_idx = total.view(B, k * V).topk(k, dim=-1)
+        parent = torch.div(top_idx, V, rounding_mode="floor")
+        label = top_idx - parent * V
+        windows = context.gather(1, parent.unsqueeze(-1).expand(B, k, ctx))
+        shifted = torch.cat([windows[:, :, 1:], label.unsqueeze(-1)], dim=2)
+        windows = torch.where((label == blank).unsqueeze(-1), windows, shifted)
+        keep = active.view(B, 1)
+        torch.where(keep.unsqueeze(-1), windows, context)
+        torch.where(keep, parent, stay)
+        torch.where(keep, label, torch.full_like(label, blank))
+        return torch.where(keep, top_scores, scores)
+
+    return {"cuda": fused, "torch": composed}
+
+
 def build_fns(
     subroutine: str, cfg: dict, dtype: torch.dtype, args: argparse.Namespace
 ) -> Dict[str, Callable[[], Any]]:
     if dtype not in (torch.float16, torch.bfloat16):
         # The strategy would quietly run its loop in the ``cuda`` arm instead.
         raise ValueError("the fused transducer decode is half precision only (--dtype)")
+    if subroutine == "beam_topk":
+        return _beam_topk_fns(cfg, dtype)
     model = _model(cfg, dtype)
     enc = torch.randn(cfg["batch"], cfg["frames"], cfg["joiner"], device="cuda", dtype=dtype)
     _calibrate_blank(model, enc)
@@ -164,6 +221,14 @@ def build_fns(
 
 
 def describe(subroutine: str, cfg: dict, dtype: torch.dtype) -> Work:
+    if subroutine == "beam_topk":
+        b, k, v, c = cfg["batch"], cfg["beam"], cfg["vocab"], cfg["context"]
+        # The kernel reads the logits once; everything else is (B, k)-sized.
+        return Work(
+            shape=f"B={b} k={k} V={v} ctx={c}",
+            params=params_of(cfg),
+            bytes=b * k * v * torch.finfo(dtype).bits // 8,
+        )
     b, t, j, d, v = cfg["batch"], cfg["frames"], cfg["joiner"], cfg["decoder"], cfg["vocab"]
     # A step is latency-bound, not FLOP- or byte-bound (the joiner head is
     # re-read every step); report the shape only.

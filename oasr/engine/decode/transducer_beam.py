@@ -24,6 +24,9 @@ from typing import List, Sequence, Tuple, Union
 import numpy as np
 import torch
 
+from oasr.functionals.transducer import transducer_beam_topk, transducer_beam_topk_supports
+from oasr.layers import _backend
+
 #: Score assigned to the ``k - 1`` initially-dead beam slots.  A large finite
 #: negative rather than ``-inf``: the slots are added to log-probs, and while
 #: ``-inf + finite`` is well defined, keeping every score finite means an
@@ -78,6 +81,24 @@ def init_beam_state(decoder, batch: int, beam: int, device: torch.device) -> Bea
     )
 
 
+def _fused_selection(logits: torch.Tensor, beam: int) -> bool:
+    """Whether a frame's selection runs as the one fused kernel.
+
+    CPU and fp32 are out of scope -- the parity oracles' dtypes -- and an
+    fp16/bf16 frame the kernel cannot take is a declared gap, never a silent
+    reroute (see ``oasr/layers/_backend.py``).
+    """
+    if _backend.layers_backend() == "torch":
+        return False
+    if not logits.is_cuda or logits.dtype not in _backend.SERVED_DTYPES:
+        return _backend.out_of_scope("transducer beam selection on CPU / fp32")
+    if not transducer_beam_topk_supports(logits, beam):
+        return _backend.take_gap(
+            "transducer-beam-topk", f"vocabulary {int(logits.size(-1))}, beam {beam}"
+        )
+    return True
+
+
 def beam_search_step(
     model,
     enc_proj_t: torch.Tensor,
@@ -86,6 +107,7 @@ def beam_search_step(
     active: torch.Tensor,
     stay: torch.Tensor,
     blank_label: torch.Tensor,
+    fused: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Advance every live hypothesis by one encoder frame.
 
@@ -105,6 +127,12 @@ def beam_search_step(
         ``(B, k)`` constants an inactive row records: ``arange(k)`` and ``blank``.
         Passed in, not built here, so a captured graph reads buffers that outlive
         the capture.
+    fused : bool
+        Run everything after the joiner -- log-softmax, score add, top-k, the
+        ``(parent, label)`` split, the masks and the window reorder -- as one
+        kernel (:func:`oasr.transducer_beam_topk`) instead of about fourteen
+        torch launches.  Same scores bit for bit; a tie inside the selected
+        ``k`` may take a different slot order (see the kernel's header).
 
     Returns ``(context, scores, parent, label)``: the beam after the frame and,
     for each new slot, the slot it extended and the label it took.
@@ -128,6 +156,10 @@ def beam_search_step(
     dec_proj = joiner.decoder_proj(dec_out)  # (B*k, J)
     enc_rep = enc_proj_t.unsqueeze(1).expand(B, k, enc_proj_t.size(-1)).reshape(B * k, -1)
     logits = joiner(enc_rep, dec_proj, project_input=False)  # (B*k, V)
+    if fused and _fused_selection(logits, k):
+        selected: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        selected = transducer_beam_topk(logits, scores, context, active, blank)
+        return selected
     vocab = int(logits.size(-1))
     log_probs = torch.log_softmax(logits.float(), dim=-1).view(B, k, vocab)
 
@@ -165,6 +197,7 @@ def beam_search_frames(
     enc_proj: torch.Tensor,
     lengths: torch.Tensor,
     state: BeamState,
+    fused: bool = True,
 ) -> BeamState:
     """Advance ``state`` over every frame of a joiner-projected chunk, eagerly."""
     device = enc_proj.device
@@ -178,7 +211,7 @@ def beam_search_frames(
     labels: List[torch.Tensor] = []
     for t in range(T):
         context, scores, parent, label = beam_search_step(
-            model, enc_proj[:, t], context, scores, t < lengths, stay, blank_label
+            model, enc_proj[:, t], context, scores, t < lengths, stay, blank_label, fused
         )
         parents.append(parent)
         labels.append(label)
@@ -198,6 +231,7 @@ def beam_search_chunk(
     enc_out: torch.Tensor,
     lengths: torch.Tensor,
     state: BeamState,
+    fused: bool = True,
 ) -> BeamState:
     """Advance ``state`` over every frame of ``enc_out``.
 
@@ -207,7 +241,7 @@ def beam_search_chunk(
     if int(enc_out.size(1)) == 0:
         return state
     enc_proj = model.joiner.encoder_proj(enc_out)  # (B, T, J)
-    return beam_search_frames(model, enc_proj, lengths, state)
+    return beam_search_frames(model, enc_proj, lengths, state, fused)
 
 
 def fold_chunk(

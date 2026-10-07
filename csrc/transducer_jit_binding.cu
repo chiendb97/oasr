@@ -14,3 +14,9 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
                              int64_t activation, int64_t rows_per_cta);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_greedy_decode, stateless_greedy_decode);
+
+void transducer_beam_topk(TensorView context_out, TensorView scores_out, TensorView parent_out,
+                          TensorView label_out, TensorView logits, TensorView scores,
+                          TensorView context, TensorView active, int64_t blank);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transducer_beam_topk, transducer_beam_topk);

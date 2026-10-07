@@ -674,13 +674,13 @@ class TestTransducerBeamSearch:
         lengths = torch.tensor([T, T - 5, T - 11, T][:B], device="cuda")
         return enc, lengths
 
-    def _strategy(self, model, beam, max_sym, graphs=False):
+    def _strategy(self, model, beam, max_sym, graphs=False, **options):
         from oasr.engine.decode.transducer import TransducerDecodeStrategy
 
         cfg = SimpleNamespace(
             device="cuda",
             transducer_max_sym_per_frame=max_sym,
-            decode_options={"beam_size": beam},
+            decode_options={"beam_size": beam, **options},
             partial_decode_interval=1,
             use_cuda_graphs=graphs,
             use_transducer_cuda_graphs=graphs,
@@ -936,6 +936,50 @@ class TestTransducerBeamSearch:
                 got = cache.run(enc_proj, lengths, st.context, st.scores)
                 assert (got is not None) is served, f"B={B}"
         assert cache.num_captured == 1 and cache.stats()["fallbacks"] == 1
+
+    # -- the fused frame selection -----------------------------------------
+
+    def test_fused_selection_routes_by_scope(self):
+        """fp32 is out of scope (the oracles' dtype), an in-scope half-precision
+        frame takes the kernel, and one past the kernel's scope is the declared
+        ``transducer-beam-topk`` gap -- counted, never a silent reroute."""
+        from oasr.engine.decode.transducer_beam import _fused_selection
+        from oasr.layers import _backend
+
+        _backend.reset_backend_stats()
+        assert not _fused_selection(torch.zeros(8, 40, device="cuda"), 4)
+        assert _fused_selection(torch.zeros(8, 40, device="cuda", dtype=torch.bfloat16), 4)
+        assert _backend.gap_hits() == {}
+        assert not _fused_selection(torch.zeros(8, 2000, device="cuda", dtype=torch.bfloat16), 4)
+        assert _backend.gap_hits() == {"transducer-beam-topk": 1}
+        _backend.reset_backend_stats()
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    @pytest.mark.parametrize("beam", [2, 4, 8])
+    def test_fused_beam_matches_the_torch_beam(self, dtype, beam):
+        """End to end, the fused selection and the torch composition decode the
+        same hypotheses with the same scores.
+
+        Continuous weights and frames, so no two candidates tie: a tie inside the
+        selected k is the one place the two may order slots differently.
+        """
+        from helpers.transducer import exact_transducer
+
+        model = exact_transducer(dtype, blank_bias=2.0, seed=beam)
+        gen = torch.Generator(device="cuda").manual_seed(beam)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.add_(torch.randn(param.shape, device="cuda", generator=gen).to(dtype) * 0.05)
+        B, T = 5, 41
+        enc = torch.randn(B, T, 64, device="cuda", generator=gen).to(dtype)
+        lengths = torch.tensor([41, 36, 30, 7, 1], device="cuda")
+        fused = self._strategy(model, beam=beam, max_sym=1)
+        reference = self._strategy(model, beam=beam, max_sym=1, fused=False)
+        with torch.no_grad():
+            want = reference.decode_offline(enc, lengths)
+            got = fused.decode_offline(enc, lengths)
+        assert [o.tokens for o in got] == [o.tokens for o in want]
+        assert [o.scores for o in got] == [o.scores for o in want]
 
     def test_beam_graph_unroll_must_fit_the_frame_capacity(self):
         """A replay count is ``ceil(T / unroll)``, which must never run past the
