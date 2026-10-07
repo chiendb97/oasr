@@ -110,6 +110,24 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
             ),
         ),
         KernelGap(
+            id="transducer-beam-topk",
+            what=(
+                "a transducer beam-search frame outside the fused selection "
+                "kernel's scope: a vocabulary over 1024 -- past torch's warp "
+                "log-softmax, whose reduction order the kernel reproduces so its "
+                "scores are bit-identical -- or a beam over 32, its k x k "
+                "shared-memory candidate grid"
+            ),
+            fix=(
+                "kernel: a block-level log-softmax pass for V > 1024 (torch's "
+                "cunn_SoftMaxForward order, or a stated departure from it) and a "
+                "two-level candidate merge for wider beams. No in-tree model "
+                "reaches either: the icefall transducer's vocabulary is 500, "
+                "beams are 4-10, and Nemotron's recurrent predictor refuses beam "
+                "search outright"
+            ),
+        ),
+        KernelGap(
             id="fmha-paged-config",
             what=(
                 "a paged attention config the arch class refuses: a head_dim off "

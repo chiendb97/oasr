@@ -230,8 +230,10 @@ class TransducerOptions:
             "Decode a greedy batch with one fused kernel launch "
             "(oasr.transducer_greedy_decode) when the model's predictor and joiner "
             "declare the tensors it reads -- a stateless label-window predictor and "
-            "an additive joiner, in half precision.  False keeps the op-by-op loop "
-            "(loop_graphs decides how that one runs)."
+            "an additive joiner, in half precision -- and, under beam search, run "
+            "each frame's log-softmax, score add and top-k as one kernel "
+            "(oasr.transducer_beam_topk).  False keeps the op-by-op paths "
+            "(loop_graphs decides how those run)."
         ),
     )
 
@@ -556,7 +558,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
         if self._beam_graphs is None:
             from oasr.engine.beam_graph import BeamLoopGraphCache
 
-            self._beam_graphs = BeamLoopGraphCache(self._model, unroll=_TERMINATION_CHECK_STRIDE)
+            self._beam_graphs = BeamLoopGraphCache(
+                self._model, unroll=_TERMINATION_CHECK_STRIDE, fused=bool(self.options.fused)
+            )
         return self._beam_graphs
 
     @torch.no_grad()
@@ -587,7 +591,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
                     labels,
                     int(cast(int, self._model.blank_id)),
                 )
-        return beam_search_frames(self._model, enc_proj, lengths, state)
+        return beam_search_frames(self._model, enc_proj, lengths, state, bool(self.options.fused))
 
     def _fused_surface(self) -> Optional["StatelessGreedyWeights"]:
         """The fused kernel's weights; ``None`` if this model's surface does not

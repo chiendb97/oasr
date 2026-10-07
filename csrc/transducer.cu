@@ -3,6 +3,7 @@
 //
 // TVM-FFI launcher for the fused stateless-transducer greedy decode.
 
+#include <oasr/transducer/beam_topk.cuh>
 #include <oasr/transducer/greedy_decode.cuh>
 
 #include "tvm_ffi_utils.h"
@@ -181,6 +182,92 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
             transducer::StatelessGreedyDecode<c_type>(p, static_cast<int>(rows_per_cta), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "stateless greedy decode failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// One modified-beam-search frame after the joiner: log-softmax, score add,
+// top-k over the beam's k * V candidates, the (parent, label) split, the mask
+// for rows past their utterance and the label-window reorder.  `logits` is the
+// joiner's (B * k, V) output, its rows possibly strided (the joiner slices a
+// padded projection).  Scores are bit-identical to the torch composition; see
+// include/oasr/transducer/beam_topk.cuh for the tie order.
+void transducer_beam_topk(TensorView context_out, TensorView scores_out, TensorView parent_out,
+                          TensorView label_out, TensorView logits, TensorView scores,
+                          TensorView context, TensorView active, int64_t blank) {
+    CHECK_INPUT(scores);
+    CHECK_CONTIGUOUS_INPUT(scores);
+    CHECK_DIM(2, scores);
+    TVM_FFI_ICHECK(is_dtype(scores, dl_float32)) << "scores must be float32 of shape (B, k)";
+    const int64_t B = scores.size(0);
+    const int64_t k = scores.size(1);
+    TVM_FFI_ICHECK(k >= 1 && k <= transducer::kBeamTopkMaxBeam)
+        << "beam must be in [1, " << transducer::kBeamTopkMaxBeam << "], got " << k;
+
+    CHECK_INPUT(logits);
+    CHECK_DIM(2, logits);
+    TVM_FFI_ICHECK(logits.stride(1) == 1) << "logits rows must be contiguous";
+    TVM_FFI_ICHECK(logits.size(0) == B * k) << "logits must be (B * k, V)";
+    const int64_t V = logits.size(1);
+    TVM_FFI_ICHECK(V >= k && V <= (int64_t{1} << transducer::kBeamTopkMaxLog2Vocab))
+        << "vocabulary must be in [beam, " << (1 << transducer::kBeamTopkMaxLog2Vocab) << "], got "
+        << V;
+    TVM_FFI_ICHECK(logits.stride(0) >= V) << "logits row stride must cover the vocabulary";
+
+    CHECK_INPUT(context);
+    CHECK_CONTIGUOUS_INPUT(context);
+    TVM_FFI_ICHECK(is_dtype(context, dl_int64) && context.ndim() == 3 && context.size(0) == B &&
+                   context.size(1) == k)
+        << "context must be int64 of shape (B, k, ctx)";
+    const int64_t ctx = context.size(2);
+    TVM_FFI_ICHECK(ctx >= 1) << "context must hold at least one label";
+
+    CHECK_INPUT(active);
+    CHECK_CONTIGUOUS_INPUT(active);
+    TVM_FFI_ICHECK(active.dtype().code == kDLBool && active.dtype().bits == 8 &&
+                   active.ndim() == 1 && active.size(0) == B)
+        << "active must be bool of shape (B,)";
+
+    CHECK_INPUT(scores_out);
+    CHECK_CONTIGUOUS_INPUT(scores_out);
+    TVM_FFI_ICHECK(is_dtype(scores_out, dl_float32) && scores_out.ndim() == 2 &&
+                   scores_out.size(0) == B && scores_out.size(1) == k)
+        << "scores_out must be float32 of shape (B, k)";
+    for (const TensorView* t : {&parent_out, &label_out}) {
+        CHECK_INPUT(*t);
+        CHECK_CONTIGUOUS_INPUT(*t);
+        TVM_FFI_ICHECK(is_dtype(*t, dl_int64) && t->ndim() == 2 && t->size(0) == B &&
+                       t->size(1) == k)
+            << "parent_out / label_out must be int64 of shape (B, k)";
+    }
+    CHECK_INPUT(context_out);
+    CHECK_CONTIGUOUS_INPUT(context_out);
+    TVM_FFI_ICHECK(is_dtype(context_out, dl_int64) && context_out.ndim() == 3 &&
+                   context_out.size(0) == B && context_out.size(1) == k &&
+                   context_out.size(2) == ctx)
+        << "context_out must be int64 of shape (B, k, ctx)";
+
+    cudaStream_t stream = get_stream(logits.device());
+
+    DISPATCH_DLPACK_HALF_DTYPE(logits.dtype(), c_type, [&] {
+        transducer::BeamTopkParams<c_type> p;
+        p.logits = static_cast<const c_type*>(logits.data_ptr());
+        p.scores = static_cast<const float*>(scores.data_ptr());
+        p.context = static_cast<const int64_t*>(context.data_ptr());
+        p.active = static_cast<const bool*>(active.data_ptr());
+        p.scores_out = static_cast<float*>(scores_out.data_ptr());
+        p.parent_out = static_cast<int64_t*>(parent_out.data_ptr());
+        p.label_out = static_cast<int64_t*>(label_out.data_ptr());
+        p.context_out = static_cast<int64_t*>(context_out.data_ptr());
+        p.B = static_cast<int>(B);
+        p.k = static_cast<int>(k);
+        p.V = static_cast<int>(V);
+        p.ld = logits.stride(0);
+        p.ctx = static_cast<int>(ctx);
+        p.blank = blank;
+        cudaError_t status = transducer::BeamTopk<c_type>(p, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "transducer beam top-k failed: " << cudaGetErrorString(status);
         return true;
     });
 }

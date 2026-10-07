@@ -370,6 +370,22 @@ launches per frame, the GPU 10% busy, and the wall time flat from `B = 64` to
 frames), the decode went from 118 ms to 15 ms. In-process on LJSpeech-200, `k = 4`
 went from 533x to 2,059x real time against greedy's 2,414x, with WER unchanged.
 
+Everything a frame does after the joiner -- `log_softmax` of the float-cast logits,
+the score add, the `top-k` over the beam's `k * V` candidates, the `(parent, label)`
+split, the masks for finished rows and the label-window reorder -- runs as one kernel,
+`oasr.transducer_beam_topk` (`TransducerOptions.fused`; about fourteen torch launches
+otherwise). Its scores are **bit-identical** to the torch composition: it reproduces
+torch's warp log-softmax (the kernel torch dispatches for a row of at most 1024
+floats) element for element, and calls libdevice's precise `__nv_expf` / `__nv_logf`
+by name because `--use_fast_math` maps `expf` / `logf` to approximate intrinsics.
+Candidates are ranked by score, then by lower `j * V + v`; `torch.topk` keeps the
+same set but sorts ties with an unstable network, so two hypotheses with *equal*
+scores can come out in the other slot order -- on 2,000 LJSpeech utterances at
+`k = 4` and `k = 8`, no transcript changed. A vocabulary over 1024 or a beam over 32
+is the declared `transducer-beam-topk` kernel gap; fp32 and CPU are out of scope.
+Measured per frame at `B = 64, k = 4, V = 500`: 8 us against 45 us; the graphed
+decode 15.5 ms to 8.1 ms.
+
 Transducer greedy is `beam_size=1` by construction and caps per-frame emissions
 with `EngineConfig.transducer_max_sym_per_frame`.
 

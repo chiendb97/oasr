@@ -798,8 +798,9 @@ class TestKernelGapRegistry:
     #:
     #: The paged loader requires a head dimension aligned to its 32-element MMA
     #: stride and a page size that divides every K tile.  Production configs meet
-    #: both constraints; small test configs may not.
-    PINNED = {"fmha-head-dim", "fmha-paged-config"}
+    #: both constraints; small test configs may not.  The fused transducer beam
+    #: selection covers V <= 1024 and beams <= 32; no in-tree model exceeds either.
+    PINNED = {"fmha-head-dim", "fmha-paged-config", "transducer-beam-topk"}
 
     def test_declared_gap_set_only_shrinks(self):
         from oasr.layers._backend import KERNEL_GAPS
