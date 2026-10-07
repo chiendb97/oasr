@@ -18,8 +18,9 @@ Both the kernel tests (``tests/kernels``) and the decode-strategy tests
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import torch
 
@@ -28,6 +29,7 @@ __all__ = [
     "DEC_DIM",
     "JOINER_DIM",
     "VOCAB",
+    "exact_projections",
     "exact_transducer",
     "integer_frames",
     "transducer_strategy",
@@ -77,6 +79,9 @@ def exact_transducer(
     seed: int = 0,
     blank_bias: Optional[float] = None,
     device: str = "cuda",
+    joiner_dim: int = JOINER_DIM,
+    dec_dim: int = DEC_DIM,
+    vocab: int = VOCAB,
 ):
     """A :class:`~oasr.models.transducer.TransducerModel` with exact decode arithmetic.
 
@@ -84,6 +89,11 @@ def exact_transducer(
     which is what exercises the bookkeeping; its default is sized to the
     activation (``tanh`` bounds the joiner input to [-1, 1], ReLU does not, and
     its logits run about twice as large on this data).
+
+    The dimensions default to the small model every test shares; larger ones
+    stay exact while every partial sum fits fp32's 24 bits (a joiner dim of a
+    few thousand), which is what lets a test reach a kernel's multi-pass and
+    shared-memory boundaries.
     """
     from oasr.models.transducer import StatelessDecoder, TransducerJoiner, TransducerModel
 
@@ -91,16 +101,16 @@ def exact_transducer(
         blank_bias = 10.0 if activation == "tanh" else 22.0
     gen = torch.Generator().manual_seed(seed)
     decoder = StatelessDecoder(
-        VOCAB, DEC_DIM, blank_id=BLANK, context_size=context, conv_group_size=group
+        vocab, dec_dim, blank_id=BLANK, context_size=context, conv_group_size=group
     )
     joiner_cls = _relu_joiner_cls() if activation == "relu" else TransducerJoiner
-    joiner = joiner_cls(JOINER_DIM, DEC_DIM, JOINER_DIM, VOCAB)
+    joiner = joiner_cls(joiner_dim, dec_dim, joiner_dim, vocab)
     with torch.no_grad():
         decoder.embedding.weight.copy_(_ternary(decoder.embedding.weight.shape, gen))
         decoder.embedding.weight[BLANK].zero_()
         if context > 1:
             decoder.conv.weight.copy_(_ternary(decoder.conv.weight.shape, gen))
-        joiner.encoder_proj.weight.copy_(torch.eye(JOINER_DIM))
+        joiner.encoder_proj.weight.copy_(torch.eye(joiner_dim))
         joiner.encoder_proj.bias.zero_()
         joiner.decoder_proj.weight.copy_(_ternary(joiner.decoder_proj.weight.shape, gen))
         joiner.decoder_proj.bias.copy_(_ternary(joiner.decoder_proj.bias.shape, gen))
@@ -111,14 +121,49 @@ def exact_transducer(
     return model.to(device=device, dtype=dtype).eval()
 
 
+@contextmanager
+def exact_projections(model) -> Iterator[None]:
+    """The joiner's output head and decoder projection in float64, rounded once.
+
+    Exact data is not enough for an oracle built on the library GEMMs: at some
+    shapes they split K and round each split's partial sum to the activation
+    dtype (a 1024-wide K at M = 24 lands 0.5 off; torch's cuBLAS path allows
+    the same reduced-precision reduction by default).  Inside this block the two
+    projections a decode step runs are what one fp32 accumulator gives on this
+    data, whatever the shape.
+    """
+    mods = (model.joiner.output_linear, model.joiner.decoder_proj)
+
+    def exact(mod):
+        def forward(x):
+            y = x.double() @ mod.weight.double().t()
+            if mod.bias is not None:
+                y = y + mod.bias.double()
+            return y.to(x.dtype)
+
+        return forward
+
+    for mod in mods:
+        mod.forward = exact(mod)
+    try:
+        yield
+    finally:
+        for mod in mods:
+            del mod.forward
+
+
 def integer_frames(
-    batch: int, frames: int, dtype: torch.dtype, *, seed: int = 1, device: str = "cuda"
+    batch: int,
+    frames: int,
+    dtype: torch.dtype,
+    *,
+    seed: int = 1,
+    device: str = "cuda",
+    dim: int = JOINER_DIM,
 ) -> torch.Tensor:
-    """``(batch, frames, JOINER_DIM)`` encoder output with values in ``{-2..2}``."""
+    """``(batch, frames, dim)`` encoder output with values in ``{-2..2}``."""
     gen = torch.Generator().manual_seed(seed)
-    return torch.randint(-2, 3, (batch, frames, JOINER_DIM), generator=gen).to(
-        device=device, dtype=dtype
-    )
+    return torch.randint(-2, 3, (batch, frames, dim), generator=gen).to(device=device, dtype=dtype)
 
 
 def transducer_strategy(model, *, max_sym: int = 3, partial_interval: int = 1, **options: Any):
