@@ -327,6 +327,31 @@ def walk_chunk(parents: torch.Tensor, labels: torch.Tensor, blank: int) -> Chunk
     )
 
 
+def read_walk(packed: torch.Tensor, beam: int, frames: int, rows: int) -> ChunkWalk:
+    """The :class:`ChunkWalk` the fused beam kernel computed on the device.
+
+    ``packed`` is its walk buffer (:func:`oasr.functionals.transducer.beam_walk_buffer`):
+    roots, counts and tokens for every hypothesis of the launch, of which the
+    first ``rows`` utterances are read.  One device-to-host copy, and the
+    tokens kept by count in one compaction -- the end of :func:`walk_chunk`,
+    without the walk.
+    """
+    hyps = packed.numel() // (2 + frames)
+    host = packed.cpu().numpy()
+    keep = rows * beam
+    counts = host[hyps : hyps + keep]
+    tokens = host[2 * hyps :].reshape(hyps, frames)[:keep]
+    emitted = np.arange(frames)[None, :] < counts[:, None]
+    ends = np.cumsum(counts).tolist()
+    return ChunkWalk(
+        beam=beam,
+        root=host[:keep].tolist(),
+        flat=tokens[emitted].tolist(),
+        starts=[0] + ends[:-1],
+        ends=ends,
+    )
+
+
 def fold_chunk(
     context: torch.Tensor,
     scores: torch.Tensor,
@@ -496,6 +521,7 @@ __all__ = [
     "beam_width_bucket",
     "fold_chunk",
     "init_beam_state",
+    "read_walk",
     "select_rows",
     "stack_states",
     "step_constants",

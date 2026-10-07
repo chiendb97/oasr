@@ -69,9 +69,11 @@ from .base import DecodeStrategy, register_decode_strategy, wants_speech_activit
 from .options import option
 from .transducer_beam import (
     BeamSlotPool,
+    ChunkWalk,
     beam_search_history,
     beam_width_bucket,
     init_beam_state,
+    read_walk,
     walk_chunk,
 )
 
@@ -230,8 +232,10 @@ class TransducerOptions:
             "Decode a greedy batch with one fused kernel launch "
             "(oasr.transducer_greedy_decode) when the model's predictor and joiner "
             "declare the tensors it reads -- a stateless label-window predictor and "
-            "an additive joiner, in half precision -- and, under beam search, run "
-            "each frame's log-softmax, score add and top-k as one kernel "
+            "an additive joiner, in half precision -- and, under beam search, every "
+            "frame of a chunk with one launch too (oasr.transducer_beam_decode, "
+            "beam_size <= 8).  A beam search the kernel cannot take runs each "
+            "frame's log-softmax, score add and top-k as one kernel "
             "(oasr.transducer_beam_topk).  False keeps the op-by-op paths "
             "(loop_graphs decides how those run)."
         ),
@@ -334,17 +338,18 @@ class TransducerDecodeStrategy(DecodeStrategy):
             and self._beam > 1
             and self.options.loop_graphs
         )
-        # The fused kernel's view of the model, laid out on first use and again
-        # whenever a source parameter changes (``_fused_versions``).  Gated on
-        # greedy only: beam search keeps its own (B, k, ctx) state.
+        # The fused kernels' view of the model -- the greedy decode's and the
+        # beam search's read the same tensors -- laid out on first use and again
+        # whenever a source parameter changes (``_fused_versions``).
         self._fused_weights: Optional["StatelessGreedyWeights"] = None
         self._fused_versions: Tuple[int, ...] = ()
-        self._fused_enabled = self._beam <= 1 and bool(self.options.fused)
+        self._fused_enabled = bool(self.options.fused)
         #: Where :meth:`decode_offline_async` issues the fused decode; created on
         #: first use, once, so it never strands a cuBLAS workspace per call.
         self._side_stream: Optional[torch.cuda.Stream] = None
-        #: Accounting for the fused path: batches it decoded, batches it handed
-        #: to the loop (unsupported dtype/shape), and emission-buffer overflows.
+        #: Accounting for the fused path: batches (beam search: chunks) it
+        #: decoded, ones it handed to the loop (unsupported dtype/shape), and
+        #: greedy emission-buffer overflows.
         self.fused_stats = {"hits": 0, "fallbacks": 0, "overflows": 0}
         if self._beam > 1 and model is not None:
             # Beam search keeps every hypothesis's state in one ``(B, k, ctx)``
@@ -578,25 +583,34 @@ class TransducerDecodeStrategy(DecodeStrategy):
         enc_lengths: torch.Tensor,
         context: torch.Tensor,
         scores: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Beam-search one chunk from ``(context, scores)``: replayed when it can be, else eager.
+        rows: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, ChunkWalk]:
+        """Beam-search one chunk from ``(context, scores)``.
 
-        Returns ``(context, scores, parents, labels)`` -- the beam after the
-        chunk and its frame-major ``(T, W, k)`` back-pointers and labels.
+        One fused launch when the kernel can take it
+        (:meth:`_beam_kernel_launch`), which also walks the back-pointers on
+        the device; else the frame loop -- replayed from CUDA graphs when it can
+        be, else eager -- walked on the host.  Returns the beam after the chunk,
+        ``W`` rows wide, and the walk of its first ``rows`` utterances.
 
         The beam is ``W = beam_width_bucket(B)`` rows wide, and rows past
         ``enc_out``'s ``B`` are padding: they get zero frames, so every frame
         leaves them as they were.  The width is padded *here*, before the
-        graph/eager branch, so both arms run the same shapes and the result does
-        not depend on which one served it -- or on whether this width happened
-        to be captured.  Padding is what makes the captures cover a cohort:
-        exact widths took every value up to ``max_batch_size``, more than the
-        capture budget, and the widths past it ran eager.
+        kernel/graph/eager branch, so every arm runs the same shapes and the
+        result does not depend on which one served it -- or on whether this
+        width happened to be captured.  Padding is what makes the captures cover
+        a cohort: exact widths took every value up to ``max_batch_size``, more
+        than the capture budget, and the widths past it ran eager.
         """
+        blank = int(cast(int, self._model.blank_id))
         T = int(enc_out.size(1))
+        k = int(scores.size(1))
         if T == 0:
-            empty = context.new_empty((0, *scores.shape))
-            return context, scores, empty, empty
+            return (
+                context,
+                scores,
+                walk_chunk(context.new_empty((0, rows, k)), context.new_empty((0, rows, k)), blank),
+            )
         joiner, _decoder = self._surface()
         enc_proj = joiner.encoder_proj(enc_out)  # type: ignore[operator]
         lengths = enc_lengths.to(device=enc_proj.device, dtype=torch.long)
@@ -604,14 +618,20 @@ class TransducerDecodeStrategy(DecodeStrategy):
         if pad:
             enc_proj = torch.cat([enc_proj, enc_proj.new_zeros(pad, T, enc_proj.size(2))])
             lengths = torch.cat([lengths, lengths.new_zeros(pad)])
+        fused = self._beam_kernel_launch(enc_proj, lengths, context, scores)
+        if fused is not None:
+            new_context, new_scores, packed = fused
+            return new_context, new_scores, read_walk(packed, k, T, rows)
+        res = None
         graphs = self._beam_loop_graphs()
         if graphs is not None:
             res = graphs.run(enc_proj, lengths, context, scores)
-            if res is not None:
-                return res
-        return beam_search_history(
-            self._model, enc_proj, lengths, context, scores, bool(self.options.fused)
-        )
+        if res is None:
+            res = beam_search_history(
+                self._model, enc_proj, lengths, context, scores, bool(self.options.fused)
+            )
+        new_context, new_scores, parents, labels = res
+        return new_context, new_scores, walk_chunk(parents[:, :rows], labels[:, :rows], blank)
 
     def _fused_surface(self) -> Optional["StatelessGreedyWeights"]:
         """The fused kernel's weights; ``None`` if this model's surface does not
@@ -704,6 +724,45 @@ class TransducerDecodeStrategy(DecodeStrategy):
             track=track,
         )
         return res
+
+    def _beam_kernel_launch(
+        self,
+        enc_proj: torch.Tensor,
+        lengths: torch.Tensor,
+        context: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Queue the fused beam search over a chunk, or ``None`` when it cannot serve it.
+
+        Returns the beam after the chunk and the kernel's walk buffer
+        (:func:`~oasr.functionals.transducer.beam_walk_buffer`), still on the
+        device -- nothing is read back here.
+
+        The kernel decodes from the same predictor and joiner tensors as the
+        greedy one, so a model that does not declare them, a dtype it does not
+        take, or a beam / vocabulary past its bounds falls back to the frame
+        loop -- counted in ``fused_stats``, as the greedy kernel's fallbacks are.
+        """
+        if not self._fused_enabled:
+            return None
+        if not (enc_proj.is_cuda and enc_proj.dtype in (torch.float16, torch.bfloat16)):
+            self.fused_stats["fallbacks"] += 1
+            return None
+        weights = self._fused_surface()
+        if weights is None:
+            return None
+        if not weights.supports_beam(enc_proj, self._beam):
+            self.fused_stats["fallbacks"] += 1
+            return None
+        from oasr.functionals.transducer import beam_walk_buffer, transducer_beam_decode
+
+        self.fused_stats["hits"] += 1
+        B, T = int(enc_proj.size(0)), int(enc_proj.size(1))
+        walk = beam_walk_buffer(B, self._beam, T, enc_proj.device)
+        new_context, new_scores, _parents, _labels = transducer_beam_decode(
+            enc_proj, lengths, context.contiguous(), scores.contiguous(), weights, walk=walk
+        )
+        return new_context, new_scores, walk
 
     def _surface(self) -> Tuple["Joiner", "TransducerPredictor"]:
         """``(joiner, predictor)`` with their real types.
@@ -891,10 +950,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
         """
         B, k = int(enc_out.size(0)), self._beam
         state = init_beam_state(self._model.decoder, beam_width_bucket(B), k, enc_out.device)
-        _, scores, parents, labels = self._beam_frames(
-            enc_out, enc_lengths, state.context, state.scores
-        )
-        walk = walk_chunk(parents[:, :B], labels[:, :B], int(cast(int, self._model.blank_id)))
+        _, scores, walk = self._beam_frames(enc_out, enc_lengths, state.context, state.scores, B)
         # Slot ``j`` holds the ``j``-th best hypothesis: every frame's selection
         # returns the new beam best first, and a frame past a row's length
         # leaves it as it was.
@@ -937,28 +993,32 @@ class TransducerDecodeStrategy(DecodeStrategy):
         on Nemotron streaming: a 52.7 ms tick against a 17.9 ms p50 when one landed
         mid-run.  All rows are passed with length zero, so each warm-up call is one
         inert replay after its capture.
+
+        Beam search warms through :meth:`_beam_frames`, the path a tick takes: a
+        chunk the fused kernel serves needs no graph, so that only loads the
+        kernel, and a graph is captured only where the frame loop would run.
         """
         greedy = self._greedy_loop_graphs()
-        beam = self._beam_loop_graphs()
-        if greedy is None and beam is None:
+        beam = self._beam > 1 and (self._fused_enabled or self._beam_graphs_enabled)
+        if greedy is None and not beam:
             return
         joiner, _decoder = self._surface()
         weight = next(joiner.parameters())
         width = int(self._model.encoder.output_size)
         widths = {int(b) for b in batch_sizes if int(b) >= 1}
-        if beam is not None:
+        if beam:
             # A beam chunk runs at its bucketed width (``_beam_frames``).
             widths = {beam_width_bucket(b) for b in widths}
         for b in sorted(widths):
             enc = torch.zeros(b, int(frames), width, dtype=weight.dtype, device=weight.device)
-            enc_proj = joiner.encoder_proj(enc)  # type: ignore[operator]
             lengths = torch.zeros(b, dtype=torch.long, device=weight.device)
             if greedy is not None:
+                enc_proj = joiner.encoder_proj(enc)  # type: ignore[operator]
                 state, dec_proj = self._init_state(b, weight.device)
                 greedy.run(enc_proj, lengths, state, dec_proj, max_steps=_TERMINATION_CHECK_STRIDE)
-            if beam is not None:
+            if beam:
                 st = init_beam_state(self._model.decoder, b, self._beam, weight.device)
-                beam.run(enc_proj, lengths, st.context, st.scores)
+                self._beam_frames(enc, lengths, st.context, st.scores, b)
 
     def _session(self, request_id: str, device: torch.device) -> _Session:
         s = self._sessions.get(request_id)
@@ -1062,12 +1122,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
             slots + slots[:1] * (beam_width_bucket(B) - B), dtype=torch.long, device=enc.device
         )
         context, scores = pool.gather(rows)
-        context, scores, parents, labels = self._beam_frames(enc, lengths, context, scores)
+        context, scores, walk = self._beam_frames(enc, lengths, context, scores, B)
         pool.scatter(rows[:B], context[:B], scores[:B])
-        pool.fold(
-            slots,
-            walk_chunk(parents[:, :B], labels[:, :B], int(cast(int, self._model.blank_id))),
-        )
+        pool.fold(slots, walk)
         # Slot 0 is the best hypothesis (see ``_decode_offline_beam``), so the
         # partial needs no read of the scores.
         for s, slot in zip(sessions, slots):

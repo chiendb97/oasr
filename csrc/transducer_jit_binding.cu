@@ -20,3 +20,16 @@ void transducer_beam_topk(TensorView context_out, TensorView scores_out, TensorV
                           TensorView context, TensorView active, int64_t blank);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(transducer_beam_topk, transducer_beam_topk);
+
+void stateless_beam_decode(TensorView context_out, TensorView scores_out, TensorView parents,
+                           TensorView labels, Optional walk, TensorView enc_proj,
+                           TensorView lengths, TensorView context_in, TensorView scores_in,
+                           TensorView w_out_t, Optional b_out, TensorView emb, Optional conv_w,
+                           TensorView w_dp_t, Optional b_dp, int64_t vocab, int64_t group,
+                           int64_t blank, int64_t activation, int64_t cluster);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_beam_decode, stateless_beam_decode);
+
+bool stateless_beam_fits(int64_t beam, int64_t J, int64_t D, int64_t vocab);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_beam_fits, stateless_beam_fits);

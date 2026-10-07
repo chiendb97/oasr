@@ -692,6 +692,14 @@ class TestTransducerBeamSearch:
         )
         return TransducerDecodeStrategy(cfg, detok, model)
 
+    @staticmethod
+    def _frame_loop(strategy):
+        """``strategy`` with the fused beam kernel off: every chunk runs the
+        per-frame loop (replayed or eager), whose selection ``fused`` still picks.
+        The greedy kernel tests switch theirs off the same way."""
+        strategy._fused_enabled = False  # noqa: SLF001
+        return strategy
+
     def _beam_rows(self, model, enc, lengths, beam):
         from oasr.engine.decode.transducer_beam import beam_search_chunk, init_beam_state
 
@@ -883,8 +891,8 @@ class TestTransducerBeamSearch:
         lengths = torch.tensor(
             [frames - (7 * i) % max(1, frames // 2) for i in range(batch)], device="cuda"
         )
-        eager = self._strategy(model, beam=beam, max_sym=1)
-        graphed = self._strategy(model, beam=beam, max_sym=1, graphs=True)
+        eager = self._frame_loop(self._strategy(model, beam=beam, max_sym=1))
+        graphed = self._frame_loop(self._strategy(model, beam=beam, max_sym=1, graphs=True))
         with torch.no_grad():
             want = eager.decode_offline(enc, lengths)
             got = graphed.decode_offline(enc, lengths)
@@ -901,7 +909,7 @@ class TestTransducerBeamSearch:
         model = exact_transducer(torch.bfloat16, blank_bias=8.0, seed=3)
         B, T, chunk = 3, 41, 16
         enc = integer_frames(B, T, torch.bfloat16, seed=7)
-        strat = self._strategy(model, beam=4, max_sym=1, graphs=True)
+        strat = self._frame_loop(self._strategy(model, beam=4, max_sym=1, graphs=True))
         reqs = [SimpleNamespace(request_id=f"s{b}") for b in range(B)]
         for req in reqs:
             strat.create_session(req)
@@ -915,7 +923,7 @@ class TestTransducerBeamSearch:
                     },
                 )
             streamed = [strat.finalize(r).tokens for r in reqs]
-            offline = self._strategy(model, beam=4, max_sym=1).decode_offline(
+            offline = self._frame_loop(self._strategy(model, beam=4, max_sym=1)).decode_offline(
                 enc, torch.full((B,), T, device="cuda")
             )
         assert strat._beam_graphs is not None and strat._beam_graphs.stats()["hits"] == 3
@@ -962,7 +970,9 @@ class TestTransducerBeamSearch:
         same hypotheses with the same scores.
 
         Continuous weights and frames, so no two candidates tie: a tie inside the
-        selected k is the one place the two may order slots differently.
+        selected k is the one place the two may order slots differently.  The
+        frame loop on both sides: this is the selection's test, and the fused
+        beam kernel's GEMVs would round differently from the loop's GEMMs here.
         """
         from helpers.transducer import exact_transducer
 
@@ -974,7 +984,7 @@ class TestTransducerBeamSearch:
         B, T = 5, 41
         enc = torch.randn(B, T, 64, device="cuda", generator=gen).to(dtype)
         lengths = torch.tensor([41, 36, 30, 7, 1], device="cuda")
-        fused = self._strategy(model, beam=beam, max_sym=1)
+        fused = self._frame_loop(self._strategy(model, beam=beam, max_sym=1))
         reference = self._strategy(model, beam=beam, max_sym=1, fused=False)
         with torch.no_grad():
             want = reference.decode_offline(enc, lengths)
@@ -1065,11 +1075,13 @@ class TestTransducerBeamSearch:
         assert pool._committed[slot] == [1]  # noqa: SLF001
         assert pool._suffixes[slot] == [[5], [7, 9]]  # noqa: SLF001
 
-    def test_pooled_streams_join_and_leave_and_each_matches_offline(self):
+    @pytest.mark.parametrize("path", ["kernel", "graphs"])
+    def test_pooled_streams_join_and_leave_and_each_matches_offline(self, path):
         """Streams arriving and finishing mid-run: every tick's cohort is a
         different set of pool rows at a different bucketed width, some ticks
         split by chunk length, finished streams hand their rows to later ones --
-        and each stream must still decode exactly as it does alone.
+        and each stream must still decode exactly as it does alone.  Through the
+        fused beam kernel and through the replayed frame loop.
 
         Exact arithmetic (``helpers.transducer``), so cohort width and padding
         cannot move a score, and the comparison is equality.
@@ -1085,6 +1097,8 @@ class TestTransducerBeamSearch:
             for i, (_, n) in enumerate(plan)
         ]
         strat = self._strategy(model, beam=k, max_sym=1, graphs=True)
+        if path == "graphs":
+            self._frame_loop(strat)
         reqs = [SimpleNamespace(request_id=f"s{i}") for i in range(len(plan))]
         finals, rows_used = {}, set()
         with torch.no_grad():
@@ -1110,7 +1124,13 @@ class TestTransducerBeamSearch:
                 assert finals[i].scores == want.scores, f"stream {i} scores"
         assert strat._beam_slots is not None and strat._beam_slots.live == 0
         assert len(rows_used) < len(plan)  # finished streams' rows were handed on
-        assert strat._beam_graphs is not None and strat._beam_graphs.stats()["fallbacks"] == 0
+        if path == "graphs":
+            assert strat._beam_graphs is not None
+            assert strat._beam_graphs.stats()["fallbacks"] == 0
+        else:
+            assert strat._beam_graphs is None and strat.fused_stats["fallbacks"] == 0
+            # A launch per tick, two on ticks split by chunk length.
+            assert strat.fused_stats["hits"] > max(start + n for start, n in plan)
 
     def test_prewarm_captures_bucketed_widths_only(self):
         """Every cohort width up to 64 is served by seven captures (1, 2, ..., 64).
@@ -1122,7 +1142,7 @@ class TestTransducerBeamSearch:
 
         model = exact_transducer(torch.bfloat16, blank_bias=8.0)
         model.encoder.output_size = JOINER_DIM
-        strat = self._strategy(model, beam=4, max_sym=1, graphs=True)
+        strat = self._frame_loop(self._strategy(model, beam=4, max_sym=1, graphs=True))
         with torch.no_grad():
             strat.prewarm_streaming(list(range(1, 65)), frames=16)
             cache = strat._beam_graphs
@@ -1134,6 +1154,67 @@ class TestTransducerBeamSearch:
                     reqs, {r.request_id: enc[b : b + 1] for b, r in enumerate(reqs)}
                 )
         assert cache.num_captured == 7 and cache.stats()["fallbacks"] == 0
+
+    # -- the fused beam kernel ---------------------------------------------
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+    @pytest.mark.parametrize("beam", [2, 3, 4, 8])
+    def test_the_kernel_decodes_what_the_frame_loop_does(self, dtype, beam):
+        """Offline, one launch per batch against the replayed frame loop: the
+        same n-best and scores, on data where every sum is exact (and the
+        loop's projections exact, see ``helpers.transducer.exact_projections``)."""
+        from helpers.transducer import exact_projections, exact_transducer, integer_frames
+
+        model = exact_transducer(dtype, blank_bias=8.0, seed=beam)
+        enc = integer_frames(6, 37, dtype, seed=beam)
+        lengths = torch.tensor([37, 30, 1, 0, 22, 37], device="cuda")
+        kernel = self._strategy(model, beam=beam, max_sym=1, graphs=True)
+        loop = self._frame_loop(self._strategy(model, beam=beam, max_sym=1, graphs=True))
+        with torch.no_grad():
+            got = kernel.decode_offline(enc, lengths)
+            with exact_projections(model):
+                want = loop.decode_offline(enc, lengths)
+        assert kernel.fused_stats == {"hits": 1, "fallbacks": 0, "overflows": 0}
+        assert kernel._beam_graphs is None
+        assert [o.tokens for o in got] == [o.tokens for o in want]
+        assert [o.scores for o in got] == [o.scores for o in want]
+
+    def test_prewarm_with_the_kernel_captures_nothing(self):
+        """A width the kernel serves needs no graph: prewarm only loads it, and
+        every cohort width then decodes through it."""
+        from helpers.transducer import JOINER_DIM, exact_transducer, integer_frames
+
+        model = exact_transducer(torch.bfloat16, blank_bias=8.0)
+        model.encoder.output_size = JOINER_DIM
+        strat = self._strategy(model, beam=4, max_sym=1, graphs=True)
+        with torch.no_grad():
+            strat.prewarm_streaming(list(range(1, 65)), frames=16)
+            assert strat._beam_graphs is None and strat.fused_stats["hits"] == 7
+            for B in (3, 37):
+                reqs = [SimpleNamespace(request_id=f"w{B}-{b}") for b in range(B)]
+                enc = integer_frames(B, 16, torch.bfloat16, seed=B)
+                strat.decode_streaming_batch(
+                    reqs, {r.request_id: enc[b : b + 1] for b, r in enumerate(reqs)}
+                )
+        assert strat._beam_graphs is None
+        assert strat.fused_stats == {"hits": 9, "fallbacks": 0, "overflows": 0}
+
+    def test_a_beam_past_the_kernel_runs_the_frame_loop(self):
+        """Beam 9 is past the kernel's register-resident rows: counted as a
+        fallback, served by the replayed loop, and the same search."""
+        from helpers.transducer import exact_transducer, integer_frames
+
+        model = exact_transducer(torch.bfloat16, blank_bias=8.0, seed=4)
+        enc = integer_frames(3, 20, torch.bfloat16, seed=4)
+        lengths = torch.tensor([20, 13, 20], device="cuda")
+        wide = self._strategy(model, beam=9, max_sym=1, graphs=True)
+        eager = self._frame_loop(self._strategy(model, beam=9, max_sym=1))
+        with torch.no_grad():
+            got = wide.decode_offline(enc, lengths)
+            want = eager.decode_offline(enc, lengths)
+        assert wide.fused_stats["fallbacks"] == 1 and wide.fused_stats["hits"] == 0
+        assert wide._beam_graphs is not None and wide._beam_graphs.stats()["hits"] == 1
+        assert [o.tokens for o in got] == [o.tokens for o in want]
 
 
 # --------------------------------------------------------------------------- #

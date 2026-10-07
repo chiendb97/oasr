@@ -103,6 +103,7 @@ from .functionals.topk import topk
 from .functionals.transducer import (
     StatelessGreedyResult,
     StatelessGreedyWeights,
+    transducer_beam_decode,
     transducer_beam_topk,
     transducer_greedy_decode,
 )
@@ -274,6 +275,7 @@ __all__ = [
     "masked_softmax",
     "softmax",
     "topk",
+    "transducer_beam_decode",
     "transducer_beam_topk",
     "transducer_greedy_decode",
     "StatelessGreedyResult",

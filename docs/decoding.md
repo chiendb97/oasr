@@ -332,7 +332,7 @@ worth understanding before adding a third.
 
 | | File | Hypotheses live | Why |
 |---|---|---|---|
-| Frame-synchronous (transducer) | `decode/transducer_beam.py` | scores and label windows on the **device**; per-frame back-pointers, walked on the host once per chunk | one beam step per encoder frame, so a host-side list-of-lists reorder would be Θ(T²) |
+| Frame-synchronous (transducer) | `decode/transducer_beam.py` | scores and label windows on the **device**; per-frame back-pointers, walked once per chunk (on the device by the fused kernel) | one beam step per encoder frame, so a host-side list-of-lists reorder would be Θ(T²) |
 | Label-synchronous (AED, LLM) | `decode/incremental_beam.py` — `ArBeamGroup` | as host lists | an AR step is a full decoder forward, so `k` list copies are free next to it |
 
 The label-synchronous one needs **no new model method**: `select(state, idx)` is
@@ -399,6 +399,37 @@ scores can come out in the other slot order -- on 2,000 LJSpeech utterances at
 is the declared `transducer-beam-topk` kernel gap; fp32 and CPU are out of scope.
 Measured per frame at `B = 64, k = 4, V = 500`: 8 us against 45 us; the graphed
 decode 15.5 ms to 8.1 ms.
+
+With `fused` on (the default) a whole chunk is **one launch**,
+`oasr.transducer_beam_decode` (`include/oasr/transducer/beam_decode.cuh`), the beam
+counterpart of the greedy kernel and built on the same tensors (`stateless_tensors()`,
+`additive_tensors()`). A CTA holds one utterance's `k` hypotheses and runs every frame
+on the device: the joiner over all `k` rows (the head read once per frame for all of
+them), the selection above, and the predictor for the hypotheses that took a label --
+a hypothesis that took blank keeps its parent's window, so its decoder projection is
+copied rather than recomputed. After the last frame it walks the back-pointers itself,
+so the host reads each hypothesis's tokens instead of the history: the host walk had
+grown to a quarter of the decode once the frames were fast.
+
+A frame is then bounded by how fast one SM pulls the two weights (512 KB each here)
+out of L2, so while the batch leaves an SM for each, an utterance is served by a
+thread-block **cluster pair** (sm_90+): the two CTAs take alternate GEMV passes,
+exchange logits and projections through distributed shared memory, and run the
+selection on the same data. The pair, a lone CTA and any batch width produce the same
+bits -- an output's arithmetic is one fixed fp32 chain whoever computes it -- so
+padding a cohort, or crossing the width where pairs stop fitting, cannot move a
+stream's result. Against the frame loop the GEMVs keep every rounding point but
+accumulate in their own order (the library GEMMs also round split-K partials to the
+activation dtype at some shapes), so a logit can move by an ulp; on data where every
+sum is exact the two agree bit for bit (`tests/kernels/test_transducer_beam_decode.py`).
+
+A beam over 8 (the hypotheses' accumulators are registers), a vocabulary over 1024, a
+dtype other than fp16/bf16, a model that does not declare the tensors, or a working set
+past the device's shared memory runs the frame loop instead, counted in `fused_stats`.
+Measured on the icefall transducer (RTX 5090, 256 frames, against the replayed frame
+loop with the fused selection): the decode at `B = 64` went from 7.9 ms to 4.3 ms at
+`k = 4` and from 9.6 ms to 5.9 ms at `k = 8`; on 2,000 LJSpeech utterances in-process,
+`k = 4` went from 13.7K to 15.6K times real time with every transcript unchanged.
 
 Transducer greedy is `beam_size=1` by construction and caps per-frame emissions
 with `EngineConfig.transducer_max_sym_per_frame`.

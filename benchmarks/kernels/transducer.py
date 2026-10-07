@@ -26,6 +26,20 @@ everywhere or nowhere would measure a different workload.
 replaces in ``beam_search_step`` (float cast, ``log_softmax``, score add,
 ``topk``, the parent/label split, the window reorder and the masks).  Each arm
 returns the new scores, which the kernel reproduces bit for bit.
+
+``beam_decode``: a whole chunk of modified beam search --
+
+* ``cuda``  -- :func:`oasr.transducer_beam_decode`, one launch for every frame
+  (a cluster pair per utterance while the batch leaves an SM for each);
+* ``graph`` -- the per-frame step replayed from CUDA graphs, 16 frames per
+  replay, its selection fused (what served beam search before the kernel);
+* ``torch`` -- the per-frame step eager, its selection the torch composition.
+
+Each arm returns the beam's final scores.  ``graph`` and ``torch`` agree bit for
+bit (the fused selection is exact); the ``cuda`` arm's GEMVs round differently
+from the library GEMMs on random weights, so it is informational --
+``tests/kernels/test_transducer_beam_decode.py`` holds it to exact agreement on
+data chosen to make every sum exact.
 """
 
 from __future__ import annotations
@@ -38,7 +52,7 @@ import torch
 
 from benchmarks.core.driver import Work, params_of
 
-SUBROUTINES = ["greedy", "beam_topk"]
+SUBROUTINES = ["greedy", "beam_topk", "beam_decode"]
 
 #: Shapes of the icefall Zipformer transducer (joiner/decoder 512, BPE-500,
 #: context 2, group 4).  ``frames`` 250 is a ~10 s utterance at 25 Hz; 16 is a
@@ -50,6 +64,14 @@ DEFAULT_CONFIGS: Dict[str, list] = {
         {"batch": 64, "frames": 250, "joiner": 512, "decoder": 512, "vocab": 500},
         {"batch": 64, "frames": 16, "joiner": 512, "decoder": 512, "vocab": 500},
     ],
+    # A chunk of the icefall transducer's beam search: a ~10 s utterance, a
+    # small batch, and a streaming chunk.
+    "beam_decode": [
+        {"batch": 64, "frames": 256, "joiner": 512, "decoder": 512, "vocab": 500, "beam": 4},
+        {"batch": 64, "frames": 256, "joiner": 512, "decoder": 512, "vocab": 500, "beam": 8},
+        {"batch": 16, "frames": 256, "joiner": 512, "decoder": 512, "vocab": 500, "beam": 4},
+        {"batch": 64, "frames": 16, "joiner": 512, "decoder": 512, "vocab": 500, "beam": 4},
+    ],
     # One frame of the icefall transducer's beam (BPE-500, context 2).
     "beam_topk": [
         {"batch": 64, "beam": 4, "vocab": 500, "context": 2},
@@ -59,7 +81,7 @@ DEFAULT_CONFIGS: Dict[str, list] = {
 }
 
 REF_BACKEND = "torch"
-TOLERANCES = {"greedy": (0.0, 0.0), "beam_topk": (0.0, 0.0)}
+TOLERANCES = {"greedy": (0.0, 0.0), "beam_topk": (0.0, 0.0), "beam_decode": (0.0, 0.0)}
 NON_GATING_BACKENDS = frozenset({"cuda"})
 
 _CONTEXT = 2
@@ -73,7 +95,7 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--joiner", type=int, default=None, help="Joiner dim")
     parser.add_argument("--decoder", type=int, default=None, help="Predictor dim")
     parser.add_argument("--vocab", type=int, default=None, help="Vocabulary size")
-    parser.add_argument("--beam", type=int, default=None, help="Beam size (beam_topk)")
+    parser.add_argument("--beam", type=int, default=None, help="Beam size (beam_*)")
     parser.add_argument("--context", type=int, default=None, help="Label window (beam_topk)")
 
 
@@ -83,6 +105,12 @@ def resolve_configs(args: argparse.Namespace, subroutine: str) -> list:
         if all(v is not None for v in beam_dims):
             b, k, v, c = beam_dims
             return [{"batch": b, "beam": k, "vocab": v, "context": c}]
+        return DEFAULT_CONFIGS[subroutine]
+    if subroutine == "beam_decode":
+        dims = (args.batch, args.frames, args.joiner, args.decoder, args.vocab, args.beam)
+        if all(v is not None for v in dims):
+            keys = ("batch", "frames", "joiner", "decoder", "vocab", "beam")
+            return [dict(zip(keys, dims))]
         return DEFAULT_CONFIGS[subroutine]
     dims = (args.batch, args.frames, args.joiner, args.decoder, args.vocab)
     if all(v is not None for v in dims):
@@ -178,6 +206,43 @@ def _beam_topk_fns(cfg: dict, dtype: torch.dtype) -> Dict[str, Callable[[], Any]
     return {"cuda": fused, "torch": composed}
 
 
+def _beam_decode_fns(cfg: dict, dtype: torch.dtype) -> Dict[str, Callable[[], Any]]:
+    from oasr.engine.beam_graph import BeamLoopGraphCache
+    from oasr.engine.decode.transducer_beam import beam_search_history, init_beam_state
+    from oasr.functionals.transducer import transducer_beam_decode
+
+    model = _model(cfg, dtype)
+    enc = torch.randn(cfg["batch"], cfg["frames"], cfg["joiner"], device="cuda", dtype=dtype)
+    _calibrate_blank(model, enc)
+    B, k = cfg["batch"], cfg["beam"]
+    lengths = torch.full((B,), cfg["frames"], dtype=torch.long, device="cuda")
+    beam = init_beam_state(model.decoder, B, k, enc.device)
+    with torch.no_grad():
+        enc_proj = model.joiner.encoder_proj(enc)
+    weights = _strategy(model)._fused_surface()
+    if weights is None or not weights.supports_beam(enc_proj, k):
+        raise ValueError(f"the fused beam search cannot take this shape: {cfg}")
+    graphs = BeamLoopGraphCache(model, unroll=16, fused=True)
+
+    def fused() -> torch.Tensor:
+        return transducer_beam_decode(enc_proj, lengths, beam.context, beam.scores, weights)[1]
+
+    def graphed() -> torch.Tensor:
+        with torch.no_grad():
+            res = graphs.run(enc_proj, lengths, beam.context, beam.scores)
+        if res is None:
+            raise RuntimeError(f"the graph arm did not replay: {graphs.stats()}")
+        return res[1]
+
+    def eager() -> torch.Tensor:
+        with torch.no_grad():
+            return beam_search_history(
+                model, enc_proj, lengths, beam.context, beam.scores, fused=False
+            )[1]
+
+    return {"cuda": fused, "graph": graphed, "torch": eager}
+
+
 def build_fns(
     subroutine: str, cfg: dict, dtype: torch.dtype, args: argparse.Namespace
 ) -> Dict[str, Callable[[], Any]]:
@@ -186,6 +251,8 @@ def build_fns(
         raise ValueError("the fused transducer decode is half precision only (--dtype)")
     if subroutine == "beam_topk":
         return _beam_topk_fns(cfg, dtype)
+    if subroutine == "beam_decode":
+        return _beam_decode_fns(cfg, dtype)
     model = _model(cfg, dtype)
     enc = torch.randn(cfg["batch"], cfg["frames"], cfg["joiner"], device="cuda", dtype=dtype)
     _calibrate_blank(model, enc)
@@ -232,4 +299,5 @@ def describe(subroutine: str, cfg: dict, dtype: torch.dtype) -> Work:
     b, t, j, d, v = cfg["batch"], cfg["frames"], cfg["joiner"], cfg["decoder"], cfg["vocab"]
     # A step is latency-bound, not FLOP- or byte-bound (the joiner head is
     # re-read every step); report the shape only.
-    return Work(shape=f"B={b} T={t} J={j} D={d} V={v}", params=params_of(cfg))
+    beam = f" k={cfg['beam']}" if subroutine == "beam_decode" else ""
+    return Work(shape=f"B={b} T={t}{beam} J={j} D={d} V={v}", params=params_of(cfg))
