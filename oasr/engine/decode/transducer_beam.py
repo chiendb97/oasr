@@ -12,14 +12,19 @@ host.  Recording is the same handful of ``(B, beam)`` writes at any length, whic
 is also what lets a whole block of frames replay from one CUDA graph
 (``oasr/engine/beam_graph.py``).
 
+Streaming keeps every live stream's beam in one :class:`BeamSlotPool`: a tick
+gathers its cohort's rows, runs the chunk at a bucketed width
+(:func:`beam_width_bucket`) and scatters them back.
+
 Beam size one must exactly match one-symbol greedy decoding.  Equivalent
 hypotheses are not merged.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple, Union
+from typing import Dict, List, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -135,7 +140,10 @@ def beam_search_step(
         ``k`` may take a different slot order (see the kernel's header).
 
     Returns ``(context, scores, parent, label)``: the beam after the frame and,
-    for each new slot, the slot it extended and the label it took.
+    for each new slot, the slot it extended and the label it took.  The new beam
+    is **best first** -- both arms select with a sorted top-k -- and an inactive
+    row keeps its order, so slot ``j`` always holds the ``j``-th best
+    hypothesis and nothing downstream needs to sort the scores.
 
     Hypothesis merging is deliberately absent.  Two beam entries can spell the
     same sequence -- a parent taking blank keeps sequence ``A`` while a shorter
@@ -200,13 +208,37 @@ def beam_search_frames(
     fused: bool = True,
 ) -> BeamState:
     """Advance ``state`` over every frame of a joiner-projected chunk, eagerly."""
-    device = enc_proj.device
-    T = int(enc_proj.size(1))
-    if T == 0:
+    if int(enc_proj.size(1)) == 0:
         return state
+    context, scores, parents, labels = beam_search_history(
+        model, enc_proj, lengths, state.context, state.scores, fused
+    )
+    return fold_chunk(context, scores, state.prefixes, parents, labels, int(model.blank_id))
+
+
+@torch.no_grad()
+def beam_search_history(
+    model,
+    enc_proj: torch.Tensor,
+    lengths: torch.Tensor,
+    context: torch.Tensor,
+    scores: torch.Tensor,
+    fused: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The eager frame loop, unfolded: ``(context, scores, parents, labels)``.
+
+    The beam after the chunk and its frame-major ``(T, B, k)`` back-pointers and
+    labels -- what :class:`oasr.engine.beam_graph.BeamLoopGraphCache` returns, so
+    a caller folds either the same way.
+    """
+    device = enc_proj.device
+    B, T = int(enc_proj.size(0)), int(enc_proj.size(1))
+    k = int(context.size(1))
+    if T == 0:
+        empty = torch.empty(0, B, k, dtype=torch.long, device=device)
+        return context, scores, empty, empty
     lengths = lengths.to(device=device, dtype=torch.long)
-    stay, blank_label = step_constants(state.batch, state.beam, int(model.blank_id), device)
-    context, scores = state.context, state.scores
+    stay, blank_label = step_constants(B, k, int(model.blank_id), device)
     parents: List[torch.Tensor] = []
     labels: List[torch.Tensor] = []
     for t in range(T):
@@ -215,14 +247,7 @@ def beam_search_frames(
         )
         parents.append(parent)
         labels.append(label)
-    return fold_chunk(
-        context,
-        scores,
-        state.prefixes,
-        torch.stack(parents, dim=0),
-        torch.stack(labels, dim=0),
-        int(model.blank_id),
-    )
+    return context, scores, torch.stack(parents, dim=0), torch.stack(labels, dim=0)
 
 
 @torch.no_grad()
@@ -244,28 +269,37 @@ def beam_search_chunk(
     return beam_search_frames(model, enc_proj, lengths, state, fused)
 
 
-def fold_chunk(
-    context: torch.Tensor,
-    scores: torch.Tensor,
-    prefixes: Sequence[Sequence[List[int]]],
-    parents: torch.Tensor,
-    labels: torch.Tensor,
-    blank: int,
-) -> BeamState:
-    """Close a chunk: walk its back-pointers into each slot's token prefix.
+@dataclass
+class ChunkWalk:
+    """A chunk's back-pointers walked from every final slot, per hypothesis ``h = b * k + j``.
 
-    ``parents`` / ``labels`` are frame-major ``(n, B, k)``: at frame ``t`` new
-    slot ``j`` extended slot ``parents[t, b, j]`` with ``labels[t, b, j]``.
-    Walking from each final slot to frame 0 gives the chunk's labels in order and
-    the slot the hypothesis occupied when the chunk began, whose prefix it extends.
+    ``root[h]`` is the slot the hypothesis held when the chunk began -- whose
+    tokens it extends -- and :meth:`tokens` the labels it emitted in the chunk.
+    """
 
-    One device->host copy per chunk, and a host walk vectorized over the ``B x k``
+    beam: int
+    root: List[int]
+    flat: List[int]
+    starts: List[int]
+    ends: List[int]
+
+    def tokens(self, h: int) -> List[int]:
+        return self.flat[self.starts[h] : self.ends[h]]
+
+
+def walk_chunk(parents: torch.Tensor, labels: torch.Tensor, blank: int) -> ChunkWalk:
+    """Walk a chunk's frame-major ``(n, B, k)`` back-pointers once.
+
+    At frame ``t`` new slot ``j`` extended slot ``parents[t, b, j]`` with
+    ``labels[t, b, j]``.  Walking from each final slot to frame 0 gives the
+    chunk's labels in order and the slot the hypothesis occupied when the chunk
+    began.  One device->host copy, and a host walk vectorized over the ``B x k``
     grid -- ``n`` steps of array indexing, never per token.
     """
     n, B, k = (int(d) for d in parents.shape)
-    if n == 0:
-        return BeamState(context=context, scores=scores, prefixes=[list(p) for p in prefixes])
     hyps = B * k
+    if n == 0:
+        return ChunkWalk(k, [h % k for h in range(hyps)], [], [0] * hyps, [0] * hyps)
     # Back-pointers as absolute indices into the flattened (B * k) grid, so each
     # frame of the walk is two 1-D gathers rather than a 2-D fancy index.  The
     # offset is added where the history lives -- one kernel on the device, not a
@@ -279,23 +313,149 @@ def fold_chunk(
     for t in range(n - 1, -1, -1):
         path[t] = lab[t, slot]
         slot = parent[t, slot]
-    root = (slot - base).tolist()  # the slot each hypothesis held when the chunk began
     # Every hypothesis's emitted labels in one compaction and one ``tolist``,
     # then cut by count: per hypothesis this is a list slice, not an array op.
     tokens = path.T  # (B * k, n)
     emitted = tokens != blank
-    flat = tokens[emitted].tolist()
     ends = np.cumsum(emitted.sum(axis=1)).tolist()
-    starts = [0] + ends[:-1]
+    return ChunkWalk(
+        beam=k,
+        root=(slot - base).tolist(),
+        flat=tokens[emitted].tolist(),
+        starts=[0] + ends[:-1],
+        ends=ends,
+    )
+
+
+def fold_chunk(
+    context: torch.Tensor,
+    scores: torch.Tensor,
+    prefixes: Sequence[Sequence[List[int]]],
+    parents: torch.Tensor,
+    labels: torch.Tensor,
+    blank: int,
+) -> BeamState:
+    """Close a chunk: each new slot's tokens are its root slot's prefix plus what
+    it emitted in the chunk (see :func:`walk_chunk`)."""
+    walk = walk_chunk(parents, labels, blank)
+    k = walk.beam
     folded = [
-        [prefixes[b][root[h]] + flat[starts[h] : ends[h]] for h in range(b * k, (b + 1) * k)]
-        for b in range(B)
+        [prefixes[b][walk.root[h]] + walk.tokens(h) for h in range(b * k, (b + 1) * k)]
+        for b in range(len(prefixes))
     ]
     return BeamState(context=context, scores=scores, prefixes=folded)
 
 
+def beam_width_bucket(n: int) -> int:
+    """The width a chunk of ``n`` utterances runs at: the next power of two.
+
+    Graph captures key on the exact width (``oasr/engine/beam_graph.py``), and a
+    cohort takes every width up to ``max_batch_size`` -- more than the capture
+    budget holds, so the widths past it ran the eager loop.  Callers pad to this
+    ladder *before* the graph/eager branch, so both see the same shapes.
+    """
+    width = 1
+    while width < n:
+        width *= 2
+    return width
+
+
+class BeamSlotPool:
+    """Every live stream's beam, as one row of a device-resident pool.
+
+    A stream holds a slot from its first chunk until it is released.  A tick
+    gathers its cohort's rows with one index -- padding rows may point at any
+    row, they are inactive and never written back -- runs the chunk, and
+    scatters the new rows home.  This replaces a ``(1, k, ...)`` state per stream
+    that every tick concatenated into a batch and split back, plus a freshly
+    built state for every arriving stream.
+
+    Tokens stay on the host, split at the beam's common prefix: ``committed``
+    holds what every hypothesis agrees on -- final, since every future
+    hypothesis extends one of today's -- and each slot keeps only the suffix it
+    adds.  A chunk therefore costs O(k x suffix) per stream rather than
+    O(k x stream length), where the per-stream lists used to copy every
+    hypothesis's whole prefix on every tick.
+
+    Hypothesis ``j`` of a slot is its ``j``-th best (see
+    :func:`beam_search_step`), so the best transcript is ``tokens(slot, 0)``
+    without reading a score back.
+    """
+
+    def __init__(self, decoder, beam: int, device: torch.device, capacity: int = 16) -> None:
+        self.beam = int(beam)
+        first = init_beam_state(decoder, 1, self.beam, device)
+        self._init_context = first.context[0].clone()  # (k, ctx)
+        self._init_scores = first.scores[0].clone()  # (k,)
+        capacity = max(1, int(capacity))
+        self.context = self._init_context.unsqueeze(0).repeat(capacity, 1, 1)
+        self.scores = self._init_scores.unsqueeze(0).repeat(capacity, 1)
+        self._free: List[int] = list(range(capacity - 1, -1, -1))
+        self._committed: Dict[int, List[int]] = {}
+        self._suffixes: Dict[int, List[List[int]]] = {}
+
+    @property
+    def capacity(self) -> int:
+        return int(self.context.size(0))
+
+    @property
+    def live(self) -> int:
+        return len(self._committed)
+
+    def allocate(self) -> int:
+        """A slot holding the empty hypothesis (one live entry, the rest dead)."""
+        if not self._free:
+            self._grow()
+        slot = self._free.pop()
+        self.context[slot].copy_(self._init_context)
+        self.scores[slot].copy_(self._init_scores)
+        self._committed[slot] = []
+        self._suffixes[slot] = [[] for _ in range(self.beam)]
+        return slot
+
+    def release(self, slot: int) -> None:
+        if self._committed.pop(slot, None) is not None:
+            self._suffixes.pop(slot, None)
+            self._free.append(slot)
+
+    def _grow(self) -> None:
+        old = self.capacity
+        self.context = torch.cat(
+            [self.context, self._init_context.unsqueeze(0).expand(old, -1, -1)], dim=0
+        )
+        self.scores = torch.cat(
+            [self.scores, self._init_scores.unsqueeze(0).expand(old, -1)], dim=0
+        )
+        self._free.extend(range(2 * old - 1, old - 1, -1))
+
+    def gather(self, index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(context, scores)`` for the rows ``index`` names, as owned copies."""
+        return self.context.index_select(0, index), self.scores.index_select(0, index)
+
+    def scatter(self, index: torch.Tensor, context: torch.Tensor, scores: torch.Tensor) -> None:
+        """Write a chunk's new rows back to the slots ``index`` names."""
+        self.context.index_copy_(0, index, context)
+        self.scores.index_copy_(0, index, scores)
+
+    def fold(self, slots: Sequence[int], walk: ChunkWalk) -> None:
+        """Extend each slot's hypotheses by the chunk, then commit their common prefix."""
+        k = self.beam
+        for b, slot in enumerate(slots):
+            old = self._suffixes[slot]
+            new = [old[walk.root[h]] + walk.tokens(h) for h in range(b * k, (b + 1) * k)]
+            shared = len(os.path.commonprefix(new))
+            if shared:
+                self._committed[slot].extend(new[0][:shared])
+                new = [suffix[shared:] for suffix in new]
+            self._suffixes[slot] = new
+
+    def tokens(self, slot: int, j: int) -> List[int]:
+        """Hypothesis ``j`` of ``slot`` in full: the committed prefix plus its suffix."""
+        return self._committed[slot] + self._suffixes[slot][j]
+
+
 def select_rows(state: BeamState, rows: Union[torch.Tensor, Sequence[int]]) -> BeamState:
-    """Keep only ``rows`` of the batch (copies; see :func:`split_rows` for views)."""
+    """Keep only ``rows`` of the batch (copies)."""
     if isinstance(rows, torch.Tensor):
         index = rows.to(device=state.context.device, dtype=torch.long)
         keep = index.tolist()
@@ -309,28 +469,12 @@ def select_rows(state: BeamState, rows: Union[torch.Tensor, Sequence[int]]) -> B
     )
 
 
-def split_rows(state: BeamState) -> List[BeamState]:
-    """One ``(1, k, ...)`` state per row, as views -- no copy, no launch.
-
-    Streaming hands each stream its row after every chunk; the views keep the
-    batched tensors alive until the next :func:`stack_states` copies them out.
-    """
-    return [
-        BeamState(
-            context=state.context[b : b + 1],
-            scores=state.scores[b : b + 1],
-            prefixes=[state.prefixes[b]],
-        )
-        for b in range(state.batch)
-    ]
-
-
 def stack_states(states: List[BeamState]) -> BeamState:
     """Stack per-stream ``(1, k, ...)`` states into one batched state.
 
-    Streaming groups streams by chunk length per tick, so the group's membership
-    changes every tick.  The device half is two small concatenations; the token
-    prefixes stay on the host.
+    For a caller that keeps one state per stream (the strategy keeps a
+    :class:`BeamSlotPool` instead).  The device half is two small
+    concatenations; the token prefixes stay on the host.
     """
     if not states:
         raise ValueError("stack_states needs at least one state")
@@ -342,14 +486,18 @@ def stack_states(states: List[BeamState]) -> BeamState:
 
 
 __all__ = [
+    "BeamSlotPool",
     "BeamState",
+    "ChunkWalk",
     "beam_search_chunk",
     "beam_search_frames",
+    "beam_search_history",
     "beam_search_step",
+    "beam_width_bucket",
     "fold_chunk",
     "init_beam_state",
     "select_rows",
-    "split_rows",
     "stack_states",
     "step_constants",
+    "walk_chunk",
 ]
