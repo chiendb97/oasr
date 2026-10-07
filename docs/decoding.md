@@ -353,18 +353,32 @@ gather-reorders states in one `(B, k, ctx)` buffer, which only expresses a label
 window. See [models.md](models.md#the-transducer-predictor-state-is-opaque).
 
 The transducer beam records, per frame and slot, only the slot it extended and the
-label it took; `fold_chunk` walks those back-pointers once per chunk (offline: once
-per utterance) into each slot's token prefix. A frame is therefore the same handful
+label it took; `walk_chunk` walks those back-pointers once per chunk (offline: once
+per utterance) into the tokens each final slot emitted and the slot it grew from. A frame is therefore the same handful
 of `(B, k)` writes at any utterance length, where the previous `(B, k, cap)` token
 buffer was gathered onto the new parents, scattered into and masked every frame.
-Streaming keeps the prefixes on the host between chunks, so a stream's device state
-stays `(1, k, ctx)` however long it runs.
+
+Streaming keeps every live stream's beam as one row of a `BeamSlotPool`: a tick
+gathers its cohort's rows by slot, runs the chunk and scatters the rows home, so a
+stream's device state is one `(k, ctx)` row however long it runs, and a cohort whose
+membership changes every tick costs one gather and one scatter rather than a stack
+and a split of per-stream states. Tokens stay on the host, split at the beam's
+common prefix: what every hypothesis agrees on is committed -- final, since every
+later hypothesis extends one of today's -- so a chunk costs `O(k x suffix)` per
+stream rather than `O(k x transcript)`. Slot `j` always holds the `j`-th best
+hypothesis (each frame's top-k comes back sorted, and a finished row keeps its
+order), so a partial reads slot 0 without reading a score back, and the scores of
+every stream that ends in a tick are read back in one copy (`finalize_batch`).
 
 Every op of a step is fixed-shape for a given `(B, k)` and no step needs a host
 decision, so `TransducerOptions.loop_graphs` replays the frame loop from CUDA graphs
 16 frames at a time (`oasr/engine/beam_graph.py`), with the same exact-width keys and
 power-of-two frame capacities as the greedy loop graphs. Replay and eager are
-bit-identical in every hypothesis and score. The eager loop was host-bound: 33
+bit-identical in every hypothesis and score. The batch is padded to the next power
+of two **before** the graph/eager branch, with rows that get no frames and so leave
+the real rows untouched: a streaming cohort's width walks `1..max_batch_size`, and
+one capture per exact width overran the 48-capture budget, so every wider tick ran
+the eager loop; padded, `max_batch_size = 64` is seven captures. The eager loop was host-bound: 33
 launches per frame, the GPU 10% busy, and the wall time flat from `B = 64` to
 `B = 256`. Measured on the icefall transducer (RTX 5090, `B = 64`, `k = 4`, 256
 frames), the decode went from 118 ms to 15 ms. In-process on LJSpeech-200, `k = 4`

@@ -61,17 +61,18 @@ from typing import (
 
 import torch
 
+from oasr.utils.staging import to_device
+
 from ..request import Request, RequestOutput
 from .alignment import wants_word_timings
 from .base import DecodeStrategy, register_decode_strategy, wants_speech_activity
 from .options import option
 from .transducer_beam import (
-    BeamState,
-    beam_search_frames,
-    fold_chunk,
+    BeamSlotPool,
+    beam_search_history,
+    beam_width_bucket,
     init_beam_state,
-    split_rows,
-    stack_states,
+    walk_chunk,
 )
 
 if TYPE_CHECKING:
@@ -101,21 +102,20 @@ def _unzip_marks(marks: Sequence[Tuple[int, float]]) -> Tuple[List[int], List[fl
 class _Session:
     """Per-stream decode state carried across chunks.
 
-    Greedy uses ``state`` / ``dec_proj`` / ``hyp``; beam search uses ``beam``
-    (a ``(1, k, ...)`` :class:`BeamState`) and refreshes ``hyp`` from its best
-    hypothesis after each chunk, so the partial/final emission path and the
-    incremental detokenizer are shared between the two.
+    Greedy uses ``state`` / ``dec_proj`` / ``hyp``; beam search holds a row of
+    the strategy's :class:`BeamSlotPool` (``slot``) and refreshes ``hyp`` from
+    its best hypothesis after each chunk, so the partial/final emission path and
+    the incremental detokenizer are shared between the two.
     """
 
     #: Opaque per-stream predictor state (``B == 1``): a label window for the
     #: stateless predictor, an ``(output, h, c)`` tuple for a recurrent one.
-    state: Any
-    dec_proj: torch.Tensor  # (1, J) predictor projection for that state
+    #: ``None`` under beam search, whose state lives in the slot pool.
+    state: Any = None
+    dec_proj: Optional[torch.Tensor] = None  # (1, J) predictor projection for that state
     hyp: List[int] = field(default_factory=list)
-    #: Beam-search state, ``None`` for greedy.
-    beam: Optional["BeamState"] = None
-    #: Per-hypothesis token lists + scores from the last beam chunk (n-best).
-    nbest: Optional[Tuple[List[List[int]], List[float]]] = None
+    #: This stream's row of the beam slot pool, ``None`` for greedy.
+    slot: Optional[int] = None
     steps: int = 0  # decoded chunks (drives the partial-emit cadence)
     #: Encoder frames consumed by previous chunks, so a chunk-local emission
     #: frame becomes an utterance-absolute one.
@@ -326,6 +326,8 @@ class TransducerDecodeStrategy(DecodeStrategy):
         self._loop_graphs_enabled = self._pred_graphs_enabled and bool(self.options.loop_graphs)
         # Beam search's frame loop, replayed the same way (oasr/engine/beam_graph.py).
         self._beam_graphs: Optional["BeamLoopGraphCache"] = None
+        #: Every live stream's beam, one row per stream (built on the first chunk).
+        self._beam_slots: Optional[BeamSlotPool] = None
         self._beam_graphs_enabled = bool(
             getattr(config, "use_cuda_graphs", False)
             and getattr(config, "use_transducer_cuda_graphs", False)
@@ -563,35 +565,53 @@ class TransducerDecodeStrategy(DecodeStrategy):
             )
         return self._beam_graphs
 
-    @torch.no_grad()
-    def _beam_search(
-        self, enc_out: torch.Tensor, enc_lengths: torch.Tensor, state: BeamState
-    ) -> BeamState:
-        """One chunk of beam search from ``state``: replayed when it can be, else eager.
+    def _beam_pool(self, device: torch.device) -> BeamSlotPool:
+        """Every live stream's beam, built when the first beam stream starts."""
+        if self._beam_slots is None:
+            self._beam_slots = BeamSlotPool(self._model.decoder, self._beam, device)
+        return self._beam_slots
 
-        Both arms run the same step op for op and fold the chunk's back-pointers
-        with the same :func:`fold_chunk`, so the result does not depend on which
-        one served it.
+    @torch.no_grad()
+    def _beam_frames(
+        self,
+        enc_out: torch.Tensor,
+        enc_lengths: torch.Tensor,
+        context: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Beam-search one chunk from ``(context, scores)``: replayed when it can be, else eager.
+
+        Returns ``(context, scores, parents, labels)`` -- the beam after the
+        chunk and its frame-major ``(T, W, k)`` back-pointers and labels.
+
+        The beam is ``W = beam_width_bucket(B)`` rows wide, and rows past
+        ``enc_out``'s ``B`` are padding: they get zero frames, so every frame
+        leaves them as they were.  The width is padded *here*, before the
+        graph/eager branch, so both arms run the same shapes and the result does
+        not depend on which one served it -- or on whether this width happened
+        to be captured.  Padding is what makes the captures cover a cohort:
+        exact widths took every value up to ``max_batch_size``, more than the
+        capture budget, and the widths past it ran eager.
         """
-        if int(enc_out.size(1)) == 0:
-            return state
+        T = int(enc_out.size(1))
+        if T == 0:
+            empty = context.new_empty((0, *scores.shape))
+            return context, scores, empty, empty
         joiner, _decoder = self._surface()
         enc_proj = joiner.encoder_proj(enc_out)  # type: ignore[operator]
         lengths = enc_lengths.to(device=enc_proj.device, dtype=torch.long)
+        pad = int(context.size(0)) - int(enc_proj.size(0))
+        if pad:
+            enc_proj = torch.cat([enc_proj, enc_proj.new_zeros(pad, T, enc_proj.size(2))])
+            lengths = torch.cat([lengths, lengths.new_zeros(pad)])
         graphs = self._beam_loop_graphs()
         if graphs is not None:
-            res = graphs.run(enc_proj, lengths, state.context, state.scores)
+            res = graphs.run(enc_proj, lengths, context, scores)
             if res is not None:
-                context, scores, parents, labels = res
-                return fold_chunk(
-                    context,
-                    scores,
-                    state.prefixes,
-                    parents,
-                    labels,
-                    int(cast(int, self._model.blank_id)),
-                )
-        return beam_search_frames(self._model, enc_proj, lengths, state, bool(self.options.fused))
+                return res
+        return beam_search_history(
+            self._model, enc_proj, lengths, context, scores, bool(self.options.fused)
+        )
 
     def _fused_surface(self) -> Optional["StatelessGreedyWeights"]:
         """The fused kernel's weights; ``None`` if this model's surface does not
@@ -869,20 +889,29 @@ class TransducerDecodeStrategy(DecodeStrategy):
         family (``OutputProcessor.fill_nbest_texts`` then detokenizes and trims
         to what the request asked for).
         """
-        B = enc_out.size(0)
-        state = init_beam_state(self._model.decoder, B, self._beam, enc_out.device)
-        state = self._beam_search(enc_out, enc_lengths, state)
-        rows, scores = state.hypotheses()
-        return [
-            RequestOutput(
-                request_id="",
-                text=self._detok.detokenize(rows[b][0]),
-                tokens=rows[b],
-                scores=scores[b],
-                finished=True,
+        B, k = int(enc_out.size(0)), self._beam
+        state = init_beam_state(self._model.decoder, beam_width_bucket(B), k, enc_out.device)
+        _, scores, parents, labels = self._beam_frames(
+            enc_out, enc_lengths, state.context, state.scores
+        )
+        walk = walk_chunk(parents[:, :B], labels[:, :B], int(cast(int, self._model.blank_id)))
+        # Slot ``j`` holds the ``j``-th best hypothesis: every frame's selection
+        # returns the new beam best first, and a frame past a row's length
+        # leaves it as it was.
+        host_scores = scores[:B].tolist()
+        outputs = []
+        for b in range(B):
+            rows = [walk.tokens(b * k + j) for j in range(k)]
+            outputs.append(
+                RequestOutput(
+                    request_id="",
+                    text=self._detok.detokenize(rows[0]),
+                    tokens=rows,
+                    scores=host_scores[b],
+                    finished=True,
+                )
             )
-            for b in range(B)
-        ]
+        return outputs
 
     # ------------------------------------------------------------------
     # Streaming greedy (per-request predictor state across chunks)
@@ -894,7 +923,9 @@ class TransducerDecodeStrategy(DecodeStrategy):
         self._sessions.setdefault(request.request_id, None)  # type: ignore[arg-type]
 
     def free_session(self, request: Request) -> None:
-        self._sessions.pop(request.request_id, None)
+        s = self._sessions.pop(request.request_id, None)
+        if s is not None and s.slot is not None and self._beam_slots is not None:
+            self._beam_slots.release(s.slot)
 
     @torch.no_grad()
     def prewarm_streaming(self, batch_sizes: Sequence[int], frames: int) -> None:
@@ -914,7 +945,11 @@ class TransducerDecodeStrategy(DecodeStrategy):
         joiner, _decoder = self._surface()
         weight = next(joiner.parameters())
         width = int(self._model.encoder.output_size)
-        for b in sorted({int(b) for b in batch_sizes if int(b) >= 1}):
+        widths = {int(b) for b in batch_sizes if int(b) >= 1}
+        if beam is not None:
+            # A beam chunk runs at its bucketed width (``_beam_frames``).
+            widths = {beam_width_bucket(b) for b in widths}
+        for b in sorted(widths):
             enc = torch.zeros(b, int(frames), width, dtype=weight.dtype, device=weight.device)
             enc_proj = joiner.encoder_proj(enc)  # type: ignore[operator]
             lengths = torch.zeros(b, dtype=torch.long, device=weight.device)
@@ -928,8 +963,11 @@ class TransducerDecodeStrategy(DecodeStrategy):
     def _session(self, request_id: str, device: torch.device) -> _Session:
         s = self._sessions.get(request_id)
         if s is None:
-            state, dec_proj = self._init_state(1, device)
-            s = _Session(state=state, dec_proj=dec_proj)
+            if self._beam > 1:
+                s = _Session(slot=self._beam_pool(device).allocate())
+            else:
+                state, dec_proj = self._init_state(1, device)
+                s = _Session(state=state, dec_proj=dec_proj)
             self._sessions[request_id] = s
         return s
 
@@ -1007,34 +1045,33 @@ class TransducerDecodeStrategy(DecodeStrategy):
     def _advance_beam(self, group, sessions, enc, lengths) -> None:
         """One batched beam-search pass over the group's chunk.
 
-        The group's membership changes every tick (streams are grouped by chunk
-        length), so the per-stream ``(1, k, ...)`` states are stacked here and
-        split back afterwards — the same regrouping the greedy path does for its
-        label window, just over four tensors instead of two.
+        Each stream's beam is a row of the slot pool, so the cohort -- whose
+        membership changes every tick -- is one ``gather`` by slot and one
+        ``scatter`` back, whatever its width.  The rows are padded to the
+        bucketed width with copies of the first (see :meth:`_beam_frames`);
+        those come back unchanged and are never written home.
 
         ``hyp`` is **replaced**, not extended: the beam's best entry can change
         as later frames arrive, and appending would splice a revised hypothesis
         onto the stale prefix.  ``_Session.text`` detects that and re-decodes.
         """
-        state = stack_states(
-            [
-                (
-                    s.beam
-                    if s.beam is not None
-                    else init_beam_state(self._model.decoder, 1, self._beam, enc.device)
-                )
-                for s in sessions
-            ]
+        pool = self._beam_pool(enc.device)
+        slots = [cast(int, s.slot) for s in sessions]
+        B = len(slots)
+        rows = to_device(
+            slots + slots[:1] * (beam_width_bucket(B) - B), dtype=torch.long, device=enc.device
         )
-        state = self._beam_search(enc, lengths, state)
-        rows, scores = state.hypotheses()
-        # Views of the batched state, not per-stream copies: the next tick's
-        # ``stack_states`` copies them out, so this costs no launch and no
-        # per-stream host->device index.
-        for s, row_state, row, row_scores in zip(sessions, split_rows(state), rows, scores):
-            s.beam = row_state
-            s.nbest = (row, row_scores)
-            s.hyp = list(row[0])
+        context, scores = pool.gather(rows)
+        context, scores, parents, labels = self._beam_frames(enc, lengths, context, scores)
+        pool.scatter(rows[:B], context[:B], scores[:B])
+        pool.fold(
+            slots,
+            walk_chunk(parents[:, :B], labels[:, :B], int(cast(int, self._model.blank_id))),
+        )
+        # Slot 0 is the best hypothesis (see ``_decode_offline_beam``), so the
+        # partial needs no read of the scores.
+        for s, slot in zip(sessions, slots):
+            s.hyp = pool.tokens(slot, 0)
 
     def decode_streaming_chunk(self, request: Request, enc_out: torch.Tensor) -> RequestOutput:
         outs = self.decode_streaming_batch([request], {request.request_id: enc_out})
@@ -1056,16 +1093,35 @@ class TransducerDecodeStrategy(DecodeStrategy):
         The session itself is released by :meth:`free_session` (the executor
         calls it right after finalize).
         """
-        s: Optional[_Session] = self._sessions.get(request.request_id)
+        return self.finalize_batch([request])[0]
+
+    def finalize_batch(self, requests: List[Request]) -> List[RequestOutput]:
+        """:meth:`finalize` for every stream ending this tick.
+
+        Beam search carries real alternatives, best first, and their scores live
+        in the slot pool: every ending stream's are read back in one copy rather
+        than one synchronising read per stream.
+        """
+        sessions: List[Optional[_Session]] = [self._sessions.get(r.request_id) for r in requests]
+        slots = [s.slot for s in sessions if s is not None and s.slot is not None]
+        beam_scores: Dict[int, List[float]] = {}
+        if slots and self._beam_slots is not None:
+            pool = self._beam_slots
+            index = to_device(slots, dtype=torch.long, device=pool.scores.device)
+            beam_scores = dict(zip(slots, pool.scores.index_select(0, index).tolist()))
+        return [self._final(r, s, beam_scores) for r, s in zip(requests, sessions)]
+
+    def _final(
+        self, request: Request, s: Optional[_Session], beam_scores: Dict[int, List[float]]
+    ) -> RequestOutput:
         hyp = list(s.hyp) if s is not None else []
-        # Beam search carries real alternatives; greedy has exactly one row.
-        if s is not None and s.nbest is not None:
-            rows, scores = s.nbest
+        if s is not None and s.slot is not None and self._beam_slots is not None:
+            pool = self._beam_slots
             return RequestOutput(
                 request_id=request.request_id,
                 text=s.text(self._detok),
-                tokens=[list(r) for r in rows],
-                scores=list(scores),
+                tokens=[pool.tokens(s.slot, j) for j in range(pool.beam)],
+                scores=beam_scores[s.slot],
                 finished=True,
             )
         out = RequestOutput(

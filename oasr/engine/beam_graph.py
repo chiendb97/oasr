@@ -32,8 +32,12 @@ op for op at the same batch width, so it is bit-identical to the eager loop:
   ``ceil(T / unroll) * unroll`` frames a call runs always fit in it.
 * **Nothing in it is data-dependent on the host.**  Back-pointers and labels
   land in static frame-major ``(T_cap, B, k)`` buffers; the chunk's first ``T``
-  frames are copied out once and folded by
-  :func:`~oasr.engine.decode.transducer_beam.fold_chunk`.
+  frames are copied out once and walked by
+  :func:`~oasr.engine.decode.transducer_beam.walk_chunk`.
+
+The strategy pads a chunk's batch to a power of two before it gets here
+(``TransducerDecodeStrategy._beam_frames``), with rows that have no frames, so
+the exact-width key sees a handful of widths rather than every cohort size.
 
 A failed capture is remembered and not retried, and an out-of-memory disables
 the cache: the ``GreedyLoopGraphCache`` discipline.

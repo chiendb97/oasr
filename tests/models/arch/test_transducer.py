@@ -761,9 +761,10 @@ class TestTransducerBeamSearch:
     def test_streaming_beam_matches_offline_beam(self, model):
         """Chunked beam search must equal one-shot beam search over the same audio.
 
-        The session carries the ``(1, k, ...)`` state across chunks and the group
-        is re-stacked every tick (streams are grouped by chunk length), so this is
-        the test that the stack/select round trip preserves the beam exactly.
+        Through the per-stream helpers: each stream's ``(1, k, ...)`` state is
+        re-stacked every chunk, so this is the test that the stack/select round
+        trip preserves the beam exactly.  (The strategy keeps a slot pool
+        instead; see ``test_pooled_streams_join_and_leave_and_each_matches_offline``.)
         """
         from oasr.engine.decode.transducer_beam import (
             beam_search_chunk,
@@ -990,6 +991,149 @@ class TestTransducerBeamSearch:
 
         with pytest.raises(ValueError, match="unroll"):
             BeamLoopGraphCache(exact_transducer(torch.bfloat16), unroll=24)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    def test_selection_returns_the_beam_best_first(self, dtype):
+        """Slot ``j`` is the ``j``-th best hypothesis after every frame, for the
+        torch composition (fp32) and the fused kernel (bf16) alike -- what lets
+        streaming read the best transcript as slot 0 without reading scores."""
+        from helpers.transducer import exact_transducer
+
+        from oasr.engine.decode.transducer_beam import beam_search_history, init_beam_state
+
+        model = exact_transducer(dtype, blank_bias=2.0, seed=2)
+        gen = torch.Generator(device="cuda").manual_seed(2)
+        B, T, k = 5, 23, 4
+        enc = torch.randn(B, T, 64, device="cuda", generator=gen).to(dtype)
+        lengths = torch.tensor([23, 17, 9, 2, 0], device="cuda")
+        st = init_beam_state(model.decoder, B, k, enc.device)
+        with torch.no_grad():
+            enc_proj = model.joiner.encoder_proj(enc)
+            for t in range(1, T + 1):
+                _, scores, _, _ = beam_search_history(
+                    model, enc_proj[:, :t], lengths.clamp(max=t), st.context, st.scores
+                )
+                assert bool((scores[:, 1:] <= scores[:, :-1]).all()), f"frame {t}"
+
+    def test_slot_pool_reuses_rows_and_grows_without_moving_live_beams(self, model):
+        from oasr.engine.decode.transducer_beam import BeamSlotPool, init_beam_state
+
+        k, device = 3, torch.device("cuda")
+        fresh = init_beam_state(model.decoder, 1, k, device)
+        pool = BeamSlotPool(model.decoder, k, device, capacity=2)
+        a, b = pool.allocate(), pool.allocate()
+        for slot, value in ((a, 7), (b, 9)):
+            pool.scatter(
+                torch.tensor([slot], device="cuda"),
+                torch.full_like(fresh.context, value),
+                torch.full_like(fresh.scores, float(value)),
+            )
+        c = pool.allocate()  # past capacity: the pool doubles
+        assert pool.capacity == 4 and len({a, b, c}) == 3
+        context, scores = pool.gather(torch.tensor([a, b, c], device="cuda"))
+        assert context[0].eq(7).all() and context[1].eq(9).all() and scores[1].eq(9).all()
+        assert torch.equal(context[2], fresh.context[0]) and torch.equal(scores[2], fresh.scores[0])
+
+        pool.release(a)
+        d, e = pool.allocate(), pool.allocate()  # a's row and the last free one
+        assert pool.capacity == 4 and {d, e} == {a, 6 - b - c - a} and pool.live == 4
+        context, scores = pool.gather(torch.tensor([d, e], device="cuda"))
+        assert torch.equal(context, fresh.context.expand(2, -1, -1))
+        assert torch.equal(scores, fresh.scores.expand(2, -1))
+        assert [pool.tokens(d, j) for j in range(k)] == [[]] * k
+
+    def test_slot_pool_commits_the_beams_common_prefix(self, model):
+        """What every hypothesis agrees on moves to the committed prefix, and the
+        full hypotheses are unchanged by the split.
+
+        chunk 1: both slots extend the empty slot 0, with 1 and with 2.
+        chunk 2: the walk of ``test_fold_chunk_walks_back_pointers_into_root_prefixes``
+        -- both survivors descend from ``[1]``, so ``[1]`` is committed.
+        """
+        from oasr.engine.decode.transducer_beam import BeamSlotPool, walk_chunk
+
+        pool = BeamSlotPool(model.decoder, 2, torch.device("cuda"))
+        slot = pool.allocate()
+        pool.fold([slot], walk_chunk(torch.tensor([[[0, 0]]]), torch.tensor([[[1, 2]]]), 0))
+        assert pool.tokens(slot, 0) == [1] and pool.tokens(slot, 1) == [2]
+        assert pool._committed[slot] == []  # noqa: SLF001
+
+        parents = torch.tensor([[[0, 0]], [[1, 0]], [[1, 0]]])
+        labels = torch.tensor([[[5, 0]], [[7, 0]], [[0, 9]]])
+        pool.fold([slot], walk_chunk(parents, labels, 0))
+        assert pool.tokens(slot, 0) == [1, 5] and pool.tokens(slot, 1) == [1, 7, 9]
+        assert pool._committed[slot] == [1]  # noqa: SLF001
+        assert pool._suffixes[slot] == [[5], [7, 9]]  # noqa: SLF001
+
+    def test_pooled_streams_join_and_leave_and_each_matches_offline(self):
+        """Streams arriving and finishing mid-run: every tick's cohort is a
+        different set of pool rows at a different bucketed width, some ticks
+        split by chunk length, finished streams hand their rows to later ones --
+        and each stream must still decode exactly as it does alone.
+
+        Exact arithmetic (``helpers.transducer``), so cohort width and padding
+        cannot move a score, and the comparison is equality.
+        """
+        from helpers.transducer import exact_transducer, integer_frames
+
+        model = exact_transducer(torch.bfloat16, blank_bias=8.0, seed=5)
+        chunk, k = 16, 4
+        # (first tick, chunks).  Two streams end together; later ones reuse rows.
+        plan = [(0, 3), (0, 1), (1, 4), (1, 2), (3, 2), (4, 3), (4, 1), (6, 1)]
+        enc = [  # odd streams end on a short chunk
+            integer_frames(1, n * chunk - 5 * (i % 2), torch.bfloat16, seed=20 + i)
+            for i, (_, n) in enumerate(plan)
+        ]
+        strat = self._strategy(model, beam=k, max_sym=1, graphs=True)
+        reqs = [SimpleNamespace(request_id=f"s{i}") for i in range(len(plan))]
+        finals, rows_used = {}, set()
+        with torch.no_grad():
+            for tick in range(max(start + n for start, n in plan)):
+                live = [i for i, (start, n) in enumerate(plan) if start <= tick < start + n]
+                for i in live:
+                    if tick == plan[i][0]:
+                        strat.create_session(reqs[i])
+                pieces = {
+                    reqs[i].request_id: enc[i][:, (tick - plan[i][0]) * chunk :][:, :chunk]
+                    for i in live
+                }
+                strat.decode_streaming_batch([reqs[i] for i in live], pieces)
+                ending = [i for i in live if tick == sum(plan[i]) - 1]
+                for i, out in zip(ending, strat.finalize_batch([reqs[i] for i in ending])):
+                    finals[i] = out
+                    rows_used.add(strat._sessions[reqs[i].request_id].slot)
+                    strat.free_session(reqs[i])
+            alone = self._strategy(model, beam=k, max_sym=1)
+            for i, e in enumerate(enc):
+                want = alone.decode_offline(e, torch.tensor([e.size(1)], device="cuda"))[0]
+                assert finals[i].tokens == want.tokens, f"stream {i} tokens"
+                assert finals[i].scores == want.scores, f"stream {i} scores"
+        assert strat._beam_slots is not None and strat._beam_slots.live == 0
+        assert len(rows_used) < len(plan)  # finished streams' rows were handed on
+        assert strat._beam_graphs is not None and strat._beam_graphs.stats()["fallbacks"] == 0
+
+    def test_prewarm_captures_bucketed_widths_only(self):
+        """Every cohort width up to 64 is served by seven captures (1, 2, ..., 64).
+
+        Exact widths were 64 keys against a 48-capture budget: prewarm stopped
+        capturing at 48, and every tick with a wider cohort ran the eager loop.
+        """
+        from helpers.transducer import JOINER_DIM, exact_transducer, integer_frames
+
+        model = exact_transducer(torch.bfloat16, blank_bias=8.0)
+        model.encoder.output_size = JOINER_DIM
+        strat = self._strategy(model, beam=4, max_sym=1, graphs=True)
+        with torch.no_grad():
+            strat.prewarm_streaming(list(range(1, 65)), frames=16)
+            cache = strat._beam_graphs
+            assert cache is not None and cache.num_captured == 7
+            for B in (3, 37, 64):
+                reqs = [SimpleNamespace(request_id=f"w{B}-{b}") for b in range(B)]
+                enc = integer_frames(B, 16, torch.bfloat16, seed=B)
+                strat.decode_streaming_batch(
+                    reqs, {r.request_id: enc[b : b + 1] for b, r in enumerate(reqs)}
+                )
+        assert cache.num_captured == 7 and cache.stats()["fallbacks"] == 0
 
 
 # --------------------------------------------------------------------------- #
