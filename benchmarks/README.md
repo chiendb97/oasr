@@ -17,6 +17,27 @@ python benchmarks/run.py --testlist benchmarks/testlists/all_kernels.txt \
 > rule 8. A missing `$CKPT_DIR` stops the run; a missing `$NUM_UTTERANCES` does
 > not, it just measures a different working point without saying so.
 
+## asrbench — the ASR inference suite
+
+`benchmarks/asrbench/` is the controlled, cross-backend performance suite:
+prepared datasets (LibriSpeech, LJSpeech, Earnings-21, derived long-form),
+deterministic workloads, single / batch / throughput / closed- and open-loop
+load / paced streaming / long-form benchmarks, out-of-process resource
+telemetry, a WER guardrail kept out of timed runs, regression gating with exit
+codes, and reports from stored runs. It is a workflow rather than one
+measurement, so it has its own command:
+
+```bash
+python -m benchmarks.asrbench prepare librispeech --download
+python -m benchmarks.asrbench prepare manifest --subset NAME --source-dir my.jsonl   # data you already have
+python -m benchmarks.asrbench run --profile smoke --backend oasr_engine   # --dataset manifest/NAME
+python -m benchmarks.asrbench compare BASELINE_RUN CANDIDATE_RUN
+python -m benchmarks.asrbench report RUN [RUN ...] --plots
+```
+
+See [`docs/asrbench.md`](../docs/asrbench.md). The families below remain the
+per-component harnesses.
+
 ## Layout
 
 One directory per measurement family, mirroring the `tests/` split that
@@ -33,6 +54,7 @@ benchmarks/
   engine/                 in-process ASREngine, plus the glue-op profiler
   service/                end-to-end oasr-server
   accuracy/               WER/CER sweep
+  asrbench/               the ASR inference suite (python -m benchmarks.asrbench)
   testlists/  manifests/
 ```
 

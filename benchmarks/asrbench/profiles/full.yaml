@@ -1,0 +1,108 @@
+# Full: release evaluation.  Everything in `standard`, larger and repeated, plus
+# real long-form recordings (Earnings-21) offline and as 5-minute live sessions.
+# Hours, not minutes -- run it deliberately.
+#
+#   python -m benchmarks.asrbench prepare librispeech --download
+#   python -m benchmarks.asrbench prepare longform --source librispeech/test-clean
+#   python -m benchmarks.asrbench prepare earnings21 --download          # 238 MB shard
+#   python -m benchmarks.asrbench run --profile full --backend oasr_engine
+name: full
+description: >-
+  Release evaluation: wide sweeps with repetitions, capacity search by
+  open-loop fractions, streaming capacity over chunk sizes and up to 128
+  sessions, synthetic and real long-form, long live sessions.
+defaults:
+  primary: librispeech/test-clean
+  seed: 0
+  timeout_s: 300
+  monitor_interval_s: 0.2
+
+workloads:
+  utterances:
+    dataset: ${primary}
+    sampling: stratified
+    num_items: 1000
+    duration_range: [0, 35]
+  fixed:
+    dataset: longform/${primary_slug}
+    crop_s: [0.5, 1, 2, 5, 10, 15, 20, 30, 60]
+    num_items: 270
+  stream_sessions:
+    dataset: ${primary}
+    sampling: random
+    num_items: 256
+    duration_range: [4, 30]
+  long:
+    dataset: longform/${primary_slug}
+    sampling: all
+  real_long:
+    dataset: earnings21/test
+    sampling: all
+  live_sessions:
+    dataset: earnings21/test
+    crop_s: [300]
+    num_items: 8
+
+benchmarks:
+  - {name: cold_start, kind: cold_start, workload: utterances, warm_repeats: 5}
+  - {name: single_fixed, kind: single, workload: fixed, repetitions: 5}
+  - {name: single_buckets, kind: single, workload: utterances, repetitions: 2}
+  - name: batch
+    kind: batch
+    workload: utterances
+    batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128]
+    compositions: [uniform, mixed]
+    num_batches: 16
+    repetitions: 5
+  - {name: throughput, kind: throughput, workload: utterances, repetitions: 5}
+  - name: load_closed
+    kind: load
+    workload: utterances
+    mode: closed
+    concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    num_requests: 1000
+    repetitions: 2
+  - name: load_open
+    kind: load
+    workload: utterances
+    mode: open
+    rate_fractions: [0.1, 0.25, 0.5, 0.7, 0.8, 0.9, 0.95, 1.0]
+    capacity_from: throughput
+    arrival: poisson
+    duration_s: 120
+    warmup_s: 10
+  - name: load_open_constant
+    kind: load
+    workload: utterances
+    mode: open
+    rate_fractions: [0.5, 0.9]
+    capacity_from: throughput
+    arrival: constant
+    duration_s: 120
+    warmup_s: 10
+  - name: streaming
+    kind: streaming
+    workload: stream_sessions
+    chunk_ms: [80, 160, 320, 640, 1280]
+    sessions: [1, 4, 16, 64, 128]
+    rounds: 2
+    pacing: realtime
+    warmup: round
+  - name: streaming_unpaced
+    kind: streaming
+    workload: stream_sessions
+    chunk_ms: [320]
+    sessions: [64]
+    rounds: 4
+    pacing: unpaced
+    warmup: round
+  - name: streaming_long_sessions
+    kind: streaming
+    workload: live_sessions
+    chunk_ms: [320]
+    sessions: [1, 8]
+    pacing: realtime
+    warmup: 0
+    final_timeout_s: 120
+  - {name: longform, kind: longform, workload: long, repetitions: 2, warmup: 1}
+  - {name: longform_real, kind: longform, workload: real_long, warmup: 1, timeout_s: 3600}

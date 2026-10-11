@@ -9,7 +9,14 @@ This document covers the three top-level harnesses:
 | `run.py --family accuracy` | WER/CER **and** speed in the same CSV row. |
 
 All three emit the **workload** schema, so an engine row and a service row are
-one query apart rather than a CSV-to-JSON join. `benchmarks/bench_engine.py`,
+one query apart rather than a CSV-to-JSON join.
+
+For controlled, reproducible measurement across backends — deterministic
+workloads drawn from prepared corpora, single-request / batch / closed- and
+open-loop load / paced streaming / long-form protocols, resource telemetry,
+regression gating and reports — use the ASR inference suite,
+[`asrbench.md`](asrbench.md) (`python -m benchmarks.asrbench`). The three
+harnesses here remain the per-component tools engine work iterates on. `benchmarks/bench_engine.py`,
 `bench_service.py` and `bench_accuracy.py` remain as shims into `run.py`.
 
 Run the first two back-to-back on the same machine for an apples-to-apples

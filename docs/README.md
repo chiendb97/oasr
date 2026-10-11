@@ -15,6 +15,7 @@ interfaces and operation.
 | [`../README.md`](../README.md) | Project overview, install, quick start, supported models |
 | [checkpoints.md](checkpoints.md) | Loading a checkpoint: resolution precedence, converter contract, `oasr-convert`, the native format |
 | [benchmarks.md](benchmarks.md) | Engine, service and accuracy benchmark recipes; measurement protocol |
+| [asrbench.md](asrbench.md) | The ASR inference performance suite: datasets, workloads, latency/throughput/concurrency/streaming protocol, backends, regression gating, reports |
 | [ci.md](ci.md) | The four workflows, running the gates locally, the asset gate, the accuracy gate |
 
 ## Architecture and design

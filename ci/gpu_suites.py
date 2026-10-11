@@ -53,6 +53,9 @@ SUITES: dict[str, list[str]] = {
     "accuracy": ["tests/accuracy"],
     # Architectures, the registry/contract ratchets and checkpoint conversion.
     "models": ["tests/models"],
+    # The asrbench suite's own infrastructure (benchmarks/asrbench): CPU-only,
+    # mock backend and generated audio, so it costs the GPU runner seconds.
+    "benchmarks": ["tests/benchmarks"],
 }
 
 #: Files deliberately outside the family split because they are reached through

@@ -1,0 +1,65 @@
+# Self-test of the suite itself: synthetic audio and (normally) the mock backend.
+# Exercises every benchmark kind in seconds with no corpus and no GPU -- this is
+# what tests/benchmarks runs.  Its numbers are simulated and say nothing.
+#
+#   python -m benchmarks.asrbench prepare synthetic
+#   python -m benchmarks.asrbench run --profile selftest --backend mock
+name: selftest
+description: >-
+  Infrastructure self-test on generated audio: every benchmark kind at toy
+  sizes.  Not a performance measurement.
+defaults:
+  primary: synthetic/default
+  seed: 0
+  timeout_s: 10
+  monitor_interval_s: 0.05
+
+workloads:
+  utterances:
+    dataset: ${primary}
+    sampling: stratified
+    num_items: 9
+    duration_range: [0, 30]
+  fixed:
+    dataset: ${primary}
+    crop_s: [1, 2]
+    num_items: 4
+  long:
+    dataset: ${primary}
+    sampling: all
+    duration_range: [60, null]
+
+benchmarks:
+  - {name: cold_start, kind: cold_start, workload: utterances, warm_repeats: 2}
+  - {name: single, kind: single, workload: utterances, repetitions: 2, warmup: all}
+  - {name: fixed_duration, kind: single, workload: fixed, warmup: 1}
+  - name: batch
+    kind: batch
+    workload: utterances
+    batch_sizes: [1, 3]
+    compositions: [uniform, mixed]
+    num_batches: 2
+  - {name: throughput, kind: throughput, workload: utterances, repetitions: 2, warmup: 2}
+  - name: load_closed
+    kind: load
+    workload: utterances
+    mode: closed
+    concurrency: [1, 3]
+    num_requests: 9
+    warmup_requests: 2
+  - name: load_open
+    kind: load
+    workload: utterances
+    mode: open
+    rate_fractions: [0.5]
+    capacity_from: throughput
+    num_requests: 9
+  - name: streaming
+    kind: streaming
+    workload: utterances
+    chunk_ms: [500]
+    sessions: [1, 3]
+    pacing: unpaced
+    warmup: 1
+    word_timestamps: true
+  - {name: longform, kind: longform, workload: long, warmup: 0}
