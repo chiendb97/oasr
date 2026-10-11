@@ -1,0 +1,77 @@
+# Standard: the regular performance evaluation.  LibriSpeech test-clean for
+# utterances; a long-form set concatenated from it for medium/long inputs.
+# Tens of minutes: paced streaming alone is real time (~2 x 9 points x 64 sessions
+# of 4-20 s audio at the session counts swept), plus the offline sweeps.
+#
+#   python -m benchmarks.asrbench prepare librispeech --download
+#   python -m benchmarks.asrbench prepare longform --source librispeech/test-clean
+#   python -m benchmarks.asrbench run --profile standard --backend oasr_engine
+name: standard
+description: >-
+  Duration buckets and a fixed-duration latency curve, a batch sweep (uniform
+  vs mixed lengths), backlog throughput, closed- and open-loop load at
+  fractions of measured capacity, paced streaming over chunk sizes and session
+  counts, and long-form recordings.
+defaults:
+  primary: librispeech/test-clean
+  seed: 0
+  timeout_s: 120
+  monitor_interval_s: 0.2
+
+workloads:
+  utterances:
+    dataset: ${primary}
+    sampling: stratified
+    num_items: 300
+    duration_range: [0, 35]
+  fixed:
+    # Exact-length crops of contiguous speech: latency vs duration without the
+    # scatter of natural lengths.  Crops carry no transcript (performance only).
+    dataset: longform/${primary_slug}
+    crop_s: [1, 2, 5, 10, 20, 30]
+    num_items: 120
+  stream_sessions:
+    dataset: ${primary}
+    sampling: random
+    num_items: 64
+    duration_range: [4, 20]
+  long:
+    dataset: longform/${primary_slug}
+    sampling: all
+
+benchmarks:
+  - {name: cold_start, kind: cold_start, workload: utterances, warm_repeats: 3}
+  - {name: single_fixed, kind: single, workload: fixed, repetitions: 3}
+  - {name: single_buckets, kind: single, workload: utterances}
+  - name: batch
+    kind: batch
+    workload: utterances
+    batch_sizes: [1, 2, 4, 8, 16, 32]
+    compositions: [uniform, mixed]
+    num_batches: 8
+    repetitions: 3
+  - {name: throughput, kind: throughput, workload: utterances, repetitions: 3}
+  - name: load_closed
+    kind: load
+    workload: utterances
+    mode: closed
+    concurrency: [1, 4, 16, 64]
+    num_requests: 300
+  - name: load_open
+    kind: load
+    workload: utterances
+    mode: open
+    rate_fractions: [0.25, 0.5, 0.75, 0.9]
+    capacity_from: throughput
+    arrival: poisson
+    duration_s: 60
+    warmup_s: 5
+  - name: streaming
+    kind: streaming
+    workload: stream_sessions
+    chunk_ms: [160, 320, 640]
+    sessions: [1, 8, 32]
+    rounds: 2
+    pacing: realtime
+    warmup: round
+  - {name: longform, kind: longform, workload: long, warmup: 1}

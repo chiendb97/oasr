@@ -1,0 +1,61 @@
+# Smoke: does the suite work end to end against a real backend?  Every offline
+# kind plus load and streaming, at toy sizes, one repetition.  Minutes, not a
+# measurement -- percentiles over 8 requests are flagged as such in the output.
+#
+#   python -m benchmarks.asrbench prepare librispeech --download     # once, 346 MB
+#   python -m benchmarks.asrbench run --profile smoke --backend oasr_engine
+#
+# On a box that already has LJSpeech:  --dataset ljspeech/all
+name: smoke
+description: >-
+  Minimal deterministic end-to-end check of every benchmark kind (offline,
+  batch, throughput, closed/open load, paced streaming) at toy sizes.
+defaults:
+  primary: librispeech/test-clean
+  seed: 0
+  timeout_s: 60
+  monitor_interval_s: 0.25
+
+workloads:
+  utterances:
+    dataset: ${primary}
+    sampling: stratified
+    num_items: 8
+    duration_range: [0, 30]
+  fixed:
+    dataset: ${primary}
+    crop_s: [2, 5]
+    num_items: 4
+
+benchmarks:
+  - {name: cold_start, kind: cold_start, workload: utterances, warm_repeats: 2}
+  - {name: single, kind: single, workload: utterances}
+  - {name: fixed_duration, kind: single, workload: fixed}
+  - name: batch
+    kind: batch
+    workload: utterances
+    batch_sizes: [1, 4]
+    compositions: [mixed]
+    num_batches: 2
+  - {name: throughput, kind: throughput, workload: utterances}
+  - name: load_closed
+    kind: load
+    workload: utterances
+    mode: closed
+    concurrency: [2]
+    num_requests: 8
+  - name: load_open
+    kind: load
+    workload: utterances
+    mode: open
+    rate_fractions: [0.5]
+    capacity_from: throughput
+    arrival: poisson
+    num_requests: 8
+  - name: streaming
+    kind: streaming
+    workload: utterances
+    chunk_ms: [320]
+    sessions: [2]
+    pacing: realtime
+    warmup: round

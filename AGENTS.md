@@ -140,6 +140,7 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | Engine / service / accuracy benchmark | `python benchmarks/run.py --family {engine,service,accuracy}` — flags default from `.env` |
 | WER for one architecture | `python benchmarks/run.py --family accuracy --ckpt-dir $CKPT_DIR --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR` |
 | …for an explicit-only one | as above with `--ckpt-dir $TRANSDUCER_CKPT --architecture transducer` |
+| ASR inference suite (cross-backend latency/throughput/streaming, regression gate) | `python -m benchmarks.asrbench run --profile smoke --backend oasr_engine` · `… compare BASE CAND` · `… report RUN` |
 
 ---
 
@@ -604,6 +605,12 @@ same trap as an unsourced test run wearing a different hat.
 | `benchmarks/run.py --family service` | End-to-end `oasr-server` — what clients see |
 | `benchmarks/run.py --family accuracy` | WER/CER **and** RTFx / p50 / p99 in the same row |
 
+`python -m benchmarks.asrbench` is the fifth: the controlled, cross-backend
+suite (prepared corpora, deterministic workloads, single/batch/load/streaming/
+long-form protocols, resource telemetry, `compare` with exit codes). Its sizing
+comes from the profile it records, **not** from `.env`; `.env` supplies only
+paths. See [`docs/asrbench.md`](docs/asrbench.md).
+
 Two output schemas, declared once in `benchmarks/core/schema.py` and printable
 with `run.py --print-schema`: **kernel** rows and **workload** rows (engine,
 service, accuracy, decoders). `rtfx = audio_s / wall_s` in all of them.
@@ -696,6 +703,7 @@ before process start.
 | [`docs/wfst_decoder_gpu.md`](docs/wfst_decoder_gpu.md) | In-tree GPU WFST decoder |
 | [`docs/serving.md`](docs/serving.md) | Rust front-end, HTTP/gRPC APIs, dispatcher, deployment |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark recipes and measurement protocol |
+| [`docs/asrbench.md`](docs/asrbench.md) | The ASR inference suite: datasets, workloads, protocols, backends, results, regression gating |
 | [`docs/ci.md`](docs/ci.md) | The four workflows, the asset gate, the accuracy gate, why mypy is a ratchet |
 | [`docs/autotuning.md`](docs/autotuning.md) | `oasr.tune` API and cache format |
 
