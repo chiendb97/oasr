@@ -55,6 +55,8 @@ class NemotronEncoderConfig:
     subsampling_conv_channels: int = 256
     subsampling_conv_kernel_size: int = 3
     subsampling_conv_stride: int = 2
+    #: Upstream's position-table size, kept for the round trip.  Not an input
+    #: limit: the relative table is computed for each length (see the encoder).
     max_position_embeddings: int = 5000
     scale_input: bool = False
     sliding_window: int = 57

@@ -373,8 +373,9 @@ class OasrEngineBackend(Backend):
             notes=(
                 "batch = one engine admission of all inputs; the scheduler may split it "
                 "(see batch_size_observed). long_form=whole means no fixed-window "
-                "frontend, not a verified bound: a model's positional table can still "
-                "cap input length, which the longform benchmark reports per request"
+                "frontend, not an unbounded input: full attention's memory grows with "
+                "the square of the length, so a long enough request is rejected for "
+                "memory, which the longform benchmark reports per request"
             ),
         )
 

@@ -42,13 +42,19 @@ import functools
 import math
 import os
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional, Tuple
 
 import torch
 
 from oasr.api_logging import oasr_api
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
+
+#: Per-stream token capacity when ``GpuDecoderConfig.max_seq_len`` is ``None``.
+#: ~20 minutes of continuous speech at a 5000-unit vocabulary, for ~0.7 MiB of
+#: beam state per stream; a stream that needs more without a VAD turn reset (which
+#: restarts the beam) should set ``max_seq_len`` itself.
+STREAMING_MAX_SEQ_LEN = 4096
 
 
 @dataclass
@@ -60,8 +66,15 @@ class GpuDecoderConfig:
         blank_id: CTC blank token id.
         blank_threshold: Skip frames where P(blank) exceeds this threshold
             (offline mode only). Reduces computation on blank-heavy frames.
-        max_seq_len: Maximum decoded sequence length per utterance. Beams
-            longer than this are truncated.
+        max_seq_len: Cap on decoded tokens per utterance, or ``None`` for none.
+            Offline, ``None`` sizes the output to the input -- ``T`` frames
+            cannot spell more than ``T`` tokens, so nothing is ever cut.  A
+            stream's state is allocated before its length is known, so
+            streaming resolves ``None`` to :data:`STREAMING_MAX_SEQ_LEN`.  A
+            hypothesis that reaches a cap stops growing (the engine reports it
+            as ``finish_reason="length"``).  A fixed 200 used to be the
+            default, which silently cut every utterance past ~200 tokens: a
+            minute of speech for a 500-unit vocabulary.
         use_paged_memory: Use paged-attention-style memory for decoded
             sequences. Reduces GPU memory usage when max_seq_len is large
             by storing sequences in fixed-size pages with prefix sharing.
@@ -72,7 +85,7 @@ class GpuDecoderConfig:
     beam_size: int = 10
     blank_id: int = 0
     blank_threshold: float = 0.98
-    max_seq_len: int = 200
+    max_seq_len: Optional[int] = None
     use_paged_memory: bool = False
     page_size: int = 16
 
@@ -321,7 +334,7 @@ def _launch_ctc_beam_search(
     beam_size: int,
     blank_id: int,
     blank_threshold: float,
-    max_seq_len: int,
+    max_seq_len: Optional[int],
     use_paged_memory: bool,
     page_size: int,
     want_times: bool,
@@ -340,9 +353,11 @@ def _launch_ctc_beam_search(
 
     device = log_prob.device
 
-    # Allocate workspace (needs max of input seq len and output seq len)
+    # The beam keeps up to ``input_seq_len`` tokens internally whatever the cap;
+    # the cap only narrows the output it copies them into.
     input_seq_len = log_prob.size(1)
-    ws_seq_len = max(input_seq_len, max_seq_len)
+    out_seq_len = max(1, input_seq_len) if max_seq_len is None else int(max_seq_len)
+    ws_seq_len = max(input_seq_len, out_seq_len)
     vocab_size = log_prob.size(2)
 
     if use_paged_memory:
@@ -353,7 +368,7 @@ def _launch_ctc_beam_search(
         ws_bytes = mod.ctc_decoder_workspace_size(batch, beam_size, vocab_size, ws_seq_len)
     workspace = torch.empty(int(ws_bytes), dtype=torch.uint8, device=device)
 
-    out_tokens = torch.empty(batch, beam_size, max_seq_len, dtype=torch.int32, device=device)
+    out_tokens = torch.empty(batch, beam_size, out_seq_len, dtype=torch.int32, device=device)
     out_times = _times_out(want_times, out_tokens)
     out_lengths = torch.empty(batch, beam_size, dtype=torch.int32, device=device)
     out_scores = torch.empty(batch, beam_size, dtype=torch.float32, device=device)
@@ -395,7 +410,7 @@ def ctc_beam_search_decode(
     beam_size: int = 10,
     blank_id: int = 0,
     blank_threshold: float = 0.98,
-    max_seq_len: int = 200,
+    max_seq_len: Optional[int] = None,
     use_paged_memory: bool = False,
     page_size: int = 16,
     want_times: bool = False,
@@ -414,8 +429,9 @@ def ctc_beam_search_decode(
         CTC blank token id.
     blank_threshold : float
         Skip threshold for blank probability.
-    max_seq_len : int
-        Maximum decoded output sequence length.
+    max_seq_len : int, optional
+        Cap on decoded tokens per row; ``None`` (default) sizes the output to
+        ``log_prob``'s time axis, which no hypothesis can outgrow.
     use_paged_memory : bool
         Use paged-attention-style memory for decoded sequences.
     page_size : int
@@ -494,6 +510,18 @@ class PendingCtcDecode:
         return self.scores_cpu.tolist()
 
 
+def _readback_width(states: Sequence["StreamState"], max_seq_len: int) -> int:
+    """Token columns a stream read-back has to copy to the host.
+
+    A hypothesis gains at most one token per decoded frame, so no beam of these
+    states is longer than the most frames any of them has decoded.  The device
+    buffers stay ``max_seq_len`` wide (the read kernel copies each beam's own
+    length only); this bounds what crosses the bus, which at the full width was
+    ~8% of streaming throughput once the capacity was raised from 200 to 4096.
+    """
+    return max(1, min(int(max_seq_len), max((int(s.step) for s in states), default=0)))
+
+
 def _to_host_async(t: torch.Tensor) -> torch.Tensor:
     """A pinned host copy of ``t``, queued on the current stream."""
     host = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
@@ -508,7 +536,7 @@ def ctc_beam_search_decode_async(
     beam_size: int = 10,
     blank_id: int = 0,
     blank_threshold: float = 0.98,
-    max_seq_len: int = 200,
+    max_seq_len: Optional[int] = None,
     use_paged_memory: bool = False,
     page_size: int = 16,
     want_times: bool = False,
@@ -612,7 +640,13 @@ class GpuStreamingDecoder:
     """
 
     def __init__(self, config: Optional[GpuDecoderConfig] = None, *, use_cuda_graphs: bool = True):
-        self._config = config or GpuDecoderConfig()
+        config = config or GpuDecoderConfig()
+        # The state is sized before the stream's length is known, so ``None``
+        # resolves to a fixed capacity here.
+        if config.max_seq_len is None:
+            config = replace(config, max_seq_len=STREAMING_MAX_SEQ_LEN)
+        self._config = config
+        self._max_seq_len = int(config.max_seq_len or STREAMING_MAX_SEQ_LEN)
         self._mod = _get_ctc_decoder_module()
 
         # Internal default state for the single-request API
@@ -693,12 +727,14 @@ class GpuStreamingDecoder:
         if cfg.use_paged_memory:
             val = int(
                 self._mod.ctc_decoder_paged_state_size(
-                    batch, cfg.beam_size, vocab_size, cfg.max_seq_len, cfg.page_size
+                    batch, cfg.beam_size, vocab_size, self._max_seq_len, cfg.page_size
                 )
             )
         else:
             val = int(
-                self._mod.ctc_decoder_state_size(batch, cfg.beam_size, vocab_size, cfg.max_seq_len)
+                self._mod.ctc_decoder_state_size(
+                    batch, cfg.beam_size, vocab_size, self._max_seq_len
+                )
             )
         self._cached_size_key = key
         self._cached_size_val = val
@@ -713,13 +749,13 @@ class GpuStreamingDecoder:
                 batch,
                 cfg.beam_size,
                 vocab_size,
-                cfg.max_seq_len,
+                self._max_seq_len,
                 cfg.blank_id,
                 cfg.page_size,
             )
         else:
             self._mod.ctc_beam_search_init_state(
-                buffer, batch, cfg.beam_size, vocab_size, cfg.max_seq_len, cfg.blank_id
+                buffer, batch, cfg.beam_size, vocab_size, self._max_seq_len, cfg.blank_id
             )
 
     def _resolve_state(self, state: Optional[StreamState]) -> StreamState:
@@ -908,7 +944,7 @@ class GpuStreamingDecoder:
                 s.actual_frame_idx,
                 s.batch,
                 s.vocab_size,
-                cfg.max_seq_len,
+                self._max_seq_len,
                 1 if cfg.use_paged_memory else 0,
                 cfg.page_size,
                 1 if self._use_cuda_graphs else 0,
@@ -1038,7 +1074,7 @@ class GpuStreamingDecoder:
             cfg.blank_threshold,
             batch,
             vocab_size,
-            cfg.max_seq_len,
+            self._max_seq_len,
             1 if cfg.use_paged_memory else 0,
             cfg.page_size,
             1 if self._use_cuda_graphs else 0,
@@ -1088,7 +1124,7 @@ class GpuStreamingDecoder:
         batch = s.batch
 
         out_tokens = torch.empty(
-            batch, cfg.beam_size, cfg.max_seq_len, dtype=torch.int32, device=device
+            batch, cfg.beam_size, self._max_seq_len, dtype=torch.int32, device=device
         )
         out_times = _times_out(want_times, out_tokens)
         out_lengths = torch.empty(batch, cfg.beam_size, dtype=torch.int32, device=device)
@@ -1105,12 +1141,19 @@ class GpuStreamingDecoder:
             batch,
             cfg.beam_size,
             s.vocab_size,
-            cfg.max_seq_len,
+            self._max_seq_len,
             use_paged,
             cfg.page_size,
         )
 
-        tokens, times = _extract_tokens(out_tokens, out_lengths, batch, cfg.beam_size, out_times)
+        width = _readback_width([s], self._max_seq_len)
+        tokens, times = _extract_tokens(
+            out_tokens[..., :width],
+            out_lengths,
+            batch,
+            cfg.beam_size,
+            out_times[..., :width] if out_times.numel() else out_times,
+        )
         return GpuDecoderResult(tokens=tokens, times=times, lengths=out_lengths, scores=out_scores)
 
     def _issue_read_states(
@@ -1134,7 +1177,7 @@ class GpuStreamingDecoder:
         """
         cfg = self._config
         beam = cfg.beam_size
-        msl = cfg.max_seq_len
+        msl = self._max_seq_len
         use_paged = 1 if cfg.use_paged_memory else 0
         n = len(states)
         want_times = out_times.numel() > 0
@@ -1214,7 +1257,7 @@ class GpuStreamingDecoder:
 
         cfg = self._config
         beam = cfg.beam_size
-        msl = cfg.max_seq_len
+        msl = self._max_seq_len
         device = states[0].buffer.device
 
         out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
@@ -1226,9 +1269,10 @@ class GpuStreamingDecoder:
 
         # Single device→host sync for the entire ready set; the emission frames
         # ride in the same one rather than costing a second.
-        out_tokens_cpu = out_tokens.cpu()
+        width = _readback_width(states, msl)
+        out_tokens_cpu = out_tokens[..., :width].cpu()
         out_lengths_cpu = out_lengths.cpu()
-        out_times_cpu = out_times.cpu() if want_times else None
+        out_times_cpu = out_times[..., :width].cpu() if want_times else None
         all_beams = _CPP.extract_beam_tokens(out_tokens_cpu, out_lengths_cpu, beam)
         results: List[GpuDecoderResult] = []
         for i in range(n):
@@ -1283,7 +1327,7 @@ class GpuStreamingDecoder:
 
         cfg = self._config
         beam = cfg.beam_size
-        msl = cfg.max_seq_len
+        msl = self._max_seq_len
         device = states[0].buffer.device
         out_tokens = torch.empty(n, beam, msl, dtype=torch.int32, device=device)
         out_times = _times_out(want_times, out_tokens)
@@ -1291,10 +1335,11 @@ class GpuStreamingDecoder:
         out_scores = torch.empty(n, beam, dtype=torch.float32, device=device)
         self._issue_read_states(states, out_tokens, out_times, out_lengths, out_scores)
 
-        tokens_cpu = out_tokens.cpu()
+        width = _readback_width(states, msl)
+        tokens_cpu = out_tokens[..., :width].cpu()
         lengths_cpu = out_lengths.cpu()
         scores = out_scores.cpu().tolist()
-        times_cpu = out_times.cpu() if want_times else None
+        times_cpu = out_times[..., :width].cpu() if want_times else None
         all_beams = _CPP.extract_beam_tokens(tokens_cpu, lengths_cpu, beam)
         return [
             (
@@ -1346,7 +1391,7 @@ class GpuStreamingDecoder:
 
         cfg = self._config
         beam = cfg.beam_size
-        msl = cfg.max_seq_len
+        msl = self._max_seq_len
         device = states[0].buffer.device
         # Shares the persistent device buffers with the overlapped path.  Only
         # one of the two runs in a given engine (``overlap_partial_readback``
@@ -1363,7 +1408,7 @@ class GpuStreamingDecoder:
         self._issue_read_states(states, dev_tok, _NO_TIMES, dev_len, self._peek_dev_scores[:n])
 
         # One beam over the bus, and one sync for the whole ready set.
-        tokens_cpu = dev_tok[:, :1].cpu()
+        tokens_cpu = dev_tok[:, :1, : _readback_width(states, msl)].cpu()
         lengths_cpu = dev_len[:, :1].cpu()
         return [rows[0] for rows in _CPP.extract_beam_tokens(tokens_cpu, lengths_cpu, 1)]
 
@@ -1414,7 +1459,7 @@ class GpuStreamingDecoder:
             return None
         cfg = self._config
         beam = cfg.beam_size
-        msl = cfg.max_seq_len
+        msl = self._max_seq_len
         if any(s.batch != 1 for s in states):
             # Trimmed to one row here too, so the contract does not depend on
             # which branch a cohort happened to take.
@@ -1440,9 +1485,13 @@ class GpuStreamingDecoder:
         # binding, so every stream under the overlapped read-back died with a
         # TypeError and finalised empty.
         self._issue_read_states(states, dev_tok, _NO_TIMES, dev_len, dev_sco)
-        host_tok = self._peek_host_tokens[:n]
+        # A contiguous (n, 1, width) view at the front of the pinned buffer, so
+        # the copy stays one async transfer.
+        width = _readback_width(states, msl)
+        assert self._peek_host_tokens is not None  # postcondition of _ensure_peek_buffers
+        host_tok = self._peek_host_tokens.view(-1)[: n * width].view(n, 1, width)
         host_len = self._peek_host_lengths[:n]
-        host_tok.copy_(dev_tok[:, :1], non_blocking=True)
+        host_tok.copy_(dev_tok[:, :1, :width], non_blocking=True)
         host_len.copy_(dev_len[:, :1], non_blocking=True)
         ev = torch.cuda.Event()
         ev.record()

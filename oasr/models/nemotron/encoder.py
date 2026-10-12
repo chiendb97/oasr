@@ -550,14 +550,11 @@ class NemotronEncoder(BaseEncoder):
             hidden = hidden * self.input_scale
         assert out_lengths is not None
 
+        # No ``max_position_embeddings`` limit: the relative table is computed for
+        # the length at hand, as NeMo's ``update_max_seq_length`` extends its own,
+        # and the trained window keeps every attended distance inside it anyway.
+        # Refusing past it rejected anything over 400 s that streaming decodes.
         t_out = hidden.size(1)
-        if t_out > self.config.max_position_embeddings:
-            raise ValueError(
-                f"encoder sequence length {t_out} exceeds "
-                f"max_position_embeddings={self.config.max_position_embeddings} "
-                f"({t_out * self.subsampling_rate} feature frames); split the audio "
-                "or raise the config's limit"
-            )
         keep = torch.arange(t_out, device=hidden.device).unsqueeze(0) < out_lengths.unsqueeze(1)
         # ``(1, 1, T, T)`` trained window ∧ ``(B, 1, 1, T)`` key padding.
         window = chunked_limited_mask(t_out, t_out, *self.attention_context(), hidden.device)
