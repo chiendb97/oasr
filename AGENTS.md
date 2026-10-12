@@ -433,6 +433,12 @@ extension cookbook for each axis.
   and must agree **exactly**, so a change lands in both — which is also why neither side uses
   `std::isspace` or `sum()`: both differ across implementations and the difference reaches the
   published output. See [`docs/decoding.md`](docs/decoding.md) § Word timings.
+- **A length limit nobody declared.** The GPU CTC beam defaulted to a 200-token output, so every
+  transcript past it lost its tail with `finish_reason` unset (a 500-unit vocabulary hits that at
+  ~36 s); WeNet's 5000-row position table — a cache of a formula, not a property of the weights —
+  failed U2++ above 200 s and device-asserted an evicting stream. Size a buffer from the input, or
+  report `finish_reason="length"` when a cap binds. The 200-utterance accuracy gate cannot reach
+  any of this: `tests/accuracy/test_long_audio.py` joins it into one 300 s request.
 
 ### Declare, don't ignore
 - **Declaring `streaming_kind` from what the class implements** rather than what *this config's

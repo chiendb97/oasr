@@ -166,10 +166,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # Two ceilings, and the ladder honours the lower.  The block table caps
         # how many frames a stream can cache (``max_stream_frames``); the
         # encoder's relative-position table caps the *attention key size*
-        # ``cache_t1 + chunk_size`` it can index, and overrunning it is an
-        # out-of-bounds ``F.embedding`` gather rather than an error.
-        pos_limit = getattr(getattr(enc, "embed", None), "pos_enc", None)
-        pos_limit = getattr(pos_limit, "max_len", None)
+        # ``cache_t1 + chunk_size`` it can serve as a plain gather.
+        pos_enc = getattr(getattr(enc, "embed", None), "pos_enc", None)
+        pos_limit = getattr(pos_enc, "max_len", None)
         capacity = int(cache_config.max_stream_frames)
         if pos_limit:
             capacity = min(capacity, max(0, int(pos_limit) - cs))
@@ -177,6 +176,15 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             capacity,
             growth=float(getattr(config, "streaming_graph_cache_growth", 1.5)),
         )
+        # A stream's positions start at ``offset - cache_seqlens``, which is zero
+        # until its history is evicted -- so without eviction they stay under the
+        # cap above, and with it (bounded or recycled history) they grow without
+        # limit.  Say which, before anything is captured: the unbounded case has
+        # to compute the rows past the table, at several times a gather's cost.
+        bound_offsets = getattr(pos_enc, "bound_offsets", None)
+        if bound_offsets is not None:
+            evicts = cache_config.max_logical_blocks is not None
+            bound_offsets(None if evicts else capacity + cs)
 
         # CUDA Graph cache for the steady-state batched paged forward.
         # Captures lazily on first encounter of each (B_active, cache_t1

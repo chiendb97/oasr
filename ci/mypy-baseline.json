@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 383,
+  "total": 378,
   "files": {
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
@@ -40,7 +40,7 @@
     "oasr/features/streaming.py": 7,
     "oasr/features/whisper.py": 1,
     "oasr/functionals/attention.py": 7,
-    "oasr/functionals/ctc_decode.py": 2,
+    "oasr/functionals/ctc_decode.py": 1,
     "oasr/jit/attention.py": 9,
     "oasr/jit/conv.py": 11,
     "oasr/jit/core.py": 2,
@@ -55,7 +55,7 @@
     "oasr/layers/topk.py": 1,
     "oasr/models/base.py": 3,
     "oasr/models/conformer/convert.py": 5,
-    "oasr/models/conformer/model.py": 49,
+    "oasr/models/conformer/model.py": 45,
     "oasr/models/decoders/transformer_decoder.py": 7,
     "oasr/models/heads/ctc.py": 1,
     "oasr/models/paraformer/convert.py": 3,

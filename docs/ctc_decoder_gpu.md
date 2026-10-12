@@ -963,7 +963,7 @@ class GpuDecoderConfig:
     beam_size: int = 10
     blank_id: int = 0
     blank_threshold: float = 0.98          # offline-only frame skip
-    max_seq_len: int = 200
+    max_seq_len: int | None = None         # no cap offline; STREAMING_MAX_SEQ_LEN per stream
     use_paged_memory: bool = False
     page_size: int = 16
 
@@ -982,7 +982,7 @@ def ctc_beam_search_decode(
     beam_size: int = 10,
     blank_id:  int = 0,
     blank_threshold: float = 0.98,
-    max_seq_len: int = 200,
+    max_seq_len: int | None = None,  # None: output sized to T, so never cut
     use_paged_memory: bool = False,
     page_size: int = 16,
 ) -> GpuDecoderResult: ...
@@ -1029,7 +1029,7 @@ across requests without `cudaMalloc`.
 | `beam_size` | 10 | Beam width. Workspace scales linearly. ≤ 128 is supported by `first_step_kernel` shared-memory layout. |
 | `blank_id` | 0 | CTC blank index. Hard-coded in token filtering. |
 | `blank_threshold` | 0.98 | Probability above which an offline frame is skipped. Use `1.0` to disable, `0.0` to skip all (no-op). Streaming ignores this — pre-filter in Python if needed. |
-| `max_seq_len` | 200 | Hard cap on decoded sequence length. Both workspace and paged page count derive from it. |
+| `max_seq_len` | `None` | Cap on decoded tokens per row. `None` offline sizes the output to the input's `T` frames, which no CTC hypothesis can outgrow, so nothing is cut. A stream's state is allocated before its length is known, so streaming resolves `None` to `STREAMING_MAX_SEQ_LEN` (4096 tokens, ~0.7 MiB of state per stream). A hypothesis that reaches a cap stops growing and the engine reports the request as `finish_reason="length"`. The old fixed default of 200 silently cut every transcript past ~200 tokens -- about a minute of speech at a 500-unit vocabulary. |
 | `use_paged_memory` | `False` | Switch to paged token storage. |
 | `page_size` | 16 | Tokens per page. 16 is one cache line. Smaller pages improve sharing but increase page-table overhead. |
 
@@ -1061,8 +1061,7 @@ seq_lengths = torch.tensor([T, T, T], dtype=torch.int32, device="cuda")
 result = ctc_beam_search_decode(
     log_prob, seq_lengths,
     beam_size=10, blank_id=0, blank_threshold=0.98,
-    max_seq_len=200,
-)
+)  # no max_seq_len: the output holds every token T frames can spell
 
 print(result.tokens[0][0])      # 1-best token IDs for utterance 0
 print(result.scores[:, 0])      # 1-best score per utterance
@@ -1135,7 +1134,7 @@ ctc_beam_search_decode_batch(
 | `log_prob` not float32 / not 3-D | TVM-FFI launcher | `TVM_FFI_ICHECK` → exception. |
 | `seq_lengths` not int32 / not 1-D | launcher | `TVM_FFI_ICHECK`. |
 | Output tensors wrong rank | launcher | `CHECK_DIM` failure. |
-| `max_out_len < beam_count` of best beam | offline | Tokens truncated by `cudaMemcpy2DAsync` to `max_out_len`. |
+| `max_out_len < beam_count` of best beam | offline | Tokens truncated by `cudaMemcpy2DAsync` to `max_out_len` (only with an explicit `max_seq_len`; the default output is `T` wide). `lengths` still reports the full count. |
 | `step ≥ max_seq_len` reached mid-chunk | `ctc_beam_search_chunk` | Loop breaks early; returns the saturated `step`. |
 | `select_seq_lens[b] == 0` (all frames are blank-dominant) | `first_step_kernel` | Early return; that batch's beams stay zero-init. |
 | `blank_threshold ≥ 1.0` | offline | All frames selected (no skipping). |
@@ -1180,8 +1179,8 @@ wrong buffer returns stale state from a previous step.
 6. **Workspace allocation.** Both `ptable` and `ptablen` are
    `B × beam × vocab × 4 B`. For `B=8, beam=10, V=5000` that's
    ~1.6 MiB each, doubled for double-buffered `clist` in flat mode
-   (per token sequence). Size `max_seq_len` for your longest
-   utterance, no more.
+   (per token sequence). Offline sizes it from the input; for a
+   stream, size `max_seq_len` for your longest session, no more.
 7. **Paged mode trade-off.** Paged storage saves memory roughly
    linearly in the number of *unique prefix tails* across beams. If
    your beams diverge quickly (high entropy) the win is small; on

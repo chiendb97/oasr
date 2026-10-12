@@ -38,6 +38,19 @@ if TYPE_CHECKING:
     from .detokenize import Detokenizer
 
 
+def _declare_cap(out: RequestOutput, best: List[int], cap: Optional[int]) -> RequestOutput:
+    """Mark a final whose best hypothesis filled the token capacity as cut short.
+
+    The beam stops appending at ``max_seq_len`` and keeps scoring, so a full
+    hypothesis is a truncated transcript that otherwise reads as complete.  A
+    hypothesis of exactly ``cap`` tokens is reported too: the two cannot be told
+    apart after the fact, and over-reporting is the safe side.
+    """
+    if cap is not None and len(best) >= cap and out.finish_reason is None:
+        out.finish_reason = "length"
+    return out
+
+
 @dataclass(frozen=True)
 class CtcGpuOptions:
     """Options for ``decoder_type="ctc_cuda"``.
@@ -173,17 +186,22 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
         batch: int,
     ) -> List[RequestOutput]:
         """One final output per row — shared by the blocking and queued decodes."""
+        cap = self.options.decoder_config.max_seq_len
         outputs = []
         for b in range(batch):
             token_seqs = result.tokens[b]  # list of beam token lists
             best_tokens = token_seqs[0] if token_seqs else []
             outputs.append(
-                RequestOutput(
-                    request_id="",
-                    text=self._detok.detokenize(best_tokens),
-                    tokens=token_seqs,
-                    scores=scores[b] if scores is not None else None,
-                    finished=True,
+                _declare_cap(
+                    RequestOutput(
+                        request_id="",
+                        text=self._detok.detokenize(best_tokens),
+                        tokens=token_seqs,
+                        scores=scores[b] if scores is not None else None,
+                        finished=True,
+                    ),
+                    best_tokens,
+                    cap,
                 )
             )
         return outputs
@@ -387,15 +405,20 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
         states = mgr.get_states([r.stream_id for r in requests])  # type: ignore[misc]
         want = [wants_word_timings(r) for r in requests]
         finals = mgr.decoder.read_final_states(states, want_times=any(want))
+        cap = mgr.decoder.config.max_seq_len
         outputs: List[RequestOutput] = []
         for req, wants, (token_seqs, beam_scores, times) in zip(requests, want, finals):
             best = token_seqs[0] if token_seqs else []
-            out = RequestOutput(
-                request_id=req.request_id,
-                text=self._detok.detokenize(best),
-                tokens=token_seqs,
-                scores=beam_scores,
-                finished=True,
+            out = _declare_cap(
+                RequestOutput(
+                    request_id=req.request_id,
+                    text=self._detok.detokenize(best),
+                    tokens=token_seqs,
+                    scores=beam_scores,
+                    finished=True,
+                ),
+                best,
+                cap,
             )
             if wants and times is not None and times[0]:
                 frames = times[0][0]
@@ -414,12 +437,16 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
         best = token_seqs[0] if token_seqs else []
         beam_scores = result.scores.cpu().tolist()[0] if result.scores is not None else None
         text = self._detok.detokenize(best)
-        out = RequestOutput(
-            request_id=request.request_id,
-            text=text,
-            tokens=token_seqs,
-            scores=beam_scores,
-            finished=True,
+        out = _declare_cap(
+            RequestOutput(
+                request_id=request.request_id,
+                text=text,
+                tokens=token_seqs,
+                scores=beam_scores,
+                finished=True,
+            ),
+            best,
+            handle.config.max_seq_len,
         )
         if want_times and result.times and result.times[0]:
             # The frames are stream-absolute, recorded as the beam decoded each

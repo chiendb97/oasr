@@ -251,7 +251,20 @@ class ConvolutionModule(nn.Module):
 
 
 class RelPositionalEncoding(nn.Module):
-    """Relative positional encoding module (WeNet). Returns (x * xscale, pos_emb)."""
+    """Relative positional encoding module (WeNet). Returns (x * xscale, pos_emb).
+
+    The ``max_len``-row table is a cache of the sinusoid, not a limit of the
+    weights: a position past it is computed from the same formula, which is what
+    WeNet would return with a larger ``max_len``.  Reading past the table instead
+    is a shape error offline (above 200 s at 40 ms frames) and an out-of-bounds
+    gather in streaming, where a stream's position keeps growing once its history
+    is bounded or recycled -- a device-side assert that takes the CUDA context,
+    and every other stream, with it.  Positions inside the table still come from
+    it, so their values are unchanged.
+    """
+
+    pe: torch.Tensor
+    div_term_bits: torch.Tensor
 
     def __init__(self, d_model: int, max_len: int = 5000):
         super().__init__()
@@ -266,26 +279,68 @@ class RelPositionalEncoding(nn.Module):
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         self.register_buffer("pe", pe.unsqueeze(0))
+        # The table's own fp32 frequencies, for the rows past it.  Held as their
+        # int32 bit pattern so the model's ``.to(dtype=float16)`` leaves them
+        # alone (it casts floating buffers only), and taken from the CPU ``exp``
+        # that built the table: a device ``exp`` is an ulp off, and at position
+        # 10^4 an ulp of frequency is 10^-3 of amplitude.
+        self.register_buffer("div_term_bits", div_term.view(torch.int32), persistent=False)
+        # Whether per-stream positions may pass the table; see ``bound_offsets``.
+        self._offsets_may_pass_table = True
+
+    def bound_offsets(self, limit: Optional[int]) -> None:
+        """Declare that per-stream positions stay below ``limit`` (``None``: no bound).
+
+        Positions past the table have to be computed, and with per-stream device
+        offsets the host cannot see which ones are, so every row is computed and
+        then discarded where the table has it -- several times a gather's cost.
+        A streaming runtime that keeps each stream's whole history knows its
+        positions never pass ``cache + chunk``, and declaring that keeps the
+        plain gather.  Call it before any graph is captured: a captured graph
+        replays the path it was recorded with.
+        """
+        self._offsets_may_pass_table = limit is None or int(limit) > self.pe.size(1)
 
     def forward(
         self, x: torch.Tensor, offset: Union[int, torch.Tensor] = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         x = x * self.xscale
-        size = x.size(1)
-        if isinstance(offset, int):
-            pos_emb = self.pe[:, offset : offset + size]
-        else:
-            index = offset.unsqueeze(1) + torch.arange(0, size, device=offset.device)
-            index = index.clamp(min=0)
-            pos_emb = torch.nn.functional.embedding(index, self.pe[0])
-        return x, pos_emb
+        return x, self.position_encoding(offset, x.size(1))
 
     def position_encoding(self, offset: Union[int, torch.Tensor], size: int) -> torch.Tensor:
+        rows = self.pe.size(1)
         if isinstance(offset, int):
-            return self.pe[:, offset : offset + size]
+            end = offset + size
+            if end <= rows:
+                return self.pe[:, offset:end]
+            # A host-side length: only the rows past the table are computed.
+            start = max(offset, rows)
+            beyond = self._sinusoid(torch.arange(start, end, device=self.pe.device))
+            if start == offset:
+                return beyond.unsqueeze(0)
+            return torch.cat([self.pe[:, offset:], beyond.unsqueeze(0)], dim=1)
         index = offset.unsqueeze(1) + torch.arange(0, size, device=offset.device)
+        if not self._offsets_may_pass_table:
+            return torch.nn.functional.embedding(index.clamp(0, rows - 1), self.pe[0])
+        # Per-stream device offsets with no declared bound: the largest index is
+        # not known on the host, and asking would be a sync a captured graph
+        # cannot contain, so every row is computed both ways and the table wins
+        # wherever it has the row.
         index = index.clamp(min=0)
-        return torch.nn.functional.embedding(index, self.pe[0])
+        inside = torch.nn.functional.embedding(index.clamp(max=rows - 1), self.pe[0])
+        return torch.where((index < rows).unsqueeze(-1), inside, self._sinusoid(index))
+
+    def _sinusoid(self, positions: torch.Tensor) -> torch.Tensor:
+        """Table rows for arbitrary integer ``positions``: ``(*positions.shape, d_model)``.
+
+        The phase is formed in fp32 -- as the table is -- and only the result is
+        cast: in fp16 it would be ``position * 2^-11`` off, radians at these
+        positions.
+        """
+        div_term = self.div_term_bits.view(torch.float32)
+        phase = positions.to(torch.float32).unsqueeze(-1) * div_term
+        rows = torch.stack([phase.sin(), phase.cos()], dim=-1).flatten(-2)
+        return rows.to(self.pe.dtype)
 
 
 # Conv2D ``(kernel, stride)`` pairs apply to time and frequency. Rate 1 is the

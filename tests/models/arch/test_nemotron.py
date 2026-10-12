@@ -445,6 +445,24 @@ class TestStreamingEqualsOffline:
             torch.nn.init.normal_(p, std=0.05)
         return enc
 
+    def test_input_past_max_position_embeddings_is_encoded(self):
+        """``max_position_embeddings`` is upstream's table size, not an input limit.
+
+        The relative table is built for each length -- NeMo extends its own the
+        same way -- so the field must not change the output.  It used to reject
+        anything past it: 400 s on the shipped config, which streaming decodes.
+        """
+        short = self._encoder(max_position_embeddings=8)
+        long = self._encoder(max_position_embeddings=5000)
+        long.load_state_dict(short.state_dict())
+        feats = torch.randn(1, short.subsampling_rate * 30, short.config.num_mel_bins)
+        lens = torch.tensor([feats.size(1)], dtype=torch.int32)
+        with torch.no_grad():
+            got, _ = short(feats, lens)
+            want, _ = long(feats, lens)
+        assert got.size(1) > 8
+        assert torch.equal(got, want)
+
     @pytest.mark.parametrize("chunk_size", [2, 4, 8])
     def test_a_chunked_pass_equals_the_whole_utterance(self, chunk_size):
         enc = self._encoder()

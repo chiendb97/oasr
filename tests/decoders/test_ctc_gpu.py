@@ -11,12 +11,14 @@ import torch.nn.functional as F
 
 import oasr
 from oasr.functionals.ctc_decode import (
+    STREAMING_MAX_SEQ_LEN,
     GpuDecoderConfig,
     GpuDecoderResult,
     GpuStreamingDecoder,
     StreamHandle,
     StreamState,
     ctc_beam_search_decode,
+    ctc_beam_search_decode_async,
 )
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,15 @@ def _make_logp_gpu(T: int, V: int, best_path: list, device="cuda") -> torch.Tens
     for t, tok in enumerate(best_path):
         logp[0, t, tok] = 0.0
     return logp
+
+
+def _spelling_path(T: int, V: int) -> list:
+    """``T`` frames that spell ``T`` tokens: no blank, no two neighbours equal.
+
+    The longest hypothesis ``T`` frames can produce, which is what a token cap
+    has to be measured against.
+    """
+    return [1 + t % (V - 1) for t in range(T)]
 
 
 def _make_batched_logp_gpu(batch_paths: list, V: int, device="cuda"):
@@ -224,6 +235,71 @@ class TestCtcDecoderGpuOffline:
             if scores[i + 1].item() > -1e20:  # Skip invalid beams
                 assert scores[i].item() >= scores[i + 1].item()
 
+    @pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged"])
+    @pytest.mark.parametrize("queued", [False, True], ids=["blocking", "async"])
+    def test_default_output_is_never_cut_short(self, device, paged, queued):
+        """No cap by default: a row comes back as long as its frames can spell.
+
+        The default was a fixed 200 tokens, and every utterance past that -- a
+        minute of speech at a 500-unit vocabulary, three at 5000 -- lost its tail
+        with nothing to say so.  The beam always kept the tokens; only the output
+        it copied them into was narrow.
+        """
+        V, T = 7, 450
+        path = _spelling_path(T, V)
+        logp, lens = _make_batched_logp_gpu([path, path[:300]], V, device)
+        kwargs = {"beam_size": 4, "blank_id": 0, "use_paged_memory": paged}
+        if queued:
+            result = ctc_beam_search_decode_async(logp, lens, **kwargs).result()
+        else:
+            result = ctc_beam_search_decode(logp, lens, **kwargs)
+        assert result.tokens[0][0] == path
+        assert result.tokens[1][0] == path[:300]
+
+    def test_an_explicit_cap_still_truncates(self, device):
+        V, T = 7, 64
+        path = _spelling_path(T, V)
+        logp = _make_logp_gpu(T, V, path, device)
+        lens = torch.tensor([T], dtype=torch.int32, device=device)
+        result = ctc_beam_search_decode(logp, lens, beam_size=4, blank_id=0, max_seq_len=20)
+        assert result.tokens[0][0] == path[:20]
+
+
+@pytest.mark.cuda
+class TestCtcStrategyDeclaresTheCap:
+    """A hypothesis cut at its cap is reported, not passed off as the transcript."""
+
+    @staticmethod
+    def _strategy(tmp_path, max_seq_len):
+        from types import SimpleNamespace
+
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.decode.ctc_gpu import CtcGpuDecodeStrategy
+        from oasr.engine.decode.detokenize import Detokenizer
+
+        cfg = EngineConfig(
+            ckpt_dir=str(tmp_path),
+            service_mode="offline",
+            ctc_decoder_config=GpuDecoderConfig(beam_size=4, max_seq_len=max_seq_len),
+        )
+        cfg._model_config = SimpleNamespace(vocab_size=7)
+        # The capability check wants the surface; this test feeds log-probs directly.
+        model = SimpleNamespace(head=object(), forward_offline=lambda *a, **k: None)
+        return CtcGpuDecodeStrategy(cfg, Detokenizer(None, None), model)
+
+    @pytest.mark.parametrize(
+        "max_seq_len,frames,expected",
+        [(None, 450, None), (20, 64, "length"), (20, 19, None)],
+        ids=["uncapped", "cut", "short-of-the-cap"],
+    )
+    def test_offline_finish_reason(self, device, tmp_path, max_seq_len, frames, expected):
+        path = _spelling_path(frames, 7)
+        logp = _make_logp_gpu(frames, 7, path, device)
+        lens = torch.tensor([frames], dtype=torch.int32, device=device)
+        (out,) = self._strategy(tmp_path, max_seq_len).decode_offline(logp, lens)
+        assert out.finish_reason == expected
+        assert out.tokens[0] == path[: max_seq_len or frames]
+
 
 # ---------------------------------------------------------------------------
 # Streaming decode tests
@@ -295,6 +371,19 @@ class TestCtcDecoderGpuStreaming:
             dec.decode_chunk(logp)
             assert dec.step > msl, f"step={dec.step} should exceed cap {msl}"
             assert dec.finalize_stream().tokens[0][0] == [1, 2], f"use_cuda_graphs={use_graphs}"
+
+    def test_default_capacity_outlasts_the_old_200_token_cap(self, device):
+        """A stream's state is sized before its length is known, so ``None``
+        resolves to a fixed capacity -- one far past the 200 tokens it replaced."""
+        dec = GpuStreamingDecoder(GpuDecoderConfig(beam_size=4, blank_id=0))
+        assert dec.config.max_seq_len == STREAMING_MAX_SEQ_LEN
+        V, T = 7, 450
+        path = _spelling_path(T, V)
+        dec.init_stream(batch=1, vocab_size=V, device=device)
+        logp = _make_logp_gpu(T, V, path, device)
+        for start in range(0, T, 64):
+            dec.decode_chunk(logp[:, start : start + 64])
+        assert dec.finalize_stream().tokens[0][0] == path
 
     def test_streaming_graph_multiframe_chunk_with_skips(self, device):
         """Regression for the captured-graph multi-frame chunk counter race.
