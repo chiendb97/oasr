@@ -432,19 +432,26 @@ struct StreamOverOfflineCfg {
     max_alts: u32,
     /// Abort if the client goes this long without sending audio.
     idle_timeout: Option<Duration>,
+    /// Ceiling on the buffered waveform, in samples at the model's rate.
+    max_samples: Option<usize>,
 }
 
 impl SpeechService {
     /// Buffer streaming input for an offline engine, then forward incremental text.
     /// Client half-close triggers submission because fixed-window frontends cannot
     /// process the incomplete utterance.
-    async fn streaming_over_offline(
+    ///
+    /// Generic over the inbound stream, which is a tonic [`Streaming`] in
+    /// service and a plain stream in the tests that drive it without a socket.
+    async fn streaming_over_offline<S>(
         &self,
-        mut inbound: Streaming<pb::StreamingRecognizeRequest>,
+        mut inbound: S,
         out_tx: mpsc::Sender<Result<pb::StreamingRecognizeResponse, Status>>,
         out_rx: mpsc::Receiver<Result<pb::StreamingRecognizeResponse, Status>>,
         mut cfg: StreamOverOfflineCfg,
     ) -> Result<Response<<Self as pb::speech_server::Speech>::StreamingRecognizeStream>, Status>
+    where
+        S: Stream<Item = Result<pb::StreamingRecognizeRequest, Status>> + Unpin + Send + 'static,
     {
         let pool = Arc::clone(&self.pool);
         let span = info_span!("grpc.stream_offline", rid = field::Empty);
@@ -484,7 +491,25 @@ impl SpeechService {
                                     bytes,
                                 ),
                             ) => match cfg.pcm.decode_chunk(&bytes) {
-                                Ok(samples) => buffered.extend_from_slice(&samples),
+                                Ok(samples) => {
+                                    buffered.extend_from_slice(&samples);
+                                    // The unary RPC bounds the decoded audio in
+                                    // `decode_audio`; a stream arrives a chunk at
+                                    // a time, so it is bounded here, or one client
+                                    // could buffer until the host runs out of
+                                    // memory.
+                                    if let Some(cap) = cfg.max_samples {
+                                        if buffered.len() / 4 > cap {
+                                            warn!(cap, "streamed audio exceeds the sample limit");
+                                            let _ = out_tx
+                                                .send(Err(Status::invalid_argument(format!(
+                                                    "audio exceeds the {cap}-sample limit"
+                                                ))))
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                }
                                 Err(e) => {
                                     debug!(reason = %e, "stream chunk pcm decode failed");
                                     let _ = out_tx
@@ -898,6 +923,7 @@ impl pb::speech_server::Speech for SpeechService {
                         want_partials,
                         max_alts,
                         idle_timeout: self.stream_idle_timeout,
+                        max_samples: self.max_audio_samples,
                     },
                 )
                 .await;
@@ -1301,5 +1327,62 @@ mod tests {
             ServiceMode::Offline
         );
         assert!(ServiceMode::from_str("both").is_err());
+    }
+
+    /// Stream `seconds` of 16 kHz f32 silence, one second per message, into
+    /// an offline engine with no workers, and return the RPC's terminal status.
+    async fn stream_to_offline(max_samples: Option<usize>, seconds: usize) -> Status {
+        let svc = SpeechService::new(
+            Arc::new(EnginePool::new(Vec::new())),
+            ServiceMode::Offline,
+            16_000,
+        );
+        let second = vec![0u8; 16_000 * 4];
+        let inbound = tokio_stream::iter((0..seconds).map(move |_| {
+            Ok(pb::StreamingRecognizeRequest {
+                streaming_request: Some(
+                    pb::streaming_recognize_request::StreamingRequest::AudioContent(second.clone()),
+                ),
+            })
+        }));
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let cfg = StreamOverOfflineCfg {
+            pcm: PcmStream::new(oasr_asr::PcmEncoding::F32Le, 16_000, 16_000).unwrap(),
+            priority: 0,
+            decoding: None,
+            want_partials: false,
+            max_alts: 1,
+            idle_timeout: None,
+            max_samples,
+        };
+        let mut out = svc
+            .streaming_over_offline(inbound, out_tx, out_rx, cfg)
+            .await
+            .unwrap()
+            .into_inner();
+        out.next()
+            .await
+            .expect("the RPC ended without a status")
+            .expect_err("there are no engine workers, so nothing can succeed")
+    }
+
+    /// An offline engine buffers a stream until half-close, so without a bound
+    /// one client could stream until the host ran out of memory.
+    #[tokio::test]
+    async fn streamed_audio_past_the_limit_is_refused_while_it_streams() {
+        let status = stream_to_offline(Some(16_000), 3).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("16000-sample limit"),
+            "{status:?}"
+        );
+    }
+
+    /// Under the bound the stream reaches the submit, which a pool with no
+    /// workers refuses -- so `RESOURCE_EXHAUSTED` is the success condition.
+    #[tokio::test]
+    async fn streamed_audio_under_the_limit_reaches_the_submit() {
+        let status = stream_to_offline(Some(16_000 * 4), 3).await;
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
     }
 }

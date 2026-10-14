@@ -363,17 +363,19 @@ pub struct Cli {
     /// healthy long-lived streams.
     #[arg(long, default_value_t = 300)]
     pub request_timeout_secs: u64,
-    /// Abort a streaming RPC that has gone this long without an inbound audio
-    /// message (before half-close) or a decode event (after), in seconds.
-    /// 0 disables.  Without it a client that opens a stream and vanishes
-    /// without closing the connection holds an engine slot indefinitely.
+    /// Abort a streaming RPC or realtime WebSocket session that has gone this
+    /// long without an inbound message (before half-close / commit) or a decode
+    /// event (after), in seconds.  0 disables.  Without it a client that opens
+    /// a stream and vanishes without closing the connection holds an engine
+    /// slot indefinitely.
     #[arg(long, default_value_t = 300)]
     pub stream_idle_timeout_secs: u64,
     /// Max requests either listener will process concurrently; excess ones
     /// queue (and are eventually cut off by the timeouts above) rather than
-    /// each parking a multi-MiB body.  0 disables.  Defaults to
-    /// 4x `--max-concurrent-requests`, i.e. deep enough that the engine's own
-    /// admission cap is what clients actually see.
+    /// each parking a multi-MiB body.  A realtime WebSocket session holds one
+    /// for its whole life and is refused with 503 when none is free.  0
+    /// disables.  Defaults to 4x `--max-concurrent-requests`, i.e. deep enough
+    /// that the engine's own admission cap is what clients actually see.
     #[arg(long)]
     pub max_inflight_connections: Option<usize>,
     /// How long to let in-flight requests finish after a shutdown signal

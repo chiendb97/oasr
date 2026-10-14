@@ -268,6 +268,7 @@ async fn serve(cli: Cli) -> Result<()> {
         RouterLimits {
             request_timeout: cli.request_timeout(),
             max_inflight: cli.inflight_limit(),
+            stream_idle_timeout: cli.stream_idle_timeout(),
             cors_allow_origins: cli.cors_allow_origin.clone(),
         },
     );

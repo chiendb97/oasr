@@ -142,6 +142,13 @@ class Scheduler:
         )
         for req in batch:
             req.state = RequestState.RUNNING
+            # A selected offline request never returns to the scheduler: no
+            # ``finish_request`` follows, and the executor owns it from here
+            # (its incremental pool answers ``find_request`` for the ones that
+            # outlive this tick).  Left indexed, every offline request -- with
+            # its output, and the waveform of one rejected before collate --
+            # stayed reachable for the life of the process.
+            self._index.pop(req.request_id, None)
         return batch
 
     def split_offline_batch(

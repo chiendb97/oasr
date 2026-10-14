@@ -6,18 +6,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Extension, State},
     http::{HeaderValue, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use serde_json::json;
+use tokio::sync::Semaphore;
 use tower::limit::GlobalConcurrencyLimitLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::realtime::SessionLimits;
 use crate::ServerState;
 
 pub type AppState = Arc<ServerState>;
@@ -46,14 +48,21 @@ impl std::str::FromStr for ServiceMode {
     }
 }
 
-/// Bounds applied to the recognition routes.  All optional so a test (or a
-/// deployment that terminates policy at a proxy) can turn them off.
+/// Bounds applied to the recognition routes and the realtime sessions.  All
+/// optional so a test (or a deployment that terminates policy at a proxy) can
+/// turn them off.
 #[derive(Clone, Debug, Default)]
 pub struct RouterLimits {
     /// Deadline for one request, end to end.
     pub request_timeout: Option<Duration>,
-    /// Max requests processed concurrently; the rest queue.
+    /// Max requests processed concurrently; the rest queue.  A realtime
+    /// session counts as one for its whole life, and is refused with `503`
+    /// rather than queued when none is free.
     pub max_inflight: Option<usize>,
+    /// End a realtime session that goes this long without a client message
+    /// (before commit) or an engine event (after).  The other bounds stop at
+    /// the WebSocket upgrade; this is the one that covers the socket.
+    pub stream_idle_timeout: Option<Duration>,
     /// Origins allowed to call the browser-reachable routes.  Empty installs no
     /// CORS layer at all (the default, and the right one behind a proxy that
     /// owns the policy); `["*"]` allows any.
@@ -88,14 +97,17 @@ pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
         // below `--max-audio-mib`, and it would reject uploads the raw-body
         // route on the same server accepts.
         .layer(DefaultBodyLimit::max(body_limit));
-    if let Some(n) = limits.max_inflight {
+    let permits = limits.max_inflight.map(|n| Arc::new(Semaphore::new(n)));
+    if let Some(permits) = &permits {
         // Bounds how many multi-MiB bodies can be resident at once; excess
         // requests wait for a permit rather than each parking a buffer.
         // *Global*, not per-layer-instance: axum clones the service per
         // connection, and the plain `ConcurrencyLimitLayer` would hand each
         // clone its own budget — a limit that scales with connection count is
         // not a limit.
-        recognize = recognize.layer(GlobalConcurrencyLimitLayer::new(n));
+        recognize = recognize.layer(GlobalConcurrencyLimitLayer::with_semaphore(Arc::clone(
+            permits,
+        )));
     }
     if let Some(d) = limits.request_timeout {
         // Applied outside the concurrency limit so the deadline covers time
@@ -106,8 +118,16 @@ pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
     let mut router = Router::new()
         .merge(recognize)
         // Streaming transcription for clients that cannot speak gRPC — every
-        // browser, and most scripting clients.
-        .route("/v1/realtime", get(crate::realtime::handle_realtime))
+        // browser, and most scripting clients.  Outside the layers above on
+        // purpose: they would see only the upgrade, which returns at once, so
+        // the session takes its permit and its idle bound with it instead.
+        .route(
+            "/v1/realtime",
+            get(crate::realtime::handle_realtime).layer(Extension(SessionLimits {
+                permits,
+                idle: limits.stream_idle_timeout,
+            })),
+        )
         // Models.
         .route("/v1/models", get(handle_models))
         // Operability.

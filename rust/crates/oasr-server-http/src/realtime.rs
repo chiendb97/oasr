@@ -46,11 +46,22 @@
 //! buffered and submitted on commit, and the *text* streams back — the same
 //! trade the gRPC surface makes, and the reason a speech-LLM still feels
 //! incremental here.
+//!
+//! ## Bounds
+//!
+//! The route's HTTP layers see only the upgrade, which returns at once, so a
+//! session carries its own: one in-flight permit for its whole life (`503` on
+//! connect when none is free), an engine stream opened at the first audio
+//! rather than at the handshake, and `--stream-idle-timeout-secs` on every wait
+//! — for a client message before commit, for an engine event after.  Without
+//! them a socket that configured and went quiet held an engine slot forever.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
 use axum::response::Response;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -61,16 +72,47 @@ use oasr_metrics as om;
 use oasr_wire::{normalize_language, DecodingParams, Event};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::http_metrics::realtime_streaming;
 use crate::router::{AppState, ServiceMode};
 
+/// What bounds a realtime session; set from [`crate::RouterLimits`].
+#[derive(Clone, Debug, Default)]
+pub struct SessionLimits {
+    /// The in-flight budget the recognition routes draw on.  `None` disables.
+    pub permits: Option<Arc<Semaphore>>,
+    /// End a session idle this long.  `None` disables.
+    pub idle: Option<Duration>,
+}
+
 /// `GET /v1/realtime` — upgrade and run one transcription session.
-pub async fn handle_realtime(State(s): State<AppState>, ws: WebSocketUpgrade) -> Response {
+pub async fn handle_realtime(
+    State(s): State<AppState>,
+    Extension(limits): Extension<SessionLimits>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Refused rather than queued: a WebSocket client handles a 503 on connect,
+    // and an upgrade parked for a permit would sit outside every timeout.
+    let permit = match &limits.permits {
+        Some(permits) => match Arc::clone(permits).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return crate::openai::api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server_error",
+                    None,
+                    "too many requests in flight",
+                )
+            }
+        },
+        None => None,
+    };
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = run_session(s, socket).await {
+        let _permit = permit;
+        if let Err(e) = run_session(s, socket, limits.idle).await {
             debug!(reason = %e, "realtime session ended");
         }
     })
@@ -334,7 +376,11 @@ fn resolve_session(s: &AppState, update: &SessionUpdate) -> Result<Session, Sess
 /// hanging up mid-stream is the normal case.
 type SessionEnd = String;
 
-async fn run_session(s: AppState, mut socket: WebSocket) -> Result<(), SessionEnd> {
+async fn run_session(
+    s: AppState,
+    mut socket: WebSocket,
+    idle: Option<Duration>,
+) -> Result<(), SessionEnd> {
     // Configuration is optional: a client that opens the socket and starts
     // sending 16 kHz LINEAR16 immediately gets the defaults.  So the first
     // message is *peeked*, not required — unlike the gRPC RPC, whose first
@@ -343,7 +389,7 @@ async fn run_session(s: AppState, mut socket: WebSocket) -> Result<(), SessionEn
     let mut pending_audio: Option<Bytes> = None;
     let mut committed = false;
     loop {
-        match next_client_message(&mut socket).await? {
+        match next_message_within(&mut socket, idle).await? {
             ClientMessage::Configure(u) => {
                 update = u;
                 break;
@@ -399,12 +445,12 @@ async fn run_session(s: AppState, mut socket: WebSocket) -> Result<(), SessionEn
     let span = info_span!("ws.realtime");
     match s.service_mode {
         ServiceMode::Streaming => {
-            chunked_session(s, socket, session, pending_audio, committed)
+            chunked_session(s, socket, session, pending_audio, committed, idle)
                 .instrument(span)
                 .await
         }
         ServiceMode::Offline => {
-            buffered_session(s, socket, session, pending_audio, committed)
+            buffered_session(s, socket, session, pending_audio, committed, idle)
                 .instrument(span)
                 .await
         }
@@ -440,6 +486,55 @@ async fn next_client_message(socket: &mut WebSocket) -> Result<ClientMessage, Se
             Message::Close(_) => return Err("client closed the socket".into()),
             Message::Ping(_) | Message::Pong(_) => continue,
         });
+    }
+}
+
+/// [`next_client_message`], ending the session if none arrives within `idle`.
+async fn next_message_within(
+    socket: &mut WebSocket,
+    idle: Option<Duration>,
+) -> Result<ClientMessage, SessionEnd> {
+    let Some(limit) = idle else {
+        return next_client_message(socket).await;
+    };
+    match tokio::time::timeout(limit, next_client_message(socket)).await {
+        Ok(msg) => msg,
+        Err(_) => Err(end_idle(socket, limit, false).await),
+    }
+}
+
+/// Tell the client why its session is over, and return that as the session end.
+///
+/// Before commit the silence is the client's; after it, the engine's.
+async fn end_idle(socket: &mut WebSocket, limit: Duration, committed: bool) -> SessionEnd {
+    let (message, kind) = if committed {
+        (
+            format!("no transcription event for {}s", limit.as_secs()),
+            "server_error",
+        )
+    } else {
+        (
+            format!("no client message for {}s", limit.as_secs()),
+            "invalid_request_error",
+        )
+    };
+    warn!(reason = %message, "realtime session idle");
+    let _ = send_json(socket, error_event(&message, kind)).await;
+    message
+}
+
+/// Report an engine refusal to the client before the session closes.  It used
+/// to close without a word, which a client cannot tell from a dropped network.
+async fn refuse(socket: &mut WebSocket, message: String) -> SessionEnd {
+    let _ = send_json(socket, error_event(&message, "server_error")).await;
+    message
+}
+
+/// A timer for a `select!` arm that never fires when the bound is off.
+async fn sleep_opt(d: Option<Duration>) {
+    match d {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -523,17 +618,34 @@ async fn chunked_session(
     s: AppState,
     mut socket: WebSocket,
     mut session: Session,
-    pending_audio: Option<Bytes>,
-    already_committed: bool,
+    mut pending_audio: Option<Bytes>,
+    mut already_committed: bool,
+    idle: Option<Duration>,
 ) -> Result<(), SessionEnd> {
-    let mut handle: StreamingHandle = s
+    // The engine stream opens at the first audio, not at the handshake: a
+    // client that configured and went quiet used to hold an engine slot for as
+    // long as it kept the socket, and enough of them held every slot.
+    while pending_audio.is_none() && !already_committed {
+        match next_message_within(&mut socket, idle).await? {
+            ClientMessage::Audio(bytes) => pending_audio = Some(bytes),
+            ClientMessage::Commit => already_committed = true,
+            ClientMessage::Configure(_) => {
+                debug!("ignoring session.update after the session has started")
+            }
+            ClientMessage::Ignored => {}
+        }
+    }
+    let mut handle: StreamingHandle = match s
         .pool
         .open_streaming(s.sample_rate, 0, session.decoding.clone())
         .await
-        .map_err(|e| {
+    {
+        Ok(handle) => handle,
+        Err(e) => {
             warn!(%e, "realtime open rejected");
-            format!("submit failed: {e}")
-        })?;
+            return Err(refuse(&mut socket, format!("submit failed: {e}")).await);
+        }
+    };
     let rid = handle.request_id.clone();
     let mut emitted = Emitted::default();
     let mut metrics = SessionMetrics::new();
@@ -622,6 +734,12 @@ async fn chunked_session(
                 Ok(ClientMessage::Ignored) => {}
                 Err(end) => break Err(end),
             },
+            // Rearmed every pass, so anything above -- a client message, or an
+            // engine event -- counts as activity.
+            _ = sleep_opt(idle) => {
+                let limit = idle.expect("an idle arm fires only with a bound");
+                break Err(end_idle(&mut socket, limit, inbound_done).await);
+            }
         }
     };
     metrics.finished(outcome_of(&result));
@@ -710,6 +828,7 @@ async fn buffered_session(
     mut session: Session,
     pending_audio: Option<Bytes>,
     already_committed: bool,
+    idle: Option<Duration>,
 ) -> Result<(), SessionEnd> {
     let mut metrics = SessionMetrics::new();
     let mut buffered = BytesMut::new();
@@ -723,7 +842,7 @@ async fn buffered_session(
     }
     let mut committed = already_committed;
     while !committed {
-        match next_client_message(&mut socket).await? {
+        match next_message_within(&mut socket, idle).await? {
             ClientMessage::Audio(chunk) => {
                 let decoded = session
                     .pcm
@@ -757,7 +876,7 @@ async fn buffered_session(
         return Err(msg.into());
     }
 
-    let mut handle: OfflineStreamHandle = s
+    let mut handle: OfflineStreamHandle = match s
         .pool
         .submit_offline_streaming(
             buffered.freeze(),
@@ -766,15 +885,27 @@ async fn buffered_session(
             session.decoding.clone(),
         )
         .await
-        .map_err(|e| {
+    {
+        Ok(handle) => handle,
+        Err(e) => {
             warn!(%e, "realtime (offline) submit rejected");
-            format!("submit failed: {e}")
-        })?;
+            return Err(refuse(&mut socket, format!("submit failed: {e}")).await);
+        }
+    };
     let rid = handle.request_id.clone();
     let mut emitted = Emitted::default();
 
     let result = loop {
-        match handle.events.next().await {
+        // The same bound after commit: an engine that stops producing events
+        // for this request must not park the session indefinitely.
+        let next = match idle {
+            None => handle.events.next().await,
+            Some(limit) => match tokio::time::timeout(limit, handle.events.next()).await {
+                Ok(ev) => ev,
+                Err(_) => break Err(end_idle(&mut socket, limit, true).await),
+            },
+        };
+        match next {
             Some(Event::Partial { text, .. }) => {
                 metrics.partial();
                 if session.interim_results {
@@ -803,11 +934,6 @@ async fn buffered_session(
     let _ = socket.send(Message::Close(None)).await;
     result
 }
-
-/// How long a realtime session may sit idle before the server gives up.  Kept
-/// here rather than on `RouterLimits` because axum's timeout layer applies to
-/// the *upgrade* request, not to the socket that outlives it.
-pub const DEFAULT_IDLE: Duration = Duration::from_secs(300);
 
 #[cfg(test)]
 mod tests {
