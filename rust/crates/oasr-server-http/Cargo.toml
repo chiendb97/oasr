@@ -32,3 +32,6 @@ metrics-exporter-prometheus = { workspace = true }
 # `ServiceExt::oneshot` drives the assembled Router without binding a socket.
 tower = { workspace = true }
 tokio = { workspace = true }
+# A WebSocket client for `/v1/realtime`, whose bounds live on the socket rather
+# than the request.  Already in the build: axum's `ws` feature is built on it.
+tokio-tungstenite = "0.24"

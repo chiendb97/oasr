@@ -88,7 +88,7 @@ impl Endpoint {
 /// OpenAI's error shape.  Clients parse `error.message` and branch on
 /// `error.type`, so these routes speak it even though the rest of the server
 /// uses the Google envelope.
-fn api_error(
+pub(crate) fn api_error(
     status: StatusCode,
     kind: &str,
     param: Option<&str>,

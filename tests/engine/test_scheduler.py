@@ -424,6 +424,44 @@ class TestOfflineBatch:
 
 
 # ---------------------------------------------------------------------------
+# The id index: waiting and running requests only
+# ---------------------------------------------------------------------------
+
+
+class TestRequestIndex:
+    """``find_request``'s index must not outlive the requests it finds.
+
+    No ``finish_request`` follows an offline request, so the index used to keep
+    every one the server had ever seen -- its output, and the waveform of one
+    rejected before collate -- for the life of the process.
+    """
+
+    def test_scheduled_offline_requests_leave_the_index(self):
+        sched = Scheduler(_preferred_config(max_batch_size=4))
+        reqs = [_make_offline() for _ in range(10)]
+        for req in reqs:
+            sched.add_request(req)
+        assert all(sched.find_request(r.request_id) is r for r in reqs)
+
+        while sched.num_waiting_offline:
+            assert sched.schedule_offline(), "a waiting queue must ship"
+        assert sched._index == {}
+        assert all(sched.find_request(r.request_id) is None for r in reqs)
+
+    def test_a_running_stream_stays_findable_until_it_finishes(self):
+        """``feed_chunk`` finds a running stream through the index."""
+        sched = Scheduler(_preferred_config(max_batch_size=4))
+        req = _preferred_streaming()
+        sched.add_request(req)
+        admitted, _ = sched.schedule_streaming()
+        assert admitted == [req]
+        assert sched.find_request(req.request_id) is req
+
+        sched.finish_request(req.request_id)
+        assert sched.find_request(req.request_id) is None
+
+
+# ---------------------------------------------------------------------------
 # Partition: splitting an admitted cohort into micro-batches
 # ---------------------------------------------------------------------------
 

@@ -168,6 +168,13 @@ class TestOfflineTranscribe:
         assert len(texts) == 4
         assert all(isinstance(t, str) and len(t) > 0 for t in texts)
 
+    def test_finished_requests_leave_the_scheduler(self, device, ckpt_dir: str, wav_dir: str):
+        """An offline server's request index must not grow with its traffic."""
+        engine = self._make_engine(ckpt_dir, device)
+        for _ in range(2):
+            engine.transcribe_offline(waveforms(wav_dir, 3))
+        assert engine._scheduler._index == {}
+
     def test_audio_in_a_pinned_buffer_transcribes_identically(
         self, device, ckpt_dir: str, wav_dir: str
     ):
