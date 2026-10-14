@@ -45,10 +45,12 @@ async fn serve(mode: ServiceMode, limits: RouterLimits) -> SocketAddr {
     addr
 }
 
-async fn connect(addr: SocketAddr) -> Result<Client, tungstenite::Error> {
+/// Boxed: tungstenite's error is 136 bytes, past clippy's `result_large_err`.
+async fn connect(addr: SocketAddr) -> Result<Client, Box<tungstenite::Error>> {
     tokio_tungstenite::connect_async(format!("ws://{addr}/v1/realtime"))
         .await
         .map(|(ws, _)| ws)
+        .map_err(Box::new)
 }
 
 /// Open a session and complete the handshake.
@@ -157,7 +159,7 @@ async fn a_session_holds_an_inflight_permit_for_its_life() {
     .await;
     let mut first = configured(addr).await;
 
-    match connect(addr).await {
+    match connect(addr).await.map_err(|e| *e) {
         Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 503),
         other => panic!("a second session got past a budget of one: {other:?}"),
     }
