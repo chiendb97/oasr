@@ -825,3 +825,120 @@ def test_overlap_admission_rejects_on_the_callers_thread():
         eng.add_request(torch.zeros(8000), request_id="r", sample_rate=8000, streaming=False)
     assert eng._admit_inflight == 0
     assert eng._prep_in.qsize() == 0
+
+
+# --------------------------------------------------------------------------- #
+# Long-form and VAD fan-out on every admission path
+# --------------------------------------------------------------------------- #
+
+
+class _AbortingExecutor(_FakeExecutor):
+    """Admits ``fail_at`` windows, then refuses; records what was aborted."""
+
+    def __init__(self, fail_at=None):
+        super().__init__()
+        self.fail_at = fail_at
+        self.aborted = []
+
+    def admit(self, request):
+        if self.fail_at is not None and len(self.admitted) == self.fail_at:
+            raise RuntimeError("executor refused")
+        super().admit(request)
+
+    def abort(self, request_id):
+        self.aborted.append(request_id)
+
+
+def _fan_out_engine(*, overlap=False, window_s=1.0, spans=None):
+    """:func:`_admission_engine` with a long-form tracker, and optionally a VAD
+    splitter that returns ``spans``."""
+    from oasr.engine.longform import LongFormTracker
+
+    eng = _admission_engine(overlap=overlap)
+    eng._executor = _AbortingExecutor()
+    eng._longform = LongFormTracker()
+    eng._longform_window_samples = int(16000 * window_s)
+    eng._longform_overlap_samples = 0
+    eng._vad_splitter = None if spans is None else SimpleNamespace(spans=lambda wave: spans)
+    eng._vad_resplit_samples = 0
+    eng._metrics = SimpleNamespace(incr=lambda *a: None)
+    return eng
+
+
+def _queued(eng):
+    """The ids queued for the prep thread, in order."""
+    ids = []
+    while not eng._prep_in.empty():
+        ids.append(eng._prep_in.get_nowait().request_id)
+    return ids
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["admit", "overlap_admit"])
+def test_bulk_admission_fans_out_long_audio(overlap):
+    """The serving dispatcher's entry point splits over-window audio too.
+
+    Regression: only ``add_request`` reached the fan-out, and the dispatcher
+    admits through ``add_requests_batch_checked``, so ``oasr-server --long-form``
+    decoded nothing past one window: Whisper refused every request over 30 s.
+    """
+    eng = _fan_out_engine(overlap=overlap)
+    results = eng.add_requests_batch_checked(
+        [
+            {"request_id": "long", "audio": torch.zeros(40000), "streaming": False},
+            {"request_id": "short", "audio": torch.zeros(8000), "streaming": False},
+        ]
+    )
+    assert results == [{"request_id": "long"}, {"request_id": "short"}]
+    children = [eng._longform.child_id("long", i) for i in range(3)]
+    admitted = _queued(eng) if overlap else eng._executor.admitted
+    assert admitted == children + ["short"]
+    assert all(eng._longform.owns(c) for c in children)
+    if overlap:
+        assert eng._admit_inflight == 4
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["admit", "overlap_admit"])
+def test_bulk_admission_segments_at_the_vad_spans(overlap):
+    """Same for ``--vad-mode segment``, which reuses the fan-out."""
+    eng = _fan_out_engine(overlap=overlap, spans=[(0, 8000), (24000, 40000)])
+    results = eng.add_requests_batch_checked(
+        [{"request_id": "file", "audio": torch.zeros(48000), "streaming": False}]
+    )
+    assert results == [{"request_id": "file"}]
+    admitted = _queued(eng) if overlap else eng._executor.admitted
+    assert admitted == [eng._longform.child_id("file", i) for i in range(2)]
+
+
+def test_a_rejected_long_request_registers_no_windows():
+    """Options are validated before the fan-out, not by each window.
+
+    Regression: the windows were registered first and then each rejected, so the
+    caller got its error and the tracker kept a parent that could never finish.
+    """
+    eng = _fan_out_engine()
+    with pytest.raises(ValueError, match="top_p"):
+        eng.add_request(torch.zeros(40000), streaming=False, decoding={"top_p": 1.5})
+    results = eng.add_requests_batch_checked(
+        [
+            {
+                "request_id": "bad",
+                "audio": torch.zeros(40000),
+                "streaming": False,
+                "decoding": {"top_p": 1.5},
+            }
+        ]
+    )
+    assert "top_p" in results[0]["error"]
+    assert not eng._longform
+    assert eng._executor.admitted == []
+
+
+def test_a_window_the_executor_refuses_aborts_its_siblings():
+    eng = _fan_out_engine()
+    eng._executor.fail_at = 1
+    results = eng.add_requests_batch_checked(
+        [{"request_id": "long", "audio": torch.zeros(40000), "streaming": False}]
+    )
+    assert "executor refused" in results[0]["error"]
+    assert not eng._longform
+    assert eng._executor.aborted == [eng._longform.child_id("long", i) for i in range(3)]

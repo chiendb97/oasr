@@ -64,6 +64,16 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
                 "Conformer implementation does not support (it uses the residual "
                 "form). Loading it would silently compute a different model."
             )
+    # WeNet's ``RMSNorm`` scales by ``1 + weight`` (``add_unit_offset``) and
+    # OASR's by ``weight``, so the same tensors would load and compute something
+    # else.  Refused for the same reason as ``concat_after``.
+    for key in ("layer_norm_type", "cnn_module_norm"):
+        if enc.get(key) == "rms_norm":
+            raise ValueError(
+                f"train.yaml sets encoder_conf.{key}=rms_norm, which this Conformer "
+                "implementation does not support (WeNet's RMSNorm scales by "
+                "1 + weight). Loading it would silently compute a different model."
+            )
     encoder_cfg = ConformerEncoderConfig(
         input_size=raw.get("input_dim", 80),
         output_size=enc.get("output_size", 256),
@@ -77,6 +87,14 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
         macaron_style=enc.get("macaron_style", True),
         causal=enc.get("causal", False),
         cnn_module_norm=enc.get("cnn_module_norm", "batch_norm"),
+        # Structural, with WeNet's defaults: dropping one builds a model the
+        # weights still load into, and it computes something else.
+        layer_norm_type=enc.get("layer_norm_type", "layer_norm"),
+        norm_eps=float(enc.get("norm_eps", 1e-5)),
+        conv_bias=enc.get("conv_bias", True),
+        conv_norm_eps=float(enc.get("conv_norm_eps", 1e-5)),
+        conv_inner_factor=enc.get("conv_inner_factor", 2),
+        final_norm=enc.get("final_norm", True),
         input_layer=enc.get("input_layer", "conv2d"),
         embed_layer_norm=False,
     )

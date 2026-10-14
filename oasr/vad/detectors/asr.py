@@ -253,7 +253,7 @@ class CifAlphaDetector(_AsrDetector):
 
 
 class AedNoSpeechDetector(_AsrDetector):
-    """Whisper's ``<|nospeech|>`` probability at the first generated position.
+    """Whisper's ``<|nospeech|>`` probability at the start-of-transcript position.
 
     One "frame" spanning the whole decoding window, because that is genuinely all
     this signal covers: Whisper reads it once per 30 s window, so it says nothing

@@ -405,12 +405,13 @@ pub fn decode_wav(body: &[u8]) -> Result<DecodedAudio, AudioError> {
         }
         (SampleFormat::Int, 24) | (SampleFormat::Int, 32) => {
             let samples: Vec<i32> = reader.samples::<i32>().collect::<Result<_, _>>()?;
-            // hound's 24/32-bit ints saturate to i32 range; scale to [-1,1).
-            const SCALE: f32 = 2_147_483_648.0;
+            // hound returns each sample in its own bit depth's range, sign
+            // extended — a 24-bit full scale is 2^23, not 2^31.  Dividing every
+            // depth by 2^31 delivered 24-bit audio 256x (48 dB) too quiet.
+            let scale = f64::from(1u32 << (bps - 1));
             for frame in samples.chunks_exact(channels) {
-                let mean = (frame.iter().map(|&s| s as f64).sum::<f64>()
-                    / channels as f64
-                    / SCALE as f64) as f32;
+                let mean =
+                    (frame.iter().map(|&s| s as f64).sum::<f64>() / channels as f64 / scale) as f32;
                 out.put_f32_le(mean);
             }
         }
@@ -511,6 +512,63 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert!((samples[0] - (1000.0 + 3000.0) / 2.0 / 32768.0).abs() < 1e-6);
         assert!((samples[1] - (2000.0 + -2000.0) / 2.0 / 32768.0).abs() < 1e-6);
+    }
+
+    fn write_wav_i32(samples: &[i32], bits_per_sample: u16, channels: u16) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: 16000,
+            bits_per_sample,
+            sample_format: SampleFormat::Int,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for s in samples {
+                w.write_sample(*s).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        buf
+    }
+
+    fn decoded_f32(wav: &[u8]) -> Vec<f32> {
+        decode_wav(wav)
+            .unwrap()
+            .samples
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect()
+    }
+
+    /// Full scale at every integer depth is 1.0: half of a 24-bit full scale
+    /// decodes to 0.5, not to 0.5 / 256.
+    #[test]
+    fn wav_wide_ints_scale_by_their_own_depth() {
+        for bits in [24u16, 32] {
+            let full = 1i64 << (bits - 1);
+            let src: Vec<i32> = [full / 2, -full / 2, -full, full / 4, 0]
+                .iter()
+                .map(|&v| v as i32)
+                .collect();
+            let got = decoded_f32(&write_wav_i32(&src, bits, 1));
+            let want = [0.5f32, -0.5, -1.0, 0.25, 0.0];
+            assert_eq!(got.len(), want.len(), "{bits}-bit");
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-6, "{bits}-bit: {g} != {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn wav_i24_stereo_averaged_to_mono() {
+        let src: Vec<i32> = vec![1 << 22, 3 << 21, -(1 << 22), 0];
+        let got = decoded_f32(&write_wav_i32(&src, 24, 2));
+        assert_eq!(got.len(), 2);
+        assert!((got[0] - 0.625).abs() < 1e-6, "{}", got[0]);
+        assert!((got[1] - -0.25).abs() < 1e-6, "{}", got[1]);
     }
 
     #[test]

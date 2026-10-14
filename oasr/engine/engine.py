@@ -8,7 +8,6 @@ import logging
 import queue
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -960,23 +959,28 @@ class ASREngine:
         self._input_processor.check_sample_rate(sample_rate)
         return int(sample_rate)
 
-    def _maybe_fan_out_longform(
-        self,
-        audio,
-        request_id: Optional[str],
-        sample_rate: int,
-        priority: int,
-        decoding,
-    ) -> Optional[str]:
-        """Split over-window audio into per-window child requests.
+    def _maybe_fan_out_longform(self, req: Request) -> Optional[str]:
+        """Split an offline request's audio into per-window child requests.
 
         Returns the parent request id when the audio was fanned out, or ``None``
-        when it fits one window and should be admitted normally.  The caller sees
-        one id either way; :meth:`step` merges the children back.
+        when it fits one window, or no splitter is configured, and ``req`` should
+        be admitted normally.  The caller sees one id either way; :meth:`step`
+        merges the children back.
+
+        Every offline admission path calls this — :meth:`add_request` *and* the
+        two batch paths the serving dispatcher uses.  Only the first did once, so
+        ``--long-form`` and ``--vad-mode segment`` did nothing under
+        ``oasr-server``: Whisper refused anything past 30 s and a Kaldi frontend
+        encoded whole files.  The caller validates ``req`` first; a rejection
+        after the windows are registered would leave the parent waiting on
+        children that never run.
         """
+        if self._longform is None or req.streaming:
+            return None
         from .longform import split_windows
 
-        wave = torch.as_tensor(audio, dtype=torch.float32, device="cpu").reshape(-1)
+        sample_rate = req.sample_rate
+        wave = torch.as_tensor(req.audio, dtype=torch.float32, device="cpu").reshape(-1)
 
         spans: Optional[List[Tuple[int, int]]] = None
         if self._vad_splitter is not None:
@@ -1030,11 +1034,9 @@ class ASREngine:
             stride = self._longform_window_samples - self._longform_overlap_samples
             starts = [(i * stride) / float(sample_rate) for i in range(len(windows))]
 
-        parent_id = request_id or uuid.uuid4().hex
+        parent_id = req.request_id
         tracker = self._longform
-        assert tracker is not None, "the caller only fans out when a tracker exists"
         child_ids: List[str] = [tracker.child_id(parent_id, i) for i in range(len(windows))]
-        tracker.register(parent_id, child_ids, starts)
         if spans is not None:
             kept = sum(int(w.numel()) for w in windows)
             self._metrics.incr(VAD_SEGMENTS, float(len(windows)))
@@ -1050,21 +1052,36 @@ class ASREngine:
             len(windows),
             sum(int(w.numel()) for w in windows) / float(sample_rate),
         )
-        # Bulk admission so the windows land in one batch — they are independent,
-        # which is exactly what makes the batched path applicable here.
-        self.add_requests_batch(
-            [
-                {
-                    "audio": w,
-                    "request_id": cid,
-                    "sample_rate": sample_rate,
-                    "streaming": False,
-                    "priority": priority,
-                    "decoding": decoding,
-                }
-                for cid, w in zip(child_ids, windows)
-            ]
-        )
+        children = [
+            Request(
+                w,
+                request_id=cid,
+                streaming=False,
+                sample_rate=sample_rate,
+                priority=req.priority,
+                decoding=req.decoding,
+            )
+            for cid, w in zip(child_ids, windows)
+        ]
+        # The windows are admitted directly, not through an entry point that
+        # would try to fan them out again, and with the parent's options, which
+        # the caller has already validated.  Under the lock, which is reentrant,
+        # so no step can finish a window before its parent is registered.
+        with self._lock:
+            tracker.register(parent_id, child_ids, starts)
+            try:
+                if self._overlap_admit:
+                    with self._admit_inflight_lock:
+                        self._admit_inflight += len(children)
+                    for child in children:
+                        self._prep_in.put(child)
+                else:
+                    for child in children:
+                        self._executor.admit(child)
+            except Exception:
+                for cid in tracker.abandon(parent_id):
+                    self._executor.abort(cid)
+                raise
         return parent_id
 
     def add_request(
@@ -1118,10 +1135,6 @@ class ASREngine:
             The assigned ``request_id``.
         """
         sr = self._resolve_sample_rate(sample_rate)
-        if self._longform is not None and not streaming:
-            fanned = self._maybe_fan_out_longform(audio, request_id, sr, priority, decoding)
-            if fanned is not None:
-                return fanned
         req = Request(
             audio,
             request_id=request_id,
@@ -1130,6 +1143,14 @@ class ASREngine:
             priority=priority,
             decoding=DecodingOptions.coerce(decoding),
         )
+        if self._longform is not None and not streaming:
+            # Outside the lock, as before: a VAD pass over a long file would
+            # otherwise stall a step loop running on another thread.
+            self._validate_mode(streaming)
+            self._validate_decoding(req)
+            fanned = self._maybe_fan_out_longform(req)
+            if fanned is not None:
+                return fanned
         if self._overlap_admit:
             self._validate_mode(streaming)
             self._validate_decoding(req)
@@ -1249,7 +1270,9 @@ class ASREngine:
             )
             self._validate_mode(streaming)
             self._validate_decoding(req)
-            self._executor.admit(req)
+            fanned = self._maybe_fan_out_longform(req)
+            if fanned is None:
+                self._executor.admit(req)
         except Exception as exc:
             return {"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"}
         return {"request_id": req.request_id}
@@ -1287,12 +1310,16 @@ class ASREngine:
                 )
                 self._validate_mode(req.streaming)  # reads immutable executor.streaming
                 self._validate_decoding(req)
-                # Raise here, not on the prep thread, where it would only be logged.
-                self._input_processor.check_audio_duration(req.audio)
+                # Queues its windows for prep itself.
+                fanned = self._maybe_fan_out_longform(req)
+                if fanned is None:
+                    # Raise here, not on the prep thread, where it would only be logged.
+                    self._input_processor.check_audio_duration(req.audio)
             except Exception as exc:
                 results.append({"request_id": rid or "", "error": f"{type(exc).__name__}: {exc}"})
                 continue
-            reqs.append(req)
+            if fanned is None:
+                reqs.append(req)
             results.append({"request_id": req.request_id})
         if reqs:
             with self._admit_inflight_lock:

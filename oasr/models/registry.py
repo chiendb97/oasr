@@ -339,8 +339,18 @@ def load_checkpoint_bundle(
     return arch, bundle
 
 
-def _log_load_report(report: Optional[LoadReport], converter: Any, arch: str) -> None:
-    """Surface dropped-weight accounting: no checkpoint tensor vanishes silently."""
+def check_load_report(report: Optional[LoadReport], converter: Any, arch: str) -> None:
+    """Account for every tensor: log what was dropped, refuse what is missing.
+
+    A dropped checkpoint tensor costs a capability, so it is logged.  A model
+    tensor the checkpoint did not fill is different: the model would run with it
+    at its initial value, and nothing downstream can tell.  That is how a WeNet
+    Conformer whose ``norm_conv`` was built as the wrong kind of norm, and an
+    icefall transducer auto-detected as Zipformer-CTC with a random CTC head,
+    both loaded and served garbage with only a warning.  Every real checkpoint
+    of every architecture fills its model exactly, so this costs nothing that
+    loads correctly.
+    """
     if report is None:
         return
     expected = tuple(getattr(converter, "expected_unused_prefixes", ()))
@@ -381,6 +391,21 @@ def _log_load_report(report: Optional[LoadReport], converter: Any, arch: str) ->
             prefixes,
             leftover[:5],
         )
+    if report.missing:
+        # The drop hints usually say what the directory really is.
+        fired = [
+            hint
+            for prefix, hint in hints.items()
+            if any(k.startswith(prefix) for k in report.dropped)
+        ]
+        raise ValueError(
+            f"the checkpoint does not fill {len(report.missing)} of the {arch} model's "
+            f"tensors (first few: {report.missing[:5]}), so they would keep their "
+            "initial values and the model would compute something else. The "
+            "directory does not have this architecture's structure"
+            + ("".join(f"; {h}" for h in fired) if fired else "")
+            + "."
+        )
 
 
 def instantiate_from_bundle(
@@ -400,7 +425,7 @@ def instantiate_from_bundle(
         report: Optional[LoadReport] = None
     else:
         report = model.load_weights(bundle.state_dict)
-        _log_load_report(report, entry.converter, arch)
+        check_load_report(report, entry.converter, arch)
 
     # Cast on the host first, then move: a big LLM checkpoint held fp32 may
     # not fit the GPU at all (8.4B fp32 = 33.6 GB), and the bf16 transfer is

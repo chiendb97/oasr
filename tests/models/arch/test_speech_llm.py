@@ -384,6 +384,22 @@ class TestLlmStrategy:
         asked, _ = self._strategy_and_model(decode_options={"kv_storage": "paged"})
         assert asked._resolve_storage(asked._decoder()) == "paged"
 
+    def test_the_prompt_estimate_is_a_full_windows_real_prompt(self):
+        """The KV pool and the admission budget are sized from this estimate.
+
+        It counted 375 audio embeddings for the 30 s window, applying the
+        pooling halving twice; the tower emits 750.  So both were sized for
+        half the audio, and concurrent clips past ~15 s failed their prefill.
+        """
+        from types import SimpleNamespace
+
+        strategy, model = self._strategy_and_model()
+        with torch.no_grad():
+            emb, elens = model.encode_offline(torch.randn(1, 3000, 128), torch.tensor([3000]))
+        _, _, totals = strategy._build_prompt([SimpleNamespace(decoding=None)], emb, elens)
+        assert int(elens[0]) == 750
+        assert strategy._prompt_len_estimate() == totals[0]
+
     def test_beam_search_stays_dense_even_asking_for_graphs(self):
         """A paged row's pages are its own, and a beam grid reorders onto its
         parents with repeated ``select`` indices — which would alias two slots

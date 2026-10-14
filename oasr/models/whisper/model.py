@@ -429,12 +429,17 @@ class WhisperDecoder(BaseDecoder):
         prompt_ids: torch.Tensor,
         capacity: Optional[int] = None,
         kv_manager: Optional["DecoderKVCacheManager"] = None,
+        all_positions: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation: cross-KV once + prompt forward.
 
         ``enc_out (B, T_enc, D)``, ``prompt_ids (B, P)`` (identical P across
         the batch — the SOT sequence) → ``(logits (B, V) at the last prompt
         position, state)``.
+
+        ``all_positions`` returns ``(B, P, V)`` instead, which the forward has
+        already computed: ``<|nospeech|>`` is read at the start-of-transcript
+        position, not the last one.
 
         ``capacity`` (optional): total self-attention KV length this generation
         may reach (prompt + generation cap).  When given, the per-layer K/V
@@ -477,7 +482,7 @@ class WhisperDecoder(BaseDecoder):
             for i, layer in enumerate(layers):
                 state["cross_k"][i], state["cross_v"][i] = layer.encoder_attn.kv(enc_out)
         logits = self._forward_tokens(prompt_ids, state, is_prefill=True)
-        return logits[:, -1], state
+        return (logits if all_positions else logits[:, -1]), state
 
     def step(
         self, tokens: torch.Tensor, state: Dict[str, Any]

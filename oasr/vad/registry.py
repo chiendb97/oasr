@@ -56,7 +56,7 @@ CONSUMES: Tuple[str, ...] = (
     "asr_log_probs",  # (B, T, V) CTC log-softmax — ctc_blank
     "asr_frames",  # (B, T) per-frame activity indicator — transducer_blank
     "asr_alphas",  # (B, T) CIF weights, already in [0, 1] — cif_alpha
-    "asr_prefill_logits",  # (B, V) logits at the first generated position — aed_no_speech
+    "asr_prefill_logits",  # (B, V) logits at the start-of-transcript position — aed_no_speech
 )
 
 #: The subset of ``CONSUMES`` that requires the ASR to have run already.

@@ -92,6 +92,7 @@ converter's declarations:
 |---|---|
 | `expected_unused_prefixes` | Silent — e.g. icefall `simple_*_proj` |
 | `capability_drop_hints` | Named warning — e.g. the U2++ `decoder.*` rescoring branch |
+| *(none)*: a model tensor left `missing` | Load error, carrying the drop hints that fired |
 
 ## Autoregressive decoder contracts
 

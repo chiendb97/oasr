@@ -79,6 +79,15 @@ registry warns about drops per the converter's declaration:
 being lost (e.g. dropping a U2++ `decoder.*` branch would lose
 `ctc_aed_rescoring`).  Silent weight drops are a bug by policy.
 
+A model tensor the checkpoint does not fill (`missing`, beyond the computed
+buffers a model declares) **fails the load**: the model would otherwise run with
+it at its initial value.  That is how a WeNet Conformer with a misbuilt norm and
+an icefall transducer sniffed as Zipformer-CTC (with a random CTC head) both used
+to serve garbage after a warning.  The error carries whichever drop hints fired,
+which usually say what the directory really is — for the transducer, to pass
+`--architecture transducer`.  Every real checkpoint of every architecture fills
+its model exactly.
+
 ## Built-in converters
 
 | Ecosystem | Detect marker | Architecture | Notes |

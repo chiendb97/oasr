@@ -317,6 +317,75 @@ class TestIncrementalDecode:
         assert state["text"] == tok.decode(ids)
 
 
+class TestByteLevelCharacterSplits:
+    """A character spanning several byte-level tokens (CJK, emoji, accents).
+
+    The first tokens render as U+FFFD until the last one completes the
+    character.  The windowed decode diffed that U+FFFD in, so the completing
+    token's rendering no longer extended the previous one: it fell back to a
+    full re-decode and returned the whole transcript as its piece.  Word
+    timestamps for Whisper and Qwen then held U+FFFD "words" and duplicated
+    text, while the final transcript stayed right.
+    """
+
+    TEXTS = ["你好，世界。今天天气很好。", " Hello 🎉 world, naïve café", "👨‍👩‍👧 Việt Nam " * 8]
+
+    @pytest.fixture(scope="class")
+    def tok(self, tmp_path_factory):
+        """Byte-level BPE with no merges: every UTF-8 byte is its own token, so
+        every non-ASCII character is split."""
+        tokenizers = pytest.importorskip("tokenizers")
+        from tokenizers import decoders, models, pre_tokenizers
+
+        vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+        t = tokenizers.Tokenizer(models.BPE(vocab=vocab, merges=[]))
+        t.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        t.decoder = decoders.ByteLevel()
+        path = tmp_path_factory.mktemp("bytelevel") / "tokenizer.json"
+        t.save(str(path))
+        return build_tokenizer(TokenizerSpec(kind="huggingface", files={"tokenizer": str(path)}))
+
+    @pytest.mark.parametrize("text", TEXTS)
+    def test_pieces_concatenate_to_the_text(self, tok, text):
+        ids = tok.encode(text)
+        assert len(ids) > len(text), "fixture must split characters"
+        pieces = tok.token_pieces(ids)
+        assert "".join(pieces) == tok.decode(ids) == text
+        assert not [p for p in pieces if "\ufffd" in p]
+
+    def test_a_character_belongs_to_the_token_that_completes_it(self, tok):
+        ids = tok.encode("a你")
+        assert tok.token_pieces(ids) == ["a", "", "", "你"]
+
+    @pytest.mark.parametrize("chunk", [1, 2, 5])
+    def test_state_text_is_the_decode_at_every_step(self, tok, chunk):
+        ids = tok.encode(self.TEXTS[2])
+        state, deltas = tok.new_decode_state(), []
+        for i in range(0, len(ids), chunk):
+            deltas.append(tok.decode_incremental(ids[i : i + chunk], state))
+            assert state["text"] == tok.decode(ids[: i + chunk])
+        assert "".join(deltas) == tok.decode(ids)
+
+    def test_a_sequence_cut_mid_character_keeps_its_tail(self, tok):
+        """A generation stopped at its cap: the tail is the last token's."""
+        ids = tok.encode("ok 🎉")[:-1]
+        pieces = tok.token_pieces(ids)
+        assert "".join(pieces) == tok.decode(ids)
+        assert pieces[-1].endswith("\ufffd")
+
+    def test_a_split_character_does_not_force_a_full_decode(self, tok):
+        """Every decode stays inside the bounded window, as for plain text."""
+        ids = tok.encode("你好世界" * 40)
+        widest = []
+        original = tok.decode
+        tok.decode = lambda chunk: (widest.append(len(chunk)), original(chunk))[1]
+        try:
+            tok.token_pieces(ids)
+        finally:
+            del tok.decode
+        assert max(widest) <= 2 * tok._INCREMENTAL_WINDOW + 1
+
+
 # ---------------------------------------------------------------------------
 # The two incremental-decode properties ``TestIncrementalDecode`` does not cover
 #

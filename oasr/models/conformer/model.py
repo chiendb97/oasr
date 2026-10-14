@@ -112,6 +112,7 @@ class ConvolutionModule(nn.Module):
         self.pointwise_conv1 = PointwiseConv1d(
             channels,
             conv_inner_factor * channels,
+            bias=bias,
         )
         if causal:
             padding = 0
@@ -123,7 +124,7 @@ class ConvolutionModule(nn.Module):
 
         inner_channels = conv_inner_factor * channels // 2
         self.depthwise_conv = DepthwiseConv1d(
-            channels,
+            inner_channels,
             kernel_size,
             padding=padding,
             bias=bias,
@@ -633,7 +634,13 @@ class ConformerEncoderLayer(nn.Module):
                 conv_inner_factor=conv_inner_factor,
             )
 
-            self.norm_conv = get_norm(cnn_module_norm)(size, eps=norm_eps)
+            # The block's pre-norm, like every other one here: WeNet builds it
+            # from ``layer_norm_type``.  ``cnn_module_norm`` is the norm *inside*
+            # the conv module, after the depthwise conv.  Building this one from
+            # it made a ``BatchNorm1d`` of any checkpoint whose yaml omits
+            # ``cnn_module_norm`` (WeNet's default is ``batch_norm``): the
+            # LayerNorm weights loaded into it and its statistics stayed at init.
+            self.norm_conv = get_norm(layer_norm_type)(size, eps=norm_eps)
             self.norm_final = get_norm(layer_norm_type)(size, eps=norm_eps)
         else:
             self.conv_module = None

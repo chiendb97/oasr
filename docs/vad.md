@@ -133,7 +133,7 @@ and an ASR-derived one decides when a turn ended (`vad.mode="endpoint"`).
 | `ctc_blank` | CTC log-probs | stream, posthoc | 1 − P(blank) per encoder frame |
 | `transducer_blank` | greedy emission frames | stream, posthoc | greedy decoding only |
 | `cif_alpha` | Paraformer CIF α | posthoc | token rate, boxcar-smoothed |
-| `aed_no_speech` | Whisper prefill logits | posthoc | `<\|nospeech\|>`; one frame per decoding window |
+| `aed_no_speech` | Whisper prefill logits at `<\|startoftranscript\|>` | posthoc | `<\|nospeech\|>`; one frame per decoding window |
 
 The roles say where a detector may be used: `presegment` runs before the
 encoder (required by `vad.mode="segment"`), `stream` reaches a verdict

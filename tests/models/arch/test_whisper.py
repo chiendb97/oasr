@@ -911,6 +911,78 @@ class TestControlTokenTables:
         assert tasks == {} and languages == {}
 
 
+class TestForcedDecoderIds:
+    """The prompt each release's generation config converts to.
+
+    Ids are fake: what is under test is which slot comes from where.
+    """
+
+    LANGUAGES = {"en": 902, "fr": 903}
+
+    @staticmethod
+    def forced(gen, raw=None, languages=LANGUAGES, no_timestamps=952):
+        from oasr.models.whisper.convert import _forced_decoder_ids
+
+        return _forced_decoder_ids(gen, raw or {}, languages, no_timestamps)
+
+    def test_large_v3_gets_a_language_and_notimestamps(self):
+        """large-v2/v3 leave the language to detection and list no
+        ``<|notimestamps|>``; ``config.json`` pins nothing to fall back on.  The
+        prompt used to convert as ``SOT <|transcribe|>``."""
+        gen = {"forced_decoder_ids": [[1, None], [2, 951]], "is_multilingual": True}
+        assert self.forced(gen) == [(1, 902), (2, 951), (3, 952)]
+
+    def test_a_pinned_fallback_still_wins(self):
+        """whisper-tiny: ``config.json`` pins all three slots."""
+        gen = {"forced_decoder_ids": [[1, None], [2, 951]]}
+        raw = {"forced_decoder_ids": [[1, 903], [2, 951], [3, 952]]}
+        assert self.forced(gen, raw) == [(1, 903), (2, 951), (3, 952)]
+
+    def test_an_english_only_model_has_no_language_slot(self):
+        gen = {"forced_decoder_ids": [[1, 952]], "is_multilingual": False}
+        assert self.forced(gen, languages={}) == [(1, 952)]
+
+    def test_a_snapshot_asking_for_timestamps_keeps_them(self):
+        gen = {"forced_decoder_ids": [[1, None], [2, 951]], "return_timestamps": True}
+        assert self.forced(gen) == [(1, 902), (2, 951)]
+
+    def test_the_language_slot_takes_a_request_language(self, tmp_path):
+        """What the empty slot cost: ``language`` was refused, as if the model
+        were English-only."""
+        import json
+
+        from oasr.models.whisper.convert import HFWhisperConverter
+
+        dims = {
+            "encoder_layers": 1,
+            "decoder_layers": 1,
+            "encoder_attention_heads": 1,
+            "decoder_attention_heads": 1,
+            "encoder_ffn_dim": 8,
+            "decoder_ffn_dim": 8,
+        }
+        files = {
+            "config.json": {"model_type": "whisper", "vocab_size": 960, "d_model": 8, **dims},
+            "generation_config.json": {
+                "decoder_start_token_id": 901,
+                "forced_decoder_ids": [[1, None], [2, 951]],
+                "is_multilingual": True,
+                "no_timestamps_token_id": 952,
+            },
+            "tokenizer.json": {
+                "added_tokens": [
+                    {"id": i, "content": c}
+                    for i, c in [(902, "<|en|>"), (903, "<|fr|>"), (951, "<|transcribe|>")]
+                ]
+            },
+        }
+        for name, body in files.items():
+            (tmp_path / name).write_text(json.dumps(body), encoding="utf-8")
+        cfg = HFWhisperConverter().build_config(tmp_path)
+        assert cfg.sot_sequence() == [901, 902, 951, 952]
+        assert cfg.sot_sequence(language="fr") == [901, 903, 951, 952]
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -982,6 +1054,61 @@ class TestEngineWhisperE2E:
         # LJ001-0001/0002 ground truth openers.
         assert "printing" in texts[0].lower()
         assert "modern" in texts[1].lower()
+
+    def test_no_speech_prob_is_read_at_the_start_of_transcript(self):
+        """``<|nospeech|>`` is predicted in place of the language token.
+
+        OpenAI reads it from ``logits[:, sot_index]`` and HF's no-speech
+        detection does the same.  It used to be read after ``<|notimestamps|>``,
+        where even silence scores ~2e-5, so every clip was reported as speech.
+        Measured on whisper-tiny: silence 0.93, 1 % noise 0.67, speech 0.002;
+        HF at the same position gives 0.94 / 0.67 / 0.002 (its features differ
+        slightly from the GPU log-mel).
+        """
+        import soundfile as sf
+
+        from oasr.engine import ASREngine, EngineConfig
+
+        speech, _ = sf.read(str(assets.require_wavs(1)[0]), dtype="float32")
+        clips = {"silence": torch.zeros(5 * 16000), "speech": torch.from_numpy(speech)}
+        eng = ASREngine(
+            EngineConfig(
+                ckpt_dir=WHISPER_CKPT,
+                service_mode="offline",
+                max_batch_size=4,
+                vad={"mode": "observe"},
+            )
+        )
+        try:
+            for rid, audio in clips.items():
+                eng.add_request(
+                    audio, request_id=rid, streaming=False, decoding={"vad_events": True}
+                )
+            got = {}
+            while eng.num_running or eng.num_waiting:
+                for out in eng.step():
+                    if out.finished:
+                        got[out.request_id] = out.no_speech_prob
+        finally:
+            eng.shutdown()
+        assert got["silence"] > 0.8, got
+        assert got["speech"] < 0.05, got
+
+        transformers = pytest.importorskip("transformers")
+        processor = transformers.WhisperProcessor.from_pretrained(WHISPER_CKPT)
+        hf = transformers.WhisperForConditionalGeneration.from_pretrained(WHISPER_CKPT).eval()
+        prompt = torch.tensor([hf.generation_config.decoder_start_token_id])
+        # The original release spells it ``<|nocaptions|>``.
+        tok = processor.tokenizer
+        [no_speech] = {tok.convert_tokens_to_ids(t) for t in ("<|nospeech|>", "<|nocaptions|>")} - {
+            tok.unk_token_id
+        }
+        for rid, audio in clips.items():
+            feats = processor(audio.numpy(), sampling_rate=16000, return_tensors="pt")
+            with torch.no_grad():
+                logits = hf(input_features=feats.input_features, decoder_input_ids=prompt[None])
+            want = logits.logits[0, 0].float().softmax(-1)[no_speech].item()
+            assert got[rid] == pytest.approx(want, abs=0.02), (rid, got[rid], want)
 
     def test_streaming_mode_rejected(self):
         from oasr.engine import ASREngine, EngineConfig
@@ -1249,6 +1376,46 @@ class TestLongFormEngine:
             assert sum(k in text for k in ("modern", "chinese", "exhibition")) >= 2
             assert got["long"].finish_reason == "stop"
         finally:
+            del eng
+            torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize("overlap_admit", [False, True], ids=["admit", "overlap_admit"])
+    def test_the_serving_admission_path_fans_out_too(self, overlap_admit):
+        """``oasr-server`` admits through ``add_requests_batch_checked``.
+
+        Only ``add_request`` used to reach the fan-out, so under the server
+        ``--long-form`` did nothing and this request came back as an error.
+        """
+        from oasr.engine import ASREngine, EngineConfig
+
+        eng = ASREngine(
+            EngineConfig(
+                ckpt_dir=WHISPER_CKPT,
+                service_mode="offline",
+                max_batch_size=8,
+                decode_steps_per_tick=64,
+                long_form=True,
+                overlap_admit=overlap_admit,
+            )
+        )
+        try:
+            [result] = eng.add_requests_batch_checked(
+                [{"request_id": "long", "audio": self._audio(), "streaming": False}]
+            )
+            assert result == {"request_id": "long"}
+            got = {}
+            for _ in range(50000):
+                for out in eng.step():
+                    if out.finished:
+                        got[out.request_id] = out
+                if "long" in got:
+                    break
+            assert set(got) == {"long"}
+            text = got["long"].text.lower()
+            assert "printing" in text
+            assert sum(k in text for k in ("modern", "chinese", "exhibition")) >= 2
+        finally:
+            eng.shutdown()
             del eng
             torch.cuda.empty_cache()
 

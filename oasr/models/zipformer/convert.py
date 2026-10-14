@@ -126,16 +126,19 @@ class IcefallConverter(BaseCheckpointConverter):
     #: Weight-drop accounting (read by the registry after ``load_weights``):
     #: the pruned-RNNT ``simple_*_proj`` heads are training-only, so dropping
     #: them is expected; the transducer / attention-decoder branches are named
-    #: capability losses.
+    #: capability losses.  A transducer directory sniffs as this format, so its
+    #: two hints say how to load it as what it is.
     expected_unused_prefixes: Tuple[str, ...] = ("simple_am_proj", "simple_lm_proj")
     capability_drop_hints: Dict[str, str] = {
         "decoder.": (
-            "the transducer predictor branch is not loaded; transducer decode "
-            "lands with the multi-paradigm Phase 1"
+            "it carries a transducer predictor, which Zipformer-CTC does not "
+            "load; load the directory with architecture='transducer' "
+            "(--architecture transducer)"
         ),
         "joiner.": (
-            "the transducer joiner branch is not loaded; transducer decode "
-            "lands with the multi-paradigm Phase 1"
+            "it carries a transducer joiner, which Zipformer-CTC does not "
+            "load; load the directory with architecture='transducer' "
+            "(--architecture transducer)"
         ),
         "attention_decoder.": (
             "the attention-decoder branch is not loaded; AED decode lands with "
