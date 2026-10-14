@@ -23,7 +23,7 @@ name mapping:
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import nn
@@ -42,14 +42,6 @@ from oasr.layers import (
 #: normalized values by whole percent.  The value lives in ``oasr.layers.norm``
 #: with the other ecosystem conventions; this alias keeps the local spelling.
 LAYER_NORM_EPS = ESPNET_EPS
-
-
-#: Cache of computed PE tables, keyed by ``(depth, device_str)``.  Values are
-#: fp32 ``(1, L, depth)`` tensors, grown (never shrunk) as longer audio arrives.
-_PE_CACHE: Dict[Tuple[int, str], torch.Tensor] = {}
-#: Rounding for the cached PE length, so a few distinct audio lengths do not
-#: each trigger a rebuild.
-_PE_GROWTH = 512
 
 
 def _build_pe_fp32(length: int, depth: int, device: torch.device) -> torch.Tensor:
@@ -72,24 +64,21 @@ def sinusoidal_position_encoding(
     ``pe[:, t] = [sin(t·inv), cos(t·inv)]`` with ``inv_i = exp(-i·ln(10000) /
     (depth/2 - 1))`` — note the concatenated (not interleaved) sin/cos halves.
 
-    Two things this fixes over recomputing inline per forward (N1):
+    **Built in fp32, cast on the way out** (N1).  Under fp16 the integer position
+    ladder ``arange(1, L+1)`` is exact only to 2048; past that consecutive
+    positions start colliding, and every trig value derived from them is wrong.
+    FunASR computes in fp32, so matching it is also a parity requirement, not only
+    a precision nicety.
 
-    * **Built in fp32, cast on the way out.**  Under fp16 the integer position
-      ladder ``arange(1, L+1)`` is exact only to 2048; past that consecutive
-      positions start colliding, and every trig value derived from them is
-      wrong.  FunASR computes in fp32, so matching it is also a parity
-      requirement, not only a precision nicety.
-    * **Cached per (depth, device).**  It is a pure function of those plus the
-      length, and it was rebuilt — arange, exp, outer product, two trig passes,
-      a cat — on *every* encoder forward.
+    **Computed per call, never cached.**  A process-wide table that grew when a
+    longer request arrived freed the storage every captured offline graph read
+    (the encoder forward is captured), so each replayed garbage positions from
+    then on.  A table fixed at load would have to be built on the host, whose
+    ``exp`` and ``sin`` differ from the device's -- by up to 2.4e-4 at 4096
+    positions -- and would move every output; computed here, the rows are the
+    device's, as FunASR's are.  It is nine launches, and free in a replay.
     """
-    key = (int(depth), str(device))
-    cached = _PE_CACHE.get(key)
-    if cached is None or cached.size(1) < length:
-        grown = ((length + _PE_GROWTH - 1) // _PE_GROWTH) * _PE_GROWTH
-        cached = _build_pe_fp32(max(grown, length), depth, device)
-        _PE_CACHE[key] = cached
-    return cached[:, :length].to(dtype=dtype)
+    return _build_pe_fp32(length, depth, device).to(dtype=dtype)
 
 
 class FsmnBlock(nn.Module):

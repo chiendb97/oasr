@@ -43,9 +43,12 @@ from helpers.kernels import (  # noqa: E402
     ACTIVATIONS,
     assert_dest_passing,
     assert_graph_replay,
+    capture_graph,
     device_sm,
+    occupy_free_memory,
     requires_cute,
     requires_sm,
+    written_sentinels,
 )
 from helpers.tolerances import tol  # noqa: E402
 
@@ -57,11 +60,13 @@ __all__ = [
     "assert_dest_passing",
     "assert_graph_replay",
     "backend_ratio_ok",
+    "capture_graph",
     "device_sm",
     "engine_config",
     "hiss",
     "speech_corpus",
     "make_engine",
+    "occupy_free_memory",
     "ref_fmha",
     "requires_cute",
     "requires_sm",
@@ -72,4 +77,5 @@ __all__ = [
     "wav_paths",
     "waveform",
     "waveforms",
+    "written_sentinels",
 ]

@@ -595,14 +595,15 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
-class TestPositionEncodingCache:
-    """N1: the PE is a pure function — build it once, in fp32.
+class TestPositionEncoding:
+    """N1: the PE is a pure function of the length — computed in fp32.
 
-    It was rebuilt on every encoder forward (arange, exp, outer product, two
-    trig passes, a cat) *in the compute dtype*, which under fp16 makes the
-    integer position ladder exact only to 2048 — past that consecutive
-    positions collide and every derived value is wrong.  FunASR computes in
-    fp32, so this is a parity requirement too.
+    It was computed *in the compute dtype*, which under fp16 makes the integer
+    position ladder exact only to 2048 — past that consecutive positions collide
+    and every derived value is wrong.  FunASR computes in fp32, so this is a
+    parity requirement too.  It is computed per call rather than cached: a cache
+    that grew freed the table captured graphs read (see
+    ``tests/models/test_positional_encoding.py``).
     """
 
     def _pe(self, length, depth=512, dtype=torch.float32):
@@ -620,8 +621,8 @@ class TestPositionEncodingCache:
         b = self._pe(64, depth=64)
         assert torch.equal(a, b)
 
-    def test_a_longer_request_extends_the_table_consistently(self):
-        """A cached prefix must not change when the table grows."""
+    def test_a_longer_request_agrees_on_the_shared_prefix(self):
+        """A position's encoding does not depend on how long the request is."""
         short = self._pe(16, depth=64).clone()
         long = self._pe(4000, depth=64)
         torch.testing.assert_close(long[:, :16], short)

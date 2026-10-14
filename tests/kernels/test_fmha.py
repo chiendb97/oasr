@@ -20,7 +20,12 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
-from helpers import ref_fmha  # noqa: E402  (tests/ is on sys.path via conftest)
+from helpers import (  # noqa: E402  (tests/ is on sys.path via conftest)
+    capture_graph,
+    occupy_free_memory,
+    ref_fmha,
+    written_sentinels,
+)
 
 from oasr.cache import PagedKVCache
 
@@ -283,6 +288,42 @@ def test_fmha_paged_matches_sdpa(fmha, cuda, dtype, shape, with_bias):
         cache_seqlens=cache_seqlens,
     )
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
+def test_offline_lengths_belong_to_the_call(cuda):
+    """A captured offline call must write only memory it owns.
+
+    With no ``cache_seqlens`` the CuTeDSL lane synthesises a ``(B,)`` vector of
+    ``T_k``, and a captured graph records both its fill and the kernel's read.
+    It was one process-wide buffer, replaced when a wider batch arrived, so the
+    replacement freed it under every earlier capture: each replay then wrote
+    ``T_k`` into memory that belonged to another tensor -- here, a sentinel.
+    """
+    _require_cute_backend()
+    from oasr.jit.attention import _capability_probe
+
+    if _capability_probe()[1] != "cute":
+        pytest.skip("no CuTeDSL attention kernel for this arch")
+    torch.manual_seed(0)
+    H, T, D = 2, 64, 64
+
+    def qkv(batch):
+        return [torch.randn(batch, H, T, D, device=cuda, dtype=torch.float16) for _ in range(3)]
+
+    def attend(q, k, v, out=None):
+        return _dense_fmha(q, k, v, softmax_scale=D**-0.5, out=out, backend="cute")
+
+    q, k, v = qkv(2)
+    want = attend(q, k, v)  # eagerly first, on this stream
+    out = torch.empty_like(q)
+    graph, _ = capture_graph(lambda: attend(q, k, v, out=out))
+    attend(*qkv(1024))  # a far wider batch, after the capture
+    torch.cuda.synchronize()
+    sentinels = occupy_free_memory()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert written_sentinels(sentinels) == 0, "the replay wrote into freed memory"
+    torch.testing.assert_close(out, want, rtol=0, atol=0)
 
 
 def test_fmha_fp32_falls_back_to_sdpa(fmha, cuda):

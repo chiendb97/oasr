@@ -99,7 +99,22 @@ def _to_tuple(x, length: int):
 
 
 class CompactRelPositionalEncoding(nn.Module):
-    """Compact relative positional encoding (parameter-free; ``pe`` is recomputed)."""
+    """Compact relative positional encoding (parameter-free).
+
+    The table is a cache of a formula, not a property of the weights.  It is built
+    once, at construction, as a non-persistent buffer, so the model's ``.to()``
+    moves and casts it with the weights and its storage lives as long as the
+    module -- which is what a captured CUDA graph needs, since a replay reads the
+    *address* it was captured with.  icefall instead grows ``pe`` in place once an
+    input outruns it (past ``max_len`` frames, ~20 s at the first stack's 50 Hz),
+    and reassigning it freed the storage every earlier capture read: each of them
+    then replayed positional embeddings out of whatever the allocator put there
+    next.  An input past the table gets its rows computed for that call, from the
+    same formula on the input's device -- what icefall's grown table holds -- and
+    they are never stored.
+    """
+
+    pe: Tensor
 
     def __init__(self, embed_dim: int, length_factor: float = 1.0, max_len: int = 1000):
         super().__init__()
@@ -107,17 +122,12 @@ class CompactRelPositionalEncoding(nn.Module):
         assert embed_dim % 2 == 0, embed_dim
         assert length_factor >= 1.0, length_factor
         self.length_factor = length_factor
-        self.pe: Optional[Tensor] = None
-        self.extend_pe(torch.tensor(0.0).expand(max_len))
+        self.register_buffer("pe", self._table(max_len, torch.device("cpu")), persistent=False)
 
-    def extend_pe(self, x: Tensor, left_context_len: int = 0) -> None:
-        T = x.size(0) + left_context_len
-        if self.pe is not None and self.pe.size(0) >= T * 2 - 1:
-            self.pe = self.pe.to(dtype=x.dtype, device=x.device)
-            return
-
-        x = torch.arange(-(T - 1), T, device=x.device).to(torch.float32).unsqueeze(1)
-        freqs = 1 + torch.arange(self.embed_dim // 2, device=x.device)
+    def _table(self, T: int, device: torch.device) -> Tensor:
+        """Rows for relative positions ``-(T - 1) .. T - 1``: ``(2T - 1, embed_dim)``."""
+        x = torch.arange(-(T - 1), T, device=device).to(torch.float32).unsqueeze(1)
+        freqs = 1 + torch.arange(self.embed_dim // 2, device=device)
         compression_length = self.embed_dim**0.5
         x_compressed = (
             compression_length
@@ -128,19 +138,19 @@ class CompactRelPositionalEncoding(nn.Module):
         x_atan = (x_compressed / length_scale).atan()
         cosines = (x_atan * freqs).cos()
         sines = (x_atan * freqs).sin()
-        pe = torch.zeros(x.shape[0], self.embed_dim, device=x.device)
+        pe = torch.zeros(x.shape[0], self.embed_dim, device=device)
         pe[:, 0::2] = cosines
         pe[:, 1::2] = sines
         pe[:, -1] = 1.0  # for bias.
-        self.pe = pe.to(dtype=torch.get_default_dtype())
+        return pe.to(dtype=torch.get_default_dtype())
 
     def forward(self, x: Tensor, left_context_len: int = 0) -> Tensor:
-        self.extend_pe(x, left_context_len)
         x_size_left = x.size(0) + left_context_len
-        pos_emb = self.pe[
-            self.pe.size(0) // 2 - x_size_left + 1 : self.pe.size(0) // 2 + x.size(0),
-            :,
-        ]
+        pe = self.pe
+        if pe.size(0) < x_size_left * 2 - 1:
+            pe = self._table(x_size_left, x.device)  # past the table: this call's rows only
+        center = pe.size(0) // 2
+        pos_emb = pe[center - x_size_left + 1 : center + x.size(0), :]
         pos_emb = pos_emb.unsqueeze(0)
         return pos_emb.to(dtype=x.dtype)
 
