@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 378,
+  "total": 376,
   "files": {
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
@@ -75,7 +75,7 @@
     "oasr/models/whisper/convert.py": 3,
     "oasr/models/whisper/model.py": 6,
     "oasr/models/zipformer/convert.py": 5,
-    "oasr/models/zipformer/encoder.py": 24,
+    "oasr/models/zipformer/encoder.py": 22,
     "oasr/models/zipformer/model.py": 13,
     "oasr/models/zipformer/scaling.py": 5,
     "oasr/tokenizers/huggingface.py": 1,

@@ -1,6 +1,6 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Conformer's relative positional encoding past its table.
+"""Positional-encoding tables past their end, and under graph capture.
 
 WeNet sizes the sinusoid table at 5000 rows -- 200 s of audio at 40 ms frames --
 and the table is a cache of a formula, not a property of the weights.  Reading
@@ -9,15 +9,25 @@ device-side assert that took the CUDA context, and every stream on it, down once
 a stream with bounded history ran long enough.  A position past the table is now
 computed.  These pin that it is computed as a larger table would have held it,
 and that a row the table does hold still comes from it.
+
+The rows past a table must also never be *stored*.  Zipformer grew its table in
+place, as icefall does, and Paraformer kept a process-wide one that grew with the
+longest request; either way the old storage was freed under every captured
+offline graph that read it, so one long request left each earlier capture
+replaying positional embeddings out of whatever the allocator put there next.
+The last section pins that a long request leaves a captured encoder intact.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
+from helpers import capture_graph, occupy_free_memory, written_sentinels
 
 from oasr.models.conformer import ConformerEncoder, ConformerEncoderConfig
 from oasr.models.conformer.model import RelPositionalEncoding
+from oasr.models.registry import get_model_entry
+from oasr.models.zipformer.encoder import CompactRelPositionalEncoding
 
 D = 64
 ROWS = 100
@@ -123,3 +133,99 @@ def test_a_declared_bound_keeps_the_plain_gather(monkeypatch):
     far = torch.tensor([3 * ROWS])
     want = RelPositionalEncoding(D, max_len=4 * ROWS).position_encoding(far, 5)
     torch.testing.assert_close(pe.position_encoding(far, 5), want, rtol=0, atol=SIN_ATOL)
+
+
+# ---------------------------------------------------------------------------
+# Under graph capture: the table a replay reads must outlive every request
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_zipformer_rows_past_the_table_are_computed_not_stored(device):
+    """Past its table, Zipformer's encoding matches a larger table and leaves its own alone."""
+    small = CompactRelPositionalEncoding(16, max_len=ROWS).to(device)
+    large = CompactRelPositionalEncoding(16, max_len=4 * ROWS).to(device)
+    table, address = small.pe, small.pe.data_ptr()
+    for size, left in ((ROWS // 2, 0), (2 * ROWS, 0), (30, ROWS)):
+        x = torch.zeros(size, 1, 16, device=device)
+        got = small(x, left)
+        assert got.shape == (1, 2 * size + left - 1, 16)
+        torch.testing.assert_close(got, large(x, left), rtol=0, atol=SIN_ATOL)
+        assert small.pe is table and small.pe.data_ptr() == address
+
+
+def _tiny(arch: str):
+    """The ``test_layer_waist`` tiny config, for the two architectures with a growing table."""
+    from oasr.models.paraformer.config import ParaformerModelConfig
+    from oasr.models.zipformer.config import ZipformerEncoderConfig, ZipformerModelConfig
+
+    configs = {
+        "zipformer": ZipformerModelConfig(
+            vocab_size=32,
+            encoder=ZipformerEncoderConfig(
+                feature_dim=80,
+                downsampling_factor=(1, 2),
+                encoder_dim=(64, 96),
+                num_encoder_layers=(1, 1),
+                query_head_dim=(8,),
+                pos_head_dim=(4,),
+                value_head_dim=(6,),
+                num_heads=(4, 4),
+                feedforward_dim=(64, 96),
+                cnn_module_kernel=(15, 15),
+                pos_dim=16,
+                causal=False,
+            ),
+        ),
+        "paraformer": ParaformerModelConfig(
+            vocab_size=64,
+            input_size=80,
+            encoder_output_size=32,
+            encoder_attention_heads=2,
+            encoder_linear_units=64,
+            encoder_num_blocks=2,
+            decoder_attention_heads=2,
+            decoder_linear_units=64,
+            decoder_num_blocks=1,
+            decoder_att_layer_num=1,
+            predictor_idim=32,
+        ),
+    }
+    return get_model_entry(arch).model_cls.from_config(configs[arch])
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "arch,short,long",
+    # Zipformer's first stack runs at half the feature rate and its table holds
+    # 1000 frames; Paraformer's process-wide table grew in 512-frame steps.
+    [("zipformer", 300, 2200), ("paraformer", 200, 700)],
+)
+def test_a_long_request_leaves_a_captured_encoder_intact(arch, short, long):
+    """Capture a short shape, run one long request eagerly, replay the short shape.
+
+    The replay must still equal the eager forward.  Before the fix the long
+    request freed the table the capture read, and :func:`occupy_free_memory`
+    makes the freed storage read as NaN rather than as whatever stale bytes it
+    happened to keep.
+    """
+    torch.manual_seed(0)
+    model = _tiny(arch).to(dtype=torch.float16).to("cuda").eval()
+
+    def inputs(frames: int):
+        feats = torch.randn(2, frames, 80, device="cuda", dtype=torch.float16)
+        lens = torch.tensor([frames, frames - 17], dtype=torch.int32, device="cuda")
+        return feats, lens
+
+    feats, lens = inputs(short)
+    with torch.no_grad():
+        want = model.encode_offline(feats, lens)[0].clone()
+        graph, (got, _) = capture_graph(lambda: model.encode_offline(feats, lens))
+        model.encode_offline(*inputs(long))
+        torch.cuda.synchronize()
+        sentinels = occupy_free_memory()
+        graph.replay()
+        torch.cuda.synchronize()
+    assert torch.isfinite(got).all(), "the replay read freed memory"
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert written_sentinels(sentinels) == 0, "the replay wrote into freed memory"

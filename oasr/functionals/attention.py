@@ -63,9 +63,6 @@ from oasr.jit.cute_runtime import current_stream as _current_stream
 _dummy_bias_cache: dict = {}
 _dummy_block_table_cache: dict = {}
 
-# Per-device length buffers grow lazily and are reused in offline mode.
-_seqlens_buffer_cache: dict = {}
-
 # Must match the kernel tile. Paged bias reads full tiles, so padding is required
 # to keep every read in bounds, especially with graph-pool allocations.
 _KERNEL_M_BLOCK = 64
@@ -93,22 +90,18 @@ def _get_dummy_block_table(device: torch.device) -> torch.Tensor:
 
 
 def _get_offline_seqlens(B: int, T_k: int, device: torch.device) -> torch.Tensor:
-    """Return a ``(B,)`` int32 tensor filled with ``T_k``.
+    """Return a ``(B,)`` int32 tensor filled with ``T_k``, owned by this call.
 
-    Uses a process-cached buffer that grows as B increases; fills the live
-    view in place so we don't allocate per call. The returned tensor is a
-    view (not a fresh allocation); the underlying buffer outlives the call.
+    Allocated per call, never shared.  A process-wide buffer filled in place
+    costs the same one launch, but a captured graph records both the fill and the
+    kernel's read at its address: replaced when a wider batch arrived, it was
+    freed under every earlier capture, whose replays then wrote ``T_k`` into
+    memory that belonged to another tensor; shared, it let two streams overwrite
+    each other's lengths between the fill and the read.  Per call, it is an
+    ordinary allocation on the calling stream -- from the capture's private pool
+    under capture.
     """
-    idx = device.index if device.index is not None else 0
-    buf = _seqlens_buffer_cache.get(idx)
-    if buf is None or buf.numel() < B:
-        # Round up to a small power-of-two so we don't churn on B+/-1.
-        cap = max(8, 1 << (B - 1).bit_length())
-        buf = torch.empty((cap,), dtype=torch.int32, device=device)
-        _seqlens_buffer_cache[idx] = buf
-    view = buf[:B]
-    view.fill_(T_k)
-    return view
+    return torch.full((B,), T_k, dtype=torch.int32, device=device)
 
 
 def _canonical_strides(shape) -> tuple:
@@ -1398,8 +1391,8 @@ def _call_cute_dsl(
     else:
         bias_t = _get_dummy_bias(q.dtype, device)
 
-    # cache_seqlens: synthesize a (B,) buffer of T_k in offline mode using
-    # the cached process buffer; otherwise use the caller's tensor.
+    # cache_seqlens: synthesize a (B,) tensor of T_k in offline mode;
+    # otherwise use the caller's tensor.
     if cache_seqlens is not None:
         seqlens_t = _ensure_canonical(cache_seqlens)
     else:
