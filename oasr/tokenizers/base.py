@@ -115,7 +115,9 @@ class Tokenizer(ABC):
     def decode_incremental(self, new_ids: Sequence[int], state: Dict[str, Any]) -> str:
         """Append ids and return text added since the previous call.
 
-        Mutates ``state``; concatenated deltas must equal ``decode(all_ids)``.
+        Mutates ``state``; ``state["text"]`` must equal ``decode(all_ids)``, and so
+        must the concatenated deltas, except that a byte-level tokenizer may hold
+        back a trailing incomplete character until a later id completes it.
         """
         ids = state.setdefault("ids", [])
         ids.extend(int(i) for i in new_ids)

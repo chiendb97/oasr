@@ -105,12 +105,19 @@ class LlmDecodeStrategy(IncrementalArStrategy):
 
         The audio half is constant because the frontend is fixed-window — a 30 s
         window always yields the same number of tower outputs — so this is a
-        real bound, not an average.  Two poolings of a Whisper-geometry tower:
-        ``(mel - 1)//2 + 1`` then ``(feat - 2)//2 + 1``, then AvgPool1d(2).
+        real bound, not an average.  Counted by the encoder's own length rule
+        (``Qwen2AudioTower.output_lengths``: 750 for the 30 s window), not
+        re-derived here: a copy of the formula applied the pooling halving
+        twice and counted 375, which undersized the decoder KV pool and the
+        admission budget by half the audio, so concurrent clips past ~15 s
+        failed their prefill.  An encoder with no rule is bounded by its input.
         """
         mel_frames = int(self._config.feature_config.fixed_window_frames or 3000)
-        feat = (mel_frames - 1) // 2 + 1
-        audio_tokens = ((feat - 2) // 2 + 1) // 2
+        output_lengths = getattr(getattr(self._model, "encoder", None), "output_lengths", None)
+        if output_lengths is None:
+            audio_tokens = mel_frames
+        else:
+            audio_tokens = int(output_lengths(torch.tensor([mel_frames]))[0])
         text_tokens = len(self._prefix_ids) + len(self._default_suffix_ids)
         return int(audio_tokens + text_tokens)
 

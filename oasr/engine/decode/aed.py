@@ -128,6 +128,10 @@ class AedDecodeStrategy(IncrementalArStrategy):
         else:
             prompt_ids = torch.tensor(rows, dtype=torch.long, device=device)
         max_new = [self._row_cap(r, self._cap) for r in requests]
+        # Only a row that asked pays for the extra slice, and only a checkpoint
+        # with the token has the signal.
+        has_token = getattr(self._mcfg, "no_speech_token_id", None) is not None
+        no_speech = has_token and any(wants_speech_activity(r) for r in requests)
         with torch.no_grad():
             # capacity → the decoder preallocates its KV buffers and every step
             # writes its own row's slot in place.  It is also what makes the
@@ -138,8 +142,20 @@ class AedDecodeStrategy(IncrementalArStrategy):
                 prompt_ids,
                 capacity=prompt_ids.size(1) + max(max_new) + 1,
                 kv_manager=self.kv_manager(),
+                **({"all_positions": True} if no_speech else {}),
             )
-        return Prefill(state=state, logits=logits, max_new=max_new)
+        no_speech_logits = None
+        if no_speech:
+            # Whisper predicts ``<|nospeech|>`` in place of the language token,
+            # so it is read at the start-of-transcript position — as OpenAI's
+            # ``probs_at_sot`` and HF's no-speech detection both do.  The last
+            # prompt position, after ``<|notimestamps|>``, puts ~0 on it even
+            # for silence.  ``sot_sequence`` always starts the prompt with SOT.
+            no_speech_logits = logits[:, 0]
+            logits = logits[:, -1]
+        return Prefill(
+            state=state, logits=logits, max_new=max_new, no_speech_logits=no_speech_logits
+        )
 
     def _prompt_for(self, request: Request) -> List[int]:
         """This request's SOT sequence, with its task / language slots applied.
@@ -180,15 +196,15 @@ class AedDecodeStrategy(IncrementalArStrategy):
         return ("offline",) if self._can_align and self._beam <= 1 else ()
 
     def prefill_no_speech(
-        self, requests: List[Request], logits: torch.Tensor
+        self, requests: List[Request], logits: Optional[torch.Tensor]
     ) -> List[Optional[float]]:
-        """``P(<|nospeech|>)`` per row, from the position it is defined at.
+        """``P(<|nospeech|>)`` per row, from the start-of-transcript logits.
 
         One softmax over ``(B, V)`` and one small device→host copy, and only when
         a row asked — the copy is a stream synchronisation, which is exactly the
         kind of cost that must not land on requests that did not ask for it.
         """
-        if not any(wants_speech_activity(r) for r in requests):
+        if logits is None or not any(wants_speech_activity(r) for r in requests):
             return [None] * len(requests)
         detector = self._speech_detector(
             no_speech_token_id=getattr(self._mcfg, "no_speech_token_id", None)

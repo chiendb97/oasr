@@ -17,7 +17,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -101,6 +101,59 @@ def _control_token_tables(tok_json: Path) -> Tuple[Dict[str, int], Dict[str, int
     return tasks, languages
 
 
+#: The language a multilingual snapshot decodes in when nothing pins one.  The
+#: same default ``config.json`` carries on the snapshots that pin it at all.
+_DEFAULT_LANGUAGE = "en"
+
+
+def _forced_decoder_ids(
+    gen: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    languages: Mapping[str, int],
+    no_timestamps_id: Optional[int],
+) -> List[Tuple[int, int]]:
+    """The decoder prompt's forced ``(position, token)`` pairs after SOT.
+
+    ``generation_config.json`` marks a slot HF resolves at run time with
+    ``null``.  ``config.json``'s concrete id for that position wins when there
+    is one (whisper-tiny pins ``<|en|>`` there).  large-v2/v3 ship no fallback:
+    position 1 is the language, which HF fills by running language detection,
+    and ``<|notimestamps|>`` is appended by ``generate`` rather than listed.  So
+    the prompt converted as ``<|startoftranscript|> <|transcribe|>``: no
+    language token, decoding in timestamp mode, and a per-request ``language``
+    refused because the slot it substitutes was gone.  This engine does not
+    detect the language, so the slot gets :data:`_DEFAULT_LANGUAGE`, which a
+    request's ``language`` replaces, and the prompt ends in
+    ``<|notimestamps|>`` unless the snapshot asks for timestamps.
+    """
+    gen_forced = {int(p): t for p, t in (gen.get("forced_decoder_ids") or [])}
+    raw_forced = {int(p): t for p, t in (raw.get("forced_decoder_ids") or [])}
+    multilingual = bool(gen.get("is_multilingual", bool(languages)))
+    forced: List[Tuple[int, int]] = []
+    for p in sorted(set(gen_forced) | set(raw_forced)):
+        tok = gen_forced.get(p)
+        if tok is None:
+            tok = raw_forced.get(p)
+        if tok is None and p == 1 and multilingual and _DEFAULT_LANGUAGE in languages:
+            tok = languages[_DEFAULT_LANGUAGE]
+            logger.info(
+                "whisper: the snapshot leaves the language slot to detection, which "
+                "OASR does not run; decoding in <|%s|> unless a request sets `language`",
+                _DEFAULT_LANGUAGE,
+            )
+        if tok is not None:
+            forced.append((p, int(tok)))
+        else:
+            logger.warning("whisper: forced decoder slot %d is unset and was dropped", p)
+    if (
+        no_timestamps_id is not None
+        and not gen.get("return_timestamps", False)
+        and int(no_timestamps_id) not in {t for _, t in forced}
+    ):
+        forced.append((max((p for p, _ in forced), default=0) + 1, int(no_timestamps_id)))
+    return forced
+
+
 class HFWhisperConverter(BaseCheckpointConverter):
     """Checkpoint converter for HF ``model_type: "whisper"`` snapshots."""
 
@@ -141,23 +194,9 @@ class HFWhisperConverter(BaseCheckpointConverter):
                 v = raw.get(key)
             return default if v is None else v
 
-        # generation_config marks auto-detected slots with null (e.g.
-        # ``[[1, null]]`` for language detection); fall back to config.json's
-        # concrete id per position (the recipe default, <|en|> on multilingual
-        # snapshots) and drop any slot neither file pins — greedy decoding
-        # here does not run language detection.
-        gen_forced = {int(p): t for p, t in (gen.get("forced_decoder_ids") or [])}
-        raw_forced = {int(p): t for p, t in (raw.get("forced_decoder_ids") or [])}
-        positions = sorted(set(gen_forced) | set(raw_forced))
-        forced = []
-        for p in positions:
-            tok = gen_forced.get(p)
-            if tok is None:
-                tok = raw_forced.get(p)
-            if tok is not None:
-                forced.append((p, int(tok)))
         tok_json = Path(ckpt_dir) / "tokenizer.json"
         tasks, languages = _control_token_tables(tok_json)
+        forced = _forced_decoder_ids(gen, raw, languages, pick("no_timestamps_token_id", None))
         no_speech = _no_speech_token_id(tok_json)
         # Published alignment heads ride in generation_config.json only; a
         # snapshot without them still converts, and word timestamps fall back

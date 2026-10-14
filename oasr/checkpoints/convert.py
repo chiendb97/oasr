@@ -33,7 +33,7 @@ def convert_to_native(
     checkpoint_name: str = "final.pt",
 ) -> Path:
     """Convert *src_dir* (WeNet / icefall / native) into a native bundle at *dst_dir*."""
-    from oasr.models.registry import get_model_entry, load_checkpoint_bundle
+    from oasr.models.registry import check_load_report, get_model_entry, load_checkpoint_bundle
 
     arch, bundle = load_checkpoint_bundle(
         Path(src_dir), checkpoint_name=checkpoint_name, architecture=architecture
@@ -47,6 +47,7 @@ def convert_to_native(
         load_native_weights(model, dict(bundle.state_dict))
     else:
         report = model.load_weights(bundle.state_dict)
+        check_load_report(report, entry.converter, arch)
         if report is not None:
             print(report.summary())
 

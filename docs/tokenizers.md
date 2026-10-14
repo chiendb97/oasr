@@ -80,7 +80,7 @@ and both are contractually required to concatenate back to it:
 
 | method | who asks | contract |
 |---|---|---|
-| `decode_incremental(new_ids, state)` | streaming and AR partials, one chunk at a time | concatenating every delta equals `decode(all_ids)` |
+| `decode_incremental(new_ids, state)` | streaming and AR partials, one chunk at a time | `state["text"]` equals `decode(all_ids)`, and so does concatenating every delta, except for a trailing incomplete character (below) |
 | `token_pieces(ids)` | word timings, once per finished hypothesis | `"".join(token_pieces(ids)) == decode(ids)` |
 
 Both have a **correct default on the ABC** and exist to be overridden for speed,
@@ -93,6 +93,15 @@ the word grouping, which is C++ too, and both ship in every successful build.
 A kind whose rendering is not piece-local (`funasr_char`'s
 `@@` merges, SentencePiece's word boundaries) is correct on the default and
 simply pays for it.
+
+A byte-level tokenizer (`huggingface`, so Whisper and Qwen) splits a CJK
+character or an emoji across tokens, and the first ones render as U+FFFD until
+the last completes it.  `decode_incremental` holds such a tail back from the
+delta, as HF's `TextIteratorStreamer` holds it back from a stream, so the
+completing token's piece is the character; `state["text"]` keeps it, and
+`token_pieces` flushes it onto the last token when a sequence ends mid-character.
+Diffing the U+FFFD in made the pieces carry it as a "word" and repeat the
+transcript so far.
 
 `decode` deliberately stays in Python for every kind.  It is the same handful of
 operations as `token_pieces`, but it produces the transcript itself and runs on

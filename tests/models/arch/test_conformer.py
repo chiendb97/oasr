@@ -32,11 +32,8 @@ from wenet.models.transformer import encoder as wenet_encoder  # type: ignore  #
 from wenet.utils.common import mask_to_bias  # type: ignore  # noqa: E402
 from wenet.utils.init_model import init_model  # type: ignore  # noqa: E402
 
-from oasr.models.conformer import (  # noqa: E402
-    ConformerEncoder,
-    ConformerEncoderConfig,
-    load_wenet_checkpoint,
-)
+from oasr.models.conformer import ConformerEncoder, load_wenet_checkpoint  # noqa: E402
+from oasr.models.conformer.convert import build_config_from_wenet  # noqa: E402
 
 
 def make_encoder_config(
@@ -70,6 +67,24 @@ def make_encoder_config(
     }
 
 
+def perturb_norms(module: torch.nn.Module) -> None:
+    """Give every norm non-trivial parameters and statistics.
+
+    At initialisation a ``BatchNorm1d`` in eval mode is close to the identity and
+    a LayerNorm's affine part is, so swapping one norm for the other moved the
+    output by less than the tolerance: this test passed while ``norm_conv`` was
+    the wrong kind of norm.
+    """
+    with torch.no_grad():
+        for mod in module.modules():
+            if isinstance(mod, (torch.nn.LayerNorm, torch.nn.BatchNorm1d)):
+                mod.weight.uniform_(0.5, 1.5)
+                mod.bias.uniform_(-0.5, 0.5)
+            if isinstance(mod, torch.nn.BatchNorm1d):
+                mod.running_mean.uniform_(-1.0, 1.0)
+                mod.running_var.uniform_(0.5, 2.0)
+
+
 @pytest.mark.parametrize("output_size,num_blocks", [(64, 1), (128, 1), (64, 4), (128, 4)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_conformer_encoder_matches_wenet(output_size: int, num_blocks: int, dtype: torch.dtype):
@@ -87,23 +102,18 @@ def test_conformer_encoder_matches_wenet(output_size: int, num_blocks: int, dtyp
     )
 
     ref_encoder = wenet_encoder.ConformerEncoder(**wenet_encoder_config)
+    perturb_norms(ref_encoder)
 
-    impl_encoder = ConformerEncoder(
-        ConformerEncoderConfig(
-            input_size=wenet_encoder_config["input_size"],
-            output_size=wenet_encoder_config["output_size"],
-            num_blocks=wenet_encoder_config["num_blocks"],
-            attention_heads=wenet_encoder_config["attention_heads"],
-            linear_units=wenet_encoder_config["linear_units"],
-            use_cnn_module=wenet_encoder_config["use_cnn_module"],
-            cnn_module_kernel=wenet_encoder_config["cnn_module_kernel"],
-        )
-    )
+    # Through the converter, as a checkpoint is: a config built by hand here
+    # cannot see a field the converter drops or misroutes.
+    raw = {"input_dim": 80, "output_dim": 32, "encoder_conf": wenet_encoder_config}
+    impl_encoder = ConformerEncoder(build_config_from_wenet(raw).encoder)
 
     # Pass full WeNet state dict; _load_from_state_dict hooks in OASR modules
     # handle key remapping (conv.0 → conv1) and weight layout conversion.
     ref_sd = ref_encoder.state_dict()
-    impl_encoder.load_state_dict(ref_sd, strict=False)
+    result = impl_encoder.load_state_dict(ref_sd, strict=False)
+    assert result.missing_keys == []
 
     ref_encoder = ref_encoder.eval().to(dtype=dtype, device=torch.device("cuda"))
     impl_encoder = impl_encoder.eval().to(dtype=dtype, device=torch.device("cuda"))

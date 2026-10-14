@@ -25,6 +25,9 @@ from .registry import register_tokenizer
 
 logger = logging.getLogger(__name__)
 
+#: What a decoder renders an incomplete UTF-8 sequence as.
+_REPLACEMENT = "\ufffd"
+
 
 class HuggingFaceTokenizer(Tokenizer):
     """Wraps a ``tokenizers.Tokenizer`` loaded from a ``tokenizer.json``."""
@@ -126,6 +129,15 @@ class HuggingFaceTokenizer(Tokenizer):
         decode a bounded suffix window, diff it against the same window's
         previous rendering, and append the difference — cost per partial is
         constant in the transcript length instead of linear.
+
+        A window that ends partway through a character renders that tail as
+        U+FFFD until a later token completes it, so the tail is held back from
+        the returned delta, as ``TextIteratorStreamer`` holds it back from a
+        stream.  Diffing it in made the completing token's rendering disagree
+        with the previous one, which sent every CJK character and emoji down
+        the full re-decode and returned the whole transcript as that token's
+        piece.  ``state["text"]`` still includes the tail, so it always equals
+        ``decode(all_ids)``; :meth:`token_pieces` flushes it.
         """
         ids = state.setdefault("ids", [])
         ids.extend(int(i) for i in new_ids)
@@ -135,35 +147,56 @@ class HuggingFaceTokenizer(Tokenizer):
         # time.  With a stable anchor, ``decode(ids[anchor:])`` only ever grows.
         anchor = state.get("anchor", 0)
         rendered = self.decode(ids[anchor:])
+        stable = rendered.rstrip(_REPLACEMENT)
+        tail = rendered[len(stable) :]
         prev_window = state.get("window_text", "")
-        if not rendered.startswith(prev_window):
+        if not stable.startswith(prev_window):
             # Appending re-rendered part of the window (a merge absorbed an
             # earlier token).  Recompute in full rather than emit a wrong delta.
             full = self.decode(ids)
-            prev = state.get("text", "")
+            full_stable = full.rstrip(_REPLACEMENT)
+            prev = state.get("stable", "")
             state["text"] = full
-            state["window_text"] = rendered
-            return full[len(prev) :] if full.startswith(prev) else full
+            state["stable"] = full_stable
+            state["window_text"] = stable
+            return full_stable[len(prev) :] if full_stable.startswith(prev) else full_stable
 
-        delta = rendered[len(prev_window) :]
+        delta = stable[len(prev_window) :]
         # ``pop`` then ``+=``, not ``get`` then ``+``.  ``a + b`` always
         # allocates and copies both operands, so the windowed decode above was
         # constant-cost while the accumulation beneath it stayed linear in the
         # transcript.  Growing in place needs the string to be the sole
-        # reference, which is what popping it out of the dict gives.
-        text = state.pop("text", "")
-        text += delta
-        state["text"] = text
+        # reference, which is what popping it out of the dict gives — both
+        # keys, since ``text`` is the same object whenever nothing is held back.
+        state.pop("text", None)
+        emitted = state.pop("stable", "")
+        emitted += delta
+        state["stable"] = emitted
+        state["text"] = emitted + tail if tail else emitted
         if len(ids) - anchor > 2 * self._INCREMENTAL_WINDOW:
             # Re-anchor, keeping a window of left context so the next decode
             # still has enough neighbours to render byte-BPE fragments.  The
             # accumulated ``text`` is authoritative and unaffected.
             anchor = len(ids) - self._INCREMENTAL_WINDOW
             state["anchor"] = anchor
-            state["window_text"] = self.decode(ids[anchor:])
+            state["window_text"] = self.decode(ids[anchor:]).rstrip(_REPLACEMENT)
         else:
-            state["window_text"] = rendered
+            state["window_text"] = stable
         return delta
+
+    def token_pieces(self, ids: Sequence[int]) -> List[str]:
+        """:meth:`decode_incremental`'s deltas, one id at a time, plus the tail.
+
+        A sequence that stops partway through a character (a generation cut at
+        its cap) still renders that tail in ``decode``; it belongs to the last
+        token, so the pieces concatenate to ``decode(ids)`` either way.
+        """
+        state = self.new_decode_state()
+        pieces = [self.decode_incremental((int(i),), state) for i in ids]
+        tail = state.get("text", "")[len(state.get("stable", "")) :]
+        if tail and pieces:
+            pieces[-1] += tail
+        return pieces
 
 
 register_tokenizer("huggingface", HuggingFaceTokenizer.from_spec)

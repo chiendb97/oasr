@@ -643,6 +643,14 @@ tokenizer). Positions and ids move between Whisper releases — large-v3 added a
 language and shifted every id after it — so anything pinned to a number would
 select the neighbouring language, silently.
 
+large-v2/v3 list the language slot as `null` (HF fills it by running language
+detection) and add `<|notimestamps|>` in `generate` rather than listing it, with
+no concrete ids in `config.json` to fall back on. OASR does not detect the
+language, so the converter fills the slot with `<|en|>` — what `config.json` pins
+on the snapshots that pin one — and appends `<|notimestamps|>`; a request's
+`language` replaces the former. Dropping the slot instead decoded every request
+from `<|startoftranscript|> <|transcribe|>`, and refused every `language`.
+
 Substitution is **length-preserving**, which is what lets a batch mixing tasks
 prefill as one rectangular tensor; `AedDecodeStrategy._prefill` keeps the single
 `expand` when no request overrode anything.

@@ -398,7 +398,7 @@ class TestExpectedUnusedMatching:
             capability_drop_hints=dict(hints or {}),
         )
         with caplog.at_level(logging.WARNING):
-            registry._log_load_report(self._report(dropped), conv, "conformer")  # noqa: SLF001
+            registry.check_load_report(self._report(dropped), conv, "conformer")
         return [r.getMessage() for r in caplog.records]
 
     def test_a_dotted_component_is_matched_not_just_a_prefix(self, caplog):
@@ -625,13 +625,63 @@ class TestLoadReport:
             (),
             {"expected_unused_prefixes": ("decoder.",), "capability_drop_hints": {}},
         )()
-        from oasr.models.registry import _log_load_report
+        from oasr.models.registry import check_load_report
 
         model, _, report = instantiate_from_bundle(arch, bundle)
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="oasr.models.registry"):
-            _log_load_report(report, entry_converter, arch)
+            check_load_report(report, entry_converter, arch)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestMissingTensorsAreRefused:
+    """A model tensor the checkpoint does not fill fails the load.
+
+    It used to be reported and ignored, so a structurally wrong model ran with
+    those tensors at their initial values: a WeNet Conformer with the wrong
+    ``norm_conv``, an icefall transducer sniffed as Zipformer-CTC with a random
+    CTC head.  Both served garbage with no error.
+    """
+
+    @staticmethod
+    def _converter(hints=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(expected_unused_prefixes=(), capability_drop_hints=hints or {})
+
+    def test_an_unfilled_tensor_raises(self):
+        from oasr.models.base import LoadReport
+        from oasr.models.registry import check_load_report
+
+        report = LoadReport(mapped=["a"], dropped=[], missing=["ctc.ctc_lo.weight"])
+        with pytest.raises(ValueError, match=r"does not fill 1 .*ctc\.ctc_lo\.weight"):
+            check_load_report(report, self._converter(), "zipformer")
+
+    def test_the_error_carries_the_drop_hints_that_fired(self):
+        from oasr.models.base import LoadReport
+        from oasr.models.registry import check_load_report
+
+        report = LoadReport(mapped=["a"], dropped=["joiner.w"], missing=["ctc.w"])
+        hints = {"joiner.": "load it as a transducer", "decoder.": "not this one"}
+        with pytest.raises(ValueError, match="load it as a transducer") as err:
+            check_load_report(report, self._converter(hints), "zipformer")
+        assert "not this one" not in str(err.value)
+
+    @pytest.mark.requires_assets("TRANSDUCER_CKPT")
+    def test_a_transducer_dir_is_not_served_as_zipformer_ctc(self):
+        """The real case: it sniffs as icefall Zipformer, which has no CTC head
+        in this checkpoint, and loaded with a random one."""
+        import assets
+
+        ckpt = assets.require("TRANSDUCER_CKPT")
+        arch, bundle = load_checkpoint_bundle(ckpt)
+        assert arch == "zipformer"
+        with pytest.raises(ValueError, match=r"architecture='transducer'"):
+            instantiate_from_bundle(arch, bundle)
+        # And named explicitly, it loads in full.
+        arch, bundle = load_checkpoint_bundle(ckpt, architecture="transducer")
+        _model, _cfg, report = instantiate_from_bundle(arch, bundle)
+        assert report is not None and not report.missing
 
 
 class TestNativeFormat:

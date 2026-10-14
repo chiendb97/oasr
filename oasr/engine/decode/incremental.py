@@ -160,6 +160,9 @@ class Prefill:
     logits: torch.Tensor
     #: Per-row generation cap, already clamped to the model's position capacity.
     max_new: List[int]
+    #: ``(B, V)`` logits a no-speech probability is read from, when a row asked
+    #: for one and the family has the signal; see :meth:`prefill_no_speech`.
+    no_speech_logits: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -658,7 +661,7 @@ class IncrementalArStrategy(DecodeStrategy):
             max_new=list(plan.max_new),
             opts=opts,
             align_enc=align_enc,
-            no_speech=self.prefill_no_speech(requests, plan.logits),
+            no_speech=self.prefill_no_speech(requests, plan.no_speech_logits),
         )
         if not self._absorb(fresh):
             self._groups.append(fresh)
@@ -955,9 +958,9 @@ class IncrementalArStrategy(DecodeStrategy):
         return outputs
 
     def prefill_no_speech(
-        self, requests: List[Request], logits: torch.Tensor
+        self, requests: List[Request], logits: Optional[torch.Tensor]
     ) -> List[Optional[float]]:
-        """``P(no speech)`` per row from the first generated position's logits.
+        """``P(no speech)`` per row from :attr:`Prefill.no_speech_logits`.
 
         The default is "this family has no such token", which is the honest
         answer for every AR family but Whisper.  Overridden rather than
