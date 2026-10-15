@@ -96,6 +96,43 @@ def test_workflow(tmp_path, capsys):
     assert (out / "baselines" / "nightly" / "run.json").is_file()
 
 
+def test_a_failed_point_fails_run_and_compare(tmp_path, capsys, monkeypatch):
+    """A point that raised is recorded and the run carries on -- but exits 1.
+
+    ``run`` used to exit 0 here and ``compare`` to skip the point, so
+    ``run && compare`` passed a candidate whose throughput benchmark crashed.
+    """
+    from benchmarks.asrbench.results import load_run
+    from benchmarks.asrbench.runners.offline import Throughput
+
+    data, out = tmp_path / "data", tmp_path / "out"
+    assert main(["--data-dir", str(data), "prepare", "synthetic"]) == 0
+    args = ["--data-dir", str(data), "run", "--profile", "selftest", "--backend", "mock",
+            "--out", str(out), "--no-monitor", "--num-items", "2", "--only"]  # fmt: skip
+    assert main(args + ["single,throughput", "--tag", "good"]) == 0
+    assert main(args + ["single", "--tag", "subset"]) == 0
+
+    async def crash(self, ctx, point, result):
+        raise RuntimeError("CUDA error: an illegal memory access")
+
+    monkeypatch.setattr(Throughput, "measure", crash)
+    capsys.readouterr()
+    assert main(args + ["single,throughput", "--tag", "crashed"]) == 1
+    captured = capsys.readouterr()
+    # By tag: directory names sort by second, then by a random run id.
+    runs = {load_run(p).meta["tag"]: p for p in out.iterdir() if p.is_dir()}
+    good, subset, crashed = runs["good"], runs["subset"], runs["crashed"]
+    assert captured.out.splitlines()[-1] == str(crashed)  # still printed, to inspect or compare
+    assert "FAILED throughput" in captured.err and "illegal memory access" in captured.err
+
+    assert main(["compare", str(good), str(crashed)]) == 1
+    assert "FAILED POINTS" in capsys.readouterr().out
+    # A deliberate subset is a lost result unless the caller says so.
+    assert main(["compare", str(good), str(subset)]) == 1
+    assert main(["compare", str(good), str(subset), "--allow-missing"]) == 0
+    assert main(["compare", str(subset), str(good)]) == 0
+
+
 def test_runs_are_found_by_id_under_the_results_root(tmp_path, capsys, monkeypatch):
     data, root = tmp_path / "data", tmp_path / "results"
     monkeypatch.setenv("ASRBENCH_RESULTS_DIR", str(root))

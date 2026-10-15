@@ -20,11 +20,10 @@ from oasr.features import FeatureConfig, extract_features_batch
 # These wrappers all delegate to C++ decoders inside the compiled ``oasr._C``
 # pybind extension.  It is built by CMake and therefore absent from a source
 # checkout that was never `pip install`ed — most of the CPU CI job's world.
-# Skip the module rather than let 26 tests fail with ModuleNotFoundError.
-pytest.importorskip(
-    "oasr._C",
-    reason="oasr._C not built (pip install -e . builds the CPU decoders)",
-)
+# Gate on the declared asset rather than let 26 tests fail with
+# ModuleNotFoundError; an `importorskip` here skipped them uncounted, even under
+# --strict-assets, on a GPU runner whose checkout had deleted the build.
+pytestmark = pytest.mark.requires_assets("OASR_C")
 
 # Only the real-audio tests need it, but a bare module-level `import torchaudio`
 # turns an environment where it is unimportable into a *collection error* — the

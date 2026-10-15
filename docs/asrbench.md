@@ -59,7 +59,7 @@ python -m benchmarks.asrbench run --profile smoke --backend oasr_engine -o dtype
 python -m benchmarks.asrbench runs
 python -m benchmarks.asrbench report <run-id>
 
-# 4. Gate a candidate against a baseline (exit 1 on regression).
+# 4. Gate a candidate against a baseline (exit 1 on a regression or a failed point).
 python -m benchmarks.asrbench compare <baseline-run-id> <candidate-run-id>
 ```
 
@@ -111,7 +111,7 @@ absent rather than zero.
 | `prepare NAME` | Index a local copy (`--source-dir`) or download (`--download`) a dataset |
 | `profiles [NAME]` | List built-in profiles, or print one resolved with any overrides applied |
 | `backends [-v]` | List backends, their availability and (`-v`) their options |
-| `run --profile P --backend B` | Execute a profile and write a run directory |
+| `run --profile P --backend B` | Execute a profile and write a run directory; exit 1 if any point failed |
 | `runs` | List stored runs, newest first |
 | `validate --backend B` | Measure WER and empty-transcript rate on a labelled subset (untimed) |
 | `compare BASE CAND` | Regression check between two runs or validation reports |
@@ -704,14 +704,36 @@ carry a banner. The default output directory is `<first run>/report`.
 
 ```bash
 python -m benchmarks.asrbench compare BASELINE CANDIDATE \
-    [--thresholds thresholds.yaml] [--json summary.json] [-v]
+    [--thresholds thresholds.yaml] [--json summary.json] [--allow-missing] [-v]
 ```
 
 | Exit code | Meaning |
 |---|---|
 | 0 | No regression |
-| 1 | At least one metric regressed |
+| 1 | A metric regressed, a point failed, or the candidate lost a result or metric the baseline measured |
 | 2 | Not comparable (different hardware, backend configuration or workloads; nothing matched; unreadable input) |
+
+What the candidate did not measure fails the gate as well as what got worse;
+otherwise a candidate that crashes passes:
+
+- **Failed points.** Any point that failed in the candidate, and any point the
+  baseline measured that the candidate reports `unsupported`, are listed under
+  `failed` and exit 1. A point that failed in the baseline but not in the
+  candidate has nothing to be judged against, so it is listed under `unjudged`.
+- **Missing results and metrics.** A result the baseline measured that is
+  absent from the candidate, or a thresholded metric the baseline has that the
+  candidate lacks (absent, `null` or NaN), is listed under `missing` and the
+  gate exits 1. An interrupted run is the usual cause, and `compare` notes a
+  run with no `finished_utc`. `--allow-missing` lists them without failing,
+  for a deliberate subset such as a `--only` run or a validation without
+  `--reference`.
+- **Telemetry.** A missing resource metric (process memory, NVML, the
+  allocator) is listed under `unjudged` and never fails, because its absence
+  means the sampler did not run.
+
+`run` itself exits 1 when any point failed. It still records the failure and
+continues with the next point, and it prints the run directory first so the
+run can be inspected or compared.
 
 Results are matched by key (`benchmark[point]@workload_id`). A metric
 regresses when it moves in its worse direction by more than **all** of:
@@ -738,9 +760,9 @@ rules:
   - {metric: final_latency_ms.p95, max_regression_pct: 20, min_abs: 20}
 ```
 
-The JSON summary lists `regressions`, `improvements`, `unchanged`,
-`insufficient_samples`, `skipped` (streaming-mode mismatches), results present
-on only one side, and blocking `problems`. A configuration problem names only
+The JSON summary lists `regressions`, `failed`, `missing`, `improvements`,
+`unchanged`, `insufficient_samples`, `unjudged`, `skipped` (streaming-mode
+mismatches), results present on only one side, and blocking `problems`. A configuration problem names only
 the fields that differ, for example
 `served[0].service_mode: 'offline' vs 'streaming'`.
 

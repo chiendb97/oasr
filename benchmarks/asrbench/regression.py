@@ -21,6 +21,18 @@ Absolute-only rules (``max_regression_abs``) suit rates such as ``error_rate``.
 The thresholds are inputs, not facts: the defaults are a starting point for a
 quiet machine, and a CI gate should carry its own file.
 
+What the candidate did *not* measure fails the gate too, because a gate that
+judges only the numbers it was given passes a candidate that crashed:
+
+* a point that failed in the candidate, and a point the baseline measured that
+  the candidate now reports unsupported;
+* a result the baseline measured that is absent from the candidate, and a
+  thresholded metric the baseline has that the candidate lacks.  Both can be
+  deliberate (a ``--only`` subset, a validation without ``--reference``), so
+  ``allow_missing`` lists them without failing.  A missing *telemetry* metric
+  (:attr:`MetricDef.telemetry`) is listed and never fails: its absence is about
+  the sampler, not the system under test.
+
 Exit codes: 0 no regression, 1 regression, 2 not comparable / bad input.
 """
 
@@ -35,8 +47,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from benchmarks.asrbench.metrics import HIGHER, LOWER, direction, min_samples_for
-from benchmarks.asrbench.results import STATUS_OK, load_run
+from benchmarks.asrbench.metrics import HIGHER, LOWER, direction, is_telemetry, min_samples_for
+from benchmarks.asrbench.results import STATUS_FAILED, STATUS_OK, load_run
 
 EXIT_OK, EXIT_REGRESSION, EXIT_INCOMPARABLE = 0, 1, 2
 
@@ -110,7 +122,9 @@ class Comparable:
     label: str
     kind: str  # "run" | "validation"
     meta: Dict[str, Any]
-    #: key -> (summary, extra) where extra carries streaming mode etc.
+    #: key -> (summary, extra); extra carries the status, its reason, the
+    #: streaming mode and the sweep point.  Every status is kept: a point that
+    #: failed is exactly what a regression gate must not skip.
     results: Dict[str, Tuple[Dict[str, float], Dict[str, Any]]]
 
 
@@ -135,16 +149,21 @@ def load_comparable(path: Path) -> Comparable:
                 "environment": doc.get("environment", {}),
                 "backend": {"name": doc["backend"]["name"], "options": doc["backend"]["options"]},
             },
-            results={key: ({k: v for k, v in summary.items() if v is not None}, {})},
+            results={
+                key: ({k: v for k, v in summary.items() if v is not None}, {"status": STATUS_OK})
+            },
         )
     run = load_run(path)
     results = {}
     for r in run.results:
-        if r.status != STATUS_OK:
-            continue
         results[r.key] = (
             r.summary,
-            {"streaming_mode": r.server.get("streaming_mode"), "point": r.point},
+            {
+                "status": r.status,
+                "reason": r.reason,
+                "streaming_mode": r.server.get("streaming_mode"),
+                "point": r.point,
+            },
         )
     return Comparable(path=run.path, label=run.label, kind="run", meta=run.meta, results=results)
 
@@ -222,6 +241,8 @@ def compatibility(
         sim = c.meta.get("simulated") or {}
         if sim.get("backend") or sim.get("inputs"):
             notes.append(f"{side} is simulated ({sim}) -- its numbers are not measurements")
+        if c.kind == "run" and not c.meta.get("finished_utc"):
+            notes.append(f"{side} run did not finish: the runner stopped before its last result")
     pb = base.meta.get("profile", {}).get("name")
     pc = cand.meta.get("profile", {}).get("name")
     if pb != pc:
@@ -229,6 +250,10 @@ def compatibility(
             f"profiles differ ({pb} vs {pc}); only results with identical keys are compared"
         )
     return problems, notes
+
+
+def _measured(x: Any) -> bool:
+    return x is not None and not (isinstance(x, float) and math.isnan(x))
 
 
 def _rule_for(rules: List[Rule], key: str) -> Optional[Rule]:
@@ -244,17 +269,37 @@ def compare_summaries(
     thresholds: Thresholds,
     point: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
-    """One verdict per thresholded metric present in both summaries."""
+    """One verdict per thresholded metric the baseline measured.
+
+    A metric the baseline has and the candidate lacks (absent, ``None`` or NaN)
+    is ``missing``, or ``unjudged`` when it is telemetry.  A metric only the
+    candidate has is new, and has nothing to regress from.
+    """
     out = []
-    for key in sorted(set(base) & set(cand)):
+    for key in sorted(base):
         rule = _rule_for(thresholds.rules, key)
         if rule is None or not rule.applies(point or {}):
             continue
         better = direction(key)
         if better not in (LOWER, HIGHER):
             continue
-        b, c = base[key], cand[key]
-        if b is None or c is None or any(isinstance(x, float) and math.isnan(x) for x in (b, c)):
+        b, c = base[key], cand.get(key)
+        if not _measured(b):
+            continue
+        if not _measured(c):
+            out.append(
+                {
+                    "metric": key,
+                    "better": better,
+                    "baseline": float(b),
+                    "candidate": None,
+                    "delta": None,
+                    "delta_pct": None,
+                    "limit": None,
+                    "noise": None,
+                    "verdict": "unjudged" if is_telemetry(key) else "missing",
+                }
+            )
             continue
         b, c = float(b), float(c)
         # A percentile its sample count cannot resolve is noise; do not judge it.
@@ -317,6 +362,7 @@ def compare(
     *,
     allow_hardware_change: bool = False,
     allow_config_change: bool = False,
+    allow_missing: bool = False,
 ) -> Tuple[Dict[str, Any], int]:
     problems, notes = compatibility(
         base,
@@ -330,20 +376,57 @@ def compare(
         "candidate": {"path": str(cand.path), "label": cand.label},
         "problems": problems,
         "notes": notes,
+        "allow_missing": allow_missing,
         "matched": 0,
         "unmatched_baseline": sorted(set(base.results) - set(cand.results)),
         "unmatched_candidate": sorted(set(cand.results) - set(base.results)),
         "regressions": [],
+        "failed": [],
+        "missing": [],
         "improvements": [],
         "unchanged": [],
         "insufficient_samples": [],
+        "unjudged": [],
         "skipped": [],
     }
+    if not problems and not set(base.results) & set(cand.results):
+        problems.append("no result is present in both runs (different profiles or inputs?)")
     if problems:
         summary["status"] = "incomparable"
         return summary, EXIT_INCOMPARABLE
-    for key in sorted(set(base.results) & set(cand.results)):
-        (sb, eb), (sc, ec) = base.results[key], cand.results[key]
+    for key in sorted(set(base.results) | set(cand.results)):
+        b, c = base.results.get(key), cand.results.get(key)
+        b_status = b[1].get("status", STATUS_OK) if b else None
+        c_status = c[1].get("status", STATUS_OK) if c else None
+        if c is not None and (
+            c_status == STATUS_FAILED or (b_status == STATUS_OK and c_status != STATUS_OK)
+        ):
+            summary["failed"].append(
+                {
+                    "result": key,
+                    "baseline": b_status,
+                    "candidate": c_status,
+                    "reason": c[1].get("reason"),
+                }
+            )
+            continue
+        if b is None or b_status != STATUS_OK:
+            if b is not None and c_status == STATUS_OK:
+                summary["unjudged"].append(
+                    {
+                        "result": key,
+                        "metric": None,
+                        "reason": f"the baseline has no measurement ({b_status}: "
+                        f"{b[1].get('reason')})",
+                    }
+                )
+            continue
+        if c is None:
+            summary["missing"].append(
+                {"result": key, "metric": None, "baseline": None, "candidate": None}
+            )
+            continue
+        (sb, eb), (sc, ec) = b, c
         if eb.get("streaming_mode") != ec.get("streaming_mode"):
             summary["skipped"].append(
                 {
@@ -360,16 +443,19 @@ def compare(
                 "regression": "regressions",
                 "improvement": "improvements",
                 "insufficient_samples": "insufficient_samples",
+                "missing": "missing",
+                "unjudged": "unjudged",
             }.get(v["verdict"], "unchanged")
             summary[bucket].append(v)
-    if summary["matched"] == 0:
-        summary["problems"].append(
-            "no result is present in both runs (different profiles or inputs?)"
-        )
+    if summary["matched"] == 0 and not summary["failed"]:
+        summary["problems"].append("no result was measured in both runs")
         summary["status"] = "incomparable"
         return summary, EXIT_INCOMPARABLE
-    summary["status"] = "regression" if summary["regressions"] else "pass"
-    return summary, EXIT_REGRESSION if summary["regressions"] else EXIT_OK
+    failing = (
+        summary["regressions"] or summary["failed"] or (summary["missing"] and not allow_missing)
+    )
+    summary["status"] = "regression" if failing else "pass"
+    return summary, EXIT_REGRESSION if failing else EXIT_OK
 
 
 def compare_paths(
@@ -409,6 +495,25 @@ def render_text(summary: Dict[str, Any], verbose: bool = False) -> str:
             f"{pct}  [{v['better']} is better; limit {limit}]"
         )
 
+    if summary.get("failed"):
+        lines.append("  FAILED POINTS (the candidate has no measurement):")
+        for f in summary["failed"]:
+            reason = (f.get("reason") or "").splitlines()
+            lines.append(
+                f"    {f['result']}: {f['baseline'] or 'absent'} -> {f['candidate']}"
+                + (f"  ({reason[0]})" if reason else "")
+            )
+    if summary.get("missing"):
+        lines.append(
+            "  missing from the candidate (allowed):"
+            if summary.get("allow_missing")
+            else "  MISSING FROM THE CANDIDATE (pass --allow-missing if that is deliberate):"
+        )
+        for m in summary["missing"]:
+            if m["metric"] is None:
+                lines.append(f"    {m['result']}: the whole result")
+            else:
+                lines.append(f"    {m['result']}  {m['metric']}: {m['baseline']:.4g} -> absent")
     for title, key in (("REGRESSIONS", "regressions"), ("improvements", "improvements")):
         if summary.get(key):
             lines.append(f"  {title}:")
@@ -421,6 +526,15 @@ def render_text(summary: Dict[str, Any], verbose: bool = False) -> str:
             f"  {len(summary['insufficient_samples'])} percentile(s) not judged: too few "
             "samples to resolve them (add requests or repetitions)"
         )
+    telemetry = [u for u in summary.get("unjudged", []) if u["metric"] is not None]
+    if telemetry:
+        lines.append(
+            f"  {len(telemetry)} telemetry metric(s) not judged: absent from the candidate "
+            f"(e.g. {telemetry[0]['metric']}; was the monitor off?)"
+        )
+    for u in summary.get("unjudged", []):
+        if u["metric"] is None:
+            lines.append(f"  not judged {u['result']}: {u['reason']}")
     for s in summary.get("skipped", []):
         lines.append(f"  skipped {s['result']}: {s['reason']}")
     return "\n".join(lines)

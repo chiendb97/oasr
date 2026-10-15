@@ -116,7 +116,10 @@ if(BUILD_PYTHON)
             "#include \"tvm_ffi_utils.h\"\n"
         )
         add_library(oasr_tvm_ffi_intellisense OBJECT ${OASR_TVM_FFI_INTELLISENSE_STUB})
+        # The stub is compiled as part of `all`, so a header tvm_ffi_utils.h
+        # includes but this list omits fails `pip install` in a fresh checkout.
         target_include_directories(oasr_tvm_ffi_intellisense PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
             ${CMAKE_SOURCE_DIR}/csrc
             ${TVM_FFI_INCLUDE_DIR}
             ${CUDAToolkit_INCLUDE_DIRS}

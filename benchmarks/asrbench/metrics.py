@@ -114,6 +114,11 @@ class MetricDef:
     unit: str
     better: str
     description: str
+    #: Sampled from the environment (the process monitor, NVML, the allocator)
+    #: rather than computed from the requests.  Its absence says the sampler did
+    #: not run, not that the system under test changed, so ``compare`` reports a
+    #: missing telemetry metric without failing on it.
+    telemetry: bool = False
 
 
 METRICS: List[MetricDef] = [
@@ -239,18 +244,42 @@ METRICS: List[MetricDef] = [
     MetricDef("late_chunk_pct", "%", LOWER, "Chunks sent later than the pacing tolerance allows."),
     MetricDef("chunk_lag_ms.*", "ms", INFO, "Chunk send time minus its real-time schedule."),
     # -- resources --------------------------------------------------------------
-    MetricDef("cpu_pct.*", "%", INFO, "Process CPU utilisation (100 = one core)."),
-    MetricDef("rss_mb.*", "MiB", LOWER, "Process resident memory."),
-    MetricDef("sys_mem_mb.*", "MiB", INFO, "System memory in use."),
-    MetricDef("gpu_util_pct.*", "%", INFO, "Device utilisation (NVML)."),
-    MetricDef("gpu_mem_mb.*", "MiB", LOWER, "Device memory in use (NVML, all processes)."),
+    MetricDef("cpu_pct.*", "%", INFO, "Process CPU utilisation (100 = one core).", telemetry=True),
+    MetricDef("rss_mb.*", "MiB", LOWER, "Process resident memory.", telemetry=True),
+    MetricDef("sys_mem_mb.*", "MiB", INFO, "System memory in use.", telemetry=True),
+    MetricDef("gpu_util_pct.*", "%", INFO, "Device utilisation (NVML).", telemetry=True),
     MetricDef(
-        "gpu_alloc_mb.*", "MiB", LOWER, "Peak torch allocator memory (in-process backends only)."
+        "gpu_mem_mb.*", "MiB", LOWER, "Device memory in use (NVML, all processes).", telemetry=True
     ),
-    MetricDef("gpu_reserved_mb.*", "MiB", LOWER, "Peak torch allocator reservation (in-process)."),
-    MetricDef("gpu_power_w.*", "W", INFO, "Device power draw (NVML)."),
-    MetricDef("energy_j", "J", LOWER, "Device energy over the measured window (power integral)."),
-    MetricDef("energy_j_per_audio_h", "J/h", LOWER, "Device energy per hour of audio processed."),
+    MetricDef(
+        "gpu_alloc_mb.*",
+        "MiB",
+        LOWER,
+        "Peak torch allocator memory (in-process backends only).",
+        telemetry=True,
+    ),
+    MetricDef(
+        "gpu_reserved_mb.*",
+        "MiB",
+        LOWER,
+        "Peak torch allocator reservation (in-process).",
+        telemetry=True,
+    ),
+    MetricDef("gpu_power_w.*", "W", INFO, "Device power draw (NVML).", telemetry=True),
+    MetricDef(
+        "energy_j",
+        "J",
+        LOWER,
+        "Device energy over the measured window (power integral).",
+        telemetry=True,
+    ),
+    MetricDef(
+        "energy_j_per_audio_h",
+        "J/h",
+        LOWER,
+        "Device energy per hour of audio processed.",
+        telemetry=True,
+    ),
     # -- correctness guardrail --------------------------------------------------
     MetricDef("wer_pct", "%", LOWER, "Corpus WER over the fixed labelled subset."),
     MetricDef(
@@ -275,6 +304,12 @@ def lookup(key: str) -> Optional[MetricDef]:
         if fnmatch.fnmatchcase(key, m.pattern):
             return m
     return None
+
+
+def is_telemetry(key: str) -> bool:
+    """Whether *key* is sampled from the environment (see :attr:`MetricDef.telemetry`)."""
+    m = lookup(key)
+    return bool(m and m.telemetry)
 
 
 def direction(key: str) -> str:
