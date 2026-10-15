@@ -290,13 +290,21 @@ def test_a_metric_the_candidate_lost_fails_the_gate_unless_allowed(mock_run, tmp
 
 
 def test_missing_telemetry_is_listed_and_never_fails(mock_run, tmp_path):
+    # The baseline's RSS is written here, not left to the monitor: the monitor
+    # samples it only when psutil imports, and test-cpu.yml does not install it.
+    def monitored(r):
+        r["summary"].update({"rss_mb.max": 900.0, "rss_mb.n": 20.0})
+
     def unmonitored(doc):
         for r in doc["results"]:
             r["summary"] = {k: v for k, v in r["summary"].items() if not k.startswith("rss_mb")}
 
-    summary, code = compare_paths(mock_run, _doctor(mock_run, tmp_path / "unmon", unmonitored))
+    base = _doctor(mock_run, tmp_path / "mon", _each("throughput", monitored))
+    summary, code = compare_paths(base, _doctor(mock_run, tmp_path / "unmon", unmonitored))
     assert code == EXIT_OK and not summary["missing"]
-    assert {u["metric"] for u in summary["unjudged"]} == {"rss_mb.max"}
+    unjudged = {(u["result"].split("[")[0], u["metric"]) for u in summary["unjudged"]}
+    assert ("throughput", "rss_mb.max") in unjudged
+    assert {metric for _, metric in unjudged} == {"rss_mb.max"}
     assert "telemetry metric(s) not judged" in render_text(summary)
 
 
