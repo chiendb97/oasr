@@ -168,7 +168,7 @@ try:
 except (ImportError, AttributeError):  # pragma: no cover
     _C_streaming = None
 
-needs_native = pytest.mark.skipif(_C_streaming is None, reason="oasr._C.streaming not built")
+needs_native = pytest.mark.requires_assets("OASR_C")
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 FEAT_DIM = 8

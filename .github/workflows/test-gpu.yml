@@ -1,8 +1,10 @@
 name: test-gpu
 
 # Nightly self-hosted suite with strict checkpoint coverage.
-# The runner needs the CUDA toolchain, an editable install, and assets declared
-# in tests/assets.py. Missing assets must be explicitly allow-listed below.
+# The runner needs the CUDA toolchain, a Rust toolchain with protoc on PATH,
+# torch, and the assets declared in tests/assets.py; every job builds the
+# extensions itself (see "Build the extensions"). Missing assets must be
+# explicitly allow-listed below.
 # SECURITY: never add a pull_request trigger; fork code must not reach this host.
 
 on:
@@ -68,6 +70,27 @@ jobs:
         with:
           submodules: recursive
 
+      # actions/checkout runs `git clean -ffdx`, which deletes every gitignored
+      # build output -- oasr/_C*.so and oasr/_core*.so with the rest -- so each
+      # job builds them again.  Without a build, the tests gated on `_C` skip
+      # (fatally under $STRICT, now that tests/assets.py declares it as OASR_C)
+      # and engine tests that reach the C++ beam read-back or alignment pass
+      # fail for a reason that is not the code's.  --no-build-isolation because
+      # setup.py imports torch to find its CMake prefix (as ci/modal_app.py
+      # builds); --no-deps so the runner's CUDA torch is never re-resolved.  The
+      # cargo target dir lives outside the workspace so the clean keeps the Rust
+      # build.
+      - name: Build the extensions
+        run: |
+          python -m pip install "setuptools>=61.0" wheel "cmake>=3.18" "pybind11>=2.10" ninja \
+            "setuptools-rust>=1.10"
+          CARGO_TARGET_DIR="$HOME/.cache/oasr/ci-cargo-target" \
+            python -m pip install --no-deps --no-build-isolation -e .
+
+      # Fail here, once, rather than as a skip or an error in every test.
+      - name: Check the extensions import
+        run: python -c "import oasr._C, oasr._core"
+
       - name: Report the environment
         run: |
           nvidia-smi
@@ -88,6 +111,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # The build and the import check, as in the suite job above.
+      - name: Build the extensions
+        run: |
+          python -m pip install "setuptools>=61.0" wheel "cmake>=3.18" "pybind11>=2.10" ninja \
+            "setuptools-rust>=1.10"
+          CARGO_TARGET_DIR="$HOME/.cache/oasr/ci-cargo-target" \
+            python -m pip install --no-deps --no-build-isolation -e .
+      - name: Check the extensions import
+        run: python -c "import oasr._C, oasr._core"
       - name: pytest -m slow
         run: python -m pytest tests/ -m "slow" -q -rs $STRICT
       - name: pytest -m concurrent
@@ -103,6 +135,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      # The build and the import check, as in the suite job above.
+      - name: Build the extensions
+        run: |
+          python -m pip install "setuptools>=61.0" wheel "cmake>=3.18" "pybind11>=2.10" ninja \
+            "setuptools-rust>=1.10"
+          CARGO_TARGET_DIR="$HOME/.cache/oasr/ci-cargo-target" \
+            python -m pip install --no-deps --no-build-isolation -e .
+      - name: Check the extensions import
+        run: python -c "import oasr._C, oasr._core"
       - name: pytest tests/
         run: |
           python -m pytest tests/ \

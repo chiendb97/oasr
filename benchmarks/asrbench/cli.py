@@ -6,10 +6,11 @@
     prepare NAME [--download]      index or fetch a dataset (fetching is opt-in)
     profiles [NAME]                list profiles, or print one resolved
     backends                       registered backends, options, availability
-    run --profile P --backend B    measure; writes a run directory
+    run --profile P --backend B    measure; writes a run directory; exit 1 if a point failed
     runs                           list stored runs, newest first
     validate --backend B           WER guardrail on a fixed labelled subset (untimed)
-    compare BASE CAND              regression check; exit 1 on regression
+    compare BASE CAND              regression check; exit 1 on a regression, a failed
+                                   point, or a result or metric the candidate lost
     report RUN [RUN ...]           Markdown (+CSV, +plots) from stored runs
     recompute RUN                  re-derive summaries from raw records
     save-baseline RUN --name N     keep a run as a named baseline
@@ -212,7 +213,29 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[asrbench] {exc}", file=sys.stderr)
         return 2
     print(path)
-    return 0
+    return _failed_points(path)
+
+
+def _failed_points(path: Path) -> int:
+    """1 when any point of the run at *path* failed, after saying which.
+
+    A failed point is a crash the run recorded and carried on from; exiting 0
+    would let ``run && compare`` treat it as a measurement.  An *unsupported*
+    point is a declared capability, not a failure.  The run directory is still
+    printed first, so a caller can inspect or compare it.
+    """
+    from benchmarks.asrbench.results import STATUS_FAILED, load_run
+
+    failed = [r for r in load_run(path).results if r.status == STATUS_FAILED]
+    for r in failed:
+        reason = (r.reason or "").splitlines()
+        print(
+            f"[asrbench] FAILED {r.result_id}: {reason[0] if reason else 'no reason recorded'}",
+            file=sys.stderr,
+        )
+    if failed:
+        print(f"[asrbench] {len(failed)} point(s) failed", file=sys.stderr)
+    return 1 if failed else 0
 
 
 def cmd_validate(args: argparse.Namespace) -> int:
@@ -294,6 +317,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         thresholds,
         allow_hardware_change=args.allow_hardware_change,
         allow_config_change=args.allow_config_change,
+        allow_missing=args.allow_missing,
     )
     print(render_text(summary, verbose=args.verbose))
     if args.json:
@@ -457,6 +481,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", help="write the machine-readable summary here")
     p.add_argument("--allow-hardware-change", action="store_true")
     p.add_argument("--allow-config-change", action="store_true")
+    p.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="list, without failing on, baseline results and metrics the candidate lacks "
+        "(a deliberate --only subset, or a validation without --reference)",
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="list unchanged metrics too")
     p.set_defaults(fn=cmd_compare)
 

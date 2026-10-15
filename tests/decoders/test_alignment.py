@@ -38,7 +38,6 @@ import pytest
 import torch
 
 from oasr.engine.decode.alignment import (
-    _CPP as _ALIGNMENT,
     AlignmentFields,
     FrameClock,
     TokenAlignment,
@@ -58,10 +57,7 @@ BLANK = 0
 #: implementation to fall back to, so the classes that exercise them need the
 #: built extension.  Everything else in this file (the clock, the CTC oracle,
 #: the DTW, the per-family contract) is pure Python and runs anywhere.
-requires_cpp = pytest.mark.skipif(
-    _ALIGNMENT is None,
-    reason="oasr._C.alignment is not built (test-cpu.yml builds no extension)",
-)
+requires_cpp = pytest.mark.requires_assets("OASR_C")  # test-cpu.yml builds no extension
 
 
 class _Detok:
@@ -867,10 +863,7 @@ class TestRealCheckpoint:
 # ---------------------------------------------------------------------------
 
 
-pytestmark = pytest.mark.skipif(
-    _ALIGNMENT is None,
-    reason="oasr._C.alignment is not built (test-cpu.yml builds no extension)",
-)
+pytestmark = requires_cpp
 
 
 @pytest.fixture(scope="module")

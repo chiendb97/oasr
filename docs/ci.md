@@ -110,6 +110,24 @@ wavs = assets.require_wavs(4)                # also gates on the file count
 **Never read the environment variable directly** — that is exactly the pattern
 that produced the trap.
 
+### The compiled extension is an asset too
+
+`oasr._C` (the CPU decoders, the word-alignment pass, the streaming feature
+append) is declared in `tests/assets.py` as `OASR_C`, kind `build`. It is
+present when it imports with its `alignment`, `decoder` and `streaming`
+submodules. Tests that need it carry `@pytest.mark.requires_assets("OASR_C")`,
+never an `importorskip`. The two behave the same in a skip run, but only the
+declared asset is counted, and under `--strict-assets` it fails.
+
+The self-hosted nightly is where that matters. `actions/checkout` runs
+`git clean -ffdx`, which deletes every gitignored build output, so a job with
+no build step tests a checkout with no `_C`. With `importorskip`, those tests
+skipped and `--strict-assets` stayed green. Every `test-gpu.yml` job now
+rebuilds the extensions (`pip install --no-deps --no-build-isolation -e .`) and
+runs `python -c "import oasr._C, oasr._core"` before pytest, so a broken build
+fails that step and no test runs. The cargo target directory is kept outside
+the workspace, so the clean does not discard the Rust build.
+
 ## The accuracy gate
 
 Everything else in this repo compares tensors. That is necessary and it is not
@@ -311,8 +329,8 @@ and `_C` is loaded lazily. The job puts the repo on `PYTHONPATH` and runs pytest
 directly.
 
 Files whose every test allocates on `device="cuda"` carry a module-level
-`pytestmark` skip, `tests/decoders/test_ctc_cpp.py` carries an `importorskip("oasr._C")`,
-and `@pytest.mark.cuda` actually gates.
+`pytestmark` skip, the tests that need the compiled `_C` gate on the `OASR_C`
+asset (see below), and `@pytest.mark.cuda` actually gates.
 
 Three rules follow, each of which cost a red run to learn:
 

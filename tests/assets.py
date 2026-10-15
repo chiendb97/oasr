@@ -5,10 +5,15 @@
 Assets resolve from their own environment variable or ``OASR_ASSET_ROOT``.
 Marker files reject incomplete assets. Missing assets are counted, and strict
 mode turns skips into failures.
+
+A compiled extension is declared the same way (kind ``build``): it is an input
+the suite cannot run without, and one a checkout deletes, so a test that skipped
+for want of it is as silent as one that skipped for want of a checkpoint.
 """
 
 from __future__ import annotations
 
+import importlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +26,7 @@ CHECKPOINT = "checkpoint"  # model weights
 AUDIO = "audio"  # wav files to transcribe
 REFERENCE = "reference"  # an upstream implementation or a captured oracle
 GRAPH = "graph"  # a decoding graph (HLG / lang dir)
+BUILD = "build"  # a compiled extension `pip install -e .` produces
 
 #: Optional single root holding the reference layout of every asset below.
 ROOT_ENV = "OASR_ASSET_ROOT"
@@ -49,14 +55,22 @@ class Asset:
     probe: Optional[Callable[[Path], bool]] = None
     #: One line on how to obtain it, shown when the asset is missing.
     how: str = ""
+    #: For a ``BUILD`` asset: the extension module.  It has no path to point at,
+    #: so ``env`` is only its name here; it is present when the module imports
+    #: and carries every name in ``attrs`` (its pybind submodules, which a build
+    #: from an older tree may lack).
+    module: str = ""
+    attrs: Tuple[str, ...] = ()
 
     def declared(self) -> str:
         """Path the suite *would* use: env var, then ``$OASR_ASSET_ROOT``, then default.
 
         Empty when none of the three applies — the asset is simply unset.
         Does not consult :data:`_DERIVED_DEFAULTS`; use the module-level
-        :func:`declared` for that.
+        :func:`declared` for that.  A ``BUILD`` asset declares its module name.
         """
+        if self.module:
+            return self.module
         explicit = os.environ.get(self.env)
         if explicit:
             return explicit
@@ -73,6 +87,17 @@ def _has_nonempty_pt(root: Path) -> bool:
 
 def _has_wavs(root: Path) -> bool:
     return root.is_dir() and any(root.glob("*.wav"))
+
+
+def _built(asset: Asset) -> Optional[str]:
+    """The extension's file if it imports with every declared attribute, else ``None``."""
+    try:
+        mod = importlib.import_module(asset.module)
+    except ImportError:
+        return None
+    if not all(hasattr(mod, a) for a in asset.attrs):
+        return None
+    return getattr(mod, "__file__", None) or asset.module
 
 
 _ASSET_LIST: List[Asset] = [
@@ -197,6 +222,14 @@ _ASSET_LIST: List[Asset] = [
         how="a k2 HLG.pt, or a prebuilt .img",
     ),
     Asset(
+        env="OASR_C",
+        kind=BUILD,
+        what="the compiled oasr._C extension (CPU decoders, word alignment, feature appends)",
+        module="oasr._C",
+        attrs=("alignment", "decoder", "streaming"),
+        how="pip install -e . builds it; a fresh checkout or `git clean -x` has none",
+    ),
+    Asset(
         env="CUTLASS_DIR",
         kind=REFERENCE,
         what="the vendored CUTLASS headers (the 3rdparty/cutlass submodule)",
@@ -307,6 +340,8 @@ def declared(name: str) -> str:
 def resolve(name: str) -> Optional[str]:
     """Resolved path if the asset is really present, else ``None``."""
     asset = ASSETS[name]
+    if asset.module:
+        return _built(asset)
     raw = _declared(name)
     if not raw:  # e.g. AUDIO_PATH with no env var and no default
         return None
@@ -369,15 +404,19 @@ def _gate(name: str) -> None:
     """Skip or fail for a missing asset, and record it either way."""
     asset = ASSETS[name]
     STATE.gated[name] = STATE.gated.get(name, 0) + 1
-    where = _declared(name) or "<unset>"
-    detail = f"{asset.what} not found at {where} (set ${asset.env})"
+    if asset.module:
+        needs = f" with {', '.join(asset.attrs)}" if asset.attrs else ""
+        detail = f"{asset.what} does not import ({asset.module}{needs})"
+    else:
+        where = _declared(name) or "<unset>"
+        detail = f"{asset.what} not found at {where} (set ${asset.env})"
     if asset.how:
         detail += f" — {asset.how}"
     if STATE.strict and name not in STATE.allowed_missing:
         pytest.fail(
             f"--strict-assets: {detail}.\n"
-            f"A skipped real-checkpoint test is the failure mode this flag exists "
-            f"to catch. Provide the asset, or allow it explicitly with "
+            f"A test skipped for a missing asset is the failure mode this flag "
+            f"exists to catch. Provide the asset, or allow it explicitly with "
             f"--allow-missing-asset {asset.env}.",
             pytrace=False,
         )
