@@ -753,8 +753,9 @@ still correct.
 **Memory sizing.** `--max-num-blocks 0` hands the paged KV pool to the engine,
 which derives it from free VRAM at startup (`--gpu-memory-utilization`, default
 0.90, is the share of the card it may occupy in total). That is what makes one
-launch command portable across card sizes; unset keeps the fixed 2048-block
-default. The same profile sizes the AR decoder-KV ceiling: leave
+launch command portable across card sizes, and it is also what an unset flag
+does: the engine default is `None`. An explicit count caps each stream at its
+share of the pool, `max_num_blocks / max_batch_size` blocks of 16 frames. The same profile sizes the AR decoder-KV ceiling: leave
 `--decode-kv-budget-gib` unset and it is derived, pass `0` to switch the byte
 budget off. Both derivations are logged with their full arithmetic — see
 [engine.md §6.1](engine.md#61-vram-aware-capacity-sizing).

@@ -858,10 +858,19 @@ class InputProcessor:
     def _collect_streaming_inputs(
         self, requests: List[Request], frame_len: int
     ) -> List["_StreamInput"]:
-        """Pop one pending chunk per stream and describe the combined waveform.
+        """Pop each stream's pending chunks and describe the combined waveform.
+
+        A stream takes queued chunks until it has one encoder stride of new
+        audio (:attr:`streaming_audio_chunk_samples`) or its queue is empty.
+        The encoder advances every stream by one stride per step, so that is the
+        rate ingestion has to match.  Popping one chunk per step instead tied a
+        stream's pace to its *client's* chunk size: 20 ms frames needed 32 steps
+        per encoder window, and once a step took longer than 20 ms the stream
+        fell behind real time for good, its queue growing without bound.  A
+        client chunk of a stride or more is still taken one per step.
 
         The combined buffer is returned as its **pieces** — the carried-over
-        ``audio_tail``, this step's chunk, and (on the final chunk) a short
+        ``audio_tail``, this step's chunks, and (on the final chunk) a short
         zero pad — not as a concatenation of them.  Concatenating here cost a
         full copy of every stream's chunk per step, for a buffer that is copied
         again into the staging batch a moment later;
@@ -871,19 +880,25 @@ class InputProcessor:
         A stream whose combined buffer is still shorter than one frame (and is
         not a final flush) keeps its tail and is skipped this step — that branch
         does concatenate, because the pieces have to survive until more audio
-        arrives, but it runs when a chunk is smaller than a single frame.  No
-        stream ever looks past its own enqueued audio: we fuse across
-        *different* streams, never across future chunks of the same stream.
+        arrives, but it runs only when everything queued is smaller than a
+        single frame.  No stream ever looks past its own enqueued audio: we fuse
+        across *different* streams, never across future chunks of the same
+        stream.
         """
         inputs: List[_StreamInput] = []
+        budget = self.streaming_audio_chunk_samples
         for req in requests:
             if req.audio_chunks is None or req.audio_tail is None:
                 continue
             tail = req.audio_tail
             if req.audio_chunks:
-                chunk = req.audio_chunks.popleft()
-                segments = [chunk] if tail.numel() == 0 else [tail, chunk]
-                n = tail.numel() + chunk.numel()
+                segments = [] if tail.numel() == 0 else [tail]
+                taken = 0
+                while req.audio_chunks and taken < budget:
+                    chunk = req.audio_chunks.popleft()
+                    segments.append(chunk)
+                    taken += chunk.numel()
+                n = tail.numel() + taken
                 last = req.audio_final and not req.audio_chunks
                 flush = last and n >= frame_len
                 # On the very last chunk pad the tail so the final partial
@@ -903,9 +918,13 @@ class InputProcessor:
                 flush = True
             else:
                 continue
-            # Too-short non-final buffers wait for more audio next step.
+            # Too-short non-final buffers wait for more audio next step.  Empty
+            # chunks are legal, so there may be no pieces at all.
             if n < frame_len and not flush:
-                req.audio_tail = segments[0] if len(segments) == 1 else torch.cat(segments)
+                if len(segments) > 1:
+                    req.audio_tail = torch.cat(segments)
+                elif segments:
+                    req.audio_tail = segments[0]
                 continue
             inputs.append(_StreamInput(request=req, segments=segments, n_samples=n, flush=flush))
         return inputs

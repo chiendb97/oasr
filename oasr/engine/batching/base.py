@@ -16,6 +16,7 @@ streaming admission path (in the scheduler) and the offline policies use them.
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -70,6 +71,31 @@ def request_cost_frames(request: Request, config: "EngineConfig") -> int:
 def sort_by_length(queue: Deque[Request]) -> None:
     """In-place stable sort of ``queue`` by ``(priority, num_frames)``."""
     ordered = sorted(queue, key=lambda r: (r.priority, r.num_frames))
+    queue.clear()
+    queue.extend(ordered)
+
+
+def sort_streams_for_admission(queue: Deque[Request], max_wait_time: float) -> None:
+    """In-place sort of the streaming waiting queue: overdue streams first, oldest first.
+
+    Within each priority class, streams that have waited ``max_wait_time`` or
+    longer come first in arrival order, and the rest follow by ``num_frames``.
+
+    Sorting a waiting *stream* by length alone is last-in, first-out. A waiting
+    stream's ``num_frames`` is the audio buffered so far, which grows the whole
+    time it waits, so the stream that has waited longest sorts last. Once more
+    streams wait than there are free slots, it is passed over on every tick by
+    each newer arrival and its backlog grows without bound. The overdue group
+    is the same starvation bound the offline policies apply.
+    """
+    now = time.monotonic()
+
+    def key(r: Request):
+        if now - r.arrival_time >= max_wait_time:
+            return (r.priority, 0, r.arrival_time)
+        return (r.priority, 1, r.num_frames)
+
+    ordered = sorted(queue, key=key)
     queue.clear()
     queue.extend(ordered)
 

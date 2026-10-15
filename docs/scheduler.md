@@ -185,7 +185,10 @@ if budget <= 0: return []
 
 # Length bucketing only — no offset gate (heterogeneous-offset batching).
 if streaming_cohort_admit or policy == "sjf":
-    sort _streaming_waiting by (priority, num_frames)
+    # within each priority: overdue streams first, oldest first; the rest by length
+    sort _streaming_waiting by
+        (priority, 0, arrival_time)  if waited_for >= max_wait_time
+        (priority, 1, num_frames)    otherwise
 
 admitted = []
 while _streaming_waiting and len(admitted) < budget:
@@ -217,6 +220,12 @@ Practical consequences:
   batched forward sees length-similar utterances (less padded-compute
   waste from a single very-long stream stretching the chunk-attention
   context for the rest of the cohort).
+- That sort is bounded by `max_wait_time`, like every offline policy. A
+  waiting stream's `num_frames` is the audio it has buffered so far, so
+  it grows for as long as the stream waits. Sorted by length alone, the
+  stream that had waited longest came last: once more streams waited than
+  there were free slots, every newer arrival overtook it on every tick
+  and its backlog grew for as long as the load lasted.
 - The encoder's positional embedding is built per-stream when offsets
   differ (`RelPositionalEncoding.position_encoding(offsets_tensor, …)`),
   collapsing to broadcast when they happen to match.
@@ -332,10 +341,10 @@ All scheduler-relevant knobs live on `EngineConfig`:
 | `preferred_batch_size` | `None` | Triton-style preferred B values. When set, streaming admission and offline batch construction snap to one of these sizes; `max_wait_time` is the escape valve. Also drives encoder CUDA-Graph pre-warm and defaults `feature_graph_batch_buckets`. All values must be `<= max_batch_size`. `None` keeps the legacy "admit greedily" behaviour. |
 | `length_bucket_ratio` | 0.0 | Soft floor on `min_len/max_len` inside a bucket. `0` disables. |
 | `max_offline_pad_ratio` | 4.0 | Hard cap on `(max_len × B) / sum_len`. `0` disables. |
-| `max_wait_time` | 0.2 s | Starvation bound: oldest offline request triggers forced flush. |
+| `max_wait_time` | 0.2 s | Starvation bound: oldest offline request triggers forced flush, and a streaming request waiting this long is admitted ahead of the length-sorted rest. |
 | `schedule_policy` | `"window"` | One of `"fcfs"`, `"window"`, `"bucket"`, `"sjf"`. |
 | `length_window_factor` | 4 | `"window"`: batches are chosen from the oldest `max_batch_size × factor` requests. Larger removes more padding and reorders more. |
-| `streaming_cohort_admit` | `True` | Length-bucket the waiting queue before admission so each batched paged forward sees length-similar utterances. **No longer gates on offset alignment** (FlexAttention handles per-stream `cache_seqlens` natively). |
+| `streaming_cohort_admit` | `True` | Length-bucket the waiting queue before admission so each batched paged forward sees length-similar utterances; streams past `max_wait_time` go first, oldest first. **No longer gates on offset alignment** (FlexAttention handles per-stream `cache_seqlens` natively). |
 
 ### Choosing a policy
 

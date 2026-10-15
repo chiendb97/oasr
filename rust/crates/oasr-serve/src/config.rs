@@ -44,25 +44,29 @@ pub struct Cli {
     /// the one that admitted it (`EnginePool`).
     ///
     /// Costs: each worker is a full copy of the weights, KV pool and graph pools,
-    /// so VRAM scales with the count, as does startup time.  Size
-    /// `--max-num-blocks` for **one** worker's `--max-batch-size`; it is not
-    /// divided for you, and a pool too small for its batch truncates every stream
-    /// (see the engine's startup warning).
+    /// so VRAM scales with the count, as does startup time.  A derived pool is
+    /// sized from what the card has free when *that* worker starts, so later
+    /// workers get what earlier ones left.  An explicit `--max-num-blocks` is
+    /// for **one** worker's `--max-batch-size`; it is not divided for you, and a
+    /// pool too small for its batch truncates every stream (see the engine's
+    /// startup warning).
     #[arg(long, default_value = "1")]
     pub engine_workers: u32,
     /// Encoder chunk size (frames).
     #[arg(long)]
     pub chunk_size: Option<u32>,
-    /// Streaming: physical blocks in the shared paged KV pool.  Pass `0` to
-    /// **derive it from free VRAM** at startup (the engine's
-    /// `max_num_blocks=None`) instead of hand-computing it from layers x heads x
-    /// head_dim x dtype; unset keeps the engine default (2048).
+    /// Streaming: physical blocks in the shared paged KV pool.  Unset (or `0`)
+    /// **derives it from free VRAM** at startup (the engine's default,
+    /// `max_num_blocks=None`), capped at what `--max-batch-size` streams can
+    /// address, instead of hand-computing it from layers x heads x head_dim x
+    /// dtype.
     ///
-    /// An undersized pool raises `BlockPool exhausted` from inside the encoder
-    /// forward — where it takes out the tick for every concurrent stream — and an
-    /// oversized one OOMs at startup, so deriving is how one config moves between
-    /// a 24 GB and an 80 GB card.  Inert in `--service-mode offline`, which
-    /// allocates no pool.
+    /// With unlimited history an explicit count caps each stream at its share,
+    /// `max_num_blocks / max_batch_size` blocks of 16 frames, where it ends with
+    /// `finish_reason="length"`: the old default of 2048 cut every stream at
+    /// ~41 s at a batch of 32.  An oversized pool OOMs at startup, so deriving is
+    /// how one config moves between a 24 GB and an 80 GB card.  Inert in
+    /// `--service-mode offline`, which allocates no pool.
     #[arg(long)]
     pub max_num_blocks: Option<u32>,
     /// Share of the device the engine may occupy in total — weights, caches and

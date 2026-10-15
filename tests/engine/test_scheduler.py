@@ -349,6 +349,97 @@ class TestStreamingAdmission:
         assert sched.num_waiting == 1
 
 
+class _Clock:
+    """A ``time.monotonic`` the test advances by hand."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class TestStreamingAdmissionIsNotLifo:
+    """Under load the stream that has waited longest is admitted first.
+
+    The default (``streaming_cohort_admit=True``) sorts waiting streams by
+    ``num_frames`` -- and a waiting stream's ``num_frames`` is the audio it has
+    buffered, which grows the whole time it waits.  So the oldest stream sorted
+    *last*: with more arrivals than free slots it was passed over on every tick,
+    and its backlog grew for as long as the load lasted.  The bound is the same
+    ``max_wait_time`` the offline policies apply.
+    """
+
+    FRAMES_PER_TICK = 10  # audio a waiting stream buffers per tick
+    TICK_S = 0.1
+
+    def _run(self, monkeypatch, ticks: int, arrivals: int, slots: int, **cfg):
+        """Admission order, by arrival index, with ``slots`` streams finishing a tick."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = Scheduler(EngineConfig(ckpt_dir="/tmp/fake", max_batch_size=slots, **cfg))
+        arrived: List[Request] = []
+        admitted: List[int] = []
+        for _ in range(ticks):
+            clock.now += self.TICK_S
+            for _ in range(arrivals):
+                req = _preferred_streaming()
+                arrived.append(req)
+                sched.add_request(req)
+            for req in sched._streaming_waiting:  # noqa: SLF001
+                req.num_frames += self.FRAMES_PER_TICK
+            new, running = sched.schedule_streaming()
+            admitted.extend(arrived.index(r) for r in new)
+            for req in running:  # every admitted stream finishes within the tick
+                sched.finish_request(req.request_id)
+        return admitted
+
+    def test_a_stream_left_waiting_is_admitted_once_overdue(self, monkeypatch):
+        # Three arrivals a tick against two free slots.  Stream 2 is the one the
+        # first tick leaves behind; by the next tick it has buffered more audio
+        # than any new arrival, so a pure length sort never reaches it.
+        order = self._run(monkeypatch, ticks=40, arrivals=3, slots=2)
+        assert 2 in order[:8], "the stream left waiting on the first tick was never admitted"
+
+    def test_under_overload_the_earliest_arrivals_are_the_ones_served(self, monkeypatch):
+        order = self._run(monkeypatch, ticks=40, arrivals=3, slots=2)
+        # 80 slots for 120 arrivals: whatever is still waiting at the end, it
+        # must be the newest 40, not one in three of every tick's arrivals.
+        assert sorted(order) == list(range(len(order)))
+
+    def test_below_the_wait_bound_streams_are_still_length_sorted(self, monkeypatch):
+        """The bound only reorders overdue streams; fresh ones keep the length sort."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = Scheduler(EngineConfig(ckpt_dir="/tmp/fake", max_batch_size=1))
+        long, short = _preferred_streaming(), _preferred_streaming()
+        long.num_frames, short.num_frames = 500, 100
+        sched.add_request(long)
+        sched.add_request(short)
+        new, _ = sched.schedule_streaming()
+        assert new == [short]
+
+    def test_the_wait_bound_is_read_off_the_oldest_stream(self, monkeypatch):
+        """``preferred_batch_size`` holds for a fuller batch until the oldest is overdue.
+
+        Not the queue's head: the head is the highest-priority stream, which may
+        have just arrived while a lower-priority one has waited past the bound.
+        """
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = Scheduler(
+            EngineConfig(ckpt_dir="/tmp/fake", max_batch_size=8, preferred_batch_size=[4, 8])
+        )
+        old = _preferred_streaming()
+        sched.add_request(old)
+        clock.now += 1.0
+        urgent = _preferred_streaming()
+        urgent.priority = -1
+        sched.add_request(urgent)
+        new, _ = sched.schedule_streaming()
+        assert set(new) == {old, urgent}
+
+
 # ---------------------------------------------------------------------------
 # Offline batch construction
 # ---------------------------------------------------------------------------

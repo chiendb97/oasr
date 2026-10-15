@@ -373,11 +373,31 @@ class TestDerivedPoolOnDevice:
 
     def test_explicit_pool_skips_the_probe_entirely(self, ckpt_dir, device):
         """Nothing is measured — and no probe forward runs — unless a capacity
-        was left to derive.  The default config must pay nothing for H4."""
+        was left to derive.  An explicit pool must pay nothing for H4."""
         engine = self._engine(ckpt_dir, max_num_blocks=1024)
         try:
             assert engine._memory_profile is None
             assert engine._config.max_num_blocks == 1024
+        finally:
+            engine.shutdown()
+
+    def test_the_default_engine_streams_past_41_seconds(self, ckpt_dir, wav_dir, device):
+        """At the default ``max_batch_size=32`` a stream is not cut at ~41 s.
+
+        The default pool was a flat 2048 blocks, and with unlimited history a
+        stream's share is ``max_num_blocks // max_batch_size``: 64 blocks of 16
+        frames, 1024 encoder frames, ~41 s.  Every longer stream ended there with
+        ``finish_reason="length"`` and the rest of its audio was dropped.
+        """
+        wave = torch.cat([waveform(wav_dir, i) for i in range(8)])
+        assert wave.numel() / 16000 > 45
+        engine = self._engine(ckpt_dir, max_batch_size=32)  # max_num_blocks left default
+        try:
+            assert engine._config.max_num_blocks >= 32 * 512
+            (out,) = engine.transcribe_outputs([wave])
+            assert out.finish_reason != "length"
+            last_words = engine.transcribe(waveform(wav_dir, 7)).split()[-3:]
+            assert out.text.split()[-3:] == last_words
         finally:
             engine.shutdown()
 
@@ -434,9 +454,9 @@ class TestExplicitPoolFloor:
     :func:`derive_pool_blocks` refuses a pool below
     ``max_batch_size * MIN_BLOCKS_PER_STREAM`` — that floor is where every stream
     starts running out of encoder cache.  The *explicit* path had no equivalent,
-    and its default is a flat 2048 blocks whatever ``max_batch_size`` is, so
-    widening the pool silently narrows each stream's history to
-    ``max_num_blocks * block_size_frames / max_batch_size`` frames.
+    and a fixed block count (the default was a flat 2048) stays fixed whatever
+    ``max_batch_size`` is, so widening the pool silently narrows each stream's
+    history to ``max_num_blocks * block_size_frames / max_batch_size`` frames.
 
     The failure is not an error: streams hit the capacity gate, finalize with
     ``finish_reason="length"`` and a truncated transcript, and the engine gets
@@ -494,6 +514,37 @@ class TestExplicitPoolFloor:
             with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
                 self._engine()._check_explicit_kv_pool(cfg)
             assert bool(caplog.records) is expect_warning, (blocks, caplog.records)
+
+
+class TestTheDefaultPool:
+    """``max_num_blocks`` defaults to ``None``: sized from VRAM, capped by the block table.
+
+    It was a flat 2048, which at the default ``max_batch_size=32`` gives each
+    stream 64 blocks — ~41 s of audio before it is cut off with
+    ``finish_reason="length"``.
+    """
+
+    def test_the_default_is_derived(self):
+        assert EngineConfig().max_num_blocks is None
+
+    @pytest.mark.parametrize("left, per_stream", [(-1, 512), (4, 4)])
+    def test_a_cpu_engine_sizes_the_pool_to_the_block_table(self, left, per_stream):
+        """No VRAM to measure, so the pool is what ``max_batch_size`` streams can address."""
+        from oasr.engine.engine import ASREngine
+
+        engine = ASREngine.__new__(ASREngine)
+        engine._device = torch.device("cpu")
+        cfg = EngineConfig(ckpt_dir="x", device="cpu", max_batch_size=4, num_left_chunks=left)
+        engine._autosize_kv_pool(cfg, cache_spec=None, consumes="log_probs")
+        assert cfg.max_num_blocks == 4 * per_stream
+        cache = CacheConfig(
+            num_left_chunks=left,
+            chunk_size=16,
+            block_size_frames=16,
+            max_batch_size=4,
+            max_num_blocks=cfg.max_num_blocks,
+        )
+        assert cache.blocks_per_stream == per_stream
 
 
 # ---------------------------------------------------------------------------

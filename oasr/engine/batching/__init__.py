@@ -20,6 +20,7 @@ from .base import (
     register_partition_policy,
     snap_to_preferred,
     sort_by_length,
+    sort_streams_for_admission,
 )
 
 __all__ = [
@@ -31,4 +32,5 @@ __all__ = [
     "register_partition_policy",
     "snap_to_preferred",
     "sort_by_length",
+    "sort_streams_for_admission",
 ]

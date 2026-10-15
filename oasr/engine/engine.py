@@ -490,14 +490,15 @@ class ASREngine:
         The derived path already refuses a pool below
         ``max_batch_size * MIN_BLOCKS_PER_STREAM`` — :func:`derive_pool_blocks`
         takes that as its floor because below it every stream runs out of
-        encoder cache.  The **explicit** path had no such check, and its default
-        is a flat 2048 blocks *whatever* ``max_batch_size`` is, so widening the
+        encoder cache.  The **explicit** path had no such check, and a fixed
+        block count stays fixed *whatever* ``max_batch_size`` is, so widening the
         pool silently narrows every stream's history:
 
             frames per stream = max_num_blocks * block_size_frames / max_batch_size
 
-        At the default 2048 blocks and 16 frames that is 512 frames per stream at
-        ``max_batch_size=64`` and **32** at 1024 — one second of audio.  Streams
+        At 2048 blocks (the default until it became ``None``) and 16 frames that
+        is 512 frames per stream at ``max_batch_size=64`` and **32** at 1024 —
+        one second of audio.  Streams
         then hit the capacity gate, finalize early with ``finish_reason="length"``
         and a truncated transcript, and the engine gets *faster*, because it is
         decoding less.  A throughput benchmark reads that as a win; this is the
@@ -534,26 +535,16 @@ class ASREngine:
         cache config, the pool, the per-stream ceiling) sees a plain number and
         needs no knowledge that it was derived.
 
+        On a device with no VRAM to measure (a CPU engine) the pool is sized to
+        that same ceiling, ``max_batch_size`` streams at their full per-stream
+        width, since ``None`` is the default and a CPU engine has to start.
+
         Raises
         ------
         ValueError
-            On a non-CUDA device (nothing to measure), or when not even the
-            minimum viable pool fits — see
+            When not even the minimum viable pool fits — see
             :func:`~oasr.engine.memory.derive_pool_blocks`.
         """
-        if self._device.type != "cuda":
-            raise ValueError(
-                "max_num_blocks=None derives the paged KV pool from free VRAM, "
-                f"which needs a CUDA device (got device={config.device!r}). Set "
-                "an explicit max_num_blocks for a non-CUDA engine."
-            )
-        per_block = bytes_per_kv_block(
-            num_layers=cache_spec.num_layers,
-            block_size_frames=int(config.block_size_frames),
-            n_kv_head=cache_spec.n_kv_head,
-            head_dim=cache_spec.head_dim,
-            dtype=config.dtype,
-        )
         # Blocks one stream can hold, hence the ceiling past which the pool is
         # memory nothing can hand out.  With eviction the retained history is an
         # exact requirement (the pool has no capacity gate — see
@@ -568,6 +559,24 @@ class ASREngine:
         else:
             per_stream = int(config.max_blocks_per_seq)
             floor_per_stream = min(per_stream, MIN_BLOCKS_PER_STREAM)
+        if self._device.type != "cuda":
+            config.max_num_blocks = batch * per_stream
+            logger.info(
+                "paged KV pool: %d blocks (%d streams x %d blocks); device=%s has no "
+                "VRAM to measure, so the pool is what the block table can address",
+                config.max_num_blocks,
+                batch,
+                per_stream,
+                config.device,
+            )
+            return
+        per_block = bytes_per_kv_block(
+            num_layers=cache_spec.num_layers,
+            block_size_frames=int(config.block_size_frames),
+            n_kv_head=cache_spec.n_kv_head,
+            head_dim=cache_spec.head_dim,
+            dtype=config.dtype,
+        )
         profile = self._profile_device_memory(config, consumes)
         sizing = derive_pool_blocks(
             profile,

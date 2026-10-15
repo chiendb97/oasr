@@ -36,7 +36,7 @@ from .batching import (
     build_batching_policy,
     build_partition_policy,
     snap_to_preferred,
-    sort_by_length,
+    sort_streams_for_admission,
 )
 from .config import EngineConfig
 from .request import Request, RequestState
@@ -264,6 +264,13 @@ class Scheduler:
         utterances (lower padded-compute waste). With ``False``, admission
         follows ``schedule_policy`` ordering (FCFS / bucket / SJF).
 
+        The length sort is bounded by ``max_wait_time``, as the offline
+        policies are: a stream that has waited that long is admitted ahead
+        of the sorted rest, oldest first.  Without the bound the sort is
+        last-in, first-out under load, because a waiting stream's
+        ``num_frames`` grows with the audio it buffers (see
+        :func:`~oasr.engine.batching.sort_streams_for_admission`).
+
         When ``preferred_batch_size`` is set, the admit count is snapped
         so that the resulting running pool size lands on a preferred
         value (largest preferred ``<= len(_running) + n_avail``).  If no
@@ -278,7 +285,7 @@ class Scheduler:
         cfg = self._config
         policy = cfg.schedule_policy
         if cfg.streaming_cohort_admit or policy == "sjf":
-            sort_by_length(self._streaming_waiting)
+            sort_streams_for_admission(self._streaming_waiting, cfg.max_wait_time)
 
         n_avail = min(budget, len(self._streaming_waiting))
         if cfg.preferred_batch_size is not None:
@@ -286,8 +293,10 @@ class Scheduler:
             target = snap_to_preferred(candidate, cfg.preferred_batch_size)
             n_admit = max(0, target - len(self._running))
             if n_admit == 0:
-                oldest = self._streaming_waiting[0]
-                if oldest.waited_for >= cfg.max_wait_time:
+                # The longest wait, not the head's: the head is the
+                # highest-priority stream, which need not be the oldest.
+                oldest = max(r.waited_for for r in self._streaming_waiting)
+                if oldest >= cfg.max_wait_time:
                     n_admit = n_avail
                 else:
                     return []

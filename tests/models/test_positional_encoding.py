@@ -129,10 +129,38 @@ def test_a_declared_bound_keeps_the_plain_gather(monkeypatch):
     assert torch.equal(pe.position_encoding(offsets, 30), computed)
     monkeypatch.undo()
 
-    pe.bound_offsets(ROWS + 1)  # a bound past the table is no bound at all
+    pe.bound_offsets(None)  # no bound: every row is computed, past the table too
     far = torch.tensor([3 * ROWS])
     want = RelPositionalEncoding(D, max_len=4 * ROWS).position_encoding(far, 5)
     torch.testing.assert_close(pe.position_encoding(far, 5), want, rtol=0, atol=SIN_ATOL)
+
+
+def test_a_bound_past_the_table_extends_the_table(monkeypatch):
+    """A bound the table does not cover grows the table, so the gather stays exact.
+
+    The gather clamps its index.  The paged runtime once declared a bound below
+    what its streams could reach, and every position past the table was read as
+    the table's last row: a wrong encoding, and no error.  A stream can cache
+    8192 frames at the default block-table width; WeNet's table has 5000 rows.
+    """
+    pe = RelPositionalEncoding(D, max_len=ROWS)
+    table = pe.pe
+    held = table.clone()
+    pe.bound_offsets(3 * ROWS + 5)
+    assert pe.pe.size(1) == 3 * ROWS + 5 and pe.max_len == 3 * ROWS + 5
+    assert torch.equal(pe.pe[:, :ROWS], held)  # the rows it had are untouched
+
+    def no_formula(positions):
+        raise AssertionError("a bounded per-stream lookup computed the sinusoid")
+
+    monkeypatch.setattr(pe, "_sinusoid", no_formula)
+    offsets = torch.tensor([0, ROWS - 3, 3 * ROWS])
+    got = pe.position_encoding(offsets, 5)
+    want = RelPositionalEncoding(D, max_len=4 * ROWS).position_encoding(offsets, 5)
+    torch.testing.assert_close(got, want, rtol=0, atol=SIN_ATOL)
+    # The replaced table stays allocated: a graph captured against it reads it
+    # by address.
+    assert any(t is table for t in pe._retired_tables)
 
 
 # ---------------------------------------------------------------------------

@@ -288,6 +288,8 @@ class RelPositionalEncoding(nn.Module):
         self.register_buffer("div_term_bits", div_term.view(torch.int32), persistent=False)
         # Whether per-stream positions may pass the table; see ``bound_offsets``.
         self._offsets_may_pass_table = True
+        # Tables ``_extend_table`` replaced, never freed; see there.
+        self._retired_tables: List[torch.Tensor] = []
 
     def bound_offsets(self, limit: Optional[int]) -> None:
         """Declare that per-stream positions stay below ``limit`` (``None``: no bound).
@@ -298,9 +300,37 @@ class RelPositionalEncoding(nn.Module):
         A streaming runtime that keeps each stream's whole history knows its
         positions never pass ``cache + chunk``, and declaring that keeps the
         plain gather.  Call it before any graph is captured: a captured graph
-        replays the path it was recorded with.
+        replays the path it was recorded with, and this may replace the table.
+
+        A bound past the table extends the table to it, once, from the same
+        sinusoid.  The gather clamps its index, so declaring a bound the table
+        did not cover read every position past it as the table's last row:
+        silently wrong, and reachable whenever a stream can cache more than
+        ``max_len`` frames (8192 at the default block-table width, 5000 rows in
+        WeNet's table).
         """
-        self._offsets_may_pass_table = limit is None or int(limit) > self.pe.size(1)
+        if limit is not None and int(limit) > self.pe.size(1):
+            self._extend_table(int(limit))
+        self._offsets_may_pass_table = limit is None
+
+    def _extend_table(self, rows: int) -> None:
+        """Grow ``pe`` to ``rows`` rows, leaving the existing rows untouched.
+
+        The new rows are built the way ``__init__`` built the table: on the CPU,
+        in fp32, from the table's own frequencies, then cast to the table's dtype.
+        The old table is kept alive rather than freed: a graph captured by an
+        earlier runtime on this model still reads it by address.
+        """
+        start = self.pe.size(1)
+        div_term = self.div_term_bits.view(torch.float32).cpu()
+        position = torch.arange(start, rows, dtype=torch.float32).unsqueeze(1)
+        extra = torch.zeros(rows - start, self.d_model)
+        extra[:, 0::2] = torch.sin(position * div_term)
+        extra[:, 1::2] = torch.cos(position * div_term)
+        extra = extra.to(device=self.pe.device, dtype=self.pe.dtype).unsqueeze(0)
+        self._retired_tables.append(self.pe)
+        self.pe = torch.cat([self.pe, extra], dim=1)
+        self.max_len = rows
 
     def forward(
         self, x: torch.Tensor, offset: Union[int, torch.Tensor] = 0
