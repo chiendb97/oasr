@@ -987,6 +987,81 @@ def test_paged_backend_gates_capacity_exhausted_stream():
     assert req.cache_exhausted is True
 
 
+class TestPositionTableCoversTheStream:
+    """Every position a stream can reach is in the encoder's positional table.
+
+    The paged runtime declared its bound from the table rather than from the
+    stream: it capped the declared positions at the table's size, so the encoder
+    kept its plain gather while a stream cached past the table, and the gather
+    clamps its index.  Every position past the table then read the table's last
+    row, which is a wrong encoding and no error.  It was reachable whenever a
+    stream could cache more than ``max_len`` frames, which a VRAM-derived pool
+    allows at any batch width (8192 frames against WeNet's 5000 rows).
+    """
+
+    ROWS = 50  # far below what one stream can cache in ``_paged_backend``
+
+    def _backend(self, num_left_chunks: int = -1):
+        from oasr.cache import CacheConfig
+        from oasr.engine.streaming_backend.paged import PagedStreamingBackend
+        from oasr.models.conformer.model import RelPositionalEncoding
+
+        class _Encoder(_RoutingEncoderStub):
+            def __init__(self, pos_enc):
+                self.embed = SimpleNamespace(pos_enc=pos_enc)
+
+        class _Model(_RoutingModelStub):
+            pass
+
+        model = _Model()
+        model.encoder = _Encoder(RelPositionalEncoding(16, max_len=self.ROWS))
+        cache_cfg = CacheConfig(
+            num_layers=2,
+            n_kv_head=4,
+            head_dim=16,
+            hidden_dim=64,
+            kernel_size=15,
+            chunk_size=16,
+            num_left_chunks=num_left_chunks,
+            block_size_frames=16,
+            max_num_blocks=32,
+            max_blocks_per_seq=8,
+            max_batch_size=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        cfg = SimpleNamespace(
+            device="cpu",
+            dtype=torch.float32,
+            chunk_size=16,
+            use_cuda_graphs=False,
+            feature_config=SimpleNamespace(output_dim=80),
+            streaming_graph_pad_batch=None,
+        )
+        PagedStreamingBackend(model, cfg, cache_cfg, consumes="log_probs")
+        return model.encoder.embed.pos_enc, cache_cfg
+
+    def test_the_table_reaches_the_last_position_a_stream_can_cache(self):
+        from oasr.models.conformer.model import RelPositionalEncoding
+
+        pos_enc, cache_cfg = self._backend()
+        reach = cache_cfg.max_stream_frames + cache_cfg.chunk_size
+        assert reach > self.ROWS
+        assert pos_enc.pe.size(1) >= reach
+
+        # The key positions of a stream at full cache, as the paged forward asks.
+        got = pos_enc.position_encoding(torch.tensor([0]), reach)
+        want = RelPositionalEncoding(16, max_len=reach).pe
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-6)
+        assert not torch.equal(got[0, self.ROWS], got[0, self.ROWS - 1])
+
+    def test_with_eviction_the_rows_are_computed(self):
+        """Evicting history moves positions without limit, so there is no bound."""
+        pos_enc, _ = self._backend(num_left_chunks=2)
+        assert pos_enc.pe.size(1) == self.ROWS
+        assert pos_enc._offsets_may_pass_table  # noqa: SLF001
+
+
 class TestOfflineModeSkipsTheStreamingBackend:
     """``service_mode="offline"`` must not build the paged backend (H13).
 

@@ -474,6 +474,72 @@ class TestPreparePaths:
         assert req.audio_chunks is not None
 
 
+class TestStreamingIngestionKeepsPace:
+    """A stream takes an encoder stride of queued audio per step, whatever its chunk size.
+
+    The encoder advances every stream by one stride per step, so ingestion has
+    to supply one.  It popped one *client* chunk per step instead: at 20 ms a
+    chunk, 32 steps per encoder window, and a stream fell behind real time for
+    good as soon as a step took longer than 20 ms, its queue growing without
+    bound.
+    """
+
+    def _stream(self, proc: InputProcessor, wave: torch.Tensor, chunk_samples: int) -> Request:
+        req = Request(audio=None, streaming=True, sample_rate=16000)
+        proc.prepare_streaming(req)
+        chunks = list(wave.split(chunk_samples))
+        for i, chunk in enumerate(chunks):
+            proc.append_streaming_chunk(req, chunk, is_last=i == len(chunks) - 1)
+        return req
+
+    def _steps_to_drain(self, proc: InputProcessor, req: Request) -> int:
+        steps = 0
+        while req.has_pending_audio:
+            proc.extract_streaming_batch([req])
+            steps += 1
+            assert steps < 1000, "ingestion stalled"
+        return steps
+
+    def test_small_client_chunks_are_drained_a_stride_at_a_time(self):
+        proc = _processor()
+        stride = proc.streaming_audio_chunk_samples  # 640 ms at the defaults
+        wave = torch.randn(4 * stride, generator=torch.Generator().manual_seed(0)) * 0.1
+        req = self._stream(proc, wave, chunk_samples=320)  # 20 ms frames, 128 of them
+        # Four strides of audio and the final flush pad: a handful of steps.
+        assert self._steps_to_drain(proc, req) <= 6
+
+    def test_a_stride_sized_chunk_is_still_one_per_step(self):
+        """Draining stops at a stride, so a backlog is not swallowed in one step."""
+        proc = _processor()
+        stride = proc.streaming_audio_chunk_samples
+        req = self._stream(proc, torch.zeros(5 * stride), chunk_samples=stride)
+        proc.extract_streaming_batch([req])
+        assert len(req.audio_chunks) == 5 - 1 + 1  # four audio chunks + the flush pad
+
+    def test_features_do_not_depend_on_the_client_chunk_size(self):
+        proc = _processor()
+        stride = proc.streaming_audio_chunk_samples
+        wave = torch.randn(3 * stride + 777, generator=torch.Generator().manual_seed(1)) * 0.1
+        feats = []
+        for chunk_samples in (stride, 320, 37):
+            req = self._stream(proc, wave, chunk_samples)
+            self._steps_to_drain(proc, req)
+            feats.append(req.feature_buffer[: req.feature_frames].clone())
+        assert feats[0].size(0) > 0
+        for other in feats[1:]:
+            assert torch.equal(other, feats[0])
+
+    def test_empty_chunks_are_harmless(self):
+        proc = _processor()
+        req = Request(audio=None, streaming=True, sample_rate=16000)
+        proc.prepare_streaming(req)
+        proc.append_streaming_chunk(req, torch.zeros(0))
+        proc.extract_streaming_batch([req])
+        assert req.audio_tail is not None and req.audio_tail.numel() == 0
+        proc.append_streaming_chunk(req, torch.zeros(0), is_last=True)
+        self._steps_to_drain(proc, req)
+
+
 # --------------------------------------------------------------------------
 # Pinned audio, collate buffers, the captured feature graph, and the streaming append
 # --------------------------------------------------------------------------

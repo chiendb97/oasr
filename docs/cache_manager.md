@@ -260,7 +260,7 @@ the loaded model. The fields you typically tune:
 | `chunk_size` | 16 | Must match training. Longer chunk = higher accuracy, higher per-chunk latency. |
 | `num_left_chunks` | -1 | -1 is unlimited; set to a positive value (e.g. 4) to bound memory in long-running streams. |
 | `block_size_frames` | 16 | Equal to `chunk_size` is simplest (one block per chunk). Smaller values reduce eviction granularity but increase block-table size. |
-| `max_num_blocks` | 2048 | Pool capacity. Must cover all concurrent streams' worst-case logical block counts plus overhead. `EngineConfig.max_num_blocks=None` derives it from free VRAM instead. |
+| `max_num_blocks` | `None` in `EngineConfig` | Pool capacity. `EngineConfig` derives it from free VRAM by default, capped at `max_batch_size × max_blocks_per_seq`. An explicit value must cover all concurrent streams' worst-case logical block counts plus overhead; with unlimited history each stream is capped at `max_num_blocks // max_batch_size` blocks. |
 | `max_blocks_per_seq` | 512 | Width of the per-stream `block_table`. Must be ≥ `max_logical_blocks`. |
 | `dtype` | `float16` | `bfloat16` works on Ampere+. The K/V pool is the dominant memory consumer. |
 
@@ -272,8 +272,9 @@ Pool memory in bytes:
 ```
 
 For a default Conformer (`num_layers=12, n_kv_head=4, head_dim=64,
-block_size=16, max_num_blocks=2048`) with FP16 this is 192 KiB per block and
-**384 MiB** for the pool.  `oasr.engine.memory.bytes_per_kv_block` is the same
+block_size=16`) with FP16 this is 192 KiB per block: **384 MiB** for 2048 blocks,
+and **3 GiB** for the 16384 a derived pool reaches at `max_batch_size=32` (the
+block-table ceiling, `32 × 512`).  `oasr.engine.memory.bytes_per_kv_block` is the same
 arithmetic in code, and `tests/engine/test_memory.py` pins it against a real
 `BlockPool` allocation — the formula and the allocator must not drift.
 
@@ -395,9 +396,9 @@ thread that performs the GPU forward calls into them.
    substantially cheaper than `B` independent prepares, even though the
    per-stream block-table writes are unavoidable.
 4. **Cohort admission** (`EngineConfig.streaming_cohort_admit=True`)
-   keeps `offset` aligned across the running pool so `_forward_batched_paged`
-   can take the fast path. Without it, mismatched offsets fragment the
-   batch into single-stream forwards.
+   length-sorts the waiting streams, bounded by `max_wait_time` (see
+   [scheduler.md §4.2](scheduler.md)). It no longer gates on offsets:
+   `_forward_batched_paged` batches streams at any offset.
 5. **`gather_kv_blocks`** (dense mode) does an `index_select` per layer
    and is O(num_layers × num_blocks). Paged mode avoids this entirely —
    prefer it for long-context streams.

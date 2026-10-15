@@ -126,6 +126,40 @@ class TestBlockPool:
         pool.free([])
         assert pool.num_free_blocks == 4
 
+    def test_double_free_is_refused_and_changes_nothing(self):
+        cfg = make_config(max_num_blocks=8)
+        pool = BlockPool(cfg)
+        a, b, c = pool.allocate(3)
+        pool.free([a])
+        for bad in ([a], [b, b], [b, 99], [c, a]):
+            with pytest.raises(ValueError):
+                pool.free(bad)
+            assert pool.num_free_blocks == 6
+        pool.free([b, c])  # the rejected calls left b and c allocated
+        assert pool.num_free_blocks == 8
+        assert sorted(pool.allocate(8)) == list(range(8))
+
+    def test_free_does_not_walk_the_free_list(self):
+        """Freeing a stream's blocks costs its blocks, not the pool's size.
+
+        The double-free check built a set from the whole free list on every call.
+        That is O(pool) per finished stream: a 16384-block pool ran the same
+        streaming work 1.12x slower than a 2048-block one, which is what made a
+        VRAM-derived pool look like it cost throughput.
+        """
+        import collections
+
+        class _NoWalk(collections.deque):
+            def __iter__(self):
+                raise AssertionError("BlockPool.free iterated the whole free list")
+
+        cfg = make_config(max_num_blocks=64)
+        pool = BlockPool(cfg)
+        ids = pool.allocate(5)
+        pool._free_list = _NoWalk(pool._free_list)  # noqa: SLF001
+        pool.free(ids)
+        assert pool.num_free_blocks == 64
+
     def test_block_view_write_and_read(self):
         cfg = make_config(max_num_blocks=4, block_size_frames=4, n_kv_head=2, head_dim=8)
         pool = BlockPool(cfg)

@@ -204,6 +204,13 @@ while not eof:
 The engine tolerates feed-before-admission (chunks queue up) and
 feed-after-admission (consumed by the next step).
 
+Chunk size is the client's choice. Each step, a stream takes queued chunks
+until it has one encoder stride of new audio (`stride × frame_shift` samples,
+640 ms at the defaults) or its queue is empty, because the encoder advances
+every stream by one stride per step. It used to take one chunk per step, so a
+client sending 20 ms frames needed 32 steps per encoder window and fell behind
+real time for good once a step took longer than 20 ms.
+
 ### 4.5 Step loop (annotated)
 
 ```python
@@ -361,13 +368,13 @@ Only read by `incremental` decode families — see [decoding.md](decoding.md).
 | `max_wait_time` | 0.2 | Starvation bound (seconds). |
 | `schedule_policy` | `"window"` | `fcfs` / `window` / `bucket` / `sjf`. See [scheduler.md §4.1.1](scheduler.md). |
 | `length_window_factor` | 4 | `window` policy: batches are chosen from the oldest `max_batch_size × factor` requests. |
-| `streaming_cohort_admit` | `True` | Admit only when running pool offsets align — enables full `B` batched paged forward. |
+| `streaming_cohort_admit` | `True` | Length-sort waiting streams before admission. Streams that have waited `max_wait_time` go first, oldest first; without that bound the sort is last-in, first-out under load, because a waiting stream's length is the audio it has buffered. See [scheduler.md §4.2](scheduler.md). |
 
 ### Paged KV cache
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_num_blocks` | 2048 | Total physical blocks in the shared pool. `None` derives it from free VRAM — see [§6.1](#61-vram-aware-capacity-sizing). Inert in `service_mode="offline"`, which builds no pool. |
+| `max_num_blocks` | `None` (derived) | Total physical blocks in the shared pool. `None` derives it from free VRAM, capped at what the block table can address — see [§6.1](#61-vram-aware-capacity-sizing). An explicit value caps each stream at `max_num_blocks // max_batch_size` blocks with unlimited history; the old default of 2048 cut every stream at ~41 s at `max_batch_size=32`. Inert in `service_mode="offline"`, which builds no pool. |
 | `gpu_memory_utilization` | 0.90 | Share of the device the engine may occupy in total (weights + caches + activations) when it derives a capacity. Read only when something is left to derive. |
 | `block_size_frames` | 16 | Frames per block (= chunk_size by default). |
 | `max_blocks_per_seq` | 512 | Block-table width. With unlimited history this, times `max_batch_size`, is also the ceiling a derived pool is capped at — blocks past it cannot be addressed. |
@@ -401,10 +408,10 @@ graph capture pools, an AR family's prefill transient, allocator fragmentation.
 The derivation is logged in full (`paged KV pool derived from VRAM: … | total=…
 resident=… cap=… activation_reserve=… → available=…`) so the numbers are
 auditable. Nothing is measured — and no probe forward runs — unless a capacity
-was actually left unset.
+was actually left unset. Both are unset by default.
 
-Failure modes are explicit rather than silent: on a non-CUDA device
-`max_num_blocks=None` raises (there is nothing to measure), and when not even
+On a non-CUDA device there is nothing to measure, so `max_num_blocks=None` sizes
+the pool to its ceiling, `max_batch_size × blocks_per_seq`. On CUDA, when not even
 the minimum viable pool fits, construction fails with the arithmetic and the
 levers (`max_batch_size`, `num_left_chunks`, `gpu_memory_utilization`, or an
 explicit `max_num_blocks`) rather than deriving a pool that OOMs at allocation
@@ -553,7 +560,7 @@ engine = ASREngine(EngineConfig(
 | Aborting a running stream | `abort_request` removes from the scheduler and frees the cache via `ModelRunner.free_stream`. |
 | Audio sample-rate mismatch | `InputProcessor.load_audio` resamples to `sample_rate`. |
 | Force-flush firing inside an offline batch | All bucket guards skipped — batch may be highly padded. Acceptable to bound starvation. |
-| Streaming admission gated by cohort | New requests wait until the running pool drains; visible as no `newly_admitted` even with `num_waiting_streaming > 0`. |
+| More waiting streams than free slots | Admission is bounded by `max_wait_time`: overdue streams are admitted first, oldest first, and only the rest are length-sorted. |
 
 ### Thread safety
 
@@ -612,8 +619,7 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
 ## 9. Performance Considerations
 
 1. **Streaming throughput is dominated by `_forward_batched_paged`.**
-   Keep `streaming_cohort_admit=True` and pick `max_batch_size` to fit
-   the GPU. Larger batches amortise launch overhead but spread per-step
+   Pick `max_batch_size` to fit the GPU. Larger batches amortise launch overhead but spread per-step
    latency.
 2. **A CUDA stream overlaps streaming fbank and forward.** `_feat_stream`
    runs the streaming fbank kernel; the default stream waits on a recorded
@@ -763,12 +769,13 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
    forward per finishing stream (~400 ms of a 664 ms Nemotron backlog). Batched,
    and consumed whole as the fallback consumed it: Nemotron streaming **1.78×**.
 
-9. **Pool sizing.** The engine's most common production failure is
-   `BlockPool` exhaustion. Size `max_num_blocks` for
-   `max_batch_size × max_logical_blocks` plus headroom; trade off
-   against GPU memory. Or hand it over: `max_num_blocks=None` derives the
-   pool from free VRAM at construction ([§6.1](#61-vram-aware-capacity-sizing)),
-   which is what makes one config portable across card sizes.
+9. **Pool sizing.** By default (`max_num_blocks=None`) the pool is derived from
+   free VRAM at construction ([§6.1](#61-vram-aware-capacity-sizing)), which is
+   what makes one config portable across card sizes. An explicit pool must cover
+   `max_batch_size × max_logical_blocks` plus headroom: with unlimited history
+   each stream is capped at its share, `max_num_blocks // max_batch_size`, and
+   ends there with `finish_reason="length"`. The pool's size does not cost
+   throughput: freeing a stream's blocks costs its own blocks, not the pool's.
 
 ## 10. Extension Points
 

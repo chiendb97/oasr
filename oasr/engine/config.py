@@ -110,9 +110,12 @@ class EngineConfig:
         keeps the legacy "admit greedily up to ``max_batch_size``" behaviour.
     max_num_blocks : int or None
         Total number of physical KV-cache blocks in the shared block pool.
-        Should satisfy ``max_num_blocks >= max_batch_size * max_blocks_per_seq``.
-        ``None`` means **derive it from free VRAM** at engine construction (H4)
-        — see :attr:`gpu_memory_utilization`.
+        ``None`` (the default) means **derive it from free VRAM** at engine
+        construction, capped at the ``max_batch_size * max_blocks_per_seq``
+        blocks a full pool of streams can address — see
+        :attr:`gpu_memory_utilization`.  With unlimited history an explicit pool
+        caps every stream at ``max_num_blocks // max_batch_size`` blocks, where
+        it ends with ``finish_reason="length"``.
     gpu_memory_utilization : float
         Fraction of the device the engine may occupy in total, weights included.
         Only read when a capacity is left to derive (``max_num_blocks=None`` in
@@ -235,9 +238,12 @@ class EngineConfig:
     # Post-subsampling frame budget per packed row, including segment gaps.
     max_packed_frames: int = 8192
 
-    # Paged-KV block count.  ``None`` derives it from available device memory;
-    # offline engines allocate no pool.
-    max_num_blocks: Optional[int] = 2048
+    # Paged-KV block count.  ``None`` derives it from available device memory, up
+    # to what the block table can address; offline engines allocate no pool.  It
+    # was a flat 2048, whose fair share at ``max_batch_size=32`` is 64 blocks per
+    # stream: every stream longer than ~41 s was cut off with
+    # ``finish_reason="length"``.
+    max_num_blocks: Optional[int] = None
     block_size_frames: int = 16
     max_blocks_per_seq: int = 512
     # Total device-memory fraction available to derived capacities.  The
