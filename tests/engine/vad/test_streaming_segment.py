@@ -19,11 +19,17 @@ worth pinning are the ones whose failures stay plausible:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from helpers.audio import SR, hiss, speech_corpus, tone
 
+from oasr.engine import metrics as m
+from oasr.engine.executor.streaming import StreamingExecutor
+from oasr.engine.request import Request, RequestOutput
 from oasr.engine.vad_stage import StreamingVadStage
+from oasr.features import FeatureConfig
 from oasr.vad import SpeechSegmenter, VadConfig
 
 
@@ -111,10 +117,10 @@ class TestEncoderGate:
 
     def test_the_turn_boundary_needs_a_confirmed_run(self):
         st = self.fed(torch.cat([tone(2.0), hiss(0.5)]))
-        assert st.turn_boundary("r") is None, "the pause is still open"
+        assert st.turn_boundary("r", after=0.0) is None, "the pause is still open"
         st.feed_audio("r", hiss(5.0))
         st.advance_audio([_Req("r")])
-        boundary = st.turn_boundary("r")
+        boundary = st.turn_boundary("r", after=0.0)
         assert boundary is not None
         assert boundary == pytest.approx(2.0 + st.pad_seconds, abs=0.15)
 
@@ -129,12 +135,194 @@ class TestEncoderGate:
         seg = st.state("r").segmenter
         assert seg.last_segment_end is not None, "max_speech_s did not fire"
         assert seg.open_run_start is not None, "speech did not resume"
-        assert st.turn_boundary("r") is None, "the turn closed on a gapless cut"
+        assert st.turn_boundary("r", after=0.0) is None, "the turn closed on a gapless cut"
 
     def test_a_confirmed_silence_still_closes_the_turn_under_a_cap(self):
         """The guard must not disable turn closing wherever a cap is set."""
         st = self.fed(torch.cat([tone(3.0), hiss(6.0)]), max_speech_s=1.0)
-        assert st.turn_boundary("r") is not None
+        assert st.turn_boundary("r", after=0.0) is not None
+
+    def test_the_boundary_is_the_first_the_turn_reaches_not_the_latest(self):
+        """A detector running ahead has closed runs the encoder has not reached.
+
+        The turn the encoder is in ends at the *first* confirmed silence after
+        the turn started.  Answering with the latest one kept a backlogged turn
+        open across a gap the gate then skipped, so the encoder resumed on the
+        far side with its old context and position — audit #10.
+        """
+        st = self.fed(torch.cat([tone(2.0), hiss(4.0), tone(1.0), hiss(3.0)]))
+        pad = st.pad_seconds
+        assert st.turn_boundary("r", after=0.0) == pytest.approx(2.0 + pad, abs=0.05)
+        assert st.turn_boundary("r", after=2.0 + pad) == pytest.approx(7.0 + pad, abs=0.05)
+        assert st.turn_boundary("r", after=7.0 + pad) is None, "no run ends in a later turn"
+
+
+# ---------------------------------------------------------------------------
+# The gate inside the executor: what the encoder is actually handed
+# ---------------------------------------------------------------------------
+
+#: A Conformer-shaped streaming geometry over 10 ms input frames.
+WINDOW, STRIDE, SUBSAMPLING, SHIFT = 67, 64, 4, 0.01
+HOP = SR // 100
+
+
+class _Decoder:
+    """The decode side of a turn, reduced to whether it heard any speech."""
+
+    def __init__(self) -> None:
+        self.heard = False
+
+    def finalize_streaming(self, req: Request) -> RequestOutput:
+        said, self.heard = self.heard, False
+        return RequestOutput(
+            request_id=req.request_id,
+            text="word" if said else "",
+            tokens=[[7] if said else []],
+            finished=False,
+        )
+
+    def free_session(self, req: Request) -> None:
+        pass
+
+    def create_session(self, req: Request) -> None:
+        pass
+
+
+class _Encoder:
+    decoding_window = WINDOW
+    stride = STRIDE
+
+    def reset_stream(self, req: Request) -> None:
+        req.offset = 0
+
+
+class _Counters(dict):
+    def incr(self, name: str, value: float = 1.0) -> None:
+        self[name] = self.get(name, 0.0) + value
+
+
+class _GatedStream:
+    """One stream through the executor's real gate and turn closing.
+
+    Everything past the gate is a stand-in: the "encoder" records the window it
+    is handed together with both clocks, and advances the model clock the way a
+    forward does.  That is all rule 13 is about.
+    """
+
+    def __init__(self, speech) -> None:
+        self.vad = stage()
+        self.vad.open("r")
+        ex = StreamingExecutor.__new__(StreamingExecutor)
+        ex._vad = self.vad
+        ex._config = SimpleNamespace(feature_config=FeatureConfig())
+        ex._mr = _Encoder()
+        ex._op = _Decoder()
+        ex._metrics = _Counters()
+        self.ex = ex
+        self.req = Request(request_id="r", streaming=True)
+        self.speech = speech
+        self.forwarded = []  # (window start s, model offset, turn start s)
+        self.outputs = []
+
+    def feed(self, wav: torch.Tensor, final: bool = False) -> None:
+        self.vad.feed_audio("r", wav)
+        self.vad.advance_audio([self.req])
+        self.req.feature_frames += int(wav.numel()) // HOP
+        self.req.audio_final = final
+
+    def feed_live(self, wav: torch.Tensor, final: bool = False, chunk: int = SR // 8) -> None:
+        """Feed at a pace the encoder keeps up with, so the gate never gets lookahead."""
+        for pos in range(0, int(wav.numel()), chunk):
+            last = pos + chunk >= wav.numel()
+            self.feed(wav[pos : pos + chunk], final=final and last)
+            self.encode()
+
+    def encode(self) -> None:
+        req = self.req
+        while req.has_ready_encoder_chunk(WINDOW):
+            if not self.ex._gate([req], self.outputs):
+                return
+            start = (req.feature_base + req.feature_cursor) * SHIFT
+            end = start + WINDOW * SHIFT
+            self.forwarded.append((start, req.offset, req.stream_time_offset))
+            if any(s < end and start < e for s, e in self.speech):
+                self.ex._op.heard = True
+            req.offset += STRIDE // SUBSAMPLING
+            req.feature_cursor += min(STRIDE, req.feature_frames - req.feature_cursor)
+
+    @property
+    def skipped(self) -> float:
+        return self.ex._metrics.get(m.AUDIO_SECONDS_SKIPPED, 0.0)
+
+    @property
+    def turns(self):
+        return [o.text for o in self.outputs if o.endpoint_reason == "vad_segment"]
+
+    def assert_never_spliced(self) -> None:
+        """Rule 13, as the encoder sees it.
+
+        The model clock and the reporting clock together must locate every
+        window the encoder was handed — that sum is what every token and word
+        time is computed from.  A window fed mid-turn after a skip is placed
+        where the *last* window ended instead, early by exactly the skipped
+        audio.
+        """
+        assert self.forwarded, "the encoder was never run"
+        for start, offset, turn_start in self.forwarded:
+            placed = turn_start + offset * SUBSAMPLING * SHIFT
+            assert placed == pytest.approx(start), (
+                f"window at {start:.2f}s was encoded as {placed:.2f}s: spliced onto the "
+                "previous window without a reset"
+            )
+
+
+class TestGateAcrossSkippedSilence:
+    """Audit #10: a skip is a turn boundary, however far ahead the detector is."""
+
+    AUDIO = staticmethod(lambda: torch.cat([tone(2.0), hiss(4.0), tone(1.0), hiss(3.0)]))
+    SPEECH = [(0.0, 2.0), (6.0, 7.0)]
+
+    def test_a_backlogged_stream_resets_across_the_silence_it_skips(self):
+        """The audit's repro: the whole waveform at once, as
+        ``transcribe(streaming=True)`` feeds it.  The 5.12 s window used to be
+        encoded at model offset 64, i.e. as if it followed 2.56 s directly."""
+        s = _GatedStream(self.SPEECH)
+        s.feed(self.AUDIO(), final=True)
+        s.encode()
+        assert s.skipped > 1.0, "nothing was skipped, so nothing was under test"
+        s.assert_never_spliced()
+        assert s.turns == ["word", "word word"], "each utterance is its own turn"
+
+    def test_the_same_audio_reports_the_same_turns_however_far_behind_the_encoder_is(self):
+        """Pacing decides how much is skipped; it must not decide the turns."""
+        live = _GatedStream(self.SPEECH)
+        live.feed_live(self.AUDIO(), final=True)
+        bulk = _GatedStream(self.SPEECH)
+        bulk.feed(self.AUDIO(), final=True)
+        bulk.encode()
+        assert live.skipped == 0.0 < bulk.skipped
+        live.assert_never_spliced()
+        bulk.assert_never_spliced()
+        assert live.turns == bulk.turns == ["word", "word word"]
+
+    def test_a_rewind_over_silence_is_not_reported_as_a_turn(self):
+        """The encoder can be mid-turn with nothing but silence behind it.
+
+        Here it keeps pace through the first utterance and closes that turn
+        live, so the pause after it is encoded into a fresh turn — and then the
+        stream falls behind.  The skip still has to rewind the encoder, but a
+        turn that heard nothing is not a turn: reporting it would make the
+        number of turns depend on the pacing again.
+        """
+        s = _GatedStream([(0.0, 1.0), (9.0, 10.0)])
+        s.feed_live(torch.cat([tone(1.0), hiss(4.0)]))
+        assert s.turns == ["word"] and s.req.offset > 0 and s.skipped == 0.0
+        s.feed(torch.cat([hiss(4.0), tone(1.0), hiss(3.0)]), final=True)
+        s.encode()
+        assert s.skipped > 1.0
+        s.assert_never_spliced()
+        assert s.turns == ["word", "word word"]
+        assert s.req.turn_index == 2 and s.ex._metrics.get(m.VAD_SEGMENTS) == 2.0
 
 
 class TestIncrementalAudioFeed:
@@ -321,6 +509,39 @@ class TestStreamingSegmentEngine:
             found = final.text.find(word.word, cursor)
             assert found >= 0, f"{word.word!r} is not a substring of the transcript"
             cursor = found + len(word.word)
+
+    @pytest.mark.requires_assets("CKPT_DIR", "WAV_DIR")
+    def test_a_backlogged_stream_times_words_where_they_were_spoken(self, ckpt_dir, wav_dir):
+        """Audit #10 end to end: the whole waveform at once, so the gate skips.
+
+        A skip that did not rewind the encoder placed every later utterance's
+        words early by the audio it skipped — in the silence before it, or in
+        the utterance before that — and merged the utterances into one turn.
+        The live-fed timing test above cannot see either, because a stream
+        arriving at real time never gets far enough ahead to skip.
+        """
+        wav, _total, spans = speech_corpus(wav_dir, gap_s=6.0)
+        engine = self.engine(ckpt_dir, {"mode": "segment", "backend": "energy"})
+        try:
+            final = engine.transcribe_outputs(
+                [wav], streaming=True, decoding={"word_timestamps": True}
+            )[0]
+            counters = engine.metrics_snapshot().get("counters", {})
+        finally:
+            engine.shutdown()
+
+        assert counters.get("oasr_engine_audio_seconds_skipped_total", 0.0) > 1.0
+        assert counters.get("oasr_engine_vad_segments_total") == len(spans) - 1
+        words = final.words or []
+        assert len(words) > 10
+        slack = 0.5
+        inside = lambda w, s, e: s - slack <= w.start and w.end <= e + slack  # noqa: E731
+        for w in words:
+            assert any(
+                inside(w, s, e) for s, e in spans
+            ), f"{w.word!r} at {w.start:.2f}-{w.end:.2f}s is in no utterance: {spans}"
+        for s, e in spans:
+            assert any(inside(w, s, e) for w in words), f"no word timed inside {s:.2f}-{e:.2f}s"
 
     @pytest.mark.requires_assets("CKPT_DIR", "WAV_DIR")
     def test_a_backlogged_stream_skips_the_silence_it_can_prove(self, ckpt_dir, wav_dir):

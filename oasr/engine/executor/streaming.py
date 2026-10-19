@@ -295,6 +295,13 @@ class StreamingExecutor(Executor):
         starts on a clean context.  Making the skip a precondition for the close
         would have made ``segment`` mode inert on exactly the streams it is
         advertised for.
+
+        The other direction is enforced rather than assumed: a skip never leaves
+        the encoder mid-turn.  A turn ends at the first confirmed silence the
+        encoder crosses, and a skipped window always lies past it, so the close
+        normally comes from :meth:`_maybe_close_turn`.  A turn with no confirmed
+        speech in it — a pause the encoder kept pace with before falling behind —
+        has no such boundary, and is rewound here instead.
         """
         if not ready or self._vad is None or not self._vad.gates_encoder:
             return ready
@@ -322,6 +329,10 @@ class StreamingExecutor(Executor):
                 self._metrics.incr(m.AUDIO_SECONDS_SKIPPED, skipped * shift)
             start_s = (req.feature_base + req.feature_cursor) * shift
             self._maybe_close_turn(req, start_s, outputs)
+            if skipped and req.offset > 0:
+                # The next window is not the one after the last the encoder saw,
+                # so its cache and position go back to zero (rule 13).
+                self._close_turn(req, outputs, rewind_only=True)
             if not req.has_ready_encoder_chunk(window):
                 continue
             if req.offset == 0:
@@ -336,32 +347,42 @@ class StreamingExecutor(Executor):
     ) -> None:
         """Close the open turn if the encoder has crossed a confirmed silence.
 
-        ``stream_time_offset`` is what stops this firing twice for one boundary:
-        it is rebased to the new turn's start, which is at or past the boundary,
-        so the test only passes again once a *later* run has closed.
+        The boundary asked for is the first one after the turn's start, which is
+        also what stops this firing twice for one boundary: ``stream_time_offset``
+        is rebased to the new turn's start, at or past the boundary just closed.
         """
         if req.offset <= 0 or self._vad is None:
             return
-        boundary = self._vad.turn_boundary(req.request_id)
-        if boundary is None:
-            return
-        if window_start_s < boundary or req.stream_time_offset >= boundary:
+        boundary = self._vad.turn_boundary(req.request_id, after=req.stream_time_offset)
+        if boundary is None or window_start_s < boundary:
             return
         self._close_turn(req, outputs)
 
-    def _close_turn(self, req: Request, outputs: List[RequestOutput]) -> None:
+    def _close_turn(
+        self, req: Request, outputs: List[RequestOutput], *, rewind_only: bool = False
+    ) -> None:
         """Finalize the open turn, fold it into the stream, and rewind the stream.
 
         Order is load-bearing.  The decoder is finalized *before* the encoder
         cache is reset, because finalizing reads the beam the encoder's output
         built; resetting first would finalize against a stream that no longer has
         the frames its hypotheses came from.
+
+        ``rewind_only`` is the gate's rewind of a turn no confirmed speech run
+        ended in.  It is finalized all the same, in case the decoder did emit
+        something, but a turn that said nothing is neither reported nor counted:
+        otherwise the number of turns a stream reports would depend on how far
+        behind its encoder ran.
         """
         final = self._op.finalize_streaming(req)
-        self._commit_turn(req, final)
+        said = bool(final.tokens and final.tokens[0]) or bool((final.text or "").strip())
+        if said or not rewind_only:
+            self._commit_turn(req, final)
         self._op.free_session(req)
         self._op.create_session(req)
         self._mr.reset_stream(req)  # encoder cache + req.offset, together
+        if rewind_only and not said:
+            return
         req.turn_index += 1
         self._metrics.incr(m.VAD_SEGMENTS, 1.0)
 
