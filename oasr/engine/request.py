@@ -325,6 +325,14 @@ class RequestOutput:
         interim output that closes a ``vad.mode="segment"`` turn — the first two
         end the *request*, the last one does not.  ``None`` when the turn ended
         because the audio did.
+    search_overflow : int, optional
+        Capacity limits the decoder's search hit and could not recover from, so
+        the transcript may be missing words — the WFST decoder's overflow bits
+        (``oasr.decoder.wfst_decoder.OVERFLOW_*``: 1 candidates, 2 hash probes,
+        4 winners arena or streaming ring, 8 state claims, 16 frontier).  A lane
+        that overflowed and was then decoded again within bounds does not set it.
+        ``None`` when the search stayed within its limits, and for decode
+        families that have none.
     """
 
     request_id: str
@@ -342,6 +350,7 @@ class RequestOutput:
     speech_events: Optional[List["VadEvent"]] = None
     no_speech_prob: Optional[float] = None
     endpoint_reason: Optional[str] = None
+    search_overflow: Optional[int] = None
 
 
 class Request:

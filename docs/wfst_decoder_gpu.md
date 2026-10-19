@@ -443,15 +443,22 @@ the C++ API (`LastLatticeRecords`).
 |---|---|---|---|
 | 1 | `kOverflowCand` | candidate buffer full | caller: rescue decode (bigger factors) |
 | 2 | `kOverflowHash` | probe bound exceeded | caller: rescue decode |
-| 4 | `kOverflowArena` | winners/lattice arena full | **automatic**: grow-commit + re-run; reported only at full reserved capacity |
+| 4 | `kOverflowArena` | winners/lattice arena full | offline **automatic**: grow-commit + re-run; reported only at full reserved capacity. Streaming: the channel's ring overran — see §8.1 |
 | 8 | `kOverflowClaims` | distinct-state claims list full | caller: rescue; `HashSanitizeKernel` wipes the lane's table at batch end (a claims overflow leaves CAS-claimed slots the targeted clear can't see) |
 | 16 | `kOverflowKept` | surviving frontier > `main_q` | caller: rescue |
 
-Any non-zero overflow means the lane's result may be degraded; the standard
-pattern (see `benchmarks/decoders/wfst.py`) is to re-decode flagged lanes on a
-small rescue instance with larger factors. At the wrapper defaults this is
-rare (6 / 2000 LJSpeech utterances, unchanged from the pre-optimization
-decoder).
+Any non-zero overflow means the lane's result may be degraded, and not only
+by a missing tail: tokens are dropped in claim order, not score order, so the
+best path can be among them, and on a synthetic burst an overflowed lane both
+dropped and *inserted* words. The Python wrapper (`WfstDecoderSearch`)
+re-decodes every flagged offline lane on a two-lane rescue instance with
+`main_q_factor=64` (the main instance uses 32), and reports what the rescue
+could not absorb through `overflow` / `batch_overflow` →
+`DecoderResult.overflow` → `RequestOutput.search_overflow` and
+`oasr_engine_search_overflow_total`. At engine settings (32 lanes, blank skip
+0.98) 15 of 2000 LJSpeech utterances overflow, all on the frontier bit; on
+those the best path is identical at 32x to 256x capacity, so the rescue
+changes nothing there, and 4 of the 15 still overflow at 64x.
 
 ## 8. Streaming Lifecycle
 
@@ -493,8 +500,13 @@ cap. Partial and final results are the host prefix + the device tail (the
 tail walk stops at the sentinel; `path_cap` grows to `fin_cap ≥ 4096` so a
 lagging tail fits). The per-round drain is bounded by `fin_cap` arcs via a
 phase-ring emit (a backlog from a convergence stall catches up at `fin_cap`
-per round); a window overrun (convergence never found) keeps the flagged
-`kOverflowArena` degrade-not-corrupt semantics.
+per round). A window overrun (convergence never found) sets `kOverflowArena`
+and cannot be recovered in place: the round's tokens are dropped and the
+per-chunk GC skips the lane from then on, so its ring never frees again and the
+hypothesis stops growing for the rest of the stream. `WfstDecoderSearch`
+therefore abandons the channel, keeps the last complete hypothesis, and decodes
+the chunk again on a fresh channel — losing the search context across the
+burst, never the audio after it — and reports the overrun.
 
 Measured: an hour-long synthetic stream (90k frames, LJS tiled) decodes with
 constant 42 MiB committed and results bit-identical between a minimal ring
@@ -636,8 +648,9 @@ These are properties of the design, not a to-do list:
   nondeterminism as k2. `scripts/wfst_parity_check.py` excludes score ties for
   this reason.
 - **Overflow rescue is the caller's job.** The decoder reports overflow through
-  the `ok` flag and the per-lane bits; the engine wrapper surfaces them but does
-  not auto-rescue.
+  the `ok` flag and the per-lane bits and recovers none of it itself (offline
+  arena growth aside); the Python wrapper rescues and restarts as described in
+  §7 and §8.1, and reports the rest.
 
 Open follow-up levers, with the measurement behind each:
 `.artifacts/decoder_perf.md` §2.3.

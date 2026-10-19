@@ -42,6 +42,24 @@ _streaming: Dict[tuple, "_DecoderRef"] = {}
 _OFFLINE_MAX_LANES = 8
 _STREAM_CHUNK_FRAMES = 128
 
+#: Per-lane capacity is ``main_q_factor * max_active_states`` (the surviving frontier),
+#: and the claims, candidate and hash tables scale with it.  Offline: bench-proven.
+_OFFLINE_MAIN_Q_FACTOR = 32
+_OFFLINE_CAND_FACTOR = 3
+#: The rescue instance a flagged lane is re-decoded on: twice the frontier capacity
+#: (so twice every table derived from it), and only two lanes — overflow is rare
+#: (15 of 2000 LJSpeech utterances at engine settings), so it stays small.
+_RESCUE_MAIN_Q_FACTOR = 64
+_RESCUE_LANES = 2
+
+#: ``DecodeResult::overflow`` bits (``include/oasr/wfst/common.cuh``).  Any of them
+#: means the search hit a capacity limit and its result may be missing words.
+OVERFLOW_CAND = 1  # candidate buffer full
+OVERFLOW_HASH = 2  # hash probe bound exceeded
+OVERFLOW_ARENA = 4  # winners arena (offline) or ring (streaming) full
+OVERFLOW_CLAIMS = 8  # distinct-state claims list full
+OVERFLOW_KEPT = 16  # surviving frontier > main_q
+
 
 @functools.cache
 def _get_module():
@@ -182,9 +200,22 @@ def _caches(
 
 
 def _get_offline_decoder(
-    fst: str, opts: WfstDecoderOptions, device: int, scope: Optional[WfstDecoderScope] = None
+    fst: str,
+    opts: WfstDecoderOptions,
+    device: int,
+    scope: Optional[WfstDecoderScope] = None,
+    rescue: bool = False,
 ) -> _DecoderRef:
-    key = _decoder_key(fst, opts, device) + (opts.max_frames, opts.max_offline_lanes)
+    """The offline decoder for these options, or with ``rescue`` its rescue instance."""
+    key = _decoder_key(fst, opts, device) + (opts.max_frames, opts.max_offline_lanes, rescue)
+    lanes = _RESCUE_LANES if rescue else opts.max_offline_lanes
+    main_q_factor = _RESCUE_MAIN_Q_FACTOR if rescue else _OFFLINE_MAIN_Q_FACTOR
+    # The rescue gets the main instance's whole arena budget rather than a two-lane
+    # share of it: an utterance that filled the shared arena needs at least that much.
+    # Reserved, not committed — the arena commits on demand.
+    arena_budget = opts.arena_budget_entries
+    if rescue and arena_budget == 0:
+        arena_budget = min(512 << 20, max(64 << 20, (16 << 20) * opts.max_offline_lanes))
     graph = _get_graph(fst)  # takes _lock itself; resolve before re-acquiring
     lock, offline, _ = _caches(scope)
     with lock:
@@ -198,18 +229,18 @@ def _get_offline_decoder(
                     opts.min_active_states,
                     opts.max_active_states,
                     1,  # allow_partial
-                    opts.max_offline_lanes,
+                    lanes,
                     opts.max_frames,
                     device,
-                    32,
-                    3,  # main_q_factor, cand_factor (offline: bench-proven)
+                    main_q_factor,
+                    _OFFLINE_CAND_FACTOR,
                     1,  # use_cuda_graphs
                     0,
                     0,
                     0,  # lattice, fp16_logprobs, streaming
                     0,
                     3,  # lat_prune_interval, eps_iterations
-                    opts.arena_budget_entries,
+                    arena_budget,
                     opts.stream_log_entries,
                     opts.gc_interval,
                 )
@@ -256,7 +287,9 @@ def _get_streaming_decoder(
 
 
 def _run_decode_batch(mod, dec_handle: int, packed: torch.Tensor, lens: List[int]):
-    """Decode a padded ``[g, T, V]`` CUDA batch; return (words_per_row, scores, oks).
+    """Decode a padded ``[g, T, V]`` CUDA batch; return (words, scores, oks, overflow).
+
+    ``overflow`` is each row's ``OVERFLOW_*`` bits (0 when the search stayed in bounds).
 
     Results marshal through caller-allocated CPU tensors. ``words`` per lane <= frames
     for HLG, so ``cap = T`` almost never truncates; if a lane's true word count exceeds
@@ -283,6 +316,7 @@ def _run_decode_batch(mod, dec_handle: int, packed: torch.Tensor, lens: List[int
     wl = out_wlen.tolist()
     ok = out_meta[:, 0].tolist()
     sc = out_scores.tolist()
+    overflow = [int(v) for v in out_meta[:, 2].tolist()]
     for b in range(g):
         if ok[b]:
             length = min(int(wl[b]), cap)
@@ -292,7 +326,7 @@ def _run_decode_batch(mod, dec_handle: int, packed: torch.Tensor, lens: List[int
             words.append([])
             scores.append(0.0)
         oks.append(bool(ok[b]))
-    return words, scores, oks
+    return words, scores, oks, overflow
 
 
 class WfstDecoderSearch:
@@ -303,6 +337,15 @@ class WfstDecoderSearch:
     a channel of the shared streaming decoder (k2-online beam semantics).  ``scope``
     selects whose decoders it uses: a :class:`WfstDecoderScope`, or ``None`` for the
     process-wide ones.
+
+    A lane that hits a capacity limit is recovered here rather than returned as if it
+    were complete.  Offline, it is decoded again on a rescue instance with twice the
+    frontier capacity.  Streaming, a winners-ring overrun is the one limit the decoder
+    cannot outlive in place — the lane's collector stops for good and its transcript
+    freezes — so the chunk is decoded again on a fresh channel, after the words already
+    decoded.  Whatever was not recovered is reported: :attr:`overflow` (the last search
+    or single decode) and :attr:`batch_overflow` (the last batch) hold the
+    ``OVERFLOW_*`` bits, 0 when the result is complete.
     """
 
     wants_device_tensor = True
@@ -320,6 +363,10 @@ class WfstDecoderSearch:
         self._fed_frames = 0
         self._outputs: List[List[int]] = []
         self._likelihood: List[float] = []
+        self._overflow = 0
+        self._batch_overflow: List[int] = []
+        # Streaming: words decoded on channels abandoned after a ring overrun.
+        self._carry: List[int] = []
 
     # -- searcher protocol -------------------------------------------------
 
@@ -335,56 +382,93 @@ class WfstDecoderSearch:
     def times(self) -> List[List[int]]:
         return []
 
+    @property
+    def overflow(self) -> int:
+        """``OVERFLOW_*`` bits the last stream or single decode could not recover from."""
+        return self._overflow
+
+    @property
+    def batch_overflow(self) -> List[int]:
+        """Per-row ``OVERFLOW_*`` bits of the last :meth:`decode_offline_batch`."""
+        return self._batch_overflow
+
     def reset(self) -> None:
         self._release()
         self._fed_frames = 0
         self._outputs = []
         self._likelihood = []
+        self._overflow = 0
+        self._carry = []
 
     def search(self, logp: torch.Tensor) -> None:
         """Streaming: advance this request's channel by one chunk of frames."""
         logp = self._prepare(logp)
         if logp.size(0) == 0:
             return
+        for start in range(0, logp.size(0), _STREAM_CHUNK_FRAMES):
+            piece = logp[start : start + _STREAM_CHUNK_FRAMES].unsqueeze(0).contiguous()
+            words, bits = self._advance(piece)
+            if bits & OVERFLOW_ARENA:
+                # The ring overran: the decoder dropped this round's tokens and the
+                # lane's collector skips it from now on, so it would never free ring
+                # space again.  Keep the last complete hypothesis and decode the piece
+                # again on a fresh channel — an empty ring, so this rarely recurs.
+                self._restart(bits)
+                words, bits = self._advance(piece)
+                if bits & OVERFLOW_ARENA:  # too much even for an empty ring: skip it
+                    self._restart(bits)
+                    self._outputs = [list(self._carry)]
+                    self._likelihood = [0.0]
+                    continue
+            self._overflow |= bits
+            self._outputs = [self._carry + words]
+            self._likelihood = [0.0]
+
+    def _advance(self, piece: torch.Tensor) -> Tuple[List[int], int]:
+        """Feed one ``[1, Tc, V]`` piece to the channel; return (best words, overflow bits).
+
+        The words are this channel's hypothesis so far, without :attr:`_carry`; the
+        bits are the lane's, cumulative since the channel opened.
+        """
         mod = _get_module()
         if self._channel is None:
-            self._device = logp.device.index or 0
+            self._device = piece.device.index or 0
             self._mod = mod
-            self._stream_dec = _get_streaming_decoder(
-                self._fst, self._opts, self._device, self._scope
-            )
-            self._channel = int(mod.wfst_create_stream(self._stream_dec.handle))
-            if self._channel < 0:
+            stream_dec = _get_streaming_decoder(self._fst, self._opts, self._device, self._scope)
+            channel = int(mod.wfst_create_stream(stream_dec.handle))
+            if channel < 0:
                 raise RuntimeError(
                     f"no free WFST stream channels (max_streams={self._opts.max_streams})"
                 )
+            self._channel, self._stream_dec = channel, stream_dec
         stream_dec = self._stream_dec
         assert stream_dec is not None  # held for as long as the channel is
-        partial_words: Optional[List[int]] = None
-        for start in range(0, logp.size(0), _STREAM_CHUNK_FRAMES):
-            piece = logp[start : start + _STREAM_CHUNK_FRAMES].unsqueeze(0).contiguous()
-            tc = int(piece.size(1))
-            self._fed_frames += tc
-            cap = max(1, self._fed_frames)  # cumulative best-path words <= fed frames (HLG)
-            out_words = torch.empty((1, cap), dtype=torch.int32)
-            out_wlen = torch.empty((1,), dtype=torch.int32)
-            out_channels = torch.empty((1,), dtype=torch.int32)
-            out_overflow = torch.empty((1,), dtype=torch.int32)
-            mod.wfst_advance_chunk(
-                stream_dec.handle,
-                torch.tensor([self._channel], dtype=torch.int32),
-                piece,
-                torch.tensor([tc], dtype=torch.int32),
-                1,  # want_partial
-                out_words,
-                out_wlen,
-                out_channels,
-                out_overflow,
-            )
-            partial_words = out_words[0, : min(int(out_wlen[0]), cap)].tolist()
-        if partial_words is not None:
-            self._outputs = [partial_words]
-            self._likelihood = [0.0]
+        tc = int(piece.size(1))
+        self._fed_frames += tc
+        cap = max(1, self._fed_frames)  # cumulative best-path words <= fed frames (HLG)
+        out_words = torch.empty((1, cap), dtype=torch.int32)
+        out_wlen = torch.empty((1,), dtype=torch.int32)
+        out_channels = torch.empty((1,), dtype=torch.int32)
+        out_overflow = torch.empty((1,), dtype=torch.int32)
+        mod.wfst_advance_chunk(
+            stream_dec.handle,
+            torch.tensor([self._channel], dtype=torch.int32),
+            piece,
+            torch.tensor([tc], dtype=torch.int32),
+            1,  # want_partial
+            out_words,
+            out_wlen,
+            out_channels,
+            out_overflow,
+        )
+        return out_words[0, : min(int(out_wlen[0]), cap)].tolist(), int(out_overflow[0])
+
+    def _restart(self, bits: int) -> None:
+        """Abandon the channel after a ring overrun, keeping the last complete hypothesis."""
+        self._overflow |= bits
+        if self._outputs:
+            self._carry = list(self._outputs[0])
+        self._release()
 
     def finalize_search(self) -> None:
         stream_dec = self._stream_dec
@@ -400,11 +484,12 @@ class WfstDecoderSearch:
             stream_dec.handle, self._channel, out_words, out_wlen, out_score, out_meta
         )
         self._release()
+        self._overflow |= int(out_meta[2])
         if int(out_meta[0]):
-            self._outputs = [out_words[: min(int(out_wlen[0]), cap)].tolist()]
+            self._outputs = [self._carry + out_words[: min(int(out_wlen[0]), cap)].tolist()]
             self._likelihood = [float(out_score[0])]
         else:
-            self._outputs = [[]]
+            self._outputs = [list(self._carry)]
             self._likelihood = [0.0]
 
     # -- offline fast path ---------------------------------------------------
@@ -414,9 +499,12 @@ class WfstDecoderSearch:
         logp = self._prepare(logp)
         device = logp.device.index or 0
         dec = _get_offline_decoder(self._fst, self._opts, device, self._scope)
-        words, scores, _ = _run_decode_batch(
+        words, scores, _, overflow = _run_decode_batch(
             _get_module(), dec.handle, logp.unsqueeze(0).contiguous(), [int(logp.size(0))]
         )
+        if overflow[0]:
+            words, scores, overflow = self._rescue([logp], device)
+        self._overflow = overflow[0]
         return [words[0]], [scores[0]]
 
     def decode_offline_batch(self, enc_out: torch.Tensor, enc_lengths):
@@ -428,7 +516,9 @@ class WfstDecoderSearch:
         one ``decode_batch`` GPU launch per group.  This preserves the original decoder's
         batched throughput (the headline perf lever) while producing per-row results
         identical to the one-at-a-time path.  ``tokens[b]`` is the best-path word list;
-        ``scores[b]`` its total score (0.0 for a lane that produced nothing).
+        ``scores[b]`` its total score (0.0 for a lane that produced nothing).  Rows that
+        overflowed are decoded again on the rescue instance afterwards, and
+        :attr:`batch_overflow` reports any it could not recover.
         """
         if enc_out.dim() != 3:
             raise ValueError(f"enc_out must be [B, T, V], got {enc_out.dim()}-D")
@@ -439,12 +529,14 @@ class WfstDecoderSearch:
             lengths = [int(x) for x in enc_lengths]
         tokens: List[List[int]] = [[] for _ in range(batch)]
         scores: List[float] = [0.0 for _ in range(batch)]
+        self._batch_overflow = [0] * batch
         if batch == 0:
             return tokens, scores
         device = enc_out.device.index or 0
         dec = _get_offline_decoder(self._fst, self._opts, device, self._scope)
         mod = _get_module()
         lanes = max(1, self._opts.max_offline_lanes)
+        flagged: List[Tuple[int, torch.Tensor]] = []  # (row, prepared log-probs)
         for start in range(0, batch, lanes):
             stop = min(start + lanes, batch)
             # _prepare handles device/dtype/contiguity + WeNet blank-skip, per row.
@@ -461,11 +553,40 @@ class WfstDecoderSearch:
                 if t > 0:
                     packed[i, :t] = r
                 lens.append(t)
-            w, s, _ = _run_decode_batch(mod, dec.handle, packed.contiguous(), lens)
+            w, s, _, o = _run_decode_batch(mod, dec.handle, packed.contiguous(), lens)
             for i in range(len(w)):
                 tokens[start + i] = w[i]
                 scores[start + i] = s[i]
+                if o[i]:
+                    flagged.append((start + i, rows[i]))
+        if flagged:
+            w, s, o = self._rescue([row for _, row in flagged], device)
+            for (b, _), words, score, bits in zip(flagged, w, s, o):
+                tokens[b], scores[b], self._batch_overflow[b] = words, score, bits
         return tokens, scores
+
+    def _rescue(self, rows: List[torch.Tensor], device: int):
+        """Decode prepared ``[T, V]`` rows on the rescue instance; (words, scores, overflow).
+
+        Its bits are what is reported: a row the rescue also overflowed on is degraded,
+        and still at least as good as the first attempt, which had half the capacity.
+        """
+        dec = _get_offline_decoder(self._fst, self._opts, device, self._scope, rescue=True)
+        mod = _get_module()
+        words: List[List[int]] = []
+        scores: List[float] = []
+        overflow: List[int] = []
+        for start in range(0, len(rows), _RESCUE_LANES):
+            group = rows[start : start + _RESCUE_LANES]
+            lens = [r.size(0) for r in group]
+            packed = group[0].new_full((len(group), max(lens), group[0].size(1)), -30.0)
+            for i, r in enumerate(group):
+                packed[i, : r.size(0)] = r
+            w, s, _, o = _run_decode_batch(mod, dec.handle, packed.contiguous(), lens)
+            words.extend(w)
+            scores.extend(s)
+            overflow.extend(o)
+        return words, scores, overflow
 
     # -- helpers ---------------------------------------------------------------
 

@@ -218,6 +218,77 @@ def loop_fst(tmp_path_factory):
 
 
 # ---------------------------------------------------------------------------
+# Fan graph: label 1 sends the start state S into N parallel states that loop on
+# label 1 and never meet, until label 2 brings them all back to S; from S, labels
+# 3 and 4 emit words 300 and 400.  A run of label 1 is a "noise burst" whose
+# frontier is exactly N tokens wide and whose chains never converge, so it can
+# overflow any capacity on demand; the words after it show whether the decode
+# survived.
+# ---------------------------------------------------------------------------
+
+_FAN_VOCAB = 5
+_FAN_SPEECH = [2, 0, 3, 0, 4, 0, 3, 0]
+_FAN_WORDS = [300, 400, 300]
+
+
+def _write_fan_graph(path: str, n: int) -> None:
+    from oasr.decoder.wfst.graph_image import build_image, write_image
+
+    final = n + 1
+    arcs = [(0, 0, 0, 0)] + [(0, k, 1, 0) for k in range(1, n + 1)]
+    arcs += [(0, 0, 3, 300), (0, 0, 4, 400), (0, final, -1, 0)]
+    for k in range(1, n + 1):
+        arcs += [(k, k, 0, 0), (k, k, 1, 0), (k, 0, 2, 0)]
+    row_splits = np.zeros(n + 3, dtype=np.int64)
+    for src, *_ in arcs:
+        row_splits[src + 1] += 1
+    aux_row_splits, pool = [0], []
+    for *_, word in arcs:
+        if word:
+            pool.append(word)
+        aux_row_splits.append(len(pool))
+    img = build_image(
+        np.cumsum(row_splits).astype(np.int32),
+        np.array([a[1] for a in arcs], dtype=np.int32),
+        np.array([a[2] for a in arcs], dtype=np.int32),
+        np.zeros(len(arcs), dtype=np.float32),
+        aux_row_splits=np.array(aux_row_splits, dtype=np.int32),
+        aux_pool=np.array(pool, dtype=np.int32),
+        vocab_size=_FAN_VOCAB,
+    )
+    write_image(img, path)
+
+
+def _fan_logp(labels) -> torch.Tensor:
+    lp = torch.full((len(labels), _FAN_VOCAB), -10.0)
+    lp[torch.arange(len(labels)), torch.tensor(labels)] = 0.0
+    return lp.cuda()
+
+
+def _fan_opts(**kw):
+    return _loop_opts(**{"max_frames": 512, "max_offline_lanes": 2, **kw})
+
+
+@pytest.fixture(scope="module")
+def fan_fst(tmp_path_factory):
+    """2048 parallel burst states: over an offline frontier of ``32 * 48``."""
+    _module()
+    path = str(tmp_path_factory.mktemp("wfst") / "fan.img")
+    _write_fan_graph(path, 2048)
+    return path
+
+
+@pytest.fixture(scope="module")
+def wide_fan_fst(tmp_path_factory):
+    """8192 parallel burst states: a streaming ring of one mapping chunk (4M entries
+    at 32 MiB) fills in about 512 frames."""
+    _module()
+    path = str(tmp_path_factory.mktemp("wfst") / "wide_fan.img")
+    _write_fan_graph(path, 8192)
+    return path
+
+
+# ---------------------------------------------------------------------------
 # Self-contained toy-graph tests (no external assets)
 # ---------------------------------------------------------------------------
 
@@ -281,8 +352,8 @@ def test_toy_batched_offline_equivalence(toy_fst):
     assert list(b_tokens[0]) == _TOY_WORDS
 
 
-def _toy_strategy(toy_fst, **decoder):
-    """The engine's ``ctc_wfst`` strategy over the toy graph, built as the engine builds it."""
+def _toy_strategy(toy_fst, vocab=_TOY_VOCAB, **decoder):
+    """The engine's ``ctc_wfst`` strategy over a toy graph, built as the engine builds it."""
     from types import SimpleNamespace
 
     from oasr.decode import DecoderConfig
@@ -302,7 +373,7 @@ def _toy_strategy(toy_fst, **decoder):
         max_batch_size=2,
         use_cuda_graphs=False,
         use_ctc_cuda_graphs=False,
-        _model_config=SimpleNamespace(vocab_size=_TOY_VOCAB),
+        _model_config=SimpleNamespace(vocab_size=vocab),
         ctc_decoder_config=None,
         wfst_decoder_config=DecoderConfig(**fields),
         fst_path=toy_fst,
@@ -686,3 +757,118 @@ def test_channel_released_on_finalize(wfst_decoder_cls):
         dec.init_stream()
         dec.decode_chunk(logp)
         dec.finalize_stream()
+
+
+# ---------------------------------------------------------------------------
+# Overflow: rescue, recovery and reporting (audit #13)
+# ---------------------------------------------------------------------------
+
+
+def test_an_overflowed_lane_is_decoded_again_with_room_to_spare(fan_fst):
+    """Offline, a lane whose frontier outgrew ``main_q`` lost tokens in claim order,
+    not score order, and was returned as if complete.  Which tokens is not
+    deterministic, so neither is the damage: at this capacity 7 of 50 first attempts
+    dropped or *inserted* words, at a third of it 33 of 50.  (On real log-probs it is
+    rarer — 15 of 2000 LJSpeech utterances overflow, none changed — which is why it
+    stayed invisible.)  What is deterministic is the flag, and that the rescue, with
+    room for the whole frontier, is exact."""
+    from oasr.decoder.wfst_decoder import (
+        OVERFLOW_KEPT,
+        WfstDecoderSearch,
+        _get_module,
+        _get_offline_decoder,
+        _run_decode_batch,
+    )
+
+    opts = _fan_opts(max_active_states=48)  # main_q 1536 < 2048; the rescue has 3072
+    search = WfstDecoderSearch(fan_fst, opts)
+    burst = _fan_logp([1] * 10 + _FAN_SPEECH)
+
+    # What production returned until now: an attempt the decoder itself flags.
+    first = _get_offline_decoder(fan_fst, opts, 0).handle
+    _, _, _, bits = _run_decode_batch(_get_module(), first, burst.unsqueeze(0), [18])
+    assert bits[0] & OVERFLOW_KEPT, "nothing overflowed, so nothing was under test"
+
+    tokens, _ = search.decode_offline(burst)
+    assert tokens[0] == _FAN_WORDS and search.overflow == 0
+
+    # Batched, beside a row that fits: only the flagged row is decoded again.
+    quiet = _fan_logp([0] * 11 + _FAN_SPEECH[1:])
+    tokens, _ = search.decode_offline_batch(torch.stack([burst, quiet]), [18, 18])
+    assert tokens == [_FAN_WORDS, _FAN_WORDS]
+    assert search.batch_overflow == [0, 0]
+
+
+def test_what_the_rescue_cannot_absorb_is_reported(fan_fst):
+    """The rescue doubles every per-lane table; a lane that needs more still comes
+    back — it is the best the search found — but flagged."""
+    from oasr.decoder.wfst_decoder import OVERFLOW_KEPT, WfstDecoderSearch
+
+    search = WfstDecoderSearch(fan_fst, _fan_opts(max_active_states=24))  # 768, then 1536
+    search.decode_offline(_fan_logp([1] * 10 + _FAN_SPEECH))
+    assert search.overflow & OVERFLOW_KEPT
+
+
+def test_a_stream_outlives_a_ring_overrun(wide_fan_fst):
+    """Streaming, a burst whose chains never converge fills the channel's winners
+    ring.  The decoder drops that round and its collector skips the lane from then
+    on, so the ring never frees again: everything after the burst was lost — the
+    final here was ``[]``.  The searcher now carries on on a fresh channel."""
+    from oasr.decoder.wfst_decoder import OVERFLOW_ARENA, WfstDecoderSearch
+
+    opts = _fan_opts(max_active_states=8192, max_streams=2, stream_log_entries=1)
+    lp = _fan_logp([1] * 1200 + _FAN_SPEECH)
+    search = WfstDecoderSearch(wide_fan_fst, opts)
+    for start in range(0, lp.size(0), 16):
+        search.search(lp[start : start + 16])
+    search.finalize_search()
+    assert search.overflow & OVERFLOW_ARENA, "the ring never overran, so nothing was under test"
+    assert search.outputs[0] == _FAN_WORDS
+
+
+def test_toy_strategy_puts_what_it_could_not_recover_on_the_output(fan_fst):
+    """``RequestOutput.search_overflow`` is the client's only sign that a transcript
+    may be short; a lane the rescue fixed must not set it."""
+    from oasr.decoder.wfst_decoder import OVERFLOW_KEPT
+
+    burst = torch.stack([_fan_logp([1] * 10 + _FAN_SPEECH)])
+    lengths = torch.tensor([18], dtype=torch.int32, device="cuda")
+
+    rescued = _toy_strategy(fan_fst, vocab=_FAN_VOCAB, wfst_max_active_states=48)
+    (out,) = rescued.decode_offline(burst, lengths)
+    assert out.tokens[0] == _FAN_WORDS and out.search_overflow is None
+
+    short = _toy_strategy(fan_fst, vocab=_FAN_VOCAB, wfst_max_active_states=24)
+    (out,) = short.decode_offline(burst, lengths)
+    assert out.search_overflow & OVERFLOW_KEPT
+
+
+def test_toy_strategy_keeps_a_turns_overflow_on_the_streams_final(wide_fan_fst):
+    """A segment-mode turn boundary restarts the search, clearing its bits; the
+    stream's final must still say an earlier turn overran."""
+    from oasr.decoder.wfst_decoder import OVERFLOW_ARENA
+    from oasr.engine.request import Request
+
+    strategy = _toy_strategy(
+        wide_fan_fst,
+        vocab=_FAN_VOCAB,
+        wfst_max_active_states=8192,
+        wfst_max_streams=2,
+        wfst_stream_log_entries=1,
+    )
+    req = Request(request_id="turns", streaming=True)
+    strategy.create_session(req)
+    burst = _fan_logp([1] * 1200 + [2, 0])
+    for start in range(0, burst.size(0), 16):
+        strategy.decode_streaming_chunk(req, burst[start : start + 16].unsqueeze(0))
+    turn = strategy.finalize(req)  # StreamingExecutor._close_turn, decode side
+    strategy.free_session(req)
+    strategy.create_session(req)
+    assert turn.search_overflow & OVERFLOW_ARENA
+
+    speech = _fan_logp(_FAN_SPEECH[1:]).unsqueeze(0)
+    partial = strategy.decode_streaming_chunk(req, speech)
+    final = strategy.finalize(req)
+    assert final.tokens[0] == _FAN_WORDS
+    assert partial.search_overflow & OVERFLOW_ARENA and final.search_overflow & OVERFLOW_ARENA
+    strategy.free_session(req)

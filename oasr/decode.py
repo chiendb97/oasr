@@ -80,11 +80,16 @@ class DecoderResult:
         scores: Log-probability (or total score) for each hypothesis.
         times: Per-token frame timestamps for each hypothesis. May be empty
             for search types that do not track timestamps.
+        overflow: Capacity limits the search hit and could not recover from, as
+            the GPU WFST decoder's ``OVERFLOW_*`` bits; non-zero means the
+            hypothesis may be missing words.  Always 0 for search types without
+            such limits.
     """
 
     tokens: List[List[int]] = field(default_factory=list)
     scores: List[float] = field(default_factory=list)
     times: List[List[int]] = field(default_factory=list)
+    overflow: int = 0
 
 
 def _to_result(searcher) -> DecoderResult:
@@ -96,6 +101,7 @@ def _to_result(searcher) -> DecoderResult:
         tokens=[list(seq) for seq in outputs],
         scores=list(scores),
         times=[list(t) for t in times],
+        overflow=int(getattr(searcher, "overflow", 0) or 0),
     )
 
 
@@ -254,6 +260,7 @@ class Decoder:
                 tokens=[list(t) for t in tokens],
                 scores=list(scores),
                 times=[],
+                overflow=int(getattr(self._searcher, "overflow", 0) or 0),
             )
         self._searcher.reset()
         self._searcher.search(logp)
@@ -277,9 +284,10 @@ class Decoder:
         batched = getattr(self._searcher, "decode_offline_batch", None)
         if batched is not None:
             tokens, scores = batched(logp, lengths)
+            overflow = getattr(self._searcher, "batch_overflow", None) or [0] * len(tokens)
             return [
-                DecoderResult(tokens=[list(t)], scores=[float(s)], times=[])
-                for t, s in zip(tokens, scores)
+                DecoderResult(tokens=[list(t)], scores=[float(s)], times=[], overflow=int(o))
+                for t, s, o in zip(tokens, scores, overflow)
             ]
         lens = [int(x) for x in (lengths.tolist() if torch.is_tensor(lengths) else lengths)]
         return [self.decode(logp[b, : lens[b], :]) for b in range(logp.size(0))]
