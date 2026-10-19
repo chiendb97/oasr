@@ -431,7 +431,7 @@ class TestNbestRefusal:
 
 
 class TestStreamingSegmentEngine:
-    def engine(self, ckpt_dir, vad):
+    def engine(self, ckpt_dir, vad, **overrides):
         from oasr.engine import ASREngine, EngineConfig
 
         return ASREngine(
@@ -441,6 +441,7 @@ class TestStreamingSegmentEngine:
                 max_batch_size=2,
                 max_num_blocks=1024,
                 vad=vad,
+                **overrides,
             )
         )
 
@@ -509,6 +510,31 @@ class TestStreamingSegmentEngine:
             found = final.text.find(word.word, cursor)
             assert found >= 0, f"{word.word!r} is not a substring of the transcript"
             cursor = found + len(word.word)
+
+    @pytest.mark.requires_assets("CKPT_DIR", "WAV_DIR", "LANG_DIR")
+    def test_a_wfst_turn_is_not_repeated_after_a_pause(self, ckpt_dir, wav_dir, lang_dir):
+        """Audit #11 end to end: ``ctc_wfst`` kept its finalized decoder across a
+        turn boundary.  The pause after the last utterance is a turn of silence,
+        whose every frame the decoder blank-skips, so it finalized as the turn
+        before it and the transcript said that utterance twice."""
+        import os
+
+        wav, _total, spans = speech_corpus(wav_dir, gap_s=5.0, n=2)
+        wav = torch.cat([wav, hiss(4.0)])
+        engine = self.engine(
+            ckpt_dir,
+            {"mode": "segment", "backend": "energy"},
+            decoder_type="ctc_wfst",
+            fst_path=os.path.join(lang_dir, "HLG.pt"),
+        )
+        try:
+            final, produced = self.drive(engine, wav)
+        finally:
+            engine.shutdown()
+
+        turns = [o.text for o in produced if o.endpoint_reason == "vad_segment"]
+        assert len(turns) == len(spans), "each utterance, the last one too, closes on its pause"
+        assert final.text == turns[-1], "the pause after the last turn repeated it"
 
     @pytest.mark.requires_assets("CKPT_DIR", "WAV_DIR")
     def test_a_backlogged_stream_times_words_where_they_were_spoken(self, ckpt_dir, wav_dir):
