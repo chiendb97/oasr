@@ -11,9 +11,14 @@ The CUDA decoder is compiled on first use via TVM-FFI JIT (``oasr.jit.wfst_decod
 mirroring the GPU CTC decoder. The stateful ``GpuDecoder`` C++ object lives behind an
 opaque ``int64`` handle; decode results (host-side after backtrack) are returned through
 caller-allocated CPU output tensors. The heavyweight state — graph image and decoder
-instances — is shared process-wide through caches keyed by (graph, options, device), so
-per-``WfstDecoderSearch`` construction stays cheap. Streaming searchers borrow a channel
-from one shared multi-channel decoder and release it on ``finalize_search`` (or GC).
+instances — is cached by (graph, options, device), so per-``WfstDecoderSearch``
+construction stays cheap. Streaming searchers borrow a channel from a multi-channel
+decoder and release it on ``finalize_search`` (or GC).
+
+Decoders are cached process-wide unless a :class:`WfstDecoderScope` is passed, in which
+case they are private to it.  A decoder serializes its callers, so the engine gives each
+``ASREngine`` its own scope: engine workers sharing one decoder would queue on each other.
+The graph's device copy is shared either way (one per graph per device).
 
 Graphs: pass either a prebuilt ``.img`` (built by :mod:`oasr.decoder.wfst.graph_export`)
 or a k2 ``HLG.pt`` — the latter is exported once and cached next to the source file.
@@ -25,14 +30,14 @@ import functools
 import math
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
 _lock = threading.Lock()
 _graphs: dict = {}
-_offline: dict = {}
-_streaming: dict = {}
+_offline: Dict[tuple, "_DecoderRef"] = {}
+_streaming: Dict[tuple, "_DecoderRef"] = {}
 
 _OFFLINE_MAX_LANES = 8
 _STREAM_CHUNK_FRAMES = 128
@@ -66,6 +71,53 @@ def _get_graph(fst: str) -> int:
             mod = _get_module()
             _graphs[fst] = int(mod.wfst_load_graph(_resolve_graph_image(fst)))
         return _graphs[fst]
+
+
+class _DecoderRef:
+    """One ``GpuDecoder`` handle, freed when the last reference to it goes.
+
+    Whatever is about to call into a decoder holds one of these for the length of the
+    call, and a stream holds one for the life of its channel, so a decoder dropped by
+    its scope is freed only once nothing can still be using it.
+    """
+
+    __slots__ = ("handle", "__weakref__")
+
+    def __init__(self, handle: int) -> None:
+        self.handle = handle
+
+    def __del__(self) -> None:
+        try:
+            _get_module().wfst_free_decoder(self.handle)
+        except Exception:  # noqa: BLE001 - interpreter teardown
+            pass
+
+
+class WfstDecoderScope:
+    """The GPU decoders private to one owner — in the engine, one ``ASREngine``.
+
+    A ``GpuDecoder`` runs one call at a time: it has one stream and one set of staging
+    buffers, and holds a mutex across every call.  Two engine workers sharing one
+    therefore queue on each other; measured on per-chunk streaming calls, two threads
+    on one decoder managed 0.55x the throughput of two threads on a decoder each, at
+    1.8x the median latency.  A scope also sizes the streaming decoder's channels to
+    its own owner, where a shared one gave N workers ``max_streams`` channels between
+    them, and failed whole cohorts once they ran out.
+
+    Decoders are created on first use and reused within the scope.  :meth:`close`
+    drops the scope's references; a stream still holding a channel keeps its decoder
+    until the channel is released.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._offline: Dict[tuple, _DecoderRef] = {}
+        self._streaming: Dict[tuple, _DecoderRef] = {}
+
+    def close(self) -> None:
+        with self._lock:
+            self._offline.clear()
+            self._streaming.clear()
 
 
 def _decoder_key(fst: str, opts: "WfstDecoderOptions", device: int) -> tuple:
@@ -121,13 +173,24 @@ class WfstDecoderOptions:
         self.gc_interval = gc_interval
 
 
-def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int:
+def _caches(
+    scope: Optional[WfstDecoderScope],
+) -> Tuple[threading.Lock, Dict[tuple, _DecoderRef], Dict[tuple, _DecoderRef]]:
+    if scope is None:
+        return _lock, _offline, _streaming
+    return scope._lock, scope._offline, scope._streaming
+
+
+def _get_offline_decoder(
+    fst: str, opts: WfstDecoderOptions, device: int, scope: Optional[WfstDecoderScope] = None
+) -> _DecoderRef:
     key = _decoder_key(fst, opts, device) + (opts.max_frames, opts.max_offline_lanes)
     graph = _get_graph(fst)  # takes _lock itself; resolve before re-acquiring
-    with _lock:
-        if key not in _offline:
+    lock, offline, _ = _caches(scope)
+    with lock:
+        if key not in offline:
             mod = _get_module()
-            _offline[key] = int(
+            offline[key] = _DecoderRef(
                 mod.wfst_create_decoder(
                     graph,
                     opts.search_beam,
@@ -151,16 +214,19 @@ def _get_offline_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int
                     opts.gc_interval,
                 )
             )
-        return _offline[key]
+        return offline[key]
 
 
-def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> int:
+def _get_streaming_decoder(
+    fst: str, opts: WfstDecoderOptions, device: int, scope: Optional[WfstDecoderScope] = None
+) -> _DecoderRef:
     key = _decoder_key(fst, opts, device) + (opts.max_streams,)
     graph = _get_graph(fst)  # takes _lock itself; resolve before re-acquiring
-    with _lock:
-        if key not in _streaming:
+    lock, _, streaming = _caches(scope)
+    with lock:
+        if key not in streaming:
             mod = _get_module()
-            _streaming[key] = int(
+            streaming[key] = _DecoderRef(
                 mod.wfst_create_decoder(
                     graph,
                     opts.search_beam,
@@ -186,7 +252,7 @@ def _get_streaming_decoder(fst: str, opts: WfstDecoderOptions, device: int) -> i
                     opts.gc_interval or 2,
                 )
             )
-        return _streaming[key]
+        return streaming[key]
 
 
 def _run_decode_batch(mod, dec_handle: int, packed: torch.Tensor, lens: List[int]):
@@ -234,16 +300,21 @@ class WfstDecoderSearch:
 
     Offline (``decode_offline``) runs the exact offline beam semantics in one batched
     call; the streaming protocol (``reset`` / ``search`` / ``finalize_search``) maps to
-    a channel of the shared streaming decoder (k2-online beam semantics).
+    a channel of the shared streaming decoder (k2-online beam semantics).  ``scope``
+    selects whose decoders it uses: a :class:`WfstDecoderScope`, or ``None`` for the
+    process-wide ones.
     """
 
     wants_device_tensor = True
 
-    def __init__(self, fst: str, opts: WfstDecoderOptions) -> None:
+    def __init__(
+        self, fst: str, opts: WfstDecoderOptions, scope: Optional[WfstDecoderScope] = None
+    ) -> None:
         self._fst = fst
         self._opts = opts
+        self._scope = scope
         self._channel: Optional[int] = None
-        self._stream_dec: Optional[int] = None
+        self._stream_dec: Optional[_DecoderRef] = None
         self._mod = None
         self._device: Optional[int] = None
         self._fed_frames = 0
@@ -279,12 +350,16 @@ class WfstDecoderSearch:
         if self._channel is None:
             self._device = logp.device.index or 0
             self._mod = mod
-            self._stream_dec = _get_streaming_decoder(self._fst, self._opts, self._device)
-            self._channel = int(mod.wfst_create_stream(self._stream_dec))
+            self._stream_dec = _get_streaming_decoder(
+                self._fst, self._opts, self._device, self._scope
+            )
+            self._channel = int(mod.wfst_create_stream(self._stream_dec.handle))
             if self._channel < 0:
                 raise RuntimeError(
                     f"no free WFST stream channels (max_streams={self._opts.max_streams})"
                 )
+        stream_dec = self._stream_dec
+        assert stream_dec is not None  # held for as long as the channel is
         partial_words: Optional[List[int]] = None
         for start in range(0, logp.size(0), _STREAM_CHUNK_FRAMES):
             piece = logp[start : start + _STREAM_CHUNK_FRAMES].unsqueeze(0).contiguous()
@@ -296,7 +371,7 @@ class WfstDecoderSearch:
             out_channels = torch.empty((1,), dtype=torch.int32)
             out_overflow = torch.empty((1,), dtype=torch.int32)
             mod.wfst_advance_chunk(
-                self._stream_dec,
+                stream_dec.handle,
                 torch.tensor([self._channel], dtype=torch.int32),
                 piece,
                 torch.tensor([tc], dtype=torch.int32),
@@ -312,7 +387,8 @@ class WfstDecoderSearch:
             self._likelihood = [0.0]
 
     def finalize_search(self) -> None:
-        if self._channel is None:
+        stream_dec = self._stream_dec
+        if self._channel is None or stream_dec is None:
             return
         mod = self._mod or _get_module()
         cap = max(1, self._fed_frames)
@@ -321,7 +397,7 @@ class WfstDecoderSearch:
         out_score = torch.empty((1,), dtype=torch.float64)
         out_meta = torch.empty((3,), dtype=torch.int32)
         mod.wfst_finalize_stream(
-            self._stream_dec, self._channel, out_words, out_wlen, out_score, out_meta
+            stream_dec.handle, self._channel, out_words, out_wlen, out_score, out_meta
         )
         self._release()
         if int(out_meta[0]):
@@ -337,9 +413,9 @@ class WfstDecoderSearch:
         """Exact offline decode of one utterance; returns (tokens, scores)."""
         logp = self._prepare(logp)
         device = logp.device.index or 0
-        dec = _get_offline_decoder(self._fst, self._opts, device)
+        dec = _get_offline_decoder(self._fst, self._opts, device, self._scope)
         words, scores, _ = _run_decode_batch(
-            _get_module(), dec, logp.unsqueeze(0).contiguous(), [int(logp.size(0))]
+            _get_module(), dec.handle, logp.unsqueeze(0).contiguous(), [int(logp.size(0))]
         )
         return [words[0]], [scores[0]]
 
@@ -366,7 +442,7 @@ class WfstDecoderSearch:
         if batch == 0:
             return tokens, scores
         device = enc_out.device.index or 0
-        dec = _get_offline_decoder(self._fst, self._opts, device)
+        dec = _get_offline_decoder(self._fst, self._opts, device, self._scope)
         mod = _get_module()
         lanes = max(1, self._opts.max_offline_lanes)
         for start in range(0, batch, lanes):
@@ -385,7 +461,7 @@ class WfstDecoderSearch:
                 if t > 0:
                     packed[i, :t] = r
                 lens.append(t)
-            w, s, _ = _run_decode_batch(mod, dec, packed.contiguous(), lens)
+            w, s, _ = _run_decode_batch(mod, dec.handle, packed.contiguous(), lens)
             for i in range(len(w)):
                 tokens[start + i] = w[i]
                 scores[start + i] = s[i]
@@ -411,10 +487,11 @@ class WfstDecoderSearch:
     def _release(self) -> None:
         if self._channel is not None and self._stream_dec is not None and self._mod is not None:
             try:
-                self._mod.wfst_release_stream(self._stream_dec, self._channel)
+                self._mod.wfst_release_stream(self._stream_dec.handle, self._channel)
             except Exception:
                 pass
         self._channel = None
+        self._stream_dec = None  # the decoder may now be freed once its scope lets go
 
     def __del__(self) -> None:  # channel safety net for aborted requests
         try:

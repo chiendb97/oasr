@@ -15,6 +15,9 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -51,9 +54,112 @@ inline int32_t ExpandBlocksFor(int32_t lanes) {
 }
 
 // ---------------------------------------------------------------------------
+// The graph's device arrays, uploaded once per (graph, device) and shared by every
+// decoder built from that graph on that device.  They are read-only (`DeviceGraph`
+// holds const pointers and kernels take it by value), and for a LibriSpeech HLG they
+// are ~0.9 GiB: a private copy per decoder was most of each decoder's footprint, paid
+// twice by an engine with an offline and a streaming decoder and again per engine
+// worker.  The store lives while any decoder holds it; the cache keeps only a weak
+// reference, so an entry for a freed graph expires instead of pinning device memory.
+struct DeviceGraphStore {
+  DeviceGraph dg{};
+  int64_t bytes = 0;
+  std::vector<void*> allocs;
+
+  template <typename T>
+  T* Alloc(int64_t count) {
+    void* p = nullptr;
+    WFST_CUDA_CHECK(cudaMalloc(&p, count * sizeof(T)));
+    allocs.push_back(p);
+    bytes += count * sizeof(T);
+    return static_cast<T*>(p);
+  }
+
+  ~DeviceGraphStore() {
+    for (void* p : allocs) cudaFree(p);
+  }
+};
+
+static std::shared_ptr<const DeviceGraphStore> UploadDeviceGraph(const GraphImage& g) {
+  auto store = std::make_shared<DeviceGraphStore>();
+  DeviceGraph& dg = store->dg;
+  dg.num_states = static_cast<int32_t>(g.num_states);
+  dg.vocab_size = g.vocab_size;
+  dg.start_state = g.start_state;
+  dg.finals_at_end = g.finals_at_end;
+  dg.eps_first = g.eps_first;
+  dg.eps_count = nullptr;
+  if (g.has_eps) {
+    auto* ec = store->Alloc<int32_t>(g.num_states);
+    WFST_CUDA_CHECK(cudaMemcpy(ec, g.eps_count.data(), g.num_states * 4, cudaMemcpyHostToDevice));
+    dg.eps_count = ec;
+  }
+  auto* rs = store->Alloc<int32_t>(g.num_states + 1);
+  auto* fc = store->Alloc<int32_t>(g.num_states);
+  auto* w = store->Alloc<float>(g.num_arcs);
+  WFST_CUDA_CHECK(
+      cudaMemcpy(rs, g.row_splits.data(), (g.num_states + 1) * 4, cudaMemcpyHostToDevice));
+  WFST_CUDA_CHECK(cudaMemcpy(fc, g.final_count.data(), g.num_states * 4, cudaMemcpyHostToDevice));
+  WFST_CUDA_CHECK(cudaMemcpy(w, g.arc_weight.data(), g.num_arcs * 4, cudaMemcpyHostToDevice));
+  // De-interleave arc columns (SoA): dest as i32, ilabel as u16 (-1 -> 0xFFFF). The
+  // kernels then stream only what each pass needs. Per-state max EMIT weight feeds the
+  // K2 upper-bound skip tests.
+  {
+    std::vector<int32_t> dest(g.num_arcs);
+    std::vector<uint16_t> il(g.num_arcs);
+    for (int64_t a = 0; a < g.num_arcs; ++a) {
+      dest[a] = g.arc_dest_ilabel[2 * a];
+      const int32_t l = g.arc_dest_ilabel[2 * a + 1];
+      if (l < -1 || l >= 0xFFFF)
+        throw std::runtime_error("arc ilabel out of the u16 range [-1, 65534]");
+      il[a] = static_cast<uint16_t>(l);
+    }
+    std::vector<float> maxw(g.num_states, -INFINITY);
+    for (int32_t s = 0; s < static_cast<int32_t>(g.num_states); ++s) {
+      for (int32_t a = g.EmitBegin(s); a < g.EmitEnd(s); ++a)
+        maxw[s] = std::max(maxw[s], g.arc_weight[a]);
+    }
+    auto* dd = store->Alloc<int32_t>(g.num_arcs);
+    auto* dl = store->Alloc<uint16_t>(g.num_arcs);
+    auto* mw = store->Alloc<float>(g.num_states);
+    WFST_CUDA_CHECK(cudaMemcpy(dd, dest.data(), g.num_arcs * 4, cudaMemcpyHostToDevice));
+    WFST_CUDA_CHECK(cudaMemcpy(dl, il.data(), g.num_arcs * 2, cudaMemcpyHostToDevice));
+    WFST_CUDA_CHECK(cudaMemcpy(mw, maxw.data(), g.num_states * 4, cudaMemcpyHostToDevice));
+    dg.arc_dest = dd;
+    dg.arc_ilabel = dl;
+    dg.emit_maxw = mw;
+  }
+  dg.row_splits = rs;
+  dg.final_count = fc;
+  dg.weight = w;
+  return store;
+}
+
+// The caller has already made `device` current.  Keyed by the graph's address: a
+// decoder borrows its graph, so the graph outlives every store built from it, and an
+// address reused by a later graph finds only an expired entry.
+static std::shared_ptr<const DeviceGraphStore> AcquireDeviceGraph(const GraphImage& g, int device) {
+  static std::mutex mu;
+  static std::map<std::pair<const GraphImage*, int>, std::weak_ptr<const DeviceGraphStore>> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  std::weak_ptr<const DeviceGraphStore>& slot = cache[{&g, device}];
+  if (std::shared_ptr<const DeviceGraphStore> live = slot.lock()) return live;
+  std::shared_ptr<const DeviceGraphStore> store = UploadDeviceGraph(g);
+  slot = store;
+  return store;
+}
+
+// ---------------------------------------------------------------------------
 struct GpuDecoder::Impl {
+  // Held for the whole of every public call.  One instance owns a single stream, a
+  // single log-prob staging buffer and descriptor (read in place by its captured
+  // graphs), lane lengths staged through `d_T`, and host-side scratch; two callers
+  // inside it at once decode against each other's inputs.  TVM-FFI releases the GIL
+  // around every call, so two engine workers in one process can do exactly that.
+  mutable std::mutex mu;
   Options opts;
   const GraphImage* host_graph;  // borrowed; aux lookups for word emission
+  std::shared_ptr<const DeviceGraphStore> dev_graph;  // shared; outlives every use of dg
   DeviceGraph dg{};
   Workspace ws{};
   Sizes sz{};
@@ -367,8 +473,13 @@ struct GpuDecoder::Impl {
   }
 
   cudaGraphExec_t CaptureGraph(const std::function<void(cudaStream_t)>& body) {
+    // Non-blocking: a capturing *blocking* stream makes any legacy-stream work in the
+    // process an error ("would make the legacy stream depend on a capturing blocking
+    // stream") -- another engine worker's encoder, a torch op, another decoder's
+    // synchronous cudaMemcpy.  Nothing here needs that ordering: the body only records,
+    // and the graph replays on `stream`, which is blocking.
     cudaStream_t cs = nullptr;
-    WFST_CUDA_CHECK(cudaStreamCreate(&cs));
+    WFST_CUDA_CHECK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
     WFST_CUDA_CHECK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal));
     body(cs);
     cudaGraph_t graph = nullptr;
@@ -502,59 +613,10 @@ struct GpuDecoder::Impl {
     channel_used.assign(sz.lanes, false);
     sz.snap_frames = o.debug_snapshots ? cfg.max_frames + 2 : 0;
 
-    // Graph to device.
-    dg.num_states = static_cast<int32_t>(g.num_states);
-    dg.vocab_size = g.vocab_size;
-    dg.start_state = g.start_state;
-    dg.finals_at_end = g.finals_at_end;
-    dg.eps_first = g.eps_first;
-    dg.eps_count = nullptr;
-    if (g.has_eps) {
-      auto* ec = Alloc<int32_t>(g.num_states);
-      WFST_CUDA_CHECK(
-          cudaMemcpy(ec, g.eps_count.data(), g.num_states * 4, cudaMemcpyHostToDevice));
-      dg.eps_count = ec;
-    }
-    auto* rs = Alloc<int32_t>(g.num_states + 1);
-    auto* fc = Alloc<int32_t>(g.num_states);
-    auto* w = Alloc<float>(g.num_arcs);
-    WFST_CUDA_CHECK(cudaMemcpy(rs, g.row_splits.data(), (g.num_states + 1) * 4,
-                               cudaMemcpyHostToDevice));
-    WFST_CUDA_CHECK(
-        cudaMemcpy(fc, g.final_count.data(), g.num_states * 4, cudaMemcpyHostToDevice));
-    WFST_CUDA_CHECK(
-        cudaMemcpy(w, g.arc_weight.data(), g.num_arcs * 4, cudaMemcpyHostToDevice));
-    // De-interleave arc columns (SoA): dest as i32, ilabel as u16 (-1 -> 0xFFFF). The
-    // kernels then stream only what each pass needs. Per-state max EMIT weight feeds the
-    // K2 upper-bound skip tests.
-    {
-      std::vector<int32_t> dest(g.num_arcs);
-      std::vector<uint16_t> il(g.num_arcs);
-      for (int64_t a = 0; a < g.num_arcs; ++a) {
-        dest[a] = g.arc_dest_ilabel[2 * a];
-        const int32_t l = g.arc_dest_ilabel[2 * a + 1];
-        if (l < -1 || l >= 0xFFFF)
-          throw std::runtime_error("arc ilabel out of the u16 range [-1, 65534]");
-        il[a] = static_cast<uint16_t>(l);
-      }
-      std::vector<float> maxw(g.num_states, -INFINITY);
-      for (int32_t s = 0; s < static_cast<int32_t>(g.num_states); ++s) {
-        for (int32_t a = g.EmitBegin(s); a < g.EmitEnd(s); ++a)
-          maxw[s] = std::max(maxw[s], g.arc_weight[a]);
-      }
-      auto* dd = Alloc<int32_t>(g.num_arcs);
-      auto* dl = Alloc<uint16_t>(g.num_arcs);
-      auto* mw = Alloc<float>(g.num_states);
-      WFST_CUDA_CHECK(cudaMemcpy(dd, dest.data(), g.num_arcs * 4, cudaMemcpyHostToDevice));
-      WFST_CUDA_CHECK(cudaMemcpy(dl, il.data(), g.num_arcs * 2, cudaMemcpyHostToDevice));
-      WFST_CUDA_CHECK(cudaMemcpy(mw, maxw.data(), g.num_states * 4, cudaMemcpyHostToDevice));
-      dg.arc_dest = dd;
-      dg.arc_ilabel = dl;
-      dg.emit_maxw = mw;
-    }
-    dg.row_splits = rs;
-    dg.final_count = fc;
-    dg.weight = w;
+    // Graph to device: shared with every other decoder built from it on this device.
+    dev_graph = AcquireDeviceGraph(g, o.device);
+    dg = dev_graph->dg;
+    fixed_bytes += dev_graph->bytes;
 
     const int64_t L = sz.lanes;
     for (int b = 0; b < 2; ++b) {
@@ -680,6 +742,7 @@ const std::vector<int32_t>& GpuDecoder::LastLatticeRecords() const {
 }
 
 GpuDecoder::MemStats GpuDecoder::GetMemStats() const {
+  std::lock_guard<std::mutex> lock(impl_->mu);
   const Impl& im = *impl_;
   MemStats s;
   for (const LazyRegion* r : {&im.winners_mem, &im.tok_fwd_mem, &im.tok_bwd_mem,
@@ -696,6 +759,7 @@ GpuDecoder::MemStats GpuDecoder::GetMemStats() const {
 // Streaming.
 
 int32_t GpuDecoder::CreateStream() {
+  std::lock_guard<std::mutex> lock(impl_->mu);
   Impl& im = *impl_;
   if (!im.opts.cfg.streaming) throw std::runtime_error("decoder not in streaming mode");
   WFST_CUDA_CHECK(cudaSetDevice(im.opts.device));
@@ -723,6 +787,7 @@ int32_t GpuDecoder::CreateStream() {
 }
 
 void GpuDecoder::ReleaseStream(int32_t channel) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
   Impl& im = *impl_;
   if (channel < 0 || channel >= im.sz.lanes || !im.channel_used[channel]) return;
   WFST_CUDA_CHECK(cudaSetDevice(im.opts.device));
@@ -743,6 +808,7 @@ void GpuDecoder::ReleaseStream(int32_t channel) {
 std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
     const std::vector<int32_t>& channels, const void* d_log_probs, int64_t chunk_frames,
     int64_t vocab_stride, const std::vector<int32_t>& lens, bool want_partial) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
   Impl& im = *impl_;
   const Sizes& sz = im.sz;
   const DecoderConfig& cfg = im.opts.cfg;
@@ -844,6 +910,7 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
 }
 
 DecodeResult GpuDecoder::FinalizeStream(int32_t channel) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
   Impl& im = *impl_;
   const Sizes& sz = im.sz;
   if (!im.opts.cfg.streaming) throw std::runtime_error("decoder not in streaming mode");
@@ -893,6 +960,7 @@ DecodeResult GpuDecoder::FinalizeStream(int32_t channel) {
 std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64_t batch,
                                                   int64_t max_frames, int64_t vocab_stride,
                                                   const std::vector<int32_t>& frames) {
+  std::lock_guard<std::mutex> lock(impl_->mu);
   Impl& im = *impl_;
   const Sizes& sz = im.sz;
   const DecoderConfig& cfg = im.opts.cfg;

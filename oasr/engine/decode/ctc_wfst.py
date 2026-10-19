@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 import torch
 
 from oasr.decode import Decoder, DecoderConfig, DecoderResult
+from oasr.decoder.wfst_decoder import WfstDecoderScope
 
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, register_decode_strategy
@@ -98,6 +99,14 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
                 cfg = replace(cfg, wfst_max_streams=streams, wfst_stream_log_entries=log_entries)
         self._stream_cfg = cfg
         self._words = self._load_word_table(self.options.fst_path)
+        # This engine's own GPU decoders.  One decoder runs one call at a time, so
+        # engine workers sharing the process-wide ones would queue on each other —
+        # and, before the decoder took a lock, decode against each other's inputs.
+        self._wfst_scope = WfstDecoderScope()
+
+    def shutdown(self) -> None:
+        """Free this engine's GPU decoders (a stream still open keeps its own)."""
+        self._wfst_scope.close()
 
     @staticmethod
     def _load_word_table(fst_path: Optional[str]) -> Optional[Dict[int, str]]:
@@ -147,7 +156,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
             lanes = max(int(self._config.max_batch_size), cfg.wfst_max_offline_lanes)
             if lanes != cfg.wfst_max_offline_lanes:
                 cfg = replace(cfg, wfst_max_offline_lanes=lanes)
-        decoder = Decoder(cfg, fst=self.options.fst_path)
+        decoder = Decoder(cfg, fst=self.options.fst_path, wfst_scope=self._wfst_scope)
 
         results: List[DecoderResult] = decoder.decode_batch(enc_out, enc_lengths)
         outputs = []
@@ -211,7 +220,9 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
 
     def decode_streaming_chunk(self, request: Request, enc_out: torch.Tensor) -> RequestOutput:
         if not hasattr(request, "_wfst_decoder"):
-            request._wfst_decoder = Decoder(self._stream_cfg, fst=self.options.fst_path)
+            request._wfst_decoder = Decoder(
+                self._stream_cfg, fst=self.options.fst_path, wfst_scope=self._wfst_scope
+            )
             request._wfst_decoder.init_stream()
 
         chunk_logp = enc_out.squeeze(0)  # (1, T, V) -> (T, V)

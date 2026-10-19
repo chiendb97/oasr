@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 import oasr.decoder as _dec
+
+if TYPE_CHECKING:
+    from oasr.decoder.wfst_decoder import WfstDecoderScope
 
 
 @dataclass
@@ -96,7 +99,9 @@ def _to_result(searcher) -> DecoderResult:
     )
 
 
-def _make_searcher(config: DecoderConfig, fst=None):
+def _make_searcher(
+    config: DecoderConfig, fst=None, wfst_scope: Optional["WfstDecoderScope"] = None
+):
     """Construct the appropriate C++ searcher from *config*."""
     stype = config.search_type.lower()
 
@@ -141,7 +146,7 @@ def _make_searcher(config: DecoderConfig, fst=None):
                 max_streams=config.wfst_max_streams,
                 stream_log_entries=config.wfst_stream_log_entries,
             )
-            searcher = WfstDecoderSearch(fst, opts)
+            searcher = WfstDecoderSearch(fst, opts, scope=wfst_scope)
         elif backend == "k2":
             if not _dec.k2_available:
                 raise RuntimeError(
@@ -209,14 +214,22 @@ class Decoder:
         fst: Path to a decoding graph file (saved with
             ``torch.save(fsa.as_dict(), path)``) required when
             ``config.search_type == "wfst"``.  Ignored otherwise.
+        wfst_scope: Whose GPU WFST decoders to use
+            (:class:`~oasr.decoder.wfst_decoder.WfstDecoderScope`); ``None`` uses the
+            process-wide ones.  Ignored by every other search type and backend.
     """
 
-    def __init__(self, config: Optional[DecoderConfig] = None, fst=None):
+    def __init__(
+        self,
+        config: Optional[DecoderConfig] = None,
+        fst=None,
+        wfst_scope: Optional["WfstDecoderScope"] = None,
+    ):
         if config is None:
             config = DecoderConfig()
         self._config = config
         self._fst = fst
-        self._searcher = _make_searcher(config, fst)
+        self._searcher = _make_searcher(config, fst, wfst_scope)
 
     # ------------------------------------------------------------------
     # Offline decoding

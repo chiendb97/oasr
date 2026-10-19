@@ -23,7 +23,10 @@ struct DecodeResult {
 };
 
 // Batched GPU decoder. Allocates its workspace once at construction (no allocations in
-// DecodeBatch). Not thread-safe; one instance per stream/GPU.
+// DecodeBatch). Thread-safe: every public method holds the instance's mutex for its whole
+// duration, so concurrent callers serialize on it; give each concurrent caller its own
+// instance to run them in parallel. LastLatticeRecords() is the one exception: the
+// reference it returns is rewritten by the next DecodeBatch.
 class GpuDecoder {
  public:
   struct Options {
@@ -76,7 +79,9 @@ class GpuDecoder {
   // Device-memory accounting. The winners/lattice arenas and the log-prob staging are
   // lazily-committed regions: `reserved_bytes` is their stable virtual reservation,
   // `committed_bytes` the physical memory actually mapped; `fixed_bytes` covers the
-  // eagerly-allocated workspace plus the graph image on device.
+  // eagerly-allocated workspace plus the graph image on device. The graph image is
+  // shared by every decoder built from the same graph on the same device, so summing
+  // `fixed_bytes` over such decoders counts it once per decoder.
   struct MemStats {
     int64_t reserved_bytes = 0;
     int64_t committed_bytes = 0;
