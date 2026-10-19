@@ -215,6 +215,41 @@ def test_toy_batched_offline_equivalence(toy_fst):
     assert list(b_tokens[0]) == _TOY_WORDS
 
 
+def _toy_strategy(toy_fst, **decoder):
+    """The engine's ``ctc_wfst`` strategy over the toy graph, built as the engine builds it."""
+    from types import SimpleNamespace
+
+    from oasr.decode import DecoderConfig
+    from oasr.engine.decode import Detokenizer, build_decode_strategy
+
+    fields = {
+        "search_type": "wfst",
+        "wfst_min_active_states": 1,
+        "wfst_max_active_states": 100,
+        "wfst_blank_skip_thresh": 1.0,
+        **decoder,
+    }
+    cfg = SimpleNamespace(
+        decoder_type="ctc_wfst",
+        device="cuda",
+        dtype=None,
+        max_batch_size=2,
+        use_cuda_graphs=False,
+        use_ctc_cuda_graphs=False,
+        _model_config=SimpleNamespace(vocab_size=_TOY_VOCAB),
+        ctc_decoder_config=None,
+        wfst_decoder_config=DecoderConfig(**fields),
+        fst_path=toy_fst,
+    )
+    # The CTC capability surface; the strategy never calls either member.
+    model = SimpleNamespace(head=lambda *a: None, forward_offline=lambda *a: None)
+    return build_decode_strategy("ctc", cfg, Detokenizer(None, None), model)
+
+
+def _best(output) -> list:
+    return list(output.tokens[0]) if output.tokens else []
+
+
 def test_toy_strategy_decode_offline_does_not_fail_the_batch(toy_fst):
     """The engine's ``ctc_wfst`` strategy decodes a batch — not just the decoder.
 
@@ -226,31 +261,7 @@ def test_toy_strategy_decode_offline_does_not_fail_the_batch(toy_fst):
     through the strategy.
     """
     _module()
-    from types import SimpleNamespace
-
-    from oasr.decode import DecoderConfig
-    from oasr.engine.decode import Detokenizer, build_decode_strategy
-
-    cfg = SimpleNamespace(
-        decoder_type="ctc_wfst",
-        device="cuda",
-        dtype=None,
-        max_batch_size=2,
-        use_cuda_graphs=False,
-        use_ctc_cuda_graphs=False,
-        _model_config=SimpleNamespace(vocab_size=_TOY_VOCAB),
-        ctc_decoder_config=None,
-        wfst_decoder_config=DecoderConfig(
-            search_type="wfst",
-            wfst_min_active_states=1,
-            wfst_max_active_states=100,
-            wfst_blank_skip_thresh=1.0,
-        ),
-        fst_path=toy_fst,
-    )
-    # The CTC capability surface; the strategy never calls either member.
-    model = SimpleNamespace(head=lambda *a: None, forward_offline=lambda *a: None)
-    strategy = build_decode_strategy("ctc", cfg, Detokenizer(None, None), model)
+    strategy = _toy_strategy(toy_fst)
     assert strategy.speech_activity_kwargs() == {"blank_id": 0}
 
     rows = [_toy_logp([1, 2, 0], "cuda"), _toy_logp([1, 0, 2], "cuda")]
@@ -259,6 +270,58 @@ def test_toy_strategy_decode_offline_does_not_fail_the_batch(toy_fst):
     outputs = strategy.decode_offline(log_probs, lengths)
     assert [o.tokens[0] for o in outputs] == [_TOY_WORDS, _TOY_WORDS]
     assert all(o.finished for o in outputs)
+
+
+def test_toy_strategy_turns_do_not_repeat_the_previous_one(toy_fst):
+    """Audit #11: a ``vad.mode="segment"`` turn boundary, decode side.
+
+    The executor finalizes the decoder, then frees and re-creates the session on
+    the *same* request.  Both used to be no-ops, so the next turn searched on the
+    finalized decoder.  With blank skipping on (the default), a turn of silence
+    never reaches the search at all, and its partial and its final were the
+    previous turn's words — so "A B" then a pause finalized as "A B A B".
+    """
+    from oasr.engine.request import Request
+
+    strategy = _toy_strategy(toy_fst, wfst_blank_skip_thresh=0.98)
+    speech = _toy_logp([1, 0, 2], "cuda").unsqueeze(0)
+    silence = _toy_logp([0, 0, 0, 0], "cuda").unsqueeze(0)
+    req = Request(request_id="turns", streaming=True)
+    strategy.create_session(req)
+
+    def close_turn():  # StreamingExecutor._close_turn, as the strategy sees it
+        final = strategy.finalize(req)
+        strategy.free_session(req)
+        strategy.create_session(req)
+        return _best(final)
+
+    assert _best(strategy.decode_streaming_chunk(req, speech)) == _TOY_WORDS
+    assert close_turn() == _TOY_WORDS
+
+    assert _best(strategy.decode_streaming_chunk(req, silence)) == [], "partial repeated a turn"
+    assert close_turn() == [], "a turn of silence finalized as the previous turn"
+
+    assert _best(strategy.decode_streaming_chunk(req, speech)) == _TOY_WORDS
+    assert close_turn() == _TOY_WORDS, "a later turn carried an earlier one's words"
+    strategy.free_session(req)
+
+
+def test_toy_strategy_free_session_returns_the_channel(toy_fst):
+    """An aborted stream is freed without being finalized, and the GPU decoder's
+    channels are shared by every stream in the process.  Releasing the channel
+    only when the request is garbage-collected let aborted streams that were
+    still referenced exhaust them."""
+    from oasr.engine.request import Request
+
+    strategy = _toy_strategy(toy_fst, wfst_max_streams=2)
+    speech = _toy_logp([1, 2], "cuda").unsqueeze(0)
+    held = []
+    for i in range(5):  # more aborted streams than channels, all still referenced
+        req = Request(request_id=f"aborted-{i}", streaming=True)
+        strategy.create_session(req)
+        assert _best(strategy.decode_streaming_chunk(req, speech)) == _TOY_WORDS
+        strategy.free_session(req)
+        held.append(req)
 
 
 def test_toy_winners_gc_matches_plain(toy_fst):

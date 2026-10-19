@@ -3,8 +3,9 @@
 """WFST CTC beam-search decode strategy (in-tree GPU decoder or k2).
 
 Wraps :class:`oasr.decode.Decoder`.  Streaming keeps a per-request decoder on
-the request object (lazily created on first chunk), so the session lifecycle
-methods stay no-ops (inherited from the base).
+the request object, created lazily on the first chunk and kept for the life of
+the stream; the session lifecycle methods restart its search rather than
+replace it.
 
 Unlike the CTC strategies, WFST decoding emits WORD ids in the decoding
 graph's ``words.txt`` symbol space — not BPE unit ids — so text comes from the
@@ -168,6 +169,34 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
     # Streaming
     # ------------------------------------------------------------------
+
+    def create_session(self, request: Request) -> None:
+        """Start a fresh search, on the decoder this stream already has if any.
+
+        A ``vad.mode="segment"`` turn boundary finalizes the decoder and then
+        frees and re-creates the session on the *same* request.  Left as the
+        base class's no-op, the next turn searched on the finalized decoder,
+        whose outputs are the previous turn's final: a turn of silence — every
+        frame blank-skipped, so no chunk ever reaches the search — finalized as
+        the previous turn again, and the executor appended it to the transcript
+        a second time (audit #11).  The decoder object itself is reused, not
+        rebuilt: the k2 backend loads its whole graph when one is constructed.
+        """
+        self._restart(request)
+
+    def free_session(self, request: Request) -> None:
+        """Hand the stream's decoder channel back now, not at garbage collection.
+
+        The GPU decoder has a fixed number of channels shared by every stream in
+        the process, and an aborted stream is freed without being finalized.
+        """
+        self._restart(request)
+
+    @staticmethod
+    def _restart(request: Request) -> None:
+        wfst_dec = getattr(request, "_wfst_decoder", None)
+        if wfst_dec is not None:
+            wfst_dec.init_stream()  # releases the channel and drops the outputs
 
     def decode_streaming_batch(
         self, requests: List[Request], enc_out_map: Dict[str, torch.Tensor]
