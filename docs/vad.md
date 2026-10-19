@@ -87,6 +87,10 @@ segments.
   saving encoder work is worth something. A stream arriving at real time still
   closes turns, it just encodes the silence first. Anything undecided is
   encoded: encoding silence costs time, dropping speech costs words.
+* A skip **always rewinds the encoder** before the audio after it. A turn ends
+  at the first confirmed silence the encoder crosses, however far ahead the
+  detector has got, and a turn that held only silence is rewound without being
+  reported, so the same audio reports the same turns whatever the pacing.
 * Reported times **keep accumulating across turns**. Word timings, token
   timestamps, segment boundaries and events are always relative to the start of
   the stream, never to the start of the current turn.

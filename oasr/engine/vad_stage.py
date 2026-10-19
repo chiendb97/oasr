@@ -489,12 +489,19 @@ class StreamingVadStage:
         state = self._states.get(request_id)
         return 0.0 if state is None else state.segmenter.elapsed
 
-    def turn_boundary(self, request_id: str) -> Optional[float]:
+    def turn_boundary(self, request_id: str, after: float) -> Optional[float]:
         """Session time after which audio belongs to a **new** turn, or ``None``.
 
-        The end of the last confirmed speech run plus the segment padding —
-        unless speech has already resumed by then, in which case there is no
-        silence to cut at and this returns ``None``.  It is
+        ``after`` is where the open turn starts.  The answer is the end of the
+        *first* confirmed speech run whose padded end falls past it — not the
+        latest.  A detector running ahead of the encoder has closed runs the
+        encoder has not reached yet, and the turn the encoder is in ends at the
+        earliest of them.  Answering with the latest one kept a backlogged turn
+        open across a silence the gate then skipped, so the encoder resumed on
+        the far side with its old context and position (audit #10).
+
+        A run after which speech resumes within the padding has no silence to
+        cut at, so it is passed over.  It is
         deliberately not the same question :meth:`should_encode` answers: a turn
         boundary is a fact about audio the detector has already judged, so it can
         be acted on however far behind the encoder happens to be, while a skip
@@ -507,20 +514,23 @@ class StreamingVadStage:
         state = self._states.get(request_id)
         if state is None:
             return None
-        end = state.segmenter.last_segment_end
-        if end is None:
-            return None
-        boundary = end + self._pad_s
-        run_start = state.segmenter.open_run_start
-        if run_start is not None and run_start <= boundary:
-            # Speech resumes at or before the boundary, so there is no silence
-            # to cut at: closing the turn here would reset the encoder in the
-            # middle of a word, and streaming cannot replay the audio to recover
-            # it.  ``max_speech_s`` is how a run closes without a silence
-            # (:class:`~oasr.vad.SpeechSegmenter` cuts at the current frame), and
-            # a cap is a length decision, not a turn decision.
-            return None
-        return boundary
+        segmenter = state.segmenter
+        pad = self._pad_s
+        runs = segmenter.runs_ending_after(after, pad=pad)
+        for k, run in enumerate(runs):
+            boundary = run.end + pad
+            resumes = runs[k + 1].start if k + 1 < len(runs) else segmenter.open_run_start
+            if resumes is not None and resumes <= boundary:
+                # Speech resumes at or before the boundary, so there is no
+                # silence to cut at: closing the turn here would reset the
+                # encoder in the middle of a word, and streaming cannot replay
+                # the audio to recover it.  ``max_speech_s`` is how a run closes
+                # without a silence (:class:`~oasr.vad.SpeechSegmenter` cuts at
+                # the current frame), and a cap is a length decision, not a turn
+                # decision.
+                continue
+            return boundary
+        return None
 
     def should_encode(self, request_id: str, start_s: float, end_s: float) -> bool:
         """Whether the encoder window covering ``[start_s, end_s)`` must run.

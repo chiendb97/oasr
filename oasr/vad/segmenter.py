@@ -205,6 +205,21 @@ class SpeechSegmenter:
         """
         return self._raw[-1].end if self._raw else None
 
+    def runs_ending_after(self, t: float, *, pad: float = 0.0) -> List[SpeechSegment]:
+        """Closed runs whose ``end + pad`` is later than ``t``, oldest first, unpadded.
+
+        ``pad`` is applied before comparing, rather than subtracted from ``t``,
+        so a caller asking with a boundary it computed as ``end + pad`` gets the
+        same answer this does — a rounding step apart would hand a run straight
+        back to the turn that has just closed on it.  Scans newest-first and stops
+        at the first run that does not qualify, so a long session costs only
+        the runs after ``t``.
+        """
+        k = len(self._raw)
+        while k > 0 and self._raw[k - 1].end + pad > t:
+            k -= 1
+        return self._raw[k:]
+
     @property
     def raw_segments(self) -> List[SpeechSegment]:
         """Closed segments, **unpadded**, in order."""
