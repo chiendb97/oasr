@@ -942,3 +942,75 @@ def test_a_window_the_executor_refuses_aborts_its_siblings():
     assert "executor refused" in results[0]["error"]
     assert not eng._longform
     assert eng._executor.aborted == [eng._longform.child_id("long", i) for i in range(3)]
+
+
+# ---------------------------------------------------------------------------
+# Results the search could not complete (audit #13)
+# ---------------------------------------------------------------------------
+
+
+def test_step_counts_and_logs_results_the_search_could_not_complete(caplog):
+    """A WFST lane that hit a capacity limit was returned as if it were complete.
+
+    It is still returned — it is the best the decoder found — but the engine now
+    counts every *finished* one and logs it.  Partials are not counted: a stream
+    reports its overflow on every partial after it, so counting them would count
+    one result once per tick.
+    """
+    import logging
+    import threading
+
+    from oasr.engine import metrics as m
+    from oasr.engine.engine import ASREngine
+    from oasr.engine.request import RequestOutput
+
+    outs = [
+        RequestOutput(request_id="clean", text="a", tokens=[[1]], finished=True),
+        RequestOutput(
+            request_id="short", text="a", tokens=[[1]], finished=True, search_overflow=16
+        ),
+        RequestOutput(
+            request_id="partial", text="a", tokens=[[1]], finished=False, search_overflow=4
+        ),
+    ]
+    eng = ASREngine.__new__(ASREngine)
+    eng._lock = threading.RLock()
+    eng._overlap_admit = False
+    eng._longform = None
+    eng._executor = SimpleNamespace(step=lambda: list(outs))
+    eng._metrics = m.EngineMetrics()
+
+    with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
+        assert eng.step() == outs
+    assert eng._metrics.snapshot()["counters"][m.SEARCH_OVERFLOW] == 1.0
+    logged = [r.getMessage() for r in caplog.records if "overflowed" in r.getMessage()]
+    assert len(logged) == 1 and "short" in logged[0]
+
+
+def test_long_form_keeps_a_window_that_overflowed():
+    """A stitched transcript is only as complete as its worst window."""
+    from oasr.engine.longform import LongFormTracker
+    from oasr.engine.request import RequestOutput
+
+    tracker = LongFormTracker()
+    tracker.register("file", ["file#0", "file#1"], [0.0, 30.0])
+    parent = tracker.absorb(
+        [
+            RequestOutput(request_id="file#0", text="a b", tokens=[[1, 2]], finished=True),
+            RequestOutput(
+                request_id="file#1",
+                text="c",
+                tokens=[[3]],
+                finished=True,
+                search_overflow=16,
+            ),
+        ]
+    )
+    assert [p.request_id for p in parent] == ["file"]
+    assert parent[0].search_overflow == 16
+
+    tracker.register("clean", ["clean#0"], [0.0])
+    (out,) = tracker.absorb(
+        [RequestOutput(request_id="clean#0", text="a", tokens=[[1]], finished=True)]
+    )
+    assert out.search_overflow is None

@@ -170,6 +170,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
                     tokens=result.tokens,
                     scores=result.scores,
                     finished=True,
+                    search_overflow=result.overflow or None,
                 )
             )
         self.attach_asr_speech_activity(outputs, enc_out, enc_lengths, requests, blank_id=cfg.blank)
@@ -234,7 +235,20 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
             tokens=result.tokens,
             scores=result.scores,
             finished=False,
+            search_overflow=self._overflow_so_far(request, result),
         )
+
+    @staticmethod
+    def _overflow_so_far(request: Request, result: DecoderResult) -> Optional[int]:
+        """The stream's overflow bits, kept on the request rather than the decoder.
+
+        A segment-mode turn boundary restarts the decoder's search, which clears its
+        bits, so a turn that overflowed would otherwise vanish from the outputs of
+        every turn after it — the final included.
+        """
+        bits = getattr(request, "_wfst_overflow", 0) | result.overflow
+        request._wfst_overflow = bits  # type: ignore[attr-defined]  # strategy-private
+        return bits or None
 
     def finalize(self, request: Request) -> RequestOutput:
         wfst_dec = getattr(request, "_wfst_decoder", None)
@@ -255,4 +269,5 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
             tokens=result.tokens,
             scores=result.scores,
             finished=True,
+            search_overflow=self._overflow_so_far(request, result),
         )

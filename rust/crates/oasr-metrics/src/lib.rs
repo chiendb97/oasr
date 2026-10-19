@@ -317,6 +317,14 @@ metrics_table! {
     /// at each edge, so the fraction skipped grows with the length of the gap.
     ENGINE_AUDIO_SECONDS_SKIPPED = "oasr_engine_audio_seconds_skipped_total", Counter, Some(Unit::Seconds), None,
         "Non-speech audio voice-activity segmentation removed before the encoder";
+    /// Results the decoder's search could not keep within its capacity limits
+    /// even after recovering — the WFST decoder re-decodes an overflowed lane
+    /// offline and restarts an overrun stream on a fresh channel — so their
+    /// transcript may be missing words.  Each such output also carries
+    /// `search_overflow`; this is the rate to alert on.  Families without
+    /// search capacity limits never count here.
+    ENGINE_SEARCH_OVERFLOW = "oasr_engine_search_overflow_total", Counter, None, None,
+        "Results whose decoder search hit a capacity limit it could not recover from";
     /// Non-zero means a histogram above is showing a *truncated* distribution:
     /// the engine buffered more samples between two drains than it may hold.
     /// Exported so the cap is visible rather than passing for a complete one.

@@ -199,11 +199,13 @@ class LongFormTracker:
                 words.append(w._replace(start=w.start + start, end=w.end + start))
         tokens: List[int] = []
         confidences: List[float] = []
+        overflow = 0  # any window the search could not complete leaves the file short
         for out in ordered:
             if out.tokens:
                 tokens.extend(out.tokens[0])
             if out.confidence is not None:
                 confidences.append(out.confidence)
+            overflow |= out.search_overflow or 0
 
         return RequestOutput(
             request_id=entry.parent_id,
@@ -217,6 +219,7 @@ class LongFormTracker:
             # windows are equal-length by construction, so the two agree except
             # at the tail, and this needs no per-window token count.
             confidence=(sum(confidences) / len(confidences)) if confidences else None,
+            search_overflow=overflow or None,
         )
 
 

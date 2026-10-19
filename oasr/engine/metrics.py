@@ -81,6 +81,9 @@ ENDPOINTS = "oasr_engine_endpoints_total"
 #: happen.
 VAD_SEGMENTS = "oasr_engine_vad_segments_total"
 AUDIO_SECONDS_SKIPPED = "oasr_engine_audio_seconds_skipped_total"
+#: Finished results whose search hit a capacity limit it could not recover from
+#: (``RequestOutput.search_overflow``): the transcript may be missing words.
+SEARCH_OVERFLOW = "oasr_engine_search_overflow_total"
 SAMPLES_DROPPED = "oasr_engine_metric_samples_dropped_total"
 
 GPU_MEMORY_USED = "oasr_gpu_memory_used_bytes"

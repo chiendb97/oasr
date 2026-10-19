@@ -61,6 +61,11 @@ class GpuDecoder {
   void ReleaseStream(int32_t channel);
   // log_probs: device, [channels.size(), chunk_frames, vocab_stride] contiguous, dtype
   // per cfg.fp16_logprobs; lens[i] <= chunk_frames <= cfg.max_frames.
+  // StreamPartial::overflow is the lane's, cumulative since CreateStream. A winners-ring
+  // overrun (bit 4) cannot be recovered in place: that round's tokens were dropped and
+  // the per-chunk GC skips the lane from then on, so its ring never frees again and the
+  // hypothesis stops growing. Release the channel and continue on a new one (the Python
+  // wrapper re-decodes the chunk there).
   std::vector<StreamPartial> AdvanceChunk(const std::vector<int32_t>& channels,
                                           const void* d_log_probs, int64_t chunk_frames,
                                           int64_t vocab_stride,

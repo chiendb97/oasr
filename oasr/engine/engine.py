@@ -40,6 +40,7 @@ from .memory import (
 )
 from .metrics import (
     AUDIO_SECONDS_SKIPPED,
+    SEARCH_OVERFLOW,
     TOKENS_GENERATED,
     VAD_SEGMENTS,
     EngineMetrics,
@@ -1829,6 +1830,18 @@ class ASREngine:
                 n_tokens = sum(len(o.tokens[0]) for o in outputs if o.finished and o.tokens)
                 if n_tokens:
                     self._metrics.incr(TOKENS_GENERATED, n_tokens)
+            # A transcript the search could not keep within its limits is still
+            # returned — it is the best the decoder found — but never silently.
+            overflowed = [o for o in outputs if o.finished and o.search_overflow]
+            for o in overflowed:
+                logger.warning(
+                    "request %s: decoder search overflowed (bits %d); the transcript "
+                    "may be missing words",
+                    o.request_id,
+                    o.search_overflow,
+                )
+            if overflowed and self._metrics.enabled:
+                self._metrics.incr(SEARCH_OVERFLOW, len(overflowed))
             if self._longform is not None and self._longform:
                 # Replace per-window child outputs with one stitched parent.
                 outputs = self._longform.absorb(outputs)
