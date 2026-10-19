@@ -537,8 +537,16 @@ so the production decoder library carries no reference-decoder code; it takes a 
 *path* (loads the image itself) rather than a decoder handle.
 
 A decoder handle co-owns its graph image (word lookups during backtrack), so
-freeing the graph handle first is safe. Instances are not thread-safe; one
-instance per stream/GPU.
+freeing the graph handle first is safe. The graph's device arrays are uploaded
+once per (graph, device) and shared by every decoder built from it there — about
+0.9 GiB for the LibriSpeech HLG, which used to be paid again by each decoder.
+
+An instance is thread-safe but serial: every call holds the instance's mutex,
+because a decoder has one stream, one log-prob staging buffer and descriptor, and
+one lane-length table, and TVM-FFI releases the GIL around the call. Callers that
+should run in parallel need an instance each. Graph capture records on a
+non-blocking stream, so a capture in one decoder does not turn legacy-stream work
+elsewhere in the process into an error.
 
 ## 11. Python API and Engine Integration
 
@@ -546,10 +554,15 @@ instance per stream/GPU.
 (`WfstDecoderSearch` + `WfstDecoderOptions`) selected by
 `DecoderConfig.wfst_backend = "gpu"`. **WFST decoding is GPU-only** — CUDA is a
 hard requirement and the CPU `"k2"` value is an unsupported legacy path, built
-only under `OASR_USE_K2=1` and not exercised by CI.  Graph handles and decoder
-instances are shared process-wide,
-keyed on `(fst, beams, actives, device, …)`; passing an `HLG.pt` exports and
-caches the `.img` next to it on first use.
+only under `OASR_USE_K2=1` and not exercised by CI.  Graph handles are shared
+process-wide; passing an `HLG.pt` exports and caches the `.img` next to it on
+first use.  Decoder instances are keyed on `(fst, beams, actives, device, …)`
+within an owner: a `WfstDecoderScope` (`Decoder(..., wfst_scope=...)`), or the
+process-wide cache when none is passed.  The engine gives every `ASREngine` its own
+scope and closes it in `shutdown()`, so engine workers in one process
+(`--engine-workers`) never queue on each other's decoders, and each worker's
+streaming decoder has channels for its own stream pool.  A stream holding a
+channel keeps its decoder alive until the channel is released.
 
 - **Offline**: `decode_offline(logp)` / `decode_offline_batch(enc_out,
   lengths)` — rows are length-clipped and blank-skipped exactly as the
@@ -559,9 +572,10 @@ caches the `.img` next to it on first use.
   (`oasr/engine/decode/ctc_wfst.py`) calls the batched path and raises
   `wfst_max_offline_lanes` to `max_batch_size`.
 - **Streaming**: the searcher protocol (`reset`/`search`/`finalize_search`)
-  borrows a channel of one shared 32-channel streaming decoder
-  (`main_q_factor=16`, `cand_factor=4`, 128-frame chunks) and releases it on
-  finalize or GC.
+  borrows a channel of its owner's streaming decoder (`wfst_max_streams`
+  channels, which the engine raises to `max_batch_size`; `main_q_factor=16`,
+  `cand_factor=4`, 128-frame chunks) and releases it on finalize, on the
+  strategy's `free_session`, or at GC.
 - **fp16**: `fp16_logprobs=1` consumes half-precision log-probs (f32
   accumulation inside; word output identical to fp32 on the benchmark sets).
 

@@ -601,6 +601,14 @@ class DecodeStrategy(ABC):
         """Release per-request decode state on finalize/abort.  Default: no-op."""
         return None
 
+    def shutdown(self) -> None:
+        """Release resources the family holds for the life of the engine.  Default: none.
+
+        Called once from :meth:`ASREngine.shutdown`.  For what an engine *must not*
+        leave behind until garbage collection: a family's own device allocations.
+        """
+        return None
+
     #: Attributes a family may hold a CUDA-graph cache in (each with ``release()``).
     _GRAPH_CACHE_ATTRS = ("_graphs", "_pred_graphs", "_loop_graphs")
 

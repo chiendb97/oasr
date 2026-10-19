@@ -1407,6 +1407,10 @@ class ASREngine:
             self._model_runner.release_graphs()
         except Exception:  # pragma: no cover - defensive
             logger.exception("graph pool release failed")
+        try:
+            self._output_processor.strategy.shutdown()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("decode strategy shutdown failed")
         if getattr(self, "_gc_frozen", False):
             self._gc_frozen = False
             gc_freeze.release()
