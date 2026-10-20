@@ -386,6 +386,159 @@ class TestByteLevelCharacterSplits:
         assert max(widest) <= 2 * tok._INCREMENTAL_WINDOW + 1
 
 
+class TestSentencePieceIncremental:
+    """SentencePiece re-renders a bounded window, not the whole prefix (audit #27).
+
+    It inherited the base class's whole-prefix re-decode: every streaming
+    partial was linear in the transcript (5.5 ms at 12k tokens, per stream, per
+    tick, under the GIL) and ``token_pieces`` quadratic (0.9 s at 2k tokens).
+    The window has one coupling to get right that byte-level BPE does not:
+    SentencePiece drops the ``▁`` of the first visible piece of whatever it
+    decodes, so a window whose context renders nothing would lose the space
+    before its next word.  The oracle throughout is ``decode`` itself.
+    """
+
+    CORPUS = (
+        "the cat sat on the mat 你好世界 今天天气很好 hello 🎉 naïve café Việt Nam\n"
+        "printing differs from most arts 東京 in the exhibition 😀 ok\n"
+    ) * 40
+
+    @pytest.fixture(scope="class")
+    def models(self, tmp_path_factory):
+        spm = pytest.importorskip("sentencepiece")
+        d = tmp_path_factory.mktemp("spm_incremental")
+        (d / "en.txt").write_text(
+            "hello world\nhello there\nworld peace\nthe quick brown fox\n" * 30
+        )
+        (d / "mixed.txt").write_text(self.CORPUS)
+        spm.SentencePieceTrainer.Train(
+            input=str(d / "en.txt"),
+            model_prefix=str(d / "uni"),
+            vocab_size=28,
+            model_type="unigram",
+        )
+        # Byte fallback: characters outside the vocabulary arrive as UTF-8 byte
+        # pieces, which render only once the character is complete.
+        spm.SentencePieceTrainer.Train(
+            input=str(d / "mixed.txt"),
+            model_prefix=str(d / "bf"),
+            vocab_size=400,
+            model_type="bpe",
+            byte_fallback=True,
+            character_coverage=0.98,
+            control_symbols=["<ctl>"],
+            user_defined_symbols=["<user>"],
+        )
+        return {"unigram": str(d / "uni.model"), "byte_fallback": str(d / "bf.model")}
+
+    @staticmethod
+    def _tok(path):
+        from oasr.tokenizers import SentencePieceTokenizer
+
+        return SentencePieceTokenizer(path)
+
+    @staticmethod
+    def _sequences(tok, seed):
+        """Random ids (specials and out-of-range ones included) and the traps."""
+        rng = random.Random(seed)
+        sp, n = tok._sp, tok.vocab_size
+        seqs = [[rng.randrange(n + 3) for _ in range(rng.choice([40, 150]))] for _ in range(4)]
+        words = [
+            i for i in range(n) if sp.IdToPiece(i).startswith("▁") and len(sp.IdToPiece(i)) > 1
+        ]
+        silent = [0, 1, 2] + [i for i in range(n) if sp.IsControl(i)]
+        visible = tok.encode("hello world the cat")
+        # A word after more silent ids than the window holds: the window is then
+        # nothing but ids that render nothing, so on its own it would render
+        # that word without the space ``decode`` gives it.
+        seqs.append(visible + [rng.choice(silent) for _ in range(50)] + words[:3] + visible)
+        seqs.append(tok.encode(TestSentencePieceIncremental.CORPUS[:2000]))
+        return seqs
+
+    @pytest.mark.parametrize("kind", ["unigram", "byte_fallback"])
+    @pytest.mark.parametrize("chunk", [1, 3, 17])
+    def test_matches_full_decode_at_every_step(self, models, kind, chunk):
+        tok = self._tok(models[kind])
+        for ids in self._sequences(tok, seed=chunk):
+            state, deltas = tok.new_decode_state(), []
+            for i in range(0, len(ids), chunk):
+                deltas.append(tok.decode_incremental(ids[i : i + chunk], state))
+                assert state["text"] == tok.decode(ids[: i + chunk]), f"after {i + chunk} ids"
+            # Deltas never re-emit text: what they add up to is a prefix of the
+            # transcript, short of it only by bytes of a character in progress.
+            emitted = "".join(deltas)
+            assert state["text"].startswith(emitted)
+            assert set(state["text"][len(emitted) :]) <= {"\ufffd"}
+
+    @pytest.mark.parametrize("kind", ["unigram", "byte_fallback"])
+    def test_pieces_concatenate_to_the_text(self, models, kind):
+        """Byte fallback was also *wrong* before the window, not just slow.
+
+        Re-rendering the prefix turns a byte piece's U+FFFD into its character
+        once the last byte arrives, which the whole-prefix diff reads as a
+        rewrite -- and it then returned the entire transcript as that token's
+        piece, so the pieces repeated the text.
+        """
+        tok = self._tok(models[kind])
+        for ids in self._sequences(tok, seed=7):
+            assert "".join(tok.token_pieces(ids)) == tok.decode(ids)
+        text = "你好 world 今天 the cat 🎉 sat 東京 ok"
+        ids = tok.encode(text)
+        pieces = tok.token_pieces(ids)
+        assert "".join(pieces) == tok.decode(ids)
+        if kind == "byte_fallback":  # without it, these characters encode as <unk>
+            assert "".join(pieces) == text
+            assert not [p for p in pieces if "\ufffd" in p], "a split character leaked as U+FFFD"
+
+    def test_the_word_after_a_silent_run_keeps_its_space(self, models):
+        tok = self._tok(models["unigram"])
+        the = tok._sp.PieceToId("▁the")
+        ids = tok.encode("hello world") + [0] * 50 + [the]
+        assert tok.decode(ids).endswith("world the")
+        assert "".join(tok.token_pieces(ids)) == tok.decode(ids)
+
+    @pytest.mark.parametrize("kind", ["unigram", "byte_fallback"])
+    def test_every_decode_stays_inside_the_window(self, models, kind):
+        """The cost model, deterministically: no call decodes more than the window.
+
+        Re-decoding the prefix is what made a partial linear in the transcript,
+        so the span each ``decode`` sees is the thing to bound -- not a timing.
+        """
+        tok = self._tok(models[kind])
+        ids = (tok.encode(self.CORPUS) * 3)[:3000]
+        widest = []
+        original = tok.decode
+        tok.decode = lambda chunk: (widest.append(len(chunk)), original(chunk))[1]
+        try:
+            tok.token_pieces(ids)
+            state = tok.new_decode_state()
+            for i in range(0, len(ids), 4):
+                tok.decode_incremental(ids[i : i + 4], state)
+        finally:
+            del tok.decode
+        # The window, the ids of one call, and the primer in front of it.
+        assert max(widest) <= 2 * tok._INCREMENTAL_WINDOW + 4 + 1
+
+    @pytest.mark.requires_assets("STREAMING_ZIPFORMER_CKPT")
+    def test_the_icefall_bpe_model(self):
+        """The real ``lang_bpe_500/bpe.model`` the streaming Zipformer ships."""
+        import os
+
+        import assets
+
+        ckpt = assets.require("STREAMING_ZIPFORMER_CKPT")
+        tok = self._tok(os.path.join(ckpt, "data", "lang_bpe_500", "bpe.model"))
+        rng = random.Random(0)
+        ids = [rng.randrange(tok.vocab_size + 4) for _ in range(1200)]
+        ids += tok.encode("PRINTING IN THE ONLY SENSE WITH WHICH WE ARE AT PRESENT CONCERNED")
+        for chunk in (1, 4):
+            state = tok.new_decode_state()
+            for i in range(0, len(ids), chunk):
+                tok.decode_incremental(ids[i : i + chunk], state)
+                assert state["text"] == tok.decode(ids[: i + chunk]), f"after {i + chunk} ids"
+        assert "".join(tok.token_pieces(ids)) == tok.decode(ids)
+
+
 # ---------------------------------------------------------------------------
 # The two incremental-decode properties ``TestIncrementalDecode`` does not cover
 #

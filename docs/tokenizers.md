@@ -85,18 +85,26 @@ and both are contractually required to concatenate back to it:
 
 Both have a **correct default on the ABC** and exist to be overridden for speed,
 not for behaviour.  The defaults re-render the accumulated prefix, so they are
-Θ(n²) in tokens; `symbol_table` and `huggingface` override `decode_incremental`,
-and `symbol_table` overrides `token_pieces` in C++
-(`csrc/tokenizers/symbol_table.cc`) — with no Python twin, rather than
-rendering the same table a second way on the request path.  Its only caller is
-the word grouping, which is C++ too, and both ship in every successful build.
-A kind whose rendering is not piece-local (`funasr_char`'s
-`@@` merges, SentencePiece's word boundaries) is correct on the default and
-simply pays for it.
+Θ(n²) in tokens.  `symbol_table` overrides both: its rendering is piece-local,
+and `token_pieces` is C++ (`csrc/tokenizers/symbol_table.cc`) — with no Python
+twin, rather than rendering the same table a second way on the request path.
+Its only caller is the word grouping, which is C++ too, and both ship in every
+successful build.  `huggingface` and `sentencepiece` share
+`WindowedIncrementalTokenizer`, which re-renders a bounded window of recent ids
+instead of the prefix, so a partial costs the same at any transcript length.
+`funasr_char` (`@@` merges) is correct on the default and simply pays for it.
 
-A byte-level tokenizer (`huggingface`, so Whisper and Qwen) splits a CJK
-character or an emoji across tokens, and the first ones render as U+FFFD until
-the last completes it.  `decode_incremental` holds such a tail back from the
+The window has one thing to get right for SentencePiece that it does not for
+byte-level BPE: SentencePiece drops the `▁` of the first visible piece of
+whatever it decodes, and stops only once a visible, non-byte piece has rendered.
+That is state from the start of the text, not from the window, so once the real
+text has passed that point the window is decoded behind a *primer* piece and
+the primer's text cut off again.  Which ids end the rule is asked of
+SentencePiece per id rather than inferred from the piece types.
+
+A byte-level tokenizer (`huggingface`, so Whisper and Qwen, or a SentencePiece
+model with byte fallback) splits a CJK character or an emoji across tokens, and
+the first ones render as U+FFFD until the last completes it.  `decode_incremental` holds such a tail back from the
 delta, as HF's `TextIteratorStreamer` holds it back from a stream, so the
 completing token's piece is the character; `state["text"]` keeps it, and
 `token_pieces` flushes it onto the last token when a sequence ends mid-character.
