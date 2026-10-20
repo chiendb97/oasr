@@ -211,6 +211,16 @@ autotuner.
   the C++ launcher was measured and is slower.
 - Every GEMM-family launcher enforces the CUTLASS alignment-8 rule uniformly via
   `CHECK_GEMM_ALIGNMENT`, with a message naming the fix.
+- **One convolution launch addresses at most 2 GiB per tensor.** CUTLASS's
+  implicit-GEMM convolutions use 32-bit byte offsets and refuse anything larger;
+  the launchers say so via `CHECK_CONV_LAUNCH_BYTES`. Every `oasr.conv*` entry
+  point therefore splits an oversized batch into launches over row slices
+  (`_row_slices` in `oasr/functionals/conv.py`) — exact, because convolution
+  rows are independent — before choosing a backend, and refuses a single row
+  that is already too large. The in-tree grouped, depthwise and depthwise-1D
+  kernels offset whole rows in 64 bits and positions within one in 32, and
+  their launchers refuse a row past that; 64-bit arithmetic in the inner loop
+  measured 1.8–4.6% slower on depthwise shapes.
 
 ## The JIT pipeline
 

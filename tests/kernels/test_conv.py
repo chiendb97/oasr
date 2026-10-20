@@ -3,6 +3,8 @@
 Unit tests for functional convolution API (TVM-FFI JIT path).
 """
 
+import functools
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -656,63 +658,149 @@ class TestConv2DCudnn:
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
+class TestRowSlices:
+    """Where a batch is split, decided from the addressable extent, not guessed."""
+
+    def test_a_batch_that_fits_is_one_launch(self):
+        from oasr.functionals.conv import _row_slices
+
+        x = torch.empty(3, 512, 520, 512, device="meta", dtype=torch.bfloat16)
+        assert _row_slices("conv2d", x, x[:, ::2, ::2, :32]) is None
+
+    def test_the_split_bounds_every_tensor_at_2gib(self):
+        from oasr.functionals.conv import _MAX_LAUNCH_TENSOR_BYTES, _row_slices
+
+        x = torch.empty(9, 512, 520, 512, device="meta", dtype=torch.bfloat16)
+        out = torch.empty(9, 255, 259, 32, device="meta", dtype=torch.bfloat16)
+        slices = _row_slices("conv2d", x, out)
+        per_row = x.stride(0) * x.element_size()
+        assert [s.start for s in slices] == list(range(0, 9, slices[0].stop))
+        assert slices[-1].stop == 9
+        rows = slices[0].stop
+        assert rows * per_row <= _MAX_LAUNCH_TENSOR_BYTES < (rows + 1) * per_row
+
+    def test_the_widest_tensor_decides(self):
+        """An output wider than the input (a channel-expanding conv) sets the split."""
+        from oasr.functionals.conv import _MAX_LAUNCH_TENSOR_BYTES, _row_slices
+
+        x = torch.empty(64, 30000, 80, 1, device="meta", dtype=torch.float16)
+        out = torch.empty(64, 29998, 80, 8, device="meta", dtype=torch.float16)
+        rows = _row_slices("conv2d", x, out)[0].stop
+        assert rows * out.stride(0) * out.element_size() <= _MAX_LAUNCH_TENSOR_BYTES
+
+    def test_a_row_too_large_to_address_is_refused(self):
+        """No split along the batch can fix it, and launching it corrupts memory."""
+        from oasr.functionals.conv import _row_slices
+
+        x = torch.empty(2, 400000, 1024, 4, device="meta", dtype=torch.float16)
+        with pytest.raises(ValueError, match="one batch row spans 3.05 GiB"):
+            _row_slices("conv2d", x, x)
+
+
 @pytest.mark.cuda
 @pytest.mark.slow
-class TestConv2dLargeTensor:
-    """A Conv2D activation tensor wider than 2 GiB.
+class TestConvLargeTensor:
+    """Every convolution entry point on a batch one launch cannot address.
 
-    CUTLASS's implicit-GEMM Conv2D addresses its activations with 32-bit **byte**
-    offsets, so one launch cannot span more than 2 GiB per tensor.  Past that the
-    kernel returned a bare failure status, and what a user saw was not an error
-    but an **engine-wide empty transcript**: at ``max_batch_size >= ~220`` the
-    Conformer subsampling's second conv crossed the limit, the launcher raised,
-    and the micro-batch retry that would have named it died on already-released
-    waveforms — reporting an ``AttributeError`` about a ``NoneType`` waveform
-    instead of the conv shape that actually broke.
+    CUTLASS's implicit-GEMM convolutions (Conv2D, and Conv1D as a height-one
+    Conv2D) address their tensors with 32-bit **byte** offsets, and past 2 GiB
+    refuse the problem.  At ``max_batch_size >= ~220`` that once came back as an
+    **engine-wide empty transcript**: the Conformer subsampling's second conv
+    crossed the limit, the launcher raised, and the micro-batch retry that would
+    have named it died on already-released waveforms.  The in-tree grouped and
+    depthwise kernels used 32-bit *element* offsets and did worse past 2^31
+    elements: an illegal address that poisons the CUDA context (depthwise
+    ``conv2d``), or a silently wrong tail of the batch (``depthwise_conv1d``).
 
-    ``conv2d_activation`` now splits the batch dimension, which is exact because
-    a batched convolution is independent across N.  The oracle here is therefore
-    the same kernel on one row at a time, not a torch reference: what is being
-    checked is that tiling changes nothing, and a bit-exact comparison says that
-    where a tolerance would not.
+    Only ``conv2d_activation`` split the batch.  Every entry point now does, by
+    the same rule, and the in-tree kernels address with 64-bit offsets.  The
+    oracle is the same op on one row at a time rather than a torch reference:
+    what is checked is that tiling changes nothing, and a bit-exact comparison
+    says that where a tolerance would not.
     """
 
-    def test_batch_over_2gib_matches_per_row(self):
+    @staticmethod
+    def _rand(*shape, dtype=torch.bfloat16, scale=0.1):
+        return torch.randn(*shape, device="cuda", dtype=dtype) * scale
+
+    @staticmethod
+    def _per_row(op, x, want, *args, **kwargs):
+        for i in range(x.shape[0]):
+            op(x[i : i + 1], *args, out=want[i : i + 1], **kwargs)
+        return want
+
+    @pytest.mark.parametrize("fused", [True, False], ids=["conv2d_activation", "conv2d"])
+    def test_conv2d_over_2gib_matches_per_row(self, fused):
         # 8 * 512 * 520 * 512 * 2 B = 2.03 GiB of input — just past the limit,
         # and the smallest shape that crosses it without a large output.
         N, H, W, IC, K = 8, 512, 520, 512, 32
         assert N * H * W * IC * 2 > 2**31, "shape must exceed the int32 byte limit"
-        dtype = torch.bfloat16
         torch.manual_seed(0)
-        x = torch.randn(N, H, W, IC, device="cuda", dtype=dtype) * 0.1
-        filt = torch.randn(K, 3, 3, IC, device="cuda", dtype=dtype) * 0.02
-        bias = torch.randn(K, device="cuda", dtype=dtype) * 0.1
-
-        got = oasr.conv2d_activation(x, filt, bias, activation_type=0, stride_h=2, stride_w=2)
-
-        want = torch.empty_like(got)
-        for i in range(N):
-            oasr.conv2d_activation(
-                x[i : i + 1],
-                filt,
-                bias,
-                activation_type=0,
-                stride_h=2,
-                stride_w=2,
-                out=want[i : i + 1],
-            )
+        x = self._rand(N, H, W, IC)
+        filt = self._rand(K, 3, 3, IC, scale=0.02)
+        bias = self._rand(K)
+        if fused:
+            op = functools.partial(oasr.conv2d_activation, activation_type=0)
+        else:
+            op = oasr.conv2d
+        got = op(x, filt, bias, stride_h=2, stride_w=2)
+        want = self._per_row(op, x, torch.empty_like(got), filt, bias, stride_h=2, stride_w=2)
         assert torch.equal(got, want)
 
-    def test_rows_per_launch_bounds_the_byte_extent(self):
-        """The split point is derived from the addressable extent, not guessed."""
-        from oasr.functionals.conv import _CONV2D_MAX_TENSOR_BYTES, _conv2d_rows_per_launch
+    def test_depthwise_conv2d_past_2_31_elements_matches_per_row(self):
+        """Nemotron's subsampling shape: 10 rows of 300 s.  ``N * P`` exceeds the
+        packed kernel's grid, so this was the general grouped kernel — whose
+        ``int`` offsets wrapped into an illegal address."""
+        N, H, W, C = 10, 15000, 64, 256
+        assert N * H * W * C > 2**31, "shape must exceed int32 element offsets"
+        torch.manual_seed(0)
+        x = self._rand(N, H, W, C, dtype=torch.float16)
+        filt = self._rand(C, 3, 3, 1, dtype=torch.float16)
+        bias = self._rand(C, dtype=torch.float16)
+        got = oasr.conv2d(x, filt, bias, stride_h=2, stride_w=2, groups=C)
+        want = self._per_row(
+            oasr.conv2d, x, torch.empty_like(got), filt, bias, stride_h=2, stride_w=2, groups=C
+        )
+        assert torch.equal(got, want)
 
-        x = torch.empty(4, 512, 520, 512, device="meta", dtype=torch.bfloat16)
-        out = torch.empty(4, 255, 259, 32, device="meta", dtype=torch.bfloat16)
-        rows = _conv2d_rows_per_launch(x, out)
-        assert rows >= 1
-        assert rows * x.stride(0) * x.element_size() <= _CONV2D_MAX_TENSOR_BYTES
-        assert (rows + 1) * x.stride(0) * x.element_size() > _CONV2D_MAX_TENSOR_BYTES
+    @pytest.mark.parametrize("fused", [False, True], ids=["conv1d", "conv1d_activation"])
+    def test_conv1d_over_2gib_matches_per_row(self, fused):
+        B, T, C = 300, 3000, 1280  # Whisper's second frontend conv; 2.15 GiB
+        assert B * T * C * 2 > 2**31
+        torch.manual_seed(0)
+        x = self._rand(B, T, C)
+        filt = self._rand(C, 3, C, scale=0.02)
+        bias = self._rand(C)
+        op = functools.partial(oasr.conv1d_activation, activation_type=1) if fused else oasr.conv1d
+        got = op(x, filt, bias, padding=1)
+        want = self._per_row(op, x, torch.empty_like(got), filt, bias, padding=1)
+        assert torch.equal(got, want)
+
+    @pytest.mark.parametrize("variant", ["plain", "fsmn", "silu"])
+    def test_depthwise_conv1d_past_2_31_elements_matches_per_row(self, variant):
+        """A Conformer-width conv module over 56 rows of 300 s.  On ``main`` the
+        rows past 2^31 elements came back silently wrong (max error 5.7)."""
+        B, T, C, K = 56, 30000, 1280, 15
+        assert B * T * C > 2**31, "shape must exceed int32 element offsets"
+        torch.manual_seed(0)
+        x = self._rand(B, T, C, dtype=torch.float16)
+        weight = self._rand(K, C, dtype=torch.float16)
+        bias = self._rand(C, dtype=torch.float16)
+        if variant == "silu":
+            op, extra = oasr.depthwise_conv1d_silu, {}
+        else:
+            op = oasr.depthwise_conv1d
+            extra = {}
+            if variant == "fsmn":  # Paraformer's masked residual contract
+                mask = torch.ones(B, T, 1, device="cuda", dtype=torch.bool)
+                mask[:, -1000:] = False
+                extra = {"mask": mask, "add_input": True}
+        got = op(x, weight, bias, K // 2, **extra)
+        want = torch.empty_like(got)
+        for i in range(B):
+            row = {k: (v[i : i + 1] if k == "mask" else v) for k, v in extra.items()}
+            op(x[i : i + 1], weight, bias, K // 2, out=want[i : i + 1], **row)
+        assert torch.equal(got, want)
 
 
 if __name__ == "__main__":

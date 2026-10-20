@@ -44,6 +44,8 @@ void {{ func_name }}(TensorView output, TensorView input, TensorView filter, Opt
     CHECK_INPUT(filter);
     CHECK_DIM(4, input);
     CHECK_DIM(4, filter);
+    CHECK_CONV_LAUNCH_BYTES(input);
+    CHECK_CONV_LAUNCH_BYTES(output);
 
     int N = input.size(0);
     int H = input.size(1);
@@ -95,6 +97,8 @@ void {{ func_name }}_activation(TensorView output, TensorView input, TensorView 
     CHECK_INPUT(filter);
     CHECK_DIM(4, input);
     CHECK_DIM(4, filter);
+    CHECK_CONV_LAUNCH_BYTES(input);
+    CHECK_CONV_LAUNCH_BYTES(output);
 
     int N = input.size(0);
     int H = input.size(1);
@@ -178,6 +182,8 @@ void conv1d_{{ config_name }}(TensorView output, TensorView input, TensorView fi
     CHECK_DIM(3, input);
     CHECK_DIM(3, filter);
     CHECK_DIM(3, output);
+    CHECK_CONV_LAUNCH_BYTES(input);
+    CHECK_CONV_LAUNCH_BYTES(output);
     CHECK_CONTIGUOUS_INPUT(input);
     CHECK_CONTIGUOUS_INPUT(output);
     CHECK_CONTIGUOUS_INPUT(filter);
@@ -238,6 +244,8 @@ void conv1d_{{ config_name }}_activation(TensorView output, TensorView input, Te
     CHECK_DIM(3, input);
     CHECK_DIM(3, filter);
     CHECK_DIM(3, output);
+    CHECK_CONV_LAUNCH_BYTES(input);
+    CHECK_CONV_LAUNCH_BYTES(output);
     CHECK_CONTIGUOUS_INPUT(input);
     CHECK_CONTIGUOUS_INPUT(output);
     CHECK_CONTIGUOUS_INPUT(filter);

@@ -125,6 +125,10 @@ void validate_grouped_conv2d(TensorView output, TensorView input, TensorView fil
                    output.size(3) == K)
         << "grouped Conv2D output must have shape [" << N << "," << P << "," << Q << "," << K
         << "]";
+    // The kernels offset whole images in 64 bits and positions inside one in 32.
+    TVM_FFI_ICHECK(H * W * IC <= 0x7fffffff && P * Q * K <= 0x7fffffff)
+        << "grouped Conv2D image of " << H * W * IC << " input / " << P * Q * K
+        << " output elements is past the kernels' 32-bit in-image offsets";
     TVM_FFI_ICHECK(input.dtype().code == filter.dtype().code &&
                    input.dtype().bits == filter.dtype().bits)
         << "input and filter dtypes must match";
@@ -208,6 +212,8 @@ void conv2d(TensorView output, TensorView input, TensorView filter, Optional bia
     CHECK_INPUT(filter);
     CHECK_DIM(4, input);   // [N, H, W, IC]
     CHECK_DIM(4, filter);  // [K, R, S, IC]
+    CHECK_CONV_LAUNCH_BYTES(input);
+    CHECK_CONV_LAUNCH_BYTES(output);
 
     int N = input.size(0);
     int H = input.size(1);
@@ -252,6 +258,8 @@ void conv2d_activation(TensorView output, TensorView input, TensorView filter, O
     CHECK_INPUT(filter);
     CHECK_DIM(4, input);
     CHECK_DIM(4, filter);
+    CHECK_CONV_LAUNCH_BYTES(input);
+    CHECK_CONV_LAUNCH_BYTES(output);
 
     int N = input.size(0);
     int H = input.size(1);

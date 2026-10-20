@@ -59,6 +59,10 @@ void check_depthwise_conv1d(TensorView output, TensorView input, TensorView weig
     TVM_FFI_ICHECK(output.size(0) == batch_size && output.size(1) == out_len &&
                    output.size(2) == channels)
         << "DepthwiseConv1D output shape mismatch";
+    // The kernels offset whole rows in 64 bits and positions inside one in 32.
+    TVM_FFI_ICHECK(seq_len * channels <= 0x7fffffff && out_len * channels <= 0x7fffffff)
+        << "DepthwiseConv1D row of " << seq_len * channels << " input / " << out_len * channels
+        << " output elements is past the kernels' 32-bit in-row offsets";
     TVM_FFI_ICHECK(same_dtype(input, output) && same_dtype(input, weight))
         << "DepthwiseConv1D input, weight, and output dtypes must match";
 

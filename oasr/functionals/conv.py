@@ -3,7 +3,7 @@
 """Functional API for convolution operations."""
 
 import functools
-from typing import Optional, cast
+from typing import List, Optional, cast
 
 import torch
 
@@ -191,27 +191,40 @@ def _dispatch_conv1d_activation(
 # cuDNN can pick better algorithms for small input-channel counts.
 _CUDNN_IC_THRESHOLD = 8
 
-#: CUTLASS's implicit-GEMM Conv2D addresses its activation tensors with 32-bit
-#: **byte** offsets, so a single launch cannot span more than 2 GiB per tensor.
-#: Splitting the batch dimension is exact because convolution rows are
-#: independent, so oversized inputs use multiple launches instead of overflowing
-#: the kernel's address range.
-_CONV2D_MAX_TENSOR_BYTES = 2**31 - 1
+#: The most one launch may address in any one tensor.  CUTLASS's implicit-GEMM
+#: convolutions (Conv2D, and Conv1D as a height-one Conv2D) use 32-bit **byte**
+#: offsets, and past them refuse the problem; the in-tree grouped and depthwise
+#: kernels used 32-bit *element* offsets and wrapped instead -- an illegal
+#: address, or a silently wrong tail of the batch.  2 GiB is the tighter of the
+#: two.  Splitting the batch dimension is exact because convolution rows are
+#: independent, so every entry point below runs an oversized batch as several
+#: launches over slices of the same tensors (:func:`_row_slices`).
+_MAX_LAUNCH_TENSOR_BYTES = 2**31 - 1
 
 
-def _conv2d_rows_per_launch(input: torch.Tensor, out: torch.Tensor) -> int:
-    """How many leading rows the implicit-GEMM conv can address in one launch.
+def _row_slices(op: str, *tensors: Optional[torch.Tensor]) -> Optional[List[slice]]:
+    """Leading-dimension slices each small enough for one launch, or ``None`` if one fits.
 
-    ``stride(0)`` rather than a shape product so a non-contiguous batch
-    dimension is measured as it is actually addressed.
+    Every tensor shares the leading (batch) dimension; ``None`` entries are
+    skipped.  ``stride(0)`` rather than a shape product, so a non-contiguous
+    batch dimension is measured as it is actually addressed.  A single row too
+    large to address raises: no split along the batch can help it, and
+    launching it anyway either fails opaquely or writes out of bounds.
     """
-    per_row = max(
-        input.stride(0) * input.element_size(),
-        out.stride(0) * out.element_size(),
-    )
-    if per_row <= 0:
-        return int(input.shape[0])
-    return max(1, _CONV2D_MAX_TENSOR_BYTES // per_row)
+    present = [t for t in tensors if t is not None]
+    rows = int(present[0].shape[0])
+    per_row = max(t.stride(0) * t.element_size() for t in present)
+    if per_row <= 0 or rows * per_row <= _MAX_LAUNCH_TENSOR_BYTES:
+        return None
+    if per_row > _MAX_LAUNCH_TENSOR_BYTES:
+        shapes = ", ".join(str(tuple(t.shape)) for t in present)
+        raise ValueError(
+            f"{op}: one batch row spans {per_row / 2**30:.2f} GiB, more than a single "
+            f"convolution launch can address (2 GiB per tensor); tensors {shapes}. "
+            "Shorten the input along time (long-form windowing) rather than the batch."
+        )
+    step = _MAX_LAUNCH_TENSOR_BYTES // per_row
+    return [slice(start, min(start + step, rows)) for start in range(0, rows, step)]
 
 
 def _conv1d_output_length(
@@ -271,6 +284,12 @@ def conv1d(
     if out is None:
         out = torch.empty(batch, out_len, out_channels, device=input.device, dtype=input.dtype)
 
+    slices = _row_slices("conv1d", input, out)  # a height-one Conv2D: same limit
+    if slices is not None:
+        for rows in slices:
+            conv1d(input[rows], filter, bias, padding, stride, dilation, out=out[rows])
+        return out
+
     from oasr.tune import is_tuning_enabled
 
     if is_tuning_enabled() and in_channels % 8 == 0 and out_channels % 8 == 0:
@@ -327,6 +346,21 @@ def conv1d_activation(
     out_len = _conv1d_output_length(seq_len, kernel_size, padding, stride, dilation)
     if out is None:
         out = torch.empty(batch, out_len, out_channels, device=input.device, dtype=input.dtype)
+
+    slices = _row_slices("conv1d_activation", input, out)
+    if slices is not None:
+        for rows in slices:
+            conv1d_activation(
+                input[rows],
+                filter,
+                bias,
+                activation_type,
+                padding,
+                stride,
+                dilation,
+                out=out[rows],
+            )
+        return out
 
     from oasr.tune import is_tuning_enabled
 
@@ -411,6 +445,19 @@ def depthwise_conv1d(
             device=input.device,
             dtype=input.dtype,
         )
+    slices = _row_slices("depthwise_conv1d", input, out, mask)
+    if slices is not None:
+        for rows in slices:
+            depthwise_conv1d(
+                input[rows],
+                weight,
+                bias,
+                (padding_left, padding_right),
+                out=out[rows],
+                mask=None if mask is None else mask[rows],
+                add_input=add_input,
+            )
+        return out
     _get_conv_module().depthwise_conv1d(
         out,
         input,
@@ -493,6 +540,25 @@ def conv2d(
         if is_tuning_enabled():
             return cast(torch.Tensor, gemm(input, filter.reshape(K, IC), bias, out=out))
         _dispatch_gemm(out, input, filter.reshape(K, IC), bias, K, IC, input.numel() // IC)
+        return out
+
+    # As in conv2d_activation: a batch too wide for one launch runs as several.
+    slices = _row_slices("conv2d", input, out)
+    if slices is not None:
+        for rows in slices:
+            conv2d(
+                input[rows],
+                filter,
+                bias,
+                pad_h=pad_h,
+                pad_w=pad_w,
+                stride_h=stride_h,
+                stride_w=stride_w,
+                dilation_h=dilation_h,
+                dilation_w=dilation_w,
+                out=out[rows],
+                groups=groups,
+            )
         return out
 
     if groups != 1:
@@ -586,6 +652,13 @@ def depthwise_conv1d_silu(
             device=input.device,
             dtype=input.dtype,
         )
+    slices = _row_slices("depthwise_conv1d_silu", input, out)
+    if slices is not None:
+        for rows in slices:
+            depthwise_conv1d_silu(
+                input[rows], weight, bias, (padding_left, padding_right), out=out[rows]
+            )
+        return out
     _get_conv_module().depthwise_conv1d_silu(out, input, weight, bias, padding_left, padding_right)
     return out
 
@@ -679,17 +752,14 @@ def conv2d_activation(
         )
         return out
 
-    # Both implicit-GEMM backends below address their tensors with 32-bit byte
-    # offsets; a batch too wide for that runs as several launches over slices of
-    # the same tensors.  Checked before the tuner so a tuning run measures the
-    # shape that will actually be launched.
-    rows_per_launch = _conv2d_rows_per_launch(input, out)
-    n_rows = int(input.shape[0])
-    if n_rows > rows_per_launch:
-        for start in range(0, n_rows, rows_per_launch):
-            stop = min(start + rows_per_launch, n_rows)
+    # A batch too wide for one launch runs as several over slices of the same
+    # tensors.  Checked before the tuner so a tuning run measures the shape that
+    # will actually be launched.
+    slices = _row_slices("conv2d_activation", input, out)
+    if slices is not None:
+        for rows in slices:
             conv2d_activation(
-                input[start:stop],
+                input[rows],
                 filter,
                 bias,
                 activation_type=activation_type,
@@ -699,7 +769,7 @@ def conv2d_activation(
                 stride_w=stride_w,
                 dilation_h=dilation_h,
                 dilation_w=dilation_w,
-                out=out[start:stop],
+                out=out[rows],
                 groups=groups,
             )
         return out
