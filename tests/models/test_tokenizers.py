@@ -411,10 +411,15 @@ class TestSentencePieceIncremental:
             "hello world\nhello there\nworld peace\nthe quick brown fox\n" * 30
         )
         (d / "mixed.txt").write_text(self.CORPUS)
+        # ``hard_vocab_limit=False``: how many pieces a corpus this small can
+        # yield differs between sentencepiece releases (28 on 0.2.1, 26 on
+        # 0.2.2), and a hard limit above it refuses to train.  Nothing below
+        # depends on the exact size.
         spm.SentencePieceTrainer.Train(
             input=str(d / "en.txt"),
             model_prefix=str(d / "uni"),
             vocab_size=28,
+            hard_vocab_limit=False,
             model_type="unigram",
         )
         # Byte fallback: characters outside the vocabulary arrive as UTF-8 byte
@@ -423,6 +428,7 @@ class TestSentencePieceIncremental:
             input=str(d / "mixed.txt"),
             model_prefix=str(d / "bf"),
             vocab_size=400,
+            hard_vocab_limit=False,
             model_type="bpe",
             byte_fallback=True,
             character_coverage=0.98,
