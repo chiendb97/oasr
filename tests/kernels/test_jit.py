@@ -1576,3 +1576,234 @@ class TestReleaseFlags:
         from oasr.jit import core
 
         assert "-DNDEBUG" in core._default_cuda_cflags()
+
+
+# ---------------------------------------------------------------------------
+# The cache never names a partly written library (audit #23)
+# ---------------------------------------------------------------------------
+
+
+def _a_real_shared_library():
+    """Bytes of a shared library that is certainly complete: torch's own."""
+    from pathlib import Path
+
+    import torch
+
+    return (Path(torch.__file__).parent / "lib" / "libc10.so").read_bytes()
+
+
+class TestTheCacheNeverNamesAPartialLibrary:
+    """``dlopen`` of a truncated library is not an error, it is ``SIGBUS``.
+
+    The JIT linked straight to the cached ``.so``, so the name existed from the
+    first byte the linker wrote.  A process that found it mid-link loaded it,
+    and a link killed mid-write left it behind for every later process to load;
+    both died of ``SIGBUS`` inside ``dlopen``, with no exception to catch and no
+    trace pointing at the cache.  The library is now built under a staging name
+    and renamed into place, and a truncated one -- from a cache written before
+    that -- is rebuilt rather than loaded.
+    """
+
+    def test_a_complete_library_is_recognised(self, tmp_path):
+        from oasr.jit.cubin_loader import is_complete_shared_object
+
+        lib = tmp_path / "lib.so"
+        lib.write_bytes(_a_real_shared_library())
+        assert is_complete_shared_object(lib)
+
+    @pytest.mark.parametrize("keep", [0.0, 0.01, 0.5, 0.99])
+    def test_a_truncated_library_is_not(self, tmp_path, keep):
+        from oasr.jit.cubin_loader import is_complete_shared_object
+
+        data = _a_real_shared_library()
+        lib = tmp_path / "lib.so"
+        lib.write_bytes(data[: int(len(data) * keep)])
+        assert not is_complete_shared_object(lib)
+        # A page, because that is the loader's unit: torch's own library ends in
+        # a byte no section or segment refers to, so one byte proves nothing.
+        lib.write_bytes(data[:-4096])
+        assert not is_complete_shared_object(lib), "one page short is still short"
+
+    def test_missing_and_foreign_files_are_not(self, tmp_path):
+        from oasr.jit.cubin_loader import is_complete_shared_object
+
+        assert not is_complete_shared_object(tmp_path / "absent.so")
+        (tmp_path / "text.so").write_text(
+            "not an ELF file at all, but long enough to have a header"
+        )
+        assert not is_complete_shared_object(tmp_path / "text.so")
+
+    def test_the_final_name_appears_only_when_the_library_is_whole(self, tmp_path):
+        from oasr.jit.cubin_loader import locked_compile
+
+        data = _a_real_shared_library()
+        lib = tmp_path / "mod" / "mod.so"
+        seen = []
+
+        def compile_fn(path):
+            assert path != str(lib), "the build was handed the published name"
+            with open(path, "wb") as f:
+                f.write(data[: len(data) // 2])
+                f.flush()
+                seen.append(lib.exists())
+                f.write(data[len(data) // 2 :])
+
+        locked_compile(str(lib), compile_fn)
+        assert seen == [False], "the cached name existed while the library was half-written"
+        assert lib.read_bytes() == data
+        assert not (tmp_path / "mod" / "mod.so.partial").exists()
+
+    def test_a_partial_left_by_a_killed_link_is_discarded_first(self, tmp_path):
+        """Not left for the build tool to judge: a newer partial looks up to date."""
+        from oasr.jit.cubin_loader import locked_compile
+
+        data = _a_real_shared_library()
+        lib = tmp_path / "mod.so"
+        staging = tmp_path / "mod.so.partial"
+        staging.write_bytes(data[:1000])
+
+        def compile_fn(path):
+            assert not staging.exists(), "the killed link's partial reached the build"
+            with open(path, "wb") as f:
+                f.write(data)
+
+        locked_compile(str(lib), compile_fn)
+        assert lib.read_bytes() == data
+
+    def test_a_truncated_library_already_in_the_cache_is_rebuilt(self, tmp_path):
+        from oasr.jit.cubin_loader import locked_compile
+
+        data = _a_real_shared_library()
+        lib = tmp_path / "mod.so"
+        lib.write_bytes(data[: len(data) // 2])
+        calls = []
+
+        def compile_fn(path):
+            calls.append(path)
+            with open(path, "wb") as f:
+                f.write(data)
+
+        locked_compile(str(lib), compile_fn)
+        assert len(calls) == 1 and lib.read_bytes() == data
+        locked_compile(str(lib), compile_fn)
+        assert len(calls) == 1, "a complete library was rebuilt"
+
+
+#: A linker that writes half its output, signals, waits, and only then finishes:
+#: the window a real link has, made wide enough to land in.
+_SLOW_LINK = r"""#!/bin/bash
+out=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[$i]}" = "-o" ]; then out="${args[$((i + 1))]}"; fi
+done
+if [[ " $* " == *" -shared "* ]] && [ -n "$out" ]; then
+  tmp="$(mktemp)"
+  newargs=()
+  skip=0
+  for a in "$@"; do
+    if [ $skip = 1 ]; then newargs+=("$tmp"); skip=0
+    elif [ "$a" = "-o" ]; then newargs+=("-o"); skip=1
+    else newargs+=("$a"); fi
+  done
+  c++ "${newargs[@]}" || exit 1
+  size=$(stat -c %s "$tmp")
+  head -c $((size / 2)) "$tmp" > "$out"
+  touch "$LINK_MARK"
+  sleep "$SLOW_LINK_S"
+  cat "$tmp" > "$out"
+  rm -f "$tmp"
+  exit 0
+fi
+exec c++ "$@"
+"""
+
+_PROBE_CU = """#include "tvm_ffi_utils.h"
+
+int64_t add_one(int64_t x) { return x + 1; }
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(add_one, add_one);
+"""
+
+_LOAD = """
+import sys
+from pathlib import Path
+
+from oasr.jit.core import gen_jit_spec
+
+print("add_one(41) =", gen_jit_spec("jit_publish_probe", [Path(sys.argv[1])]).build_and_load().add_one(41))
+"""
+
+
+@pytest.mark.cuda
+class TestAKilledOrUnfinishedLinkIsNeverLoaded:
+    """The two ways #23 reached a process, through the real JIT, nvcc and linker."""
+
+    @staticmethod
+    def _setup(tmp_path):
+        import os
+
+        (tmp_path / "slow_cxx.sh").write_text(_SLOW_LINK)
+        (tmp_path / "slow_cxx.sh").chmod(0o755)
+        (tmp_path / "probe.cu").write_text(_PROBE_CU)
+        (tmp_path / "load.py").write_text(_LOAD)
+        return dict(
+            os.environ,
+            OASR_JIT_DIR=str(tmp_path / "jit"),
+            OASR_GEN_SRC_DIR=str(tmp_path / "gen"),
+            LINK_MARK=str(tmp_path / "linking"),
+        )
+
+    @staticmethod
+    def _start(tmp_path, env, slow_s=None):
+        import subprocess
+        import sys
+
+        if slow_s is not None:
+            env = dict(env, CXX=str(tmp_path / "slow_cxx.sh"), SLOW_LINK_S=str(slow_s))
+        return subprocess.Popen(
+            [sys.executable, str(tmp_path / "load.py"), str(tmp_path / "probe.cu")],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+
+    @staticmethod
+    def _wait_for_the_link(tmp_path, proc):
+        import time
+
+        deadline = time.monotonic() + 300
+        while not (tmp_path / "linking").exists():
+            assert proc.poll() is None, proc.communicate()[0][-2000:]
+            assert time.monotonic() < deadline, "the link never started"
+            time.sleep(0.05)
+
+    @staticmethod
+    def _loaded(proc) -> str:
+        out = proc.communicate(timeout=600)[0]
+        assert proc.returncode == 0, f"exit {proc.returncode} (-7 is SIGBUS): {out[-2000:]}"
+        assert "add_one(41) = 42" in out, out[-2000:]
+        return out
+
+    def test_a_process_arriving_mid_link_waits_for_the_whole_library(self, tmp_path):
+        env = self._setup(tmp_path)
+        first = self._start(tmp_path, env, slow_s=3)
+        self._wait_for_the_link(tmp_path, first)
+        second = self._start(tmp_path, env)
+        self._loaded(second)
+        self._loaded(first)
+
+    def test_a_link_killed_mid_write_leaves_nothing_to_load(self, tmp_path):
+        import os
+        import signal
+
+        env = self._setup(tmp_path)
+        first = self._start(tmp_path, env, slow_s=600)
+        self._wait_for_the_link(tmp_path, first)
+        os.killpg(first.pid, signal.SIGKILL)
+        first.wait()
+        published = list((tmp_path / "jit").glob("*/*/jit_publish_probe.so"))
+        assert not published, "a killed link left a library under the cached name"
+        self._loaded(self._start(tmp_path, env))

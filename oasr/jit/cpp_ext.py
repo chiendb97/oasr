@@ -264,8 +264,13 @@ def generate_ninja_build_for_op(
     extra_ldflags: Optional[List[str]] = None,
     extra_include_dirs: Optional[List[Path]] = None,
     build_dir: Optional[Path] = None,
+    output: Optional[Path] = None,
 ) -> str:
     """Generate a Ninja build file for compiling an OASR kernel module.
+
+    ``output`` is the path the link writes, ``<build_dir>/<name>.so`` by default;
+    :func:`~oasr.jit.cubin_loader.locked_compile` passes a staging name there and
+    publishes the result itself.
 
     Returns the content of the ``build.ninja`` file as a string.
     """
@@ -337,7 +342,7 @@ def generate_ninja_build_for_op(
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
 
     lines.append("")
-    output_so = str((output_dir / f"{name}.so").resolve())
+    output_so = str((Path(output) if output is not None else output_dir / f"{name}.so").resolve())
     lines.append(f"build {output_so}: link " + " ".join(objects))
     lines.append(f"default {output_so}")
     lines.append("")
