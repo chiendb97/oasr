@@ -128,12 +128,21 @@ struct BlockMN {
                 bound = std::max(bound, cute::ceil_div(row_min > 0 ? row_min : 0, kBlockN));
             }
         }
-        // At most one tile straddles `seqstart_k`, and only when the start is
-        // not itself tile-aligned.
-        if (info.seqstart_k > 0 && (info.seqstart_k % kBlockN) != 0) {
-            bound = std::max(bound, info.seqstart_k / kBlockN + 1);
-        }
+        bound = std::max(bound, get_n_block_seqstart(info) + 1);
         return bound;
+    }
+
+    /*! \brief The one K tile that straddles `seqstart_k`, or -1 if none does.
+     *
+     * Tiles wholly below the start are outside `[n_block_min, n_block_max)`,
+     * so this is the only tile the start predicate can change, and it exists
+     * only when the start is not itself tile-aligned.
+     */
+    CUTLASS_DEVICE static int get_n_block_seqstart(SeqlenInfoQK const& info) {
+        if (info.seqstart_k > 0 && (info.seqstart_k % kBlockN) != 0) {
+            return info.seqstart_k / kBlockN;
+        }
+        return -1;
     }
 };
 
