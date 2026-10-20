@@ -22,7 +22,7 @@ from .cpp_ext import (
     generate_ninja_build_for_op,
     run_ninja,
 )
-from .cubin_loader import locked_compile, write_if_different
+from .cubin_loader import is_complete_shared_object, locked_compile, write_if_different
 
 logger = logging.getLogger("oasr.jit")
 
@@ -330,10 +330,14 @@ class JitSpec:
         return self._get_lib_dir() / f"{self.name}.so"
 
     def _compile(self, lib_path: str, jobs: Optional[int] = None) -> None:
-        """Compile sources into a shared library using Ninja (``jobs`` parallel)."""
+        """Compile sources into a shared library at exactly ``lib_path`` (``jobs`` parallel).
+
+        Under :func:`~oasr.jit.cubin_loader.locked_compile` that is a staging
+        name in the module's build directory, not the cached ``.so``.
+        """
         require_known_cuda_arch(f"module {self.name!r}")
-        lib_path = Path(lib_path)
-        build_dir = lib_path.parent
+        output = Path(lib_path)
+        build_dir = output.parent
         build_dir.mkdir(parents=True, exist_ok=True)
 
         ninja_content = generate_ninja_build_for_op(
@@ -343,6 +347,7 @@ class JitSpec:
             extra_include_dirs=self.extra_include_dirs,
             extra_ldflags=self.extra_ldflags,
             build_dir=build_dir,
+            output=output,
         )
         ninja_file = build_dir / "build.ninja"
         write_if_different(ninja_file, ninja_content)
@@ -356,9 +361,14 @@ class JitSpec:
         Returns a ``tvm_ffi.Module`` handle.  Functions exported via
         ``TVM_FFI_DLL_EXPORT_TYPED_FUNC`` are accessible as attributes
         or via indexing (e.g., ``module["layernorm"]``).
+
+        The check runs without the lock: ``locked_compile`` publishes with an
+        atomic rename, so a library under the final name is a finished one.
+        It is still a completeness check, not an existence check, because a
+        truncated library kills the process in ``dlopen`` rather than raising.
         """
         lib_path = self._get_lib_path()
-        if not lib_path.exists():
+        if not is_complete_shared_object(lib_path):
             locked_compile(str(lib_path), self._compile)
         import tvm_ffi
 

@@ -240,6 +240,16 @@ Compiled modules are cached in `~/.cache/oasr/jit/`, keyed on a hash that covers
 the sources, the `include/` tree, the nvcc flags, **and** the CUTLASS version
 stamp.
 
+A module is built under a file lock to `<name>.so.partial` and renamed into
+place only once the link has finished (`cubin_loader.locked_compile`), so the
+cached name never refers to a partly written library. That matters more than
+it looks: `dlopen` of a truncated library does not raise, it kills the process
+with `SIGBUS`. A process that finds a module mid-build therefore waits on the
+lock instead of loading it, and a build killed mid-link leaves only the
+`.partial`, which the next build discards. Before loading, `build_and_load`
+also checks that every section and segment the ELF headers describe is in the
+file (`is_complete_shared_object`) and rebuilds a library that fails.
+
 The default flags (`core._default_cuda_cflags`) include `-DNDEBUG`, which is
 how CUTLASS's own release builds compile. Without it, CuTe's device-side
 `assert()`s become `__assertfail` calls inside the GEMM mainloop, and ptxas

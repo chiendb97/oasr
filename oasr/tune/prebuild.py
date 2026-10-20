@@ -82,14 +82,14 @@ def prebuild(ops: Iterable[str], jobs: int, progress=None) -> List[Prebuilt]:
     end of the others.
     """
     from oasr.jit.core import require_known_cuda_arch
-    from oasr.jit.cubin_loader import locked_compile
+    from oasr.jit.cubin_loader import is_complete_shared_object, locked_compile
 
     require_known_cuda_arch("the tuning modules")
     specs = modules_for(ops)
     pending, results = [], []
     for name, spec in specs:
         lib = spec._get_lib_path()
-        if lib.exists():
+        if is_complete_shared_object(lib):
             results.append(Prebuilt(name, str(lib), len(spec.sources), 0, "cached"))
         else:
             pending.append((name, spec, lib))
