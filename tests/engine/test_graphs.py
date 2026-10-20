@@ -630,6 +630,214 @@ class TestAnUncapturableForwardCostsNothingLasting:
 
 
 # --------------------------------------------------------------------------
+# The streaming encoder and feature captures fail the same way, mid-traffic
+# --------------------------------------------------------------------------
+
+
+def _host_read_when_capturing(fn, attempts: list, only=lambda *a, **k: True):
+    """``fn``, made uncapturable: a host read whenever a capture is recording it.
+
+    Eager calls are untouched, so the eager fallback computes exactly what the
+    graph would have.  ``attempts`` counts the captures that were tried.
+    """
+
+    def wrapped(*a, **k):
+        if torch.cuda.is_current_stream_capturing() and only(*a, **k):
+            attempts.append(1)
+            torch.zeros(1, device="cuda").item()
+        return fn(*a, **k)
+
+    return wrapped
+
+
+def _stranded_gib(device: torch.device) -> float:
+    """VRAM a 256 MiB allocation keeps after being freed: ~0 unless a pool is stuck."""
+    before = _free_gib(device)
+    block = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    del block
+    gc.collect()
+    torch.cuda.empty_cache()
+    return before - _free_gib(device)
+
+
+def _tiny_paged_backend(graphs: bool, batch: int):
+    """A real paged streaming backend over a two-block causal Conformer."""
+    from types import SimpleNamespace
+
+    from oasr.cache.types import CacheConfig
+    from oasr.engine.streaming_backend.paged import PagedStreamingBackend
+    from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
+    from oasr.models.conformer.model import ConformerModel
+
+    enc = ConformerEncoderConfig(
+        input_size=80,
+        output_size=64,
+        num_blocks=2,
+        attention_heads=2,
+        linear_units=128,
+        cnn_module_kernel=15,
+        causal=True,
+        embed_layer_norm=False,
+    )
+    torch.manual_seed(7)
+    model = (
+        ConformerModel.from_config(ConformerModelConfig(encoder=enc, vocab_size=32))
+        .eval()
+        .to(device="cuda", dtype=torch.float16)
+    )
+    spec = model.cache_spec
+    cache_cfg = CacheConfig(
+        num_layers=spec.num_layers,
+        n_kv_head=spec.n_kv_head,
+        head_dim=spec.head_dim,
+        hidden_dim=spec.hidden_dim,
+        kernel_size=spec.conv_kernel_size,
+        chunk_size=16,
+        num_left_chunks=-1,
+        block_size_frames=16,
+        max_num_blocks=64 * batch,
+        max_blocks_per_seq=64,
+        max_batch_size=batch,
+        device=torch.device("cuda"),
+        dtype=torch.float16,
+    )
+    cfg = SimpleNamespace(
+        device="cuda",
+        dtype=torch.float16,
+        chunk_size=16,
+        use_cuda_graphs=graphs,
+        finalize_silence_pad=True,
+        feature_config=SimpleNamespace(output_dim=80),
+    )
+    return PagedStreamingBackend(model, cfg, cache_cfg, consumes="log_probs")
+
+
+def _drive_streams(backend, batch: int, ticks: int = 3):
+    """Per stream, the outputs of ``ticks`` batched steps (every stream every step)."""
+    from oasr.engine.request import Request
+
+    torch.manual_seed(21)
+    window = backend.decoding_window
+    reqs = []
+    for sid in range(batch):
+        feats = torch.randn(window * (ticks + 1), 80, dtype=torch.float16, device="cuda") * 0.5
+        req = Request(None, streaming=True)
+        req.stream_id, req.feature_buffer, req.feature_frames = sid, feats, int(feats.size(0))
+        req.feature_cursor, req.offset = 0, 0
+        backend.allocate(req)
+        reqs.append(req)
+    outs: dict = {r.stream_id: [] for r in reqs}
+    for _ in range(ticks):
+        res = backend.forward_step(reqs)
+        for r in reqs:
+            outs[r.stream_id].append(res[r.request_id].float().cpu().clone())
+    for r in reqs:
+        backend.free(r)
+    return outs
+
+
+@pytest.mark.cuda
+class TestStreamingCapturesRepairWhatTheySwallow:
+    """A capture that fails on a live tick costs that shape its graph, nothing else.
+
+    These two caches let the failure escape (audit #22).  The step raised, so
+    every stream in it failed; the allocator was left recording into the
+    aborted capture's pool, so the retry at the same shape on the next tick
+    died with ``beginAllocateToPool: already recording`` -- every stream that
+    reached that shape failed for the rest of the process -- and a later
+    256 MiB allocation stayed stranded after it was freed.
+    """
+
+    def test_a_failed_encoder_capture_runs_that_shape_eager(self):
+        dev = torch.device("cuda")
+        assert recover_from_failed_capture(dev, None)
+        want = _drive_streams(_tiny_paged_backend(graphs=False, batch=2), batch=2)
+
+        backend = _tiny_paged_backend(graphs=True, batch=2)
+        cache = backend._graph_cache  # noqa: SLF001
+        attempts: list = []
+        cache._chunk_forward = _host_read_when_capturing(  # noqa: SLF001
+            cache._chunk_forward, attempts  # noqa: SLF001
+        )
+        got = _drive_streams(backend, batch=2)
+
+        assert len(attempts) == 1, f"the failed shape was re-captured {len(attempts)} times"
+        assert cache.capture_failures == 1
+        # Bit-exact, which also proves the warm-up's stream-state writes were
+        # undone before the eager forward ran.
+        for sid in want:
+            for w, g in zip(want[sid], got[sid]):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+        assert _stranded_gib(dev) < 0.05, "the aborted capture's pool is still recording"
+
+    def test_one_bad_shape_does_not_end_capture_for_the_others(self):
+        """Pre-warm walks every width; the one that cannot capture is skipped, not fatal.
+
+        On ``main`` the failure escaped ``prewarm``, and the engine's guard
+        around it left every later width to capture on a live tick.
+        """
+        dev = torch.device("cuda")
+        assert recover_from_failed_capture(dev, None)
+        backend = _tiny_paged_backend(graphs=True, batch=4)
+        cache = backend._graph_cache  # noqa: SLF001
+        attempts: list = []
+        cache._chunk_forward = _host_read_when_capturing(  # noqa: SLF001
+            cache._chunk_forward,  # noqa: SLF001
+            attempts,
+            only=lambda xs, *a, **k: xs.size(0) == 2,
+        )
+        backend.prewarm([1, 2, 4], cache_t1_buckets=[0])
+        window = backend.decoding_window
+        assert attempts == [1]
+        assert cache.have(1, window, 0) and cache.have(4, window, 0)
+        assert not cache.have(2, window, 0)
+        assert _stranded_gib(dev) < 0.05
+
+    def test_a_failed_feature_capture_runs_that_bucket_eager(self):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor, _StreamInput
+        from oasr.features import FeatureConfig
+
+        dev = torch.device("cuda")
+        assert recover_from_failed_capture(dev, None)
+
+        def processor(graphs: bool) -> InputProcessor:
+            cfg = EngineConfig(
+                ckpt_dir="x",
+                device="cuda",
+                dtype=torch.float32,
+                max_batch_size=8,
+                feature_config=FeatureConfig(feature_type="fbank", num_mel_bins=80, dither=0.0),
+                use_cuda_graphs=graphs,
+                use_feature_cuda_graphs=graphs,
+            )
+            return InputProcessor(cfg, dev)
+
+        def inputs(waves):
+            return [
+                _StreamInput(request=None, segments=[w], n_samples=int(w.numel()), flush=False)  # type: ignore[arg-type]
+                for w in waves
+            ]
+
+        graphed = processor(True)
+        fg = graphed._feature_graph  # noqa: SLF001
+        assert fg is not None, "the feature graph must be on or nothing is tested"
+        torch.manual_seed(7)
+        n = graphed.streaming_audio_chunk_samples
+        waves = [torch.randn(n).clamp(-1, 1) for _ in range(3)]
+        want, _ = processor(False)._run_streaming_features(inputs(waves), None)  # noqa: SLF001
+
+        attempts: list = []
+        fg._extractor = _host_read_when_capturing(fg._extractor, attempts)  # noqa: SLF001
+        for _ in range(3):
+            got, _ = graphed._run_streaming_features(inputs(waves), None)  # noqa: SLF001
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert len(attempts) == 1, f"the failed bucket was re-captured {len(attempts)} times"
+        assert fg.capture_failures == 1
+        assert _stranded_gib(dev) < 0.05, "the aborted capture's pool is still recording"
+
+
+# --------------------------------------------------------------------------
 # The transducer predictor step, and which shapes of state can be carried
 # --------------------------------------------------------------------------
 

@@ -41,12 +41,16 @@ Capture constraints
   capture and restored after; the warmup and captured ``_run`` both
   mutate those rows, but the first real replay must read the engine's
   pre-chunk state.
+* Capture is best-effort, as in every other capture cache: a shape that fails
+  to capture is remembered and runs eager, and the aborted capture's
+  process-global damage is undone on the spot (:class:`_BestEffortCapture`).
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import tvm_ffi
@@ -59,6 +63,8 @@ from oasr.features import FeatureConfig, build_extractor
 from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
 
 from .capture_recovery import recover_from_failed_capture
+
+logger = logging.getLogger(__name__)
 
 # N_BLOCK tile size of the FMHA kernel; T_kv must be a multiple of this.
 _KERNEL_N_BLOCK = 64
@@ -150,6 +156,89 @@ def pick_cache_bucket(cache_t1: int, ladder: Sequence[int]) -> int:
     return round_up_bucket(want)
 
 
+class _BestEffortCapture:
+    """What both caches here do when a capture fails: decline, repair, remember.
+
+    A capture failure used to propagate.  On a live tick that failed every
+    stream in the step, and it left the allocator recording into the aborted
+    capture's pool, so the retry at the same shape on the next tick died with
+    ``beginAllocateToPool: already recording to mempool_id`` -- every stream
+    that reached that shape failed for the rest of the process (audit #22).
+    This is the protocol ``offline_graph``, ``predictor_graph`` and the slot
+    backend already follow: undo the damage (see
+    :mod:`oasr.engine.capture_recovery`), run this shape eager from now on, and
+    treat an out-of-memory as a fact about the process rather than the shape.
+
+    Subclasses set ``_device``, ``_pool`` and ``_captured`` and call
+    :meth:`_init_failure_tracking` from ``__init__``.
+    """
+
+    _device: torch.device
+    _pool: Optional[Tuple[int, int]]
+    _captured: Dict
+
+    def _init_failure_tracking(self, what: str, max_capture_failures: int) -> None:
+        self._what = what
+        self._failed: Set[Hashable] = set()
+        self._disabled = False
+        self._max_capture_failures = max(1, int(max_capture_failures))
+        #: Captures that aborted.  A shape is attempted at most once.
+        self.capture_failures = 0
+
+    def _declines(self, key: Hashable) -> bool:
+        """Whether ``key`` must run eager without attempting a capture."""
+        return self._disabled or key in self._failed
+
+    @torch.no_grad()
+    def recover_after_failed_capture(self) -> None:
+        """Undo an aborted capture: release the stuck pool and take a fresh one.
+
+        Captures here undo their own failures; this is for a caller that saw an
+        exception from around them.  See :mod:`oasr.engine.capture_recovery`.
+        """
+        recover_from_failed_capture(self._device, self._pool)
+        try:
+            self._pool = torch.cuda.graph_pool_handle()
+        except Exception:  # pragma: no cover - defensive
+            self._pool = None
+
+    def _capture_failed(self, key: Hashable, exc: BaseException) -> None:
+        """Repair the process after a failed capture at ``key`` and decide what it rules out."""
+        self.capture_failures += 1
+        torch.cuda.synchronize(self._device)
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            self._disabled = True
+            recover_from_failed_capture(self._device, self._pool)
+            self._pool = None
+            torch.cuda.empty_cache()
+            logger.warning(
+                "%s graph capture ran out of memory at %s (%s); %s graphs are off "
+                "for this engine and run eager",
+                self._what,
+                key,
+                exc,
+                self._what,
+            )
+            return
+        self._failed.add(key)
+        self.recover_after_failed_capture()
+        logger.warning(
+            "%s graph capture failed at %s (%s); this shape runs eager", self._what, key, exc
+        )
+        if self.capture_failures >= self._max_capture_failures and not self._captured:
+            # Nothing has ever captured, so the forward itself is not capturable
+            # (a host read, a data-dependent extent) and every other shape would
+            # abort the same way, each paying a warm-up forward to find out.
+            self._disabled = True
+            logger.warning(
+                "%s graph capture failed %d time(s) with nothing captured; %s graphs "
+                "are off for this engine",
+                self._what,
+                self.capture_failures,
+                self._what,
+            )
+
+
 @dataclass
 class _CapturedShape:
     """One captured CUDA graph + the pre-allocated input/output buffers."""
@@ -166,7 +255,7 @@ class _CapturedShape:
     output_buf: torch.Tensor
 
 
-class GraphedEncoderForward:
+class GraphedEncoderForward(_BestEffortCapture):
     """Lazy CUDA-Graph cache for the batched paged chunk forward.
 
     Parameters
@@ -205,6 +294,7 @@ class GraphedEncoderForward:
         pool: Optional[Tuple[int, int]] = None,
         extra_states: Sequence[str] = (),
         max_captures: int = 512,
+        max_capture_failures: int = 1,
     ) -> None:
         self._chunk_forward = chunk_forward
         self._att_mgr = att_mgr
@@ -228,6 +318,7 @@ class GraphedEncoderForward:
         # here meant raising that budget grew the pre-warm and left this cap
         # where it was, so the extra shapes fell back to eager anyway.
         self._max_captures = int(max_captures)
+        self._init_failure_tracking("streaming encoder", max_capture_failures)
 
     # ------------------------------------------------------------------
     # Public API
@@ -287,15 +378,16 @@ class GraphedEncoderForward:
             first; see ``PagedStreamingBackend.forward_step``, where getting this
             wrong cost the trailing words of every stream that finalized in the same
             step as a fresh capture.
-            Returns ``None`` when the per-shape capture cache is saturated
-            (caller falls back to eager mode).
+            Returns ``None`` when the per-shape capture cache is saturated, or
+            when this shape failed to capture (now or earlier) -- the caller
+            then runs the chunk eagerly.
         """
         key = (B, T_input, cache_t1_bucket)
         state = self._captured.get(key)
         if state is None:
-            if len(self._captured) >= self._max_captures:
-                # Refuse to capture once the cache is saturated; the caller
-                # will fall back to eager mode for this chunk.
+            if self._declines(key) or len(self._captured) >= self._max_captures:
+                # Refuse to capture a shape that already failed, or once the
+                # cache is saturated; the caller runs this chunk eagerly.
                 return None
             state = self._capture(
                 B,
@@ -305,6 +397,8 @@ class GraphedEncoderForward:
                 slot_ids,
                 offsets,
             )
+            if state is None:
+                return None
             self._captured[key] = state
 
         # Refresh captured input buffers with current per-chunk state.
@@ -330,20 +424,6 @@ class GraphedEncoderForward:
     # Capture
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def recover_after_failed_capture(self) -> None:
-        """Undo an aborted capture: release the stuck pool and take a fresh one.
-
-        Captures here are not wrapped in ``try``, so a failure reaches the
-        caller — but the damage is process-global and outlives the exception.
-        See :mod:`oasr.engine.capture_recovery`.
-        """
-        recover_from_failed_capture(self._device, self._pool)
-        try:
-            self._pool = torch.cuda.graph_pool_handle()
-        except Exception:  # pragma: no cover - defensive
-            self._pool = None
-
     def release(self) -> None:
         """Return the graph pool's VRAM.  Idempotent.
 
@@ -358,6 +438,7 @@ class GraphedEncoderForward:
             except Exception:  # pragma: no cover - teardown must not raise
                 pass
         self._captured.clear()
+        self._failed.clear()
 
     def _capture(
         self,
@@ -367,7 +448,7 @@ class GraphedEncoderForward:
         xs: torch.Tensor,
         slot_ids: torch.Tensor,
         offsets: torch.Tensor,
-    ) -> _CapturedShape:
+    ) -> Optional[_CapturedShape]:
         """Allocate persistent buffers, warm up, then capture the forward.
 
         The captured graph reads from **pre-allocated** gather buffers for
@@ -435,26 +516,34 @@ class GraphedEncoderForward:
             for name, snapshot in saved.items():
                 states[name].scatter(snapshot)
 
-        # Warmup once on the default stream so cuBLAS / cuDNN finalise any
-        # one-time workspace allocations before we open capture. Real
-        # streaming writes K/V to the chunk's logical position; the
-        # subsequent ``replay()`` overwrites that warmup write with the
-        # caller's actual ``xs``.
-        _run()
-        torch.cuda.synchronize(self._device)
-        # Restore so the captured ``_run`` reads the same pre-chunk state that
-        # the first real replay will see.
-        _restore()
+        try:
+            # Warmup once on the default stream so cuBLAS / cuDNN finalise any
+            # one-time workspace allocations before we open capture. Real
+            # streaming writes K/V to the chunk's logical position; the
+            # subsequent ``replay()`` overwrites that warmup write with the
+            # caller's actual ``xs``.
+            _run()
+            torch.cuda.synchronize(self._device)
+            # Restore so the captured ``_run`` reads the same pre-chunk state that
+            # the first real replay will see.
+            _restore()
 
-        graph = torch.cuda.CUDAGraph()
-        # ``tvm_ffi.use_torch_stream(torch.cuda.graph(g))`` is the documented
-        # path for capturing TVM-FFI kernel launches into a CUDA graph: it
-        # opens the torch graph context and sets the FFI environment stream
-        # to the active capture stream so the cute kernel's launch is
-        # captured into ``graph`` (rather than escaping to the default
-        # stream and tripping ``cudaErrorIllegalAddress`` on replay).
-        with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
-            output_buf = _run()
+            graph = torch.cuda.CUDAGraph()
+            # ``tvm_ffi.use_torch_stream(torch.cuda.graph(g))`` is the documented
+            # path for capturing TVM-FFI kernel launches into a CUDA graph: it
+            # opens the torch graph context and sets the FFI environment stream
+            # to the active capture stream so the cute kernel's launch is
+            # captured into ``graph`` (rather than escaping to the default
+            # stream and tripping ``cudaErrorIllegalAddress`` on replay).
+            with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
+                output_buf = _run()
+        except Exception as exc:  # noqa: BLE001 - capture is best-effort
+            # Repair the allocator first: the restore below allocates.
+            self._capture_failed((B, T_input, cache_t1_bucket), exc)
+            # The warm-up may have written this chunk's stream state before the
+            # failure; the eager forward the caller runs next must not see it.
+            _restore()
+            return None
 
         # Restore again so the first real replay (line below in caller)
         # reads the engine's pre-chunk state.
@@ -500,7 +589,7 @@ class _CapturedFeatureShape:
     ready: Optional["torch.cuda.Event"] = None
 
 
-class GraphedFeatureExtraction:
+class GraphedFeatureExtraction(_BestEffortCapture):
     """Lazy CUDA-Graph cache for batched ``fbank`` / ``mfcc`` feature extraction.
 
     The per-step batched feature extraction path in
@@ -549,6 +638,7 @@ class GraphedFeatureExtraction:
         chunk_samples: int,
         max_batch_size: int,
         batch_buckets: Optional[List[int]] = None,
+        max_capture_failures: int = 1,
     ) -> None:
         self._pool: Optional[Tuple[int, int]] = (
             pool if pool is not None else torch.cuda.graph_pool_handle()
@@ -589,6 +679,7 @@ class GraphedFeatureExtraction:
 
         self._max_bucket = self._buckets[-1] if self._buckets else 0
         self._captured: Dict[int, _CapturedFeatureShape] = {}
+        self._init_failure_tracking("streaming feature", max_capture_failures)
 
     # ------------------------------------------------------------------
     # Public API
@@ -642,8 +733,8 @@ class GraphedFeatureExtraction:
             output buffer in ``output_dtype``. Callers should slice the
             first ``B_active`` rows and the first ``feat_lens_cpu[i]``
             frames per row. Returns ``None`` when ``B_active`` or
-            ``padded_cpu.size(1)`` exceeds the captured shape (caller
-            falls back to the eager path).
+            ``padded_cpu.size(1)`` exceeds the captured shape, or when the
+            bucket failed to capture (caller falls back to the eager path).
         """
         bucket = self.pick_bucket(B_active)
         if bucket is None:
@@ -654,7 +745,11 @@ class GraphedFeatureExtraction:
 
         state = self._captured.get(bucket)
         if state is None:
+            if self._declines(bucket):
+                return None
             state = self._capture(bucket)
+            if state is None:
+                return None
             self._captured[bucket] = state
 
         # Zero only the per-row tail (samples [T, t_pad)) of the active rows;
@@ -691,20 +786,6 @@ class GraphedFeatureExtraction:
     # Capture
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def recover_after_failed_capture(self) -> None:
-        """Undo an aborted capture: release the stuck pool and take a fresh one.
-
-        Captures here are not wrapped in ``try``, so a failure reaches the
-        caller — but the damage is process-global and outlives the exception.
-        See :mod:`oasr.engine.capture_recovery`.
-        """
-        recover_from_failed_capture(self._device, self._pool)
-        try:
-            self._pool = torch.cuda.graph_pool_handle()
-        except Exception:  # pragma: no cover - defensive
-            self._pool = None
-
     def release(self) -> None:
         """Return the graph pool's VRAM.  Idempotent.
 
@@ -719,8 +800,9 @@ class GraphedFeatureExtraction:
             except Exception:  # pragma: no cover - teardown must not raise
                 pass
         self._captured.clear()
+        self._failed.clear()
 
-    def _capture(self, bucket: int) -> _CapturedFeatureShape:
+    def _capture(self, bucket: int) -> Optional[_CapturedFeatureShape]:
         device = self._device
         T_pad = self._t_pad
 
@@ -747,14 +829,18 @@ class GraphedFeatureExtraction:
             feats_f32, _ = batched_fn(wav_device, lengths_device, fcfg)
             return feats_f32.to(dtype=out_dtype)
 
-        # Warmup once on the default stream so any one-shot kernel/workspace
-        # initialisation finishes before capture opens.
-        _run()
-        torch.cuda.synchronize(device)
+        try:
+            # Warmup once on the default stream so any one-shot kernel/workspace
+            # initialisation finishes before capture opens.
+            _run()
+            torch.cuda.synchronize(device)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._pool):
-            feats_out = _run()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._pool):
+                feats_out = _run()
+        except Exception as exc:  # noqa: BLE001 - capture is best-effort
+            self._capture_failed(bucket, exc)
+            return None
 
         return _CapturedFeatureShape(
             graph=graph,
