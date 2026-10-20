@@ -132,6 +132,19 @@ inline T* OptionalDataPtr(Optional const& t) {
         << ". Pad the projection at the model layer -- see "                               \
            "oasr.models.base.align_out_features / pad_output_projection."
 
+// CUTLASS's implicit-GEMM convolutions address each tensor with 32-bit byte
+// offsets.  Past 2 GiB they refuse the problem with a bare failure status, which
+// once surfaced as an engine-wide empty transcript; name the limit instead.
+#define CHECK_CONV_LAUNCH_BYTES(x)                                                  \
+    TVM_FFI_ICHECK(static_cast<int64_t>((x).numel()) *                              \
+                       static_cast<int64_t>(oasr::get_element_size((x).dtype())) <= \
+                   int64_t{0x7fffffff})                                             \
+        << "convolution tensor " #x " is "                                          \
+        << static_cast<int64_t>((x).numel()) *                                      \
+               static_cast<int64_t>(oasr::get_element_size((x).dtype()))            \
+        << " bytes, more than one launch can address (2 GiB); split the batch -- "  \
+           "the oasr.conv* entry points do"
+
 // =============================================================================
 // Dtype dispatch macros
 // =============================================================================

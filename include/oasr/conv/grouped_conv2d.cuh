@@ -43,6 +43,12 @@ __global__ void depthwiseConv2dKernel(const T* __restrict__ input, const T* __re
     if (n >= N || p >= P || q0 >= Q)
         return;
 
+    // Images are offset in 64 bits -- past 2^31 elements the whole-tensor int
+    // offset wrapped to an illegal address -- and positions inside one image in
+    // 32 (the launcher refuses an image that would not fit).
+    const T* input_n = input + static_cast<int64_t>(n) * H * W * channels;
+    T* output_n = output + static_cast<int64_t>(n) * P * Q * channels;
+
     float bias_value = bias == nullptr ? 0.0f : static_cast<float>(bias[channel]);
     float acc[QTile];
 #pragma unroll
@@ -67,8 +73,8 @@ __global__ void depthwiseConv2dKernel(const T* __restrict__ input, const T* __re
                 int q = q0 + q_it;
                 int w = q * stride_w - pad_w + s * dilation_w;
                 if (q < Q && w >= 0 && w < W) {
-                    int input_offset = ((n * H + h) * W + w) * channels + channel;
-                    acc[q_it] = fmaf(static_cast<float>(input[input_offset]), weight, acc[q_it]);
+                    int input_offset = (h * W + w) * channels + channel;
+                    acc[q_it] = fmaf(static_cast<float>(input_n[input_offset]), weight, acc[q_it]);
                 }
             }
         }
@@ -78,8 +84,8 @@ __global__ void depthwiseConv2dKernel(const T* __restrict__ input, const T* __re
     for (int q_it = 0; q_it < QTile; ++q_it) {
         int q = q0 + q_it;
         if (q < Q) {
-            int output_offset = ((n * P + p) * Q + q) * channels + channel;
-            output[output_offset] = static_cast<T>(groupedConv2dActivate<Activation>(acc[q_it]));
+            int output_offset = (p * Q + q) * channels + channel;
+            output_n[output_offset] = static_cast<T>(groupedConv2dActivate<Activation>(acc[q_it]));
         }
     }
 }
@@ -257,6 +263,8 @@ __global__ void groupedConv2dKernel(const T* __restrict__ input, const T* __rest
     position /= Q;
     int p = position % P;
     int n = position / P;
+    // As in depthwiseConv2dKernel: images in 64 bits, positions within one in 32.
+    const T* input_n = input + static_cast<int64_t>(n) * H * W * IC;
 
     int in_channels_per_group = IC / groups;
     int out_channels_per_group = K / groups;
@@ -278,10 +286,10 @@ __global__ void groupedConv2dKernel(const T* __restrict__ input, const T* __rest
             int w = input_w0 + s * dilation_w;
             if (w < 0 || w >= W)
                 continue;
-            int input_base = ((n * H + h) * W + w) * IC + input_channel0;
+            int input_base = (h * W + w) * IC + input_channel0;
             int filter_base = ((out_channel * R + r) * S + s) * in_channels_per_group;
             for (int c = 0; c < in_channels_per_group; ++c) {
-                acc = fmaf(static_cast<float>(input[input_base + c]),
+                acc = fmaf(static_cast<float>(input_n[input_base + c]),
                            static_cast<float>(filter[filter_base + c]), acc);
             }
         }
@@ -317,10 +325,13 @@ cudaError_t launchGroupedConv2d(const T* input, const T* filter, const T* bias, 
     } else {
         constexpr int kThreads = 256;
         int64_t num_outputs = static_cast<int64_t>(N) * P * Q * K;
-        int blocks = static_cast<int>((num_outputs + kThreads - 1) / kThreads);
-        groupedConv2dKernel<T, Activation, KernelH, KernelW><<<blocks, kThreads, 0, stream>>>(
-            input, filter, bias, output, N, H, W, IC, K, R, S, P, Q, pad_h, pad_w, stride_h,
-            stride_w, dilation_h, dilation_w, groups, num_outputs);
+        const int64_t blocks = (num_outputs + kThreads - 1) / kThreads;
+        if (blocks > 0x7fffffff)
+            return cudaErrorInvalidConfiguration;  // grid.x limit
+        groupedConv2dKernel<T, Activation, KernelH, KernelW>
+            <<<static_cast<unsigned>(blocks), kThreads, 0, stream>>>(
+                input, filter, bias, output, N, H, W, IC, K, R, S, P, Q, pad_h, pad_w, stride_h,
+                stride_w, dilation_h, dilation_w, groups, num_outputs);
     }
     return cudaGetLastError();
 }

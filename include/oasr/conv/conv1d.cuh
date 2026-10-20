@@ -40,7 +40,11 @@ __global__ void depthwiseConv1DKernel(
 
     int k_start = max(padding_left - s_id, 0);
 
-    const T* input_base = input + b_id * seq_len * channels + c_offset;
+    // Rows are offset in 64 bits -- past 2^31 elements the int product wrapped
+    // into another row's memory -- and positions inside one row in 32 (the
+    // launcher refuses a row that would not fit).
+    const int64_t row = static_cast<int64_t>(b_id) * seq_len;
+    const T* input_base = input + row * channels + c_offset;
     const T* weight_base = weight + c_offset;
 
     // Accumulate in float for numerical stability
@@ -61,7 +65,7 @@ __global__ void depthwiseConv1DKernel(
         for (int v = 0; v < VecSize; v++) {
             float in_value = static_cast<float>(in_vec[v]);
             if constexpr (FuseMask) {
-                in_value *= static_cast<float>(mask[b_id * seq_len + i]);
+                in_value *= static_cast<float>(mask[row + i]);
             }
             acc[v] += in_value * static_cast<float>(w_vec[v]);
         }
@@ -86,7 +90,7 @@ __global__ void depthwiseConv1DKernel(
         input_vec.load(input_base + s_id * channels);
         float input_scale = 1.0f;
         if constexpr (FuseMask) {
-            input_scale = static_cast<float>(mask[b_id * seq_len + s_id]);
+            input_scale = static_cast<float>(mask[row + s_id]);
         }
 #pragma unroll
         for (int v = 0; v < VecSize; v++) {
@@ -95,7 +99,7 @@ __global__ void depthwiseConv1DKernel(
     }
 
     if constexpr (FuseMask) {
-        const float output_scale = static_cast<float>(mask[b_id * seq_len + s_id]);
+        const float output_scale = static_cast<float>(mask[row + s_id]);
 #pragma unroll
         for (int v = 0; v < VecSize; v++) {
             acc[v] *= output_scale;
@@ -103,13 +107,14 @@ __global__ void depthwiseConv1DKernel(
     }
 
     // Store result
-    const int out_offset = (b_id * gridDim.x + s_id) * channels + c_offset;
+    T* output_row = output + static_cast<int64_t>(b_id) * gridDim.x * channels;
+    const int out_offset = s_id * channels + c_offset;
     Vec<T, VecSize> out_vec;
 #pragma unroll
     for (int v = 0; v < VecSize; v++) {
         out_vec[v] = static_cast<T>(acc[v]);
     }
-    out_vec.store(output + out_offset);
+    out_vec.store(output_row + out_offset);
 }
 
 // =============================================================================
@@ -135,7 +140,11 @@ __global__ void depthwiseConv1DSiluKernel(
 
     int k_start = max(padding_left - s_id, 0);
 
-    const T* input_base = input + b_id * seq_len * channels + c_offset;
+    // Rows are offset in 64 bits -- past 2^31 elements the int product wrapped
+    // into another row's memory -- and positions inside one row in 32 (the
+    // launcher refuses a row that would not fit).
+    const int64_t row = static_cast<int64_t>(b_id) * seq_len;
+    const T* input_base = input + row * channels + c_offset;
     const T* weight_base = weight + c_offset;
 
     // Accumulate in float for numerical stability
@@ -171,13 +180,14 @@ __global__ void depthwiseConv1DSiluKernel(
         acc[v] = oasr::swish(acc[v]);
     }
 
-    const int out_offset = (b_id * gridDim.x + s_id) * channels + c_offset;
+    T* output_row = output + static_cast<int64_t>(b_id) * gridDim.x * channels;
+    const int out_offset = s_id * channels + c_offset;
     Vec<T, VecSize> out_vec;
 #pragma unroll
     for (int v = 0; v < VecSize; v++) {
         out_vec[v] = static_cast<T>(acc[v]);
     }
-    out_vec.store(output + out_offset);
+    out_vec.store(output_row + out_offset);
 }
 
 // =============================================================================
