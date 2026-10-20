@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 //
 //   (a) the first (highest) tile   -- straddles `seqlen_k`; also `Is_first`
-//   (b) the causal / local right edge
+//   (b) the causal / local right edge -- and `seqstart_k`, which it can reach
 //   (c) the interior               -- **no mask at all**
 //   (d) the left edge              -- sliding window and/or `seqstart_k`
 //
@@ -539,6 +539,16 @@ struct CollectiveFmhaMainloopSm80 {
         --n_block;
 
         // --- (b) the causal / local right edge -----------------------------
+        // This range is bounded below by `n_block_min`, so it can reach the one
+        // tile that straddles `seqstart_k` whenever the right edge spans more
+        // than one K tile -- a right window, an unbounded one, or
+        // `kBlockN < kBlockM` under plain causal.  That tile needs the start
+        // predicate as well: without it the keys below each stream's start
+        // took softmax weight there (audit #16).  When this range reaches it,
+        // it is the range's lowest tile, so the loop stops above it and it is
+        // stepped on its own.  Not the predicate on every tile here, nor a
+        // per-tile branch in this loop: those cost up to 29% and 9.5% on an
+        // unbounded right window, where this loop is the whole K range.
         int const n_block_right_masked =
             BlockMN_t::get_n_block_min_right_masked(m_block, n_block_min,
                                                     params.window_size_right);
@@ -547,9 +557,21 @@ struct CollectiveFmhaMainloopSm80 {
                 mask.template apply</*Seqlenk_mask=*/false, Is_causal, Is_local,
                                     /*Seqstart_mask=*/false>(tSrS, m_block, nb);
             };
+            int const n_block_seqstart = BlockMN_t::get_n_block_seqstart(info);
+            int const n_block_right_unstarted =
+                std::max(n_block_right_masked, n_block_seqstart + 1);
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; n_block >= n_block_right_masked; --n_block) {
+            for (; n_block >= n_block_right_unstarted; --n_block) {
                 kv_step(n_block, mask_fn, cute::false_type{});
+            }
+            // Only `n_block == n_block_seqstart == n_block_min` gets here.
+            if (n_block >= n_block_right_masked) {
+                auto mask_start_fn = [&](auto& tSrS, int nb) {
+                    mask.template apply</*Seqlenk_mask=*/false, Is_causal, Is_local,
+                                        /*Seqstart_mask=*/true>(tSrS, m_block, nb);
+                };
+                kv_step(n_block, mask_start_fn, cute::false_type{});
+                --n_block;
             }
         }
 

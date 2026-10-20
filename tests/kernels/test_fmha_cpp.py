@@ -116,6 +116,24 @@ def _cxx_resolve(sm: int, elem_bits: int, head_dim: int):
     return out.tolist()
 
 
+def _narrow_k_tile_head_dim():
+    """A head dim whose K tile is narrower than its Q tile on this device, or None.
+
+    Only there does plain causal have a right edge wider than the diagonal tile
+    (320 on sm_86/89/120, 512 on sm_80); every narrower head is 64x64.
+    """
+    for head_dim in (320, 512):
+        valid, block_m, block_n = _cxx_resolve(device_sm(), 16, head_dim)[:3]
+        if valid and block_n < block_m:
+            return head_dim
+    return None
+
+
+# Left padding that lands inside the right edge of Q tiles 0, 1 and 2, whether
+# the K tile is 64 wide (tiles 0, 1, 2) or 32 (tiles 0, 2, 4).
+_EDGE_STARTS = [20, 70, 140]
+
+
 class TestTileSelectionAgrees:
     """``fmhaResolveTile`` and :func:`oasr.jit.fmha.resolve_config`, field for field.
 
@@ -424,6 +442,31 @@ class TestMaskedInteriorSplit:
         want = ref_fmha(q, k, v, 0.125, cache_seqlens=lens, cache_seqstarts=starts)
         torch.testing.assert_close(got, want, **FMHA_TOL)
 
+    def test_causal_masks_left_padding_on_a_narrow_k_tile(self, fmha_cxx):
+        """Causal over a left-padded batch -- Qwen2-Audio's prefill -- at a wide head.
+
+        With the K tile narrower than the Q tile, the causal right edge is two
+        tiles, and the lower one can straddle a stream's start.  That loop ran
+        without the start predicate, so the padding keys took softmax weight
+        (audit #16: max error 4.7 against SDPA at head dim 320).  At 64x64 the
+        right edge is the diagonal tile alone, which is why no head dim a
+        shipped model uses could show it.  Against SDPA rather than as a
+        bias identity: at this tile the two spellings of causal already differ
+        by an ulp with no padding at all.
+        """
+        head_dim = _narrow_k_tile_head_dim()
+        if head_dim is None:
+            pytest.skip(f"no head dim has a K tile narrower than its Q tile on sm_{device_sm()}")
+        B, H, T = 3, 4, 200
+        q, k, v = _qkv(B, H, T, T, head_dim, seed=head_dim)
+        lens = torch.tensor([T, T, 180], dtype=torch.int32, device="cuda")
+        starts = torch.tensor(_EDGE_STARTS, dtype=torch.int32, device="cuda")
+        got = fmha_cxx(
+            q, k, v, softmax_scale=0.125, cache_seqlens=lens, cache_seqstarts=starts, causal=True
+        )
+        want = ref_fmha(q, k, v, 0.125, cache_seqlens=lens, cache_seqstarts=starts, causal=True)
+        torch.testing.assert_close(got, want, **FMHA_TOL)
+
 
 class TestSlidingWindow:
     """A per-row window: this lane has one, the CuTeDSL lane has no argument for it.
@@ -490,6 +533,41 @@ class TestSlidingWindow:
         )
         want = ref_fmha(q, k, v, 0.125, cache_seqlens=lens, window_left=24, window_right=0)
         torch.testing.assert_close(got, want, **FMHA_TOL)
+
+    @pytest.mark.parametrize(
+        "window_left,window_right", [(64, 16), (16, 16), (-1, 8), (8, -1), (24, 0)]
+    )
+    @pytest.mark.parametrize("narrow_k_tile", [False, True], ids=["head64", "narrow"])
+    def test_window_composes_with_cache_seqstarts(
+        self, fmha_cxx, window_left, window_right, narrow_k_tile
+    ):
+        """Left padding is masked on the window's right-edge tiles too (audit #16).
+
+        A right window, or an unbounded one, makes the right edge more than one
+        K tile, and the lowest of them can straddle a stream's start.  Those
+        tiles ran without the start predicate, so the padding keys took softmax
+        weight: max error 0.4-3.2 against SDPA, every row finite and summing to
+        one.  `(24, 0)` has a one-tile right edge at head dim 64 and is the
+        control there; with a narrower K tile it is two tiles and fails too.
+        """
+        head_dim = _narrow_k_tile_head_dim() if narrow_k_tile else 64
+        if head_dim is None:
+            pytest.skip(f"no head dim has a K tile narrower than its Q tile on sm_{device_sm()}")
+        B, H, T = 3, 4, 200
+        q, k, v = _qkv(B, H, T, T, head_dim, seed=head_dim + window_left)
+        lens = torch.tensor([T, 190, T], dtype=torch.int32, device="cuda")
+        starts = torch.tensor(_EDGE_STARTS, dtype=torch.int32, device="cuda")
+        window = {"window_left": window_left, "window_right": window_right}
+        got = fmha_cxx(
+            q, k, v, softmax_scale=0.125, cache_seqlens=lens, cache_seqstarts=starts, **window
+        )
+        want = ref_fmha(q, k, v, 0.125, cache_seqlens=lens, cache_seqstarts=starts, **window)
+        torch.testing.assert_close(
+            got,
+            want,
+            **FMHA_TOL,
+            msg=lambda m: f"window ({window_left}, {window_right}) at head dim {head_dim}: {m}",
+        )
 
     def test_the_cute_backend_refuses_a_window_rather_than_ignoring_it(self):
         """Naming a backend means requiring it (rule 3, restated for attention)."""
