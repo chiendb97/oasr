@@ -36,6 +36,8 @@ KERNEL_FAMILIES: Dict[str, str] = {
     "composite": "benchmarks.kernels.composite",
     "transducer": "benchmarks.kernels.transducer",
     "feature": "benchmarks.features.frontend",
+    "quant": "benchmarks.kernels.quant",
+    "scaled_mm": "benchmarks.kernels.scaled_mm",
 }
 
 WORKLOAD_FAMILIES: Dict[str, str] = {

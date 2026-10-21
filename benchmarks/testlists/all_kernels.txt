@@ -67,6 +67,11 @@
 --family recurrent --subroutine rnn_tanh --batch 32 --seq 128 --input-size 256 --hidden-size 256 --num-layers 2 --backends oasr native cudnn
 --family mlp --subroutine gated_mlp --rows 32 --hidden 4096 --intermediate 11008
 
+# Quantization (int8 w8a8)
+--family quant --subroutine quantize_per_token --M 16384 --K 256
+--family scaled_mm --subroutine scaled_mm --M 2048 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 2048 --K 256 --bias --activation swish
+
 # Feature frontend
 --family feature --subroutine fbank_preprocess --batch 64 --num-frames 500 --frame-length 400 --n-fft 512
 --family feature --subroutine mel_log --batch 64 --num-frames 500 --n-freq 257 --num-mel 80

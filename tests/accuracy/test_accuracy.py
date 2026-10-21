@@ -39,6 +39,36 @@ def _manifest_path() -> Path:
     return REPO_ROOT / REFERENCE["manifest"]
 
 
+#: ``(source checkpoint, recipe)`` -> the quantized checkpoint built for it, so a
+#: recipe shared by an offline and a streaming row is calibrated once per session.
+_QUANTIZED: dict = {}
+
+
+def _quantized_checkpoint(src: str, recipe: dict, tmp_path_factory) -> str:
+    """``oasr quantize`` *src* with an entry's ``quantize_recipe``, once per session.
+
+    The recipe names its calibration data as an asset (``calib_asset``), gated
+    like every other one; calibration is deterministic (sorted, strided
+    selection, TF32 off), so the checkpoint — and the rate — is reproducible.
+    """
+    key = json.dumps([src, recipe], sort_keys=True)
+    if key not in _QUANTIZED:
+        from oasr.quantization.export import quantize_checkpoint
+
+        calib = assets.require(recipe["calib_asset"])
+        dst = tmp_path_factory.mktemp("quantized")
+        quantize_checkpoint(
+            src,
+            str(dst),
+            recipe=recipe["recipe"],
+            calib_manifest=str(Path(calib) / "manifest.jsonl"),
+            calib_utterances=int(recipe.get("calib_utterances", 128)),
+            algorithm_options=recipe.get("options"),
+        )
+        _QUANTIZED[key] = str(dst)
+    return _QUANTIZED[key]
+
+
 class TestManifest:
     """The manifest itself, without a GPU or a checkpoint."""
 
@@ -84,10 +114,15 @@ class TestManifest:
 
 @pytest.mark.cuda
 @pytest.mark.parametrize("spec", ENTRIES, ids=[e["key"] for e in ENTRIES])
-def test_wer_has_not_regressed(spec, device):
+def test_wer_has_not_regressed(spec, device, tmp_path_factory):
     """Measure the manifest and compare against the recorded rate."""
     assets.require(spec["asset"], REFERENCE["audio_asset"])
     ckpt = assets.resolve(spec["asset"])
+    # A quantized row measures a checkpoint ``oasr quantize`` writes from the
+    # asset, built here rather than stored, so it always reflects the current
+    # calibration and SmoothQuant code.
+    if spec.get("quantize_recipe"):
+        ckpt = _quantized_checkpoint(ckpt, spec["quantize_recipe"], tmp_path_factory)
     audio_root = Path(assets.resolve(REFERENCE["audio_asset"]))
 
     from oasr.engine import ASREngine, EngineConfig
@@ -126,8 +161,14 @@ def test_wer_has_not_regressed(spec, device):
         cfg_kwargs["decode_options"] = dict(spec["decode_options"])
     if spec.get("chunk_size"):
         cfg_kwargs["chunk_size"] = spec["chunk_size"]
+    # Online quantization of a full-precision checkpoint.  Forwarded explicitly:
+    # an unforwarded key would leave the row silently measuring fp16.
+    if spec.get("quantization"):
+        cfg_kwargs["quantization"] = dict(spec["quantization"])
 
     engine = ASREngine(EngineConfig(**cfg_kwargs))
+    if spec.get("quantization") or spec.get("quantize_recipe"):
+        assert engine.quantization_info() is not None, f"{spec['key']} measured an fp model"
     try:
         waves, _ = load_audio(entries, engine.sample_rate)
         hyps, _ = transcribe(engine, waves, spec["max_batch_size"], streaming=mode == "streaming")

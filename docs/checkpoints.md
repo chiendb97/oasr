@@ -108,7 +108,7 @@ materializes any supported directory as a round-trippable native bundle:
 ```
 dst/
 ├── oasr_config.json      # format_version 1: architecture + model config +
-│                         # tokenizer/feature/decoding specs
+│                         # tokenizer/feature/decoding specs (2: + quantization)
 ├── model.safetensors     # post-load_weights state dict — loads via strict
 │                         # load_state_dict, no name mapping
 └── tokenizer/            # tokenizer assets copied verbatim
@@ -122,6 +122,12 @@ Properties worth knowing:
   in `_computed_buffer_suffixes` and skipped at save; they rebuild at load.
 - The model's own state-dict `_metadata` is stamped at load so version-gated
   `_load_from_state_dict` remaps don't re-fire on native round-trips.
+- A **quantized** bundle (`oasr quantize`) is `format_version: 2` and carries a
+  `quantization` section — which layers are quantized, by which scheme, and the
+  provenance — with int8 `weight` and fp32 `weight_scale` tensors.  A
+  full-precision export stays version 1; readers accept both.  The load sequence
+  that keeps quantized tensors out of fp slots is
+  `oasr.models.registry.materialize_model` ([quantization.md](quantization.md)).
 - Bundles load host-side (`map_location="cpu"`) and the engine casts dtype
   **before** the device move — a GPU-mapped bundle would hold a full second
   weight copy resident while the model moves over (an 8.4 B-param checkpoint

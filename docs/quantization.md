@@ -1,0 +1,315 @@
+# Quantization
+
+OASR quantizes the dense GEMMs of the layer waist — `Linear`, `LinearActivation`
+and `PointwiseConv1d` — so every architecture inherits it.  It is the ninth
+registry axis: a format is a preset plus a method plus its kernel lanes, an
+algorithm is a registration, and an architecture declares what its structure
+allows.  The engine core has no per-scheme branch.
+
+Today's scheme is **W8A8 int8**: per-output-channel int8 weights and int8
+activations -- per-token *dynamic* scales (`int8_w8a8`), or a calibrated static
+per-tensor scale (`int8_w8a8_static`) -- run by a CUTLASS 2.x int8 `mma.sync` GEMM
+whose epilogue dequantizes, adds the bias and applies the layer's activation, and
+can quantize its own output for the next GEMM.  The
+format layer already describes FP8 and NVFP4 (`oasr.quantization.spec.PRESETS`);
+no method serves them yet, and asking for one is refused by name.
+
+## Using it
+
+**Online, no calibration** — round-to-nearest weights on a full-precision checkpoint:
+
+```python
+from oasr.engine import ASREngine, EngineConfig
+
+engine = ASREngine(EngineConfig(ckpt_dir=..., quantization="int8_w8a8"))
+# or {"scheme": "int8_w8a8", "ignore": "encoder.encoders.0.*"}
+```
+
+```bash
+oasr-server --ckpt-dir <dir> --quantization int8_w8a8 [--quantization-option ignore=GLOB,...]
+```
+
+**Offline, SmoothQuant** — calibrate, smooth, quantize, write a native checkpoint:
+
+```bash
+python -m benchmarks.asrbench prepare librispeech --subset dev-clean --download
+oasr quantize $CKPT_DIR /path/to/u2pp_w8a8_sq \
+    --recipe smoothquant_w8a8 \
+    --calib-manifest ~/.cache/oasr/asrbench/librispeech/dev-clean/manifest.jsonl \
+    [--calib-utterances 128] [--alpha 0.5] [--ignore GLOB]
+```
+
+`--recipe smoothquant_w8a8_fused` adds a calibrated static input scale to every
+GEMM-chain consumer (the FFN's `w_2`), so `w_1` quantizes for it and the pair
+exchanges int8 ([Fewer quantize launches](#fewer-quantize-launches)): faster, and
+on the U2++ gate 4.11 % offline / 3.64 % streaming against 4.03 / 3.70 for
+`smoothquant_w8a8` and 4.08 / 3.70 for fp16.
+
+A checkpoint written by `oasr quantize` is served quantized with **no flag**: its
+`oasr_config.json` carries the spec, and the spec is authoritative — an online
+request for a different scheme raises, the same scheme is a no-op.
+
+`--calib-manifest` takes any `{id, audio, ...}` jsonl (paths relative to
+`--audio-root`, default the manifest's directory), so production recipes
+calibrate on their own domain.  Calibrate on audio at the model's sample rate;
+the loader refuses another rate rather than resample.
+
+`ASREngine.quantization_info()` and the engine's startup log report what is
+served: schemes, layer count, and the kernel lane each layer bound.
+
+## How it fits together
+
+```
+OFFLINE (oasr quantize)                       RUNTIME
+fp32 master model ◄─ quantization_layout()    native checkpoint v2 ─► QuantizationSpec
+calibration audio ─► checkpoint frontend      apply_quantization: a QuantMethod per selected layer
+observers on GEMM inputs                       strict load (dtype-checked) ─► .to(dtype) ─► .to(device)
+algorithm: smoothquant | rtn                   bind: each layer picks its kernel lane once
+QuantMethod.quantize_weight  ◄── shared ──►    link: fused norms, GEMM chains (from the layout)
+save_native(format_version=2)                 forward: [norm | producer | quantize_*] ─► scaled_mm[_quant]
+```
+
+| Module | Owns |
+|---|---|
+| `oasr/quantization/spec.py` | Number formats (`QuantArgs`, `QuantScheme`, presets) and `QuantizationSpec` — which layers, which scheme, provenance |
+| `oasr/quantization/layout.py` | `SmoothGroup`, `GemmChain`, `QuantLayout` (incl. `batch_invariant` pins): the data a model declares |
+| `oasr/quantization/methods/` | `QuantMethod`: storage slots, weight quantization, lane binding, forward, torch reference |
+| `oasr/quantization/kernels/lanes.py` | `ScaledMMLane`: which kernel serves a scheme on this GPU (`is_supported(sm)`, `can_implement(scheme, N, K)`) |
+| `oasr/quantization/calibration/` | Observers; `asr_forward_loop` through the checkpoint's own frontend |
+| `oasr/quantization/algorithms/` | `rtn`, `smoothquant`, `static_inputs`, registered with an `options_cls` |
+| `oasr/quantization/apply.py`, `export.py`, `cli.py` | Glue, report, `oasr quantize` |
+| `oasr/layers/_quantizable.py` | `QuantizableGemm`: the `quant_method` slot and the dtype-preserving `_apply`; `QuantizedActivation` |
+| `oasr/functionals/quant.py`, `scaled_mm.py`, `norm.py` | `quantize_per_token`, `quantize_static`, `scaled_mm`, `scaled_mm_quant`, `layer_norm_quant`, `add_layer_norm_residual_quant`, and their torch twins |
+
+### The layer seam
+
+A quantized layer keeps its type, path and state-dict key names; its
+`quant_method` (a plain object, not a module) takes over `forward` **before** the
+fp row floor (`GEMM_MIN_ROWS` would hand `F.linear` int8 storage).  CPU, fp32 and
+`OASR_LAYERS_BACKEND=torch` run `apply_reference`, the torch emulation of the same
+numerics.  Layers whose weight a fused kernel reads raw — the gated MLP's
+gate/up (one dual-B GEMM), the transducer joiner's `decoder_proj` /
+`output_linear` (the fused decode) — set `quantizable = False`, and a spec that
+selects one is refused.
+
+State dict of a quantized layer (names follow compressed-tensors):
+
+| Key | dtype | Shape |
+|---|---|---|
+| `weight` | int8 | the layer's own (`[N, K]`; `[N, K, 1]` for a pointwise conv) |
+| `weight_scale` | fp32 | `[N]` |
+| `smooth_inv` | fp32 | `[K]`, only on runtime-smoothed layers |
+| `input_scale` | fp32 | `[1]`, only with a static activation scale (`int8_w8a8_static`) |
+| `bias` | served dtype | unchanged |
+
+`Module.to(dtype)` casts every floating tensor — fp32 scales included — so
+`QuantizableGemm._apply` moves quantized slots by device only.
+
+### Load order
+
+`oasr.models.registry.materialize_model` is the one load sequence (engine,
+`oasr-convert`, `oasr quantize`, the round-trip tests):
+
+* **native quantized checkpoint** — quantized slots are created *before* the
+  strict load, and their dtypes are checked first (`param.copy_` would cast an
+  fp32 tensor into an int8 slot silently);
+* **online** — the fp weights load first (a converted checkpoint's legacy
+  remaps run inside `_load_from_state_dict`), then each selected layer quantizes
+  its own fp32 weight on the host;
+* then the dtype cast, the device move, and lane binding.
+
+The native format writes `format_version: 2` only for a quantized checkpoint; a
+full-precision export stays version 1.  Readers accept both.
+
+### Kernel lanes
+
+| Lane | SMs | Notes |
+|---|---|---|
+| `cutlass_sm80_int8` | 80, 86, 89, 120 (native); 90, 100 (the Sm80 `mma.sync` kernel, as fp16 GEMM runs there) | Default.  Needs `K % 16 == 0`, `N % 8 == 0`.  Per-token or per-tensor activation scale (a runtime switch in the epilogue).  No serial/parallel split-K (the Sm80 EVT rejects it only by an `assert` NDEBUG removes); Stream-K instead, below |
+| `torch_int_mm` | ≥ 75 | `torch._int_mm` + a torch epilogue; A/B and baseline only |
+
+Turing (sm75) is the declared kernel gap `scaled-mm-int8-sm75`: a quantized layer
+there runs the torch reference.  `OASR_SCALED_MM_BACKEND=auto|cutlass|torch`
+(read at import) is the A/B switch; naming a lane requires it.
+
+**Stream-K.**  Two Stream-K variants are built.  Their partials are the int32
+accumulator, so the reduction is an exact integer sum and a Stream-K launch
+returns the same bits as the data-parallel one -- batch invariance survives it,
+unlike the fp16 GEMM's fp32 partials.  Measured against the best data-parallel
+tile on an RTX 5090 it loses on every Conformer shape (0.35-0.69x: K <= 2048 is
+16 int8 K-tiles, too few to amortise the barrier memset and partial-tile
+fixup), is 0.5-0.9x at K = 4864-8192, at parity at K = 16384 and 1.09-1.16x
+only on a 7B-size down-projection (N=896, K=18944, M >= 256).  So the shape
+heuristic never picks it; a measured tuning entry may.
+
+Tile selection (`oasr.jit.scaled_mm.select_config`, and `select_quant_config` for
+the int8-output launch) reads the tuning DB's `scaled_mm` family first — a
+measured entry per `(op, N, K)`, M rounded up to a region, user tier over the
+shipped `oasr/tune/db/sm<family>/scaled_mm.json` — and falls back to the shape
+heuristic: the largest data-parallel tile that still launches half a wave of
+CTAs.  A region may name the heuristic itself (`"heuristic"`: measured, nothing
+beat it), and only a measured entry picks a Stream-K tile.  Every variant computes
+the same bits, so tuning changes speed only.  The tuning census records the int8
+GEMMs (`oasr tune census --quantization int8_w8a8`), `oasr tune build` writes
+`scaled_mm.json` beside `gemm.json`, `tuning.strict` / `tuning.mode="prewarm"`
+cover them like fp GEMMs, and `ASREngine.tuning_report()` ends with how many
+quantized layers have a tuning entry and how many run on the heuristic.  See
+[`autotuning.md`](autotuning.md#the-int8-scaled-gemm-scaled_mm).
+
+Two norm kernels emit the quantized activation themselves, so a norm-fed int8
+GEMM skips its quantize launch (bit-exact with the unfused pair; see
+[kernels.md](kernels.md#layernorm-with-a-per-token-int8-output)).
+`oasr.functionals.norm.layer_norm_quant` is LayerNorm whose output is per-token
+int8 plus a per-row fp32 scale: `quantize_per_token(layer_norm(x))` in one launch,
+with no smoother, because SmoothQuant folds its scale into the norm's affine.
+`oasr.functionals.norm.add_layer_norm_residual_quant` does the same for the fused
+add + LayerNorm, and also returns the unnormalized residual sum exactly as
+`add_layer_norm_residual` stores it.
+
+## Fewer quantize launches
+
+A quantized GEMM needs int8 input.  Unfused, every one pays a quantize launch
+and reads its input in fp16; three mechanisms let the producer of that input
+emit int8 instead, so on the Conformer only three of a block's eight quantized
+GEMMs (`linear_out`, `pointwise_conv1`, `pointwise_conv2`) still quantize
+their own input.
+
+| Producer | Emits | Declared by | Armed when |
+|---|---|---|---|
+| a pre-norm (`LayerNorm.quantize_output`) | per-token int8 + scales: `layer_norm_quant` / `add_layer_norm_residual_quant` | `SmoothGroup(..., fuse_output_quant=True)` | every consumer takes a per-token pre-quantized input (a bound lane, no runtime smoother) |
+| a GEMM (`W8A8Int8Method.emit`) | int8 at its consumer's static scale: `scaled_mm_quant` | `GemmChain(producer, consumer)` | the consumer has a static input scale and both have a lane |
+
+The quantized activation travels as a `QuantizedActivation` (`data`, `scale`,
+`dtype`): what passes between producer and consumer may read its `shape` and
+nothing else -- the Conformer's attention reads `x.shape` before `linear_qkv`,
+the FFN calls `w_2(w_1(x))`.  `bind_quantization` re-derives every link after
+binding lanes (a rebind on the host disarms them all), and the report says
+which inputs were quantized by whom.  `OASR_QUANT_FUSION=0` (read at import)
+leaves them all disarmed: the A/B switch for attributing a change to the fusion.
+
+**Every fused kernel is bit-identical to the composition it replaces** -- the
+norm rounds to the input dtype before taking the amax, the producer's epilogue
+rounds `act(y)` to the layer's dtype before multiplying by the consumer's
+multiplier -- so a model with its links armed returns exactly what it returns
+with them disarmed (`tests/quantization/test_quant_fusion.py`, `torch.equal` on
+the encoder output).
+
+**Why a GEMM chain needs a static scale.**  A per-token scale needs the whole
+row, which no single output tile of the producer sees.  The consumer instead
+takes a calibrated per-tensor scale (`int8_w8a8_static`, `input_scale`): the
+`static_inputs` algorithm measures the input the quantize kernel will see
+(smoothed by the consumer's runtime `smooth_inv`, so it runs after
+`smoothquant`) and chooses a clip.  The clip is searched, not taken at the
+maximum.  On the U2++ `w_2` inputs (mean SQNR over 24 layers) per-token scales
+give 29.8 dB; a static scale at the calibration maximum 17.3 dB -- the median
+frame spans 22 % of that range -- which cost 0.44 WER in streaming; the 99.999th
+percentile 24.9 dB.  `observer=mse` (the default) picks the clip minimising the
+expected quantization error of a histogram of the calibration values (rounding
+below the clip, saturation above it); it measured 4.11 / 3.64 % against 4.20 /
+3.73 % for the percentile and 4.08 / 4.14 % for the maximum (offline / streaming).
+
+## Numerics
+
+Pinned, and reproduced bit for bit by the torch reference
+(`oasr.functionals.quant.reference_quantize_per_token`):
+
+```
+quantize (per token, row r):
+  x'       = f32(x) * smooth_inv                 # applied before the amax
+  amax     = max(max_j |x'_j|, 1e-8)
+  inv      = __fdiv_rn(127, amax)                # IEEE division under --use_fast_math
+  q_j      = clamp(__float2int_rn(x'_j * inv), -127, 127)
+  scale[r] = __fdiv_rn(amax, 127)
+
+weights (per output channel, host, fp32):  same rule, eps floor for all-zero rows
+
+static quantize (per-tensor scale s, consumer multiplier mul, computed once at bind):
+  mul[k]   = smooth_inv[k] * (1 / s)            # one IEEE division, one multiply
+  q        = clamp(rne(f32(x) * mul[k]), -127, 127)
+
+epilogue:  out = round(act(fma(a_scale[m], b_scale[n] * f32(acc), bias[n])))
+           a_scale[m] per token, or one per-tensor scale
+quantizing epilogue (scaled_mm_quant), for a static consumer:
+           q = clamp(rint(f32(round_T(act(...))) * mul[n]), -127, 127)
+```
+
+The int32 accumulator is exact and the activation scale is row-local (or a
+constant), so a quantized layer returns bitwise-equal rows for bitwise-equal
+inputs however the batch is made up.  That alone does not make the *model*
+batch-invariant: a full-precision GEMM's config (cuBLAS, split-K, Stream-K) is
+chosen from M by the rule table, so its rounding depends on the batch, and int8
+rounding amplifies those ulps into flipped words.  A model therefore names its
+fp GEMMs ahead of int8 layers in `QuantLayout.batch_invariant`, and
+`apply_quantization` pins them (`Linear.batch_invariant`: data-parallel CUTLASS
+only, see [kernels.md](kernels.md)) -- the Conformer pins the subsampling
+projection and `linear_pos`, which made `max_batch_size` 8 / 16 / 32 give
+identical transcripts.  What remains is attention at batch 1: alone, its grid
+underfills the GPU and it takes the split-KV path, which sums the fp32 partials
+in another order (a word or two on the 200-utterance gate; the rows record it).
+
+A per-tensor *dynamic* activation scale is refused outright: padding and
+co-batched utterances would change every row's quantization.
+
+## SmoothQuant
+
+For GEMMs sharing an input `X`, a per-channel `s` rewrites `X Wᵀ` as
+`(X / s)(W s)ᵀ` — exact in real arithmetic — with
+`s_j = max|X_j|^α / max|W_j|^(1-α)` (α = 0.5 by default), clamped so the folded
+parameters stay inside fp16.  The model declares where `X / s` is absorbed:
+
+| Fold | Producer change | Valid when |
+|---|---|---|
+| `norm_affine` | LayerNorm / RMSNorm `γ /= s`, `β /= s` | only commuting ops (zero mask, zero pad, a same-domain cache `cat`) sit between norm and GEMM |
+| `v_to_o` | V rows of the fused QKV projection `/= s` | attention is linear in V per channel; tied per KV head under GQA |
+| `producer_rows` | the previous GEMM's rows and bias `/= s` | the activation between is positively homogeneous (ReLU) |
+| `runtime` | none: `smooth_inv = 1/s` on the consumer, applied inside `quantize_per_token` | always |
+
+Every scale is computed from the original weights before any fold is applied,
+so a layer that is a consumer in one group (its input columns) and a producer in
+another (its output rows) folds consistently.
+
+The Conformer's layout (`ConformerModel.quantization_layout`): per block,
+`norm_ff_macaron → feed_forward_macaron.w_1`, `norm_mha → self_attn.linear_qkv`,
+`norm_conv → conv_module.pointwise_conv1` and `norm_ff → feed_forward.w_1` fold
+into the norm; V folds into `linear_out`; both `w_2` and `pointwise_conv2` carry a
+runtime smoother.  The subsampling front-end, `linear_pos` (its input is the
+sinusoidal table), the CTC head and the AED decoder stay full precision.  The CNN
+cache holds post-`norm_conv` values in the smoothed domain, which is consistent
+because only this encoder reads it.
+
+Calibration runs one unpadded utterance at a time through the checkpoint's own
+frontend (`audio_scale` and the `FeatureSpec`, exactly as `InputProcessor`), in
+fp32, TF32 off, on a sorted and evenly strided selection of the manifest.  The
+manifest hash, selection rule and α are recorded in the spec's `producer`, and
+`quantization_report.json` beside the checkpoint lists every layer's scale
+ranges.
+
+## Extending
+
+| To add… | Touch |
+|---|---|
+| a format (FP8, NVFP4) | a preset in `spec.py`, a `QuantMethod` (`register_quant_method`), its lanes, its quantize kernel |
+| a backend (a native sm90 int8 kernel) | a `ScaledMMLane` + `register_lane`; methods pick it through `choose_lane` |
+| an algorithm (GPTQ, AWQ) | `algorithms/<name>.py` + `register_quant_algorithm`; reuse the observers and `quantize_weight` |
+| an architecture | `quantization_layout()` on the model — data only; online RTN works without it |
+| a GEMM-bearing layer | mix in `QuantizableGemm`, implement `gemm_weight()`, branch on `quant_method` first |
+
+## Tests and benchmarks
+
+| Where | What |
+|---|---|
+| `tests/kernels/test_quant.py` | quantize is bit-exact against the reference; row-local; graph replay |
+| `tests/kernels/test_scaled_mm.py` | every compiled variant; exact accumulator; bitwise batch invariance; contracts |
+| `tests/models/test_quantized_layers.py` | the seam: state dict, casts, CPU reference, kernel parity, per-architecture layout and raw readers |
+| `tests/quantization/` | spec, SmoothQuant invariance on every encoder path (per-op, fused, packed, paged streaming), export round trip, calibration frontend == engine frontend; `test_quant_fusion.py`: the static scheme, links armed where declared, fused model == unfused model bitwise, `static_inputs` and the clip searches, the pins |
+| `tests/kernels/test_norm_quant.py`, `tests/models/test_layer_norm_quant_output.py` | the fused norm kernels == LayerNorm then `quantize_per_token`, bitwise; `LayerNorm.quantize_output` |
+| `tests/kernels/test_gemm_batch_invariant.py`, `tests/models/test_linear_batch_invariant.py` | pinned GEMM rows bitwise independent of M; the pin bypasses the row floor |
+| `tests/kernels/tune/test_scaled_mm_tuning.py`, `tests/engine/test_tuning_scaled_mm_engine.py` | the `scaled_mm` tuning tier: resolution, capture, build, `strict` |
+| `tests/engine/test_quantized_engine.py` | capture == eager, per-layer batch invariance, a quantized checkpoint served offline and streaming |
+| `ci/wer-reference.json` | `conformer_int8_rtn`, `conformer_w8a8_sq`, `conformer_w8a8_sq_streaming`, `conformer_w8a8_sq_fused`, `conformer_w8a8_sq_fused_streaming` |
+
+Calibration data is the `LIBRISPEECH_DEV_DIR` asset (asrbench-prepared
+LibriSpeech dev-clean): in-domain for LibriSpeech-trained checkpoints and a
+different corpus from the LJSpeech WER gate.  The kernel benchmark families are
+`quant` and `scaled_mm` (`python benchmarks/run.py --list`); the accuracy and
+engine families take `--quantization`.

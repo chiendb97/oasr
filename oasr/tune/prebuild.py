@@ -14,7 +14,8 @@ nvcc identity, so a CPU box that names the target through
 What is compiled is what :func:`oasr.tune.build.build_gemm` loads for the ops it
 measures (:data:`~oasr.tune.build.TUNED_OPS`): the production GEMM module, the
 tuning module (the space minus production), and for the CTC head the composed
-GEMM + online log_softmax pair.  Modules build **concurrently**, the job budget
+GEMM + online log_softmax pair -- plus, for a quantized model's census, the int8
+``scaled_mm`` module :func:`oasr.tune.build_scaled_mm.build_scaled_mm` measures.  Modules build **concurrently**, the job budget
 split by translation-unit count: built one after another, every module's tail
 leaves reserved cores idle, and a reserved core bills whether or not it works.
 """
@@ -53,8 +54,10 @@ def modules_for(ops: Iterable[str]) -> List[Tuple[str, Any]]:
     """``(name, JitSpec)`` for every module a build over *ops* loads."""
     import oasr.jit.gemm as jg
     from oasr.tune.build import TUNED_OPS
+    from oasr.tune.build_scaled_mm import SCALED_MM_TUNED_OPS
 
-    wanted = set(ops) & set(TUNED_OPS)
+    ops = set(ops)
+    wanted = ops & set(TUNED_OPS)
     specs: List[Tuple[str, Any]] = []
     if wanted:
         specs.append(("gemm", jg.gen_gemm_module("production")))
@@ -65,6 +68,11 @@ def modules_for(ops: Iterable[str]) -> List[Tuple[str, Any]]:
 
         specs.append(("gemm_log_softmax", jg.gen_gemm_log_softmax_module()))
         specs.append(("softmax", gen_softmax_module()))
+    if ops & set(SCALED_MM_TUNED_OPS):
+        # One module holds every int8 variant, fp- and int8-output launchers alike.
+        from oasr.jit.scaled_mm import gen_scaled_mm_module
+
+        specs.append(("scaled_mm", gen_scaled_mm_module()))
     return specs
 
 

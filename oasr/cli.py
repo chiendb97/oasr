@@ -112,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     p.set_defaults(func=_cmd_tune)
+
+    p = sub.add_parser(
+        "quantize",
+        help="quantize a checkpoint and write it in the native format (see `oasr quantize -h`)",
+        add_help=False,
+    )
+    p.set_defaults(func=_cmd_quantize)
     return parser
 
 
@@ -293,15 +300,23 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     return tune_main(args.rest)
 
 
+def _cmd_quantize(args: argparse.Namespace) -> int:
+    from oasr.quantization.cli import main as quantize_main
+
+    return quantize_main(args.rest)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     # `serve` and `convert` are pass-throughs: parse only the subcommand name
     # and hand the rest over untouched, so their own `--help` and flags work.
-    if argv and argv[0] in ("serve", "convert", "tune"):
+    if argv and argv[0] in ("serve", "convert", "tune", "quantize"):
         args = argparse.Namespace(rest=argv[1:])
         if argv[0] == "tune":
             return _cmd_tune(args)
+        if argv[0] == "quantize":
+            return _cmd_quantize(args)
         return _cmd_serve(args) if argv[0] == "serve" else _cmd_convert(args)
     args = parser.parse_args(argv)
     try:

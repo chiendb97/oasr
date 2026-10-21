@@ -126,6 +126,44 @@ def test_attached_server_is_identified_by_what_it_reports_not_its_pid():
     assert code == EXIT_INCOMPARABLE and "max_batch_size" in summary["problems"][0]
 
 
+def _in_process(summary, quantization_info, recorded=True):
+    """A run whose engine reports what it served; *recorded*=False predates the field."""
+    config = {"service_mode": "offline"}
+    if recorded:
+        config["quantization_info"] = quantization_info
+    return Comparable(
+        path=Path("/x"),
+        label="x",
+        kind="run",
+        meta={
+            "environment": {"gpus": [{"name": "GPU-A"}]},
+            "backend": {
+                "name": "oasr_engine",
+                "options": {"ckpt_dir": "/ckpt"},
+                "instances": {"offline": {"info": {"model": {"id": "ckpt"}, "config": config}}},
+            },
+        },
+        results={"k": (summary, {"streaming_mode": None, "point": {}})},
+    )
+
+
+def test_a_quantized_checkpoint_is_not_the_same_configuration_as_a_full_precision_one():
+    """`oasr quantize` output is served quantized with no option set, so the
+    options alone cannot tell the two runs apart; the served quantization can."""
+    s = {"latency_ms.p50": 10.0, "latency_ms.n": 100}
+    int8 = {"schemes": ["int8_w8a8"], "layers": 72, "lanes": ["cutlass_sm80_int8"]}
+    full = _in_process(s, None)
+    summary, code = compare(full, _in_process(s, int8), RULES)
+    assert code == EXIT_INCOMPARABLE and "quantization" in summary["problems"][0]
+    assert compare(_in_process(s, int8), _in_process(s, int8), RULES)[1] == EXIT_OK
+    torch_lane = {**int8, "lanes": ["torch_int_mm"]}
+    assert compare(_in_process(s, int8), _in_process(s, torch_lane), RULES)[1] == (
+        EXIT_INCOMPARABLE
+    )
+    # A run recorded before the field existed still compares with a full-precision one.
+    assert compare(_in_process(s, None, recorded=False), full, RULES)[1] == EXIT_OK
+
+
 def test_default_thresholds_load_and_yaml_override(tmp_path):
     t = load_thresholds(None)
     assert any(r.metric == "latency_ms.p50" for r in t.rules)

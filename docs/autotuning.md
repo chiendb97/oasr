@@ -28,6 +28,8 @@ oasr tune census --ckpt-dir $CKPT_DIR --service-mode streaming --max-batch-size 
 
 # 2. Measure it on this GPU and write this machine's user tier.
 oasr tune build --census offline.json --census streaming.json --out user
+#    (a quantized model: add --quantization int8_w8a8 to the census; the build then
+#     also writes scaled_mm.json, the int8 GEMM's file)
 
 # 3. Score it: regret of each selector against the measured oracle.
 oasr tune evaluate --log ~/.cache/oasr/tune/v2/measurements/sm120.jsonl \
@@ -49,7 +51,8 @@ engine = ASREngine(EngineConfig(ckpt_dir=..., service_mode="offline",
 ## The tuning database
 
 `oasr/tune/database.py`. One JSON file per `(arch family, kernel family)` —
-`sm120/gemm.json`, `sm120/conv1d.json` — in one of two tiers:
+`sm120/gemm.json`, `sm120/conv1d.json`, `sm120/scaled_mm.json` (the int8 GEMM of
+a quantized model; [below](#the-int8-scaled-gemm-scaled_mm)) — in one of two tiers:
 
 | Tier | Where | Written by | Precedence |
 |---|---|---|---|
@@ -99,6 +102,52 @@ captured graph and an eager call always run the same kernel (AGENTS rule 11).
 **The production compile set** is what the DB references for the arch, the
 default, and a coverage basis (`jit.gemm.get_production_configs`);
 `OASR_GEMM_COMPILE_SET=all` compiles the whole space.
+
+### The int8 scaled GEMM (`scaled_mm`)
+
+The W8A8 GEMM of a quantized layer (`oasr.scaled_mm`, [`quantization.md`](quantization.md))
+is its own kernel family with its own file, keyed by op and width:
+
+```json
+"scaled_mm|op=scaled_mm|N=768|K=256": {
+  "regions": [[7136, "heuristic"], [null, "b128x128x64_w64x64x64_s5"]], ...
+}
+```
+
+- **Two ops.** `scaled_mm` (fp16/bf16 output) and `scaled_mm_quant` (the same GEMM
+  quantizing its output to int8 for the next GEMM) are measured and keyed
+  separately; `select_quant_config` never serves a Stream-K tile (there is no
+  quantizing Stream-K launcher), so such an entry is warned about once and skipped.
+- **The `"heuristic"` sentinel.** The family's untuned selector is a shape
+  heuristic (the largest data-parallel tile still launching half a wave of CTAs),
+  within a few percent of the best tile on Conformer shapes. A region names
+  `"heuristic"` where nothing beat it by the gate; the build keeps an entry even
+  when every region does — `[[null, "heuristic"]]` says *measured*, which
+  `tuning.strict` and the coverage report need, where an absent entry would say
+  *never looked*. Only a measured entry can pick a Stream-K tile (it wins only at
+  deep K, ≥ 16384).
+- **Resolution** (`oasr.jit.scaled_mm.select_config` / `select_quant_config`):
+  user tier, then system, M rounded up to a region, a config outside this
+  process's production set warned once and skipped; else the heuristic. Memoised
+  per `(epoch, shape)` — one dict lookup per call — and recorded per resolution
+  as tier `user` / `system` / `heuristic` in `oasr tune status` and
+  `ASREngine.tuning_report()`. Every variant computes the same bits (an exact
+  int32 accumulator; Stream-K reduces int32 partials), so an entry changes speed,
+  never a transcript.
+- **Census and build.** The shape recorder patches `oasr.scaled_mm` and
+  `oasr.functionals.scaled_mm.{scaled_mm, scaled_mm_quant}` (the lanes call
+  through the module), recording dtype `int8`. `oasr tune census --quantization
+  int8_w8a8` probes a full-precision checkpoint quantized online; a quantized
+  checkpoint needs no flag. `oasr tune build` then writes `scaled_mm.json` beside
+  `gemm.json` (`--family scaled_mm` builds only it): every eligible variant is
+  measured at every point (the set is eight tiles — no pruning, no cost model),
+  numerics-gated **bitwise** against the heuristic's variant, and partitioned
+  against a `heuristic` pseudo-arm (`oasr/tune/build_scaled_mm.py`).
+- **The engine.** `TuningConfig(strict=True)` raises on an uncovered int8
+  must-tune point as on a GEMM one, `mode="prewarm"` measures it into the user
+  tier before capture (one `budget_s` for both families), and the tuning report
+  ends with one line per quantized model: `scaled_mm: 96 quantized layer(s) over
+  5 signature(s): 96 with a tuning entry (system=96), 0 on the shape heuristic`.
 
 ## The cost model
 

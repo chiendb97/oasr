@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Capture GEMM shapes and frequency from a real workload.
 
-Functional entry points are wrapped to record shape, dtype, calls, and FLOP
+Functional entry points -- the fp GEMM family and the int8 ``scaled_mm`` of
+quantized layers -- are wrapped to record shape, dtype, calls, and FLOP
 weight. Graph replay does not re-enter wrappers, so disable graphs when call
 frequency matters. ``OASR_CAPTURE_GEMM`` enables process-wide capture.
 """
@@ -39,6 +40,15 @@ _PATCH_NAMES = ("gemm", "gemm_activation", "bmm", "group_gemm", "gemm_log_softma
 # they take ``(out, A, B, C, [activation,] N, K, M)``, so their shapes are read
 # from the explicit arguments rather than from operand geometry.
 _MODULE_PATCH_NAMES = _PATCH_NAMES
+
+# The int8 W8A8 GEMM of a quantized layer (``oasr.tune`` family ``scaled_mm``).
+# The kernel lanes call ``oasr.functionals.scaled_mm.scaled_mm`` /
+# ``.scaled_mm_quant`` through the module at call time, so patching the module
+# attributes is what the census sees; ``oasr.scaled_mm`` is the exported name
+# (``scaled_mm_quant`` is not exported).  ``a`` is int8 ``[..., K]`` and ``b``
+# the ``[N, K]`` weight, as for ``gemm``; the recorded dtype is ``"int8"``.
+SCALED_MM_PATCH_NAMES = ("scaled_mm", "scaled_mm_quant")
+
 _DISPATCH_PATCH_SPECS = {
     # name: (index of N, index of K, index of M) in the positional signature
     "_dispatch_gemm": (4, 5, 6),
@@ -128,14 +138,28 @@ class GemmShapeRecorder:
         return len(self._stats)
 
 
+def _operand(args, kwargs, index: int, *names: str):
+    """Positional operand *index*, else the first of *names* passed by keyword.
+
+    The GEMM functionals name their operands ``A``/``B``, ``oasr.scaled_mm``
+    ``a``/``b``.
+    """
+    if len(args) > index:
+        return args[index]
+    for name in names:
+        if name in kwargs:
+            return kwargs[name]
+    return None
+
+
 def _shapes_of(op: str, args, kwargs) -> Optional[Tuple[int, int, int, int]]:
     """Extract ``(M, N, K, batch)`` from a functional call's args.
 
     Layout matches :mod:`oasr.functionals.gemm`: ``A`` is operand 0, ``B`` (the ``[N, K]``
     weight, or a 3-D/4-D ``[..., N, K]`` operand for bmm/group_gemm) is operand 1.
     """
-    A = args[0] if args else kwargs.get("A")
-    B = args[1] if len(args) > 1 else kwargs.get("B")
+    A = _operand(args, kwargs, 0, "A", "a")
+    B = _operand(args, kwargs, 1, "B", "b")
     if A is None or B is None:
         return None
     K = int(A.shape[-1])
@@ -181,7 +205,7 @@ def _make_wrapper(rec, op_name, fn):
             if record:
                 shp = _shapes_of(op_name, args, kwargs)
                 if shp is not None:
-                    A = args[0] if args else kwargs.get("A")
+                    A = _operand(args, kwargs, 0, "A", "a")
                     M, N, K, batch = shp
                     rec.record(op_name, M, N, K, _dtype_str(A.dtype), batch)
             return fn(*args, **kwargs)
@@ -214,9 +238,14 @@ def _make_dispatch_wrapper(rec, op_name, fn, idx):
 
 @contextlib.contextmanager
 def capture_gemm_shapes(recorder: Optional[GemmShapeRecorder] = None):
-    """Monkeypatch the OASR functional GEMM entries to record shapes for the block."""
+    """Monkeypatch the OASR functional GEMM entries to record shapes for the block.
+
+    Covers the int8 ``scaled_mm`` / ``scaled_mm_quant`` of quantized layers too
+    (recorded with dtype ``"int8"``), so a census of a quantized model sees them.
+    """
     import oasr
     import oasr.functionals.gemm as _fg
+    import oasr.functionals.scaled_mm as _fsm
 
     rec = recorder if recorder is not None else GemmShapeRecorder()
     originals: List[Tuple[object, str, object]] = []
@@ -244,6 +273,13 @@ def capture_gemm_shapes(recorder: Optional[GemmShapeRecorder] = None):
             op_name = name[len("_dispatch_") :]
             originals.append((_fg, name, orig))
             setattr(_fg, name, _make_dispatch_wrapper(rec, op_name, orig, idx))
+        for mod in (oasr, _fsm):
+            for name in SCALED_MM_PATCH_NAMES:
+                orig = getattr(mod, name, None)
+                if orig is None:
+                    continue
+                originals.append((mod, name, orig))
+                setattr(mod, name, _make_wrapper(rec, name, orig))
         yield rec
     finally:
         for owner, name, orig in reversed(originals):

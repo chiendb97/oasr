@@ -760,6 +760,19 @@ share of the pool, `max_num_blocks / max_batch_size` blocks of 16 frames. The sa
 budget off. Both derivations are logged with their full arithmetic — see
 [engine.md §6.1](engine.md#61-vram-aware-capacity-sizing).
 
+**Quantization.** `--quantization int8_w8a8` quantizes the model's GEMMs at load
+(online round-to-nearest W8A8 on an fp checkpoint), and a repeatable
+`--quantization-option key=value` tunes it — same split as `--vad-mode` /
+`--vad-option`: the flags fold into **one** `quantization` object,
+`{"scheme": ..., <options>}`, that the Python side receives as
+`EngineConfig.quantization`, with every value sent as a string for the engine to
+type. The only option key the engine accepts today is `ignore`: comma-separated
+module-path globs kept in full precision (`--quantization-option
+ignore=ctc.*,decoder.*`). A checkpoint written by `oasr quantize` needs **no**
+flag — it is served quantized as-is — so leave `--quantization` unset to follow
+the checkpoint; with neither flag the key is not sent at all. A `quantization`
+object in `--engine-config` JSON wins over both flags.
+
 > **Known limitation.** The front-end configures `tracing`, not Python's
 > `logging`, so **no engine-side INFO line reaches the server's output** — the
 > VRAM derivation, the streaming-cache ceiling and the long-form messages are all

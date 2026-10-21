@@ -23,7 +23,7 @@ does).  Entries whose dynamic shape has no natural total order use exact
 ``points`` instead.
 
 This module knows nothing about any kernel family.  Each family module
-(``oasr.jit.gemm``, ``oasr.jit.conv``) owns the codec between a config's
+(``oasr.jit.gemm``, ``oasr.jit.conv``, ``oasr.jit.scaled_mm``) owns the codec between a config's
 parameters and its config object, and builds its lookup views from
 :func:`tiers`.  That keeps the import graph acyclic: the JIT modules import
 this one, never the reverse.
@@ -101,7 +101,10 @@ SCHEMA = 2
 
 #: The kernel families that keep tuning files.  A file for any other family is
 #: rejected on load: an unknown family means a reader older than the writer.
-KERNEL_FAMILIES = ("gemm", "conv1d")
+#: ``scaled_mm`` is the int8 W8A8 GEMM (``oasr.jit.scaled_mm``), whose regions
+#: may name the ``"heuristic"`` sentinel -- "measured; the shape heuristic's
+#: own pick is the best here".
+KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm")
 
 _USER_ENV = "OASR_TUNE_USER_DB"
 _OFF_VALUES = ("0", "off", "none", "false", "no")
@@ -666,20 +669,34 @@ def reset_tier_counts() -> None:
     _TIER_COUNTS.clear()
 
 
-def tuning_report() -> str:
-    """Which tier served each family's selections, and which files are stale."""
+#: The order :func:`tuning_report` lists tiers in: measured first, then each
+#: family's untuned fallback (``default`` for the GEMM family, ``heuristic`` for
+#: ``scaled_mm``).
+_REPORT_TIERS = ("user", "system", "prior", "model", "default", "heuristic")
+
+
+def tuning_report(families: Optional[Iterable[str]] = None) -> str:
+    """Which tier served each family's selections, and which files are stale.
+
+    *families* restricts the report to those kernel families (default: every
+    family).  The counters are process-wide, so a caller reporting on one model
+    -- ``ASREngine.tuning_report`` for a full-precision model in a process that
+    also served a quantized one -- names the families that model can issue.
+    """
+    wanted = None if families is None else set(families)
     lines = []
-    if _TIER_COUNTS:
-        lines.append("kernel selection by tier (distinct shapes resolved):")
-        by_family: Dict[Tuple[str, str], Counter] = {}
-        for (family, op, tier), n in _TIER_COUNTS.items():
+    by_family: Dict[Tuple[str, str], Counter] = {}
+    for (family, op, tier), n in _TIER_COUNTS.items():
+        if wanted is None or family in wanted:
             by_family.setdefault((family, op), Counter())[tier] += n
+    if by_family:
+        lines.append("kernel selection by tier (distinct shapes resolved):")
         for (family, op), c in sorted(by_family.items()):
-            parts = ", ".join(
-                f"{t}={c[t]}" for t in ("user", "system", "prior", "model", "default") if c.get(t)
-            )
+            parts = ", ".join(f"{t}={c[t]}" for t in _REPORT_TIERS if c.get(t))
             lines.append(f"    {family}.{op:<18} {parts}")
     for t in list(_TIERS.values()):
+        if wanted is not None and t.family not in wanted:
+            continue
         for tier, tf in t.ordered():
             if tf.stale:
                 lines.append(f"stale {tier} tuning file {tf.path}: " + "; ".join(tf.stale))

@@ -6,8 +6,10 @@ import functools
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from oasr.api_logging import oasr_api
+from oasr.functionals.quant import QUANT_EPS, reference_quantize_per_token
 
 
 @functools.cache
@@ -280,6 +282,148 @@ def add_layer_norm_residual(
         out, residual_out, input, residual, weight, bias, eps, alpha
     )
     return out, residual_out
+
+
+def _quant_outputs(
+    input: torch.Tensor, out: Optional[torch.Tensor], scale: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``quantize_per_token``'s destinations: int8 like *input*, fp32 per row."""
+    if out is None:
+        out = torch.empty(input.shape, dtype=torch.int8, device=input.device)
+    if scale is None:
+        scale = torch.empty(input.shape[:-1], dtype=torch.float32, device=input.device)
+    return out, scale
+
+
+@oasr_api
+def layer_norm_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    qeps: float = QUANT_EPS,
+    out: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """LayerNorm emitting per-token int8 directly: one launch for the norm and quantize.
+
+    Bit-exact with the unfused pair::
+
+        layer_norm_quant(x, w, b, eps, qeps)
+            == quantize_per_token(layer_norm(x, w, b, eps), None, qeps)
+
+    The normalized value is rounded to the input dtype before it is quantized,
+    exactly as the stored norm output would be, and the quantize follows
+    ``include/oasr/quant/quantize.cuh`` (no smoother: SmoothQuant folds its
+    scale into the norm's affine for these layers).
+
+    Args:
+        input: fp16/bf16 CUDA tensor ``[..., hidden]``, contiguous.
+        weight: LayerNorm scale ``[hidden]``, the input's dtype.
+        bias: Optional LayerNorm offset ``[hidden]``.
+        eps: LayerNorm epsilon.
+        qeps: Floor on each row's amax (:data:`oasr.functionals.quant.QUANT_EPS`).
+        out: Optional pre-allocated int8 tensor shaped like *input*.
+        scale: Optional pre-allocated fp32 tensor, one entry per row.
+
+    Returns:
+        ``(q, scale)``: int8 shaped like *input* and the fp32 per-row scale,
+        shaped ``input.shape[:-1]`` (as :func:`oasr.quantize_per_token`).
+    """
+    out, scale = _quant_outputs(input, out, scale)
+    _get_norm_module().layernorm_quant(out, scale, input, weight, bias, eps, qeps)
+    return out, scale
+
+
+@oasr_api
+def add_layer_norm_residual_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    alpha: float = 1.0,
+    qeps: float = QUANT_EPS,
+    out: Optional[torch.Tensor] = None,
+    scale: Optional[torch.Tensor] = None,
+    residual_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`add_layer_norm_residual` whose normalized output is per-token int8.
+
+    Bit-exact with the unfused pair: for ``(y, s) = add_layer_norm_residual(
+    input, residual, weight, bias, eps, alpha)`` this returns
+    ``(*quantize_per_token(y, None, qeps), s)``.  ``residual_out`` (``s``) is
+    stored exactly as :func:`add_layer_norm_residual` stores it.
+
+    Args:
+        input: Sub-layer output ``[..., hidden]``, fp16/bf16, contiguous.
+        residual: Residual stream, shaped and laid out like *input*.
+        weight: LayerNorm scale ``[hidden]``.
+        bias: Optional LayerNorm offset ``[hidden]``.
+        eps: LayerNorm epsilon.
+        alpha: Scale applied to *input* before the residual add.
+        qeps: Floor on each row's amax.
+        out: Optional pre-allocated int8 tensor shaped like *input*.
+        scale: Optional pre-allocated fp32 tensor, one entry per row.
+        residual_out: Optional pre-allocated sum (``s``) tensor.
+
+    Returns:
+        ``(q, scale, residual_out)``.
+    """
+    out, scale = _quant_outputs(input, out, scale)
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    _get_norm_module().addlayernorm_residual_quant(
+        out, scale, residual_out, input, residual, weight, bias, eps, alpha, qeps
+    )
+    return out, scale, residual_out
+
+
+def _reference_layer_norm(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], eps: float
+) -> torch.Tensor:
+    """LayerNorm in fp32, rounded once to the input dtype (the kernels' order)."""
+    bias_float = None if bias is None else bias.float()
+    return F.layer_norm(x.float(), (x.size(-1),), weight.float(), bias_float, eps).to(x.dtype)
+
+
+def reference_layer_norm_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    qeps: float = QUANT_EPS,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch twin of :func:`layer_norm_quant`, on any device.
+
+    The quantize half is :func:`oasr.functionals.quant.reference_quantize_per_token`
+    and bit-exact given the same normalized values; the LayerNorm half is torch's
+    reduction, not the kernel's, so a normalized value can differ by one ulp of
+    the input dtype -- and its int8 code by one step -- from the kernel.
+    """
+    return reference_quantize_per_token(_reference_layer_norm(input, weight, bias, eps), None, qeps)
+
+
+def reference_add_layer_norm_residual_quant(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    alpha: float = 1.0,
+    qeps: float = QUANT_EPS,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch twin of :func:`add_layer_norm_residual_quant`, on any device.
+
+    The fp32 sum is normalized directly and only rounded for the carried
+    residual, as in the kernel; see :func:`reference_layer_norm_quant` for what
+    is and is not bit-exact.
+    """
+    summed = residual.float() + alpha * input.float()
+    bias_float = None if bias is None else bias.float()
+    normalized = F.layer_norm(summed, (input.size(-1),), weight.float(), bias_float, eps)
+    q, scale = reference_quantize_per_token(normalized.to(input.dtype), None, qeps)
+    return q, scale, summed.to(input.dtype)
 
 
 @oasr_api

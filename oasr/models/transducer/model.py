@@ -116,7 +116,7 @@ class TransducerModel(BaseAsrModel):
     ) -> List[torch.Tensor]:
         """Initial encoder streaming state (``dtype`` defaults to param dtype)."""
         if dtype is None:
-            dtype = next(self.parameters()).dtype
+            dtype = self.compute_dtype
         return self.encoder.get_streaming_init_states(batch_size, device, dtype)
 
     def load_weights(

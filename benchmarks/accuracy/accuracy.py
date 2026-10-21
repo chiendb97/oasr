@@ -18,11 +18,19 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from benchmarks.core.driver import params_of  # noqa: E402
+from benchmarks.core.footprint import (  # noqa: E402
+    model_weight_mib,
+    parse_quantization,
+    peak_alloc_mib,
+    quantization_label,
+    reset_peak_memory,
+    served_quantization,
+)
 from benchmarks.core.metrics import percentile as _percentile  # noqa: E402
 from benchmarks.core.report import Reporter  # noqa: E402
 from benchmarks.core.schema import WorkloadRow  # noqa: E402
@@ -42,6 +50,7 @@ CSV_COLUMNS = [
     "vad_backend",
     "vad_options",
     "dtype",
+    "quantization",
     "max_batch_size",
     "metric",
     "normalizer",
@@ -57,6 +66,8 @@ CSV_COLUMNS = [
     "utt_per_second",
     "latency_p50_ms",
     "latency_p99_ms",
+    "weight_mib",
+    "peak_alloc_mib",
 ]
 
 
@@ -88,6 +99,10 @@ class Row:
     utt_per_second: float
     latency_p50_ms: float
     latency_p99_ms: float
+    #: What the engine served (``ASREngine.quantization_info``), not the flag.
+    quantization: str = ""
+    weight_mib: Optional[float] = None
+    peak_alloc_mib: Optional[float] = None
     #: Not a CSV column — carried so the caller can print the worst utterances.
     result: Optional[Result] = field(default=None, repr=False, compare=False)
 
@@ -236,6 +251,7 @@ def run_one(
     normalizer_kind: str,
     manifest_name: str,
     save_transcripts: Optional[Path],
+    quantization: Union[None, str, Dict[str, Any]] = None,
 ) -> Row:
     import torch
 
@@ -278,6 +294,11 @@ def run_one(
             vad_cfg["model_dir"] = vad_model_dir
         vad_cfg.update(vad_options)
         cfg_kwargs["vad"] = vad_cfg
+    # Online quantization of a full-precision checkpoint.  Absent, a checkpoint
+    # written by ``oasr quantize`` is still served quantized, which is why the
+    # row records ``quantization_info()`` rather than this argument.
+    if quantization is not None:
+        cfg_kwargs["quantization"] = quantization
     cfg = EngineConfig(**cfg_kwargs)
     engine = ASREngine(cfg)
     # Report the chunk actually run, not the flag: 0 on the CLI means "whatever
@@ -285,11 +306,22 @@ def run_one(
     effective_chunk = int(cfg.chunk_size) if streaming else 0
 
     try:
+        served = served_quantization(engine)
+        if served not in ("", "none"):
+            print(f"[INFO] served quantization: {engine.quantization_info()}")
+        weight_mib = model_weight_mib(getattr(engine, "_model", None))
         waves, audio_seconds = load_audio(entries, engine.sample_rate)
+        # After construction: the peak is what serving the manifest needs on top
+        # of what the engine holds, not a one-time load or quantization transient.
+        reset_peak_memory()
         t0 = time.perf_counter()
         hyps, per_utt_ms = transcribe(engine, waves, max_batch_size, streaming=streaming)
         wall = time.perf_counter() - t0
+        peak_mib = peak_alloc_mib()
     finally:
+        # Graph pools and pinned staging outlive the object without this, and the
+        # next cell's peak would then include them.
+        engine.shutdown()
         del engine
         import torch as _t
 
@@ -344,6 +376,9 @@ def run_one(
         utt_per_second=round(len(entries) / wall, 2) if wall else 0.0,
         latency_p50_ms=round(_pct(ordered, 0.50), 2),
         latency_p99_ms=round(_pct(ordered, 0.99), 2),
+        quantization=served,
+        weight_mib=weight_mib,
+        peak_alloc_mib=peak_mib,
         result=result,
     )
 
@@ -474,6 +509,18 @@ def _add_arguments(p: argparse.ArgumentParser) -> None:
         metavar="D",
     )
     p.add_argument("--max-batch-size", nargs="+", type=int, default=[16], metavar="N")
+    p.add_argument(
+        "--quantization",
+        nargs="+",
+        default=["none"],
+        metavar="Q",
+        help="One row per online quantization of the model's GEMMs: `none`, a scheme "
+        "name (`int8_w8a8`), or a JSON object such as "
+        '\'{"scheme": "int8_w8a8", "ignore": "encoder.embed.*"}\'. '
+        "`none int8_w8a8` is the A/B. The `quantization` column records what the "
+        "engine served, so a checkpoint written by `oasr quantize` reads as "
+        "quantized under `none` too.",
+    )
 
     p.add_argument("--metric", default="wer", choices=["wer", "cer"])
     p.add_argument(
@@ -536,27 +583,34 @@ def _to_workload_row(r: "Row", repro_command: str) -> WorkloadRow:
     """Map one sweep cell onto the shared workload schema.
 
     Every field name the previous 27-column CSV used is preserved, so
-    ``ci/wer-reference.json`` and this row stay one vocabulary.
+    ``ci/wer-reference.json`` and this row stay one vocabulary.  A quantized
+    cell adds itself to ``shape`` and ``params``; a full-precision one leaves
+    both as they were, so it still joins against rows recorded before the
+    column existed.
     """
+    quantized = r.quantization not in ("", "none")
+    params = {
+        "decode_method": r.decode_method,
+        "service_mode": r.service_mode,
+        "dtype": r.dtype,
+        "max_batch_size": r.max_batch_size,
+        "vad_mode": r.vad_mode,
+    }
+    if quantized:
+        params["quantization"] = r.quantization
     return WorkloadRow(
         harness="accuracy",
         subroutine="wer",
-        shape=f"{r.decode_method}/{r.service_mode}/{r.dtype}/bs{r.max_batch_size}",
-        params=params_of(
-            {
-                "decode_method": r.decode_method,
-                "service_mode": r.service_mode,
-                "dtype": r.dtype,
-                "max_batch_size": r.max_batch_size,
-                "vad_mode": r.vad_mode,
-            }
-        ),
+        shape=f"{r.decode_method}/{r.service_mode}/{r.dtype}/bs{r.max_batch_size}"
+        + (f"/{r.quantization}" if quantized else ""),
+        params=params_of(params),
         architecture=r.architecture,
         ckpt=r.ckpt,
         manifest=r.manifest,
         decode_method=r.decode_method,
         decode_options=r.decode_options,
         dtype=r.dtype,
+        quantization=r.quantization,
         max_batch_size=r.max_batch_size,
         chunk_size=r.chunk_size,
         service_mode=r.service_mode,
@@ -577,6 +631,8 @@ def _to_workload_row(r: "Row", repro_command: str) -> WorkloadRow:
         deletions=r.deletions,
         insertions=r.insertions,
         ref_units=r.ref_units,
+        weight_mib=r.weight_mib,
+        peak_alloc_mib=r.peak_alloc_mib,
         repro_command=repro_command,
     )
 
@@ -664,6 +720,16 @@ def _sweep(args: argparse.Namespace):
     vad_cells = [
         (vm, vb) for vm in args.vad_mode for vb in (args.vad_backend if vm != "off" else [""])
     ]
+    try:
+        quant_cells = [parse_quantization(q) for q in args.quantization]
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    # Batch size, voice activity and quantization: the axes every
+    # (method, mode, dtype) row is crossed with.
+    cells = [(b, v, q) for b in args.max_batch_size for v in vad_cells for q in quant_cells]
+    # Transcripts are what a "did the output change?" comparison reads, so once a
+    # second VAD or quantization cell exists each row keeps its own file.
+    per_row_transcripts = len(vad_cells) * len(quant_cells) > 1
 
     rows: List[Row] = []
     failures: List[str] = []
@@ -676,48 +742,47 @@ def _sweep(args: argparse.Namespace):
             for c in (args.chunk_size if m == "streaming" else [0])
         ]:
             for dtype in args.dtype:
-                for bs in args.max_batch_size:
-                    for vad_mode, vad_backend in vad_cells:
-                        tag = mode if mode == "offline" else f"{mode}{chunk or ''}"
-                        vad_tag = _vad_tag(vad_mode, vad_backend)
-                        label = f"{method or 'default'}/{tag}/{dtype}/bs{bs}{vad_tag}"
-                        print(f"[INFO] running {label} ...", flush=True)
-                        try:
-                            row = run_one(
-                                entries,
-                                ckpt_dir=args.ckpt_dir,
-                                architecture=args.architecture,
-                                decode_method=method or None,
-                                decode_options=decode_options,
-                                service_mode=mode,
-                                chunk_size=chunk or None,
-                                vad_mode=vad_mode,
-                                vad_backend=vad_backend or None,
-                                vad_model_dir=args.vad_model_dir,
-                                vad_options=vad_options,
-                                dtype=dtype,
-                                max_batch_size=bs,
-                                metric=args.metric,
-                                normalizer_kind=norm_kind,
-                                manifest_name=manifest.name,
-                                save_transcripts=_transcript_path(
-                                    args.save_transcripts, label, len(vad_cells) > 1
-                                ),
-                            )
-                        except (
-                            Exception
-                        ) as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
-                            # Unsupported sweep cells are reported without
-                            # discarding rows already collected.
-                            msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
-                            print(f"       FAILED — {msg}", flush=True)
-                            failures.append(msg)
-                            continue
-                        rows.append(row)
-                        print(
-                            f"       {row.result.summary()}  RTFx {row.rtfx}  "
-                            f"p50 {row.latency_p50_ms} ms"
+                for bs, (vad_mode, vad_backend), quant in cells:
+                    tag = mode if mode == "offline" else f"{mode}{chunk or ''}"
+                    vad_tag = _vad_tag(vad_mode, vad_backend)
+                    q_tag = f"/q:{quantization_label(quant)}" if quant is not None else ""
+                    label = f"{method or 'default'}/{tag}/{dtype}/bs{bs}{vad_tag}{q_tag}"
+                    print(f"[INFO] running {label} ...", flush=True)
+                    try:
+                        row = run_one(
+                            entries,
+                            ckpt_dir=args.ckpt_dir,
+                            architecture=args.architecture,
+                            decode_method=method or None,
+                            decode_options=decode_options,
+                            service_mode=mode,
+                            chunk_size=chunk or None,
+                            vad_mode=vad_mode,
+                            vad_backend=vad_backend or None,
+                            vad_model_dir=args.vad_model_dir,
+                            vad_options=vad_options,
+                            dtype=dtype,
+                            max_batch_size=bs,
+                            metric=args.metric,
+                            normalizer_kind=norm_kind,
+                            manifest_name=manifest.name,
+                            save_transcripts=_transcript_path(
+                                args.save_transcripts, label, per_row_transcripts
+                            ),
+                            quantization=quant,
                         )
+                    except Exception as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
+                        # Unsupported sweep cells are reported without
+                        # discarding rows already collected.
+                        msg = f"{label}: {type(exc).__name__}: {exc}".splitlines()[0]
+                        print(f"       FAILED — {msg}", flush=True)
+                        failures.append(msg)
+                        continue
+                    rows.append(row)
+                    print(
+                        f"       {row.result.summary()}  RTFx {row.rtfx}  "
+                        f"p50 {row.latency_p50_ms} ms"
+                    )
 
     _print_table(rows)
     return rows
@@ -736,16 +801,19 @@ def _finish(rows, failures, args):
 
 
 def _print_table(rows: Sequence[Row]) -> None:
-    hdr = f"{'config':<44} {'metric':>7} {'rate %':>8} {'RTFx':>8} {'p50 ms':>8} {'p99 ms':>8}"
+    labels = [_table_label(r) for r in rows]
+    width = max([44, *(len(label) for label in labels)])
+    hdr = (
+        f"{'config':<{width}} {'metric':>7} {'rate %':>8} {'RTFx':>8} {'p50 ms':>8}"
+        f" {'p99 ms':>8} {'wts MiB':>8} {'peak MiB':>8}"
+    )
     print("\n" + hdr)
     print("-" * len(hdr))
-    for r in rows:
-        mode = r.service_mode if r.service_mode == "offline" else f"streaming{r.chunk_size}"
-        vad = "" if r.vad_mode == "off" else f"/vad:{r.vad_mode}:{r.vad_backend}"
-        cfg = f"{r.decode_method}/{mode}/{r.dtype}/bs{r.max_batch_size}{vad}"
+    for r, cfg in zip(rows, labels):
         print(
-            f"{cfg:<44} {r.metric:>7} {r.error_rate_pct:>8.2f} "
+            f"{cfg:<{width}} {r.metric:>7} {r.error_rate_pct:>8.2f} "
             f"{r.rtfx:>8.1f} {r.latency_p50_ms:>8.1f} {r.latency_p99_ms:>8.1f}"
+            f" {_mib(r.weight_mib):>8} {_mib(r.peak_alloc_mib):>8}"
         )
     print()
     print(
@@ -753,6 +821,17 @@ def _print_table(rows: Sequence[Row]) -> None:
         f"{rows[0].utterances if rows else 0} utterances, "
         f"{rows[0].audio_seconds if rows else 0:.0f} s of audio)"
     )
+
+
+def _table_label(r: Row) -> str:
+    mode = r.service_mode if r.service_mode == "offline" else f"streaming{r.chunk_size}"
+    vad = "" if r.vad_mode == "off" else f"/vad:{r.vad_mode}:{r.vad_backend}"
+    quant = "" if r.quantization in ("", "none") else f"/q:{r.quantization}"
+    return f"{r.decode_method}/{mode}/{r.dtype}/bs{r.max_batch_size}{vad}{quant}"
+
+
+def _mib(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.1f}"
 
 
 if __name__ == "__main__":

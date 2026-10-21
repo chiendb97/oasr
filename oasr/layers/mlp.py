@@ -180,6 +180,10 @@ class GatedMLP(nn.Module):
         self.add_module(
             names[2], RowParallelLinear(hidden, d_model, bias=bias, device=device, dtype=dtype)
         )
+        # ``oasr.gated_mlp`` reads the gate and up weights raw (one dual-B GEMM),
+        # so those two cannot be quantized behind its back.
+        for name in names[:2]:
+            self._modules[name].quantizable = False  # type: ignore[union-attr]
 
     def _proj(self, which: int) -> nn.Module:
         """Resolve gate / up / down by its configured name (see

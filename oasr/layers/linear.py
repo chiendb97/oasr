@@ -10,7 +10,9 @@ reaches every architecture.  Parameter layout is ``nn.Linear``'s exactly
 migrated module keeps its upstream state-dict keys.
 
 Backend choice lives in :mod:`oasr.layers._backend`: ``oasr.gemm`` on CUDA
-fp16/bf16 with both dimensions 8-aligned, ``F.linear`` otherwise.
+fp16/bf16 with both dimensions 8-aligned, ``F.linear`` otherwise.  A projection
+pinned with ``batch_invariant = True`` takes ``oasr.gemm(...,
+batch_invariant=True)`` on that path at every M, below the row floor included.
 
 **Tensor-parallel naming.**  :class:`ColumnParallelLinear` and
 :class:`RowParallelLinear` are today exact aliases of :class:`Linear` — they
@@ -34,7 +36,8 @@ from torch import nn
 
 import oasr
 
-from ._backend import use_gemm_kernel
+from ._backend import GEMM_ALIGNMENT, GEMM_DTYPES, layers_backend, use_gemm_kernel
+from ._quantizable import QuantizableGemm
 
 #: Torch equivalent of each fused CUDA epilogue. Exact-erf ``gelu`` and the
 #: ``gelu_tanh`` approximation deliberately remain separate names so checkpoint
@@ -57,7 +60,27 @@ _FUSED_ACTIVATION_ID = {
 }
 
 
-class Linear(nn.Module):
+def _use_pinned_gemm(x: torch.Tensor, in_features: int, out_features: int) -> bool:
+    """Can a ``batch_invariant`` projection take the pinned CUDA kernel path?
+
+    The kernel path's own preconditions -- CUDA, fp16/bf16, both dimensions
+    8-aligned, the ``oasr`` backend -- and deliberately *not* its row floor
+    (``GEMM_MIN_ROWS``): below the floor the unpinned path is ``F.linear``,
+    i.e. cuBLAS choosing its kernel from M, which is the very dependence the
+    pin removes.  Anything else (CPU, fp32, ``OASR_LAYERS_BACKEND=torch``, an
+    unaligned shape) keeps its existing route: the pin is a property of the
+    CUDA kernel path, not a second backend.
+    """
+    return (
+        x.is_cuda
+        and x.dtype in GEMM_DTYPES
+        and in_features % GEMM_ALIGNMENT == 0
+        and out_features % GEMM_ALIGNMENT == 0
+        and layers_backend() != "torch"
+    )
+
+
+class Linear(QuantizableGemm, nn.Module):
     """``y = x @ weightᵀ + bias``, on the OASR GEMM kernel where it can run.
 
     Parameters
@@ -68,11 +91,30 @@ class Linear(nn.Module):
         ``F.linear``.
     bias : bool
         Whether to allocate a bias parameter.
+
+    Attributes
+    ----------
+    batch_invariant : bool
+        ``False`` by default.  Set it on an instance (``layer.batch_invariant =
+        True``) to *pin* the projection: on the CUDA fp16/bf16 kernel path every
+        output row is then bitwise independent of how many rows share the call,
+        at any M, including below ``GEMM_MIN_ROWS`` (``oasr.gemm(...,
+        batch_invariant=True)``: CUTLASS data-parallel variants only, never
+        cuBLAS, split-K or Stream-K).  For a full-precision layer whose ulps a
+        later quantizer would amplify into a batch-dependent result.  It costs
+        speed where the unpinned choice was a K decomposition or cuBLAS, and
+        changes nothing off the kernel path (CPU, fp32,
+        ``OASR_LAYERS_BACKEND=torch``) or for a quantized layer, whose
+        ``quant_method`` runs first.  Not a parameter or buffer: it is not in
+        the state dict.
     """
 
     #: Axis this projection would be sharded on under tensor parallelism.
     #: ``None`` = replicated (the shard axis is not implied by the module).
     tp_dim: Optional[int] = None
+
+    #: Pin every output row to be independent of M (see the class docstring).
+    batch_invariant: bool = False
 
     def __init__(
         self,
@@ -99,6 +141,11 @@ class Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``x: (*, in_features) -> (*, out_features)``."""
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x)
+        if self.batch_invariant and _use_pinned_gemm(x, self.in_features, self.out_features):
+            pinned: torch.Tensor = oasr.gemm(x, self.weight, self.bias, batch_invariant=True)
+            return pinned
         if use_gemm_kernel(x, self.in_features, self.out_features):
             return oasr.gemm(x, self.weight, self.bias)
         return F.linear(x, self.weight, self.bias)
@@ -107,7 +154,7 @@ class Linear(nn.Module):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}"
-        )
+        ) + (", batch_invariant=True" if self.batch_invariant else "")
 
 
 class ColumnParallelLinear(Linear):
@@ -133,14 +180,20 @@ class RowParallelLinear(Linear):
     tp_dim = 1
 
 
-class LinearActivation(nn.Module):
+class LinearActivation(QuantizableGemm, nn.Module):
     """``y = activation(x @ weightᵀ + bias)`` as one fused GEMM epilogue.
 
     ``activation`` is one of ``relu`` / ``swish`` (== ``silu``) / exact-erf
     ``gelu`` / ``gelu_tanh``. The two GELU spellings select distinct epilogues.
+
+    ``batch_invariant`` pins the projection exactly as on :class:`Linear`
+    (``oasr.gemm_activation(..., batch_invariant=True)``).
     """
 
     tp_dim: Optional[int] = None
+
+    #: Pin every output row to be independent of M (see :class:`Linear`).
+    batch_invariant: bool = False
 
     def __init__(
         self,
@@ -160,6 +213,7 @@ class LinearActivation(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.activation_name = activation_type
+        self.fused_activation = activation_type
         self.activation_type = oasr.get_activation_type_id(_FUSED_ACTIVATION_ID[activation_type])
         self.weight = nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
@@ -174,6 +228,13 @@ class LinearActivation(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``x: (*, in_features) -> (*, out_features)``."""
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x)
+        if self.batch_invariant and _use_pinned_gemm(x, self.in_features, self.out_features):
+            pinned: torch.Tensor = oasr.gemm_activation(
+                x, self.weight, self.bias, self.activation_type, batch_invariant=True
+            )
+            return pinned
         if use_gemm_kernel(x, self.in_features, self.out_features):
             return oasr.gemm_activation(x, self.weight, self.bias, self.activation_type)
         return _TORCH_ACTIVATION[self.activation_name](F.linear(x, self.weight, self.bias))
@@ -182,7 +243,7 @@ class LinearActivation(nn.Module):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"bias={self.bias is not None}, activation={self.activation_name}"
-        )
+        ) + (", batch_invariant=True" if self.batch_invariant else "")
 
 
 __all__ = [

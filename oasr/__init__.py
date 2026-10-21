@@ -76,6 +76,7 @@ from .functionals.mlp import gated_mlp, gated_mlp_available, gated_mlp_backend
 from .functionals.norm import (
     add_layer_norm,
     add_layer_norm_residual,
+    add_layer_norm_residual_quant,
     add_rms_norm,
     add_rms_norm_residual,
     batch_norm_1d,
@@ -86,10 +87,12 @@ from .functionals.norm import (
     group_norm,
     layer_norm,
     layer_norm_activation,
+    layer_norm_quant,
     rms_norm,
     rms_norm_activation,
 )
 from .functionals.pooling import avg_pool1d, max_pool1d
+from .functionals.quant import quantize_per_token, quantize_static
 from .functionals.recurrent import (
     lstm_gemm_layer,
     lstm_layer,
@@ -98,6 +101,7 @@ from .functionals.recurrent import (
     rnn_layer,
     rnn_slot_step,
 )
+from .functionals.scaled_mm import scaled_mm, scaled_mm_quant
 from .functionals.softmax import log_softmax, masked_softmax, softmax
 from .functionals.topk import topk
 from .functionals.transducer import (
@@ -241,6 +245,8 @@ __all__ = [
     "group_norm",
     "add_layer_norm",
     "add_layer_norm_residual",
+    "add_layer_norm_residual_quant",
+    "layer_norm_quant",
     "add_rms_norm",
     "add_rms_norm_residual",
     "layer_norm_activation",
@@ -268,6 +274,10 @@ __all__ = [
     "group_gemm",
     "gemm_activation",
     "gemm_log_softmax",
+    "quantize_per_token",
+    "quantize_static",
+    "scaled_mm",
+    "scaled_mm_quant",
     "log_softmax",
     "gated_mlp",
     "gated_mlp_available",

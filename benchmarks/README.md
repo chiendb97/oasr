@@ -75,6 +75,8 @@ docs name keep working.
 | `topk` · `fft` · `pooling` | topk · rfft, rfft_power · avg_pool1d, max_pool1d | `cuda`, `torch` (+`torch_previous`) | TB/s |
 | `recurrent` | lstm, rnn_tanh, rnn_relu, lstm_slot_step, lstm_step_cute | `oasr`, `native`, `cutlass16/32/64`, `streamk`, `splitk`, `cudnn` | TFLOPS |
 | `mlp` | gated_mlp | `cute`, `oasr`, `torch` | TFLOPS + TB/s |
+| `quant` | quantize_per_token | `cuda`, `torch` (bit-exact twin) | TB/s |
+| `scaled_mm` | scaled_mm, quant_scaled_mm | `cutlass`, `torch` (`_int_mm` lane), `fp16` (speed baseline; checked against the exact `reference`) | TFLOPS |
 | `composite` | conv_block | `cuda`, `torch` | TFLOPS |
 | `feature` | fbank_preprocess, mel_log, dct_lifter, fbank_pipeline, mfcc_pipeline | `cuda`, `cuda_unfold`, `torch`, `torchaudio` | TB/s |
 | `ctc_decoder` | beam_search, streaming | `fused`, `legacy`, `torchaudio` | frames/s |

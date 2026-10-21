@@ -7,13 +7,17 @@
         --out census.json
     oasr tune build --census census.json --out user        # this machine's user tier
     oasr tune build --census a.json --census b.json --out system   # the shipped file
+    oasr tune census --ckpt-dir CKPT --quantization int8_w8a8 --out q.json  # a quantized model
+    oasr tune build --census q.json --family scaled_mm --out user  # its int8 GEMMs only
     oasr tune diff oasr/tune/db/sm120/gemm.json ~/.cache/oasr/tune/v2/sm120/gemm.json
     oasr tune status
     oasr tune export-misses --out misses.json               # after a workload ran
 
 ``build`` measures on the GPU it runs on and writes the file for that GPU's
 architecture family; a shipped file for another family is built on that family
-(``ci/modal_app.py``'s tune entry point runs one per GPU of the matrix).
+(``ci/modal_app.py``'s tune entry point runs one per GPU of the matrix).  A census
+of a quantized model also holds int8 ``scaled_mm`` points: ``build`` then writes
+``scaled_mm.json`` beside ``gemm.json`` (``--family`` restricts it to one).
 """
 
 from __future__ import annotations
@@ -44,6 +48,8 @@ def _cmd_census(args) -> int:
         kw["chunk_size"] = args.chunk_size
     if args.preferred_batch_size:
         kw["preferred_batch_size"] = args.preferred_batch_size
+    if args.quantization:
+        kw["quantization"] = args.quantization
     cfg = EngineConfig(**kw)
     if args.manifest:
         traffic = C.TrafficModel.from_manifest(args.manifest, args.audio_root)
@@ -60,17 +66,27 @@ def _cmd_census(args) -> int:
     ss.provenance["ckpt_dir"] = os.path.abspath(args.ckpt_dir)
     if args.architecture:
         ss.provenance["architecture"] = args.architecture
+    if args.quantization:
+        ss.provenance["quantization"] = args.quantization
     ss.save(args.out)
     sigs = ss.signatures()
+    int8 = sum(1 for sig in sigs if C.kernel_family(sig[0]) == "scaled_mm")
     print(
-        f"[census] {len(ss.points)} points over {len(sigs)} signatures, "
-        f"{sum(p.must for p in ss.points)} must-tune; weights {ss.working_set_bytes / 2**20:.1f} "
-        f"MiB -> {args.out}"
+        f"[census] {len(ss.points)} points over {len(sigs)} signatures"
+        + (f" ({int8} int8 scaled_mm)" if int8 else "")
+        + f", {sum(p.must for p in ss.points)} must-tune; weights "
+        f"{ss.working_set_bytes / 2**20:.1f} MiB -> {args.out}"
     )
     return 0
 
 
 def _resolve_out(out: str, sm: int, family: str = "gemm") -> Path:
+    """Where *family*'s file goes for ``--out``.
+
+    ``user`` / ``system`` name the tier's ``<family>.json``.  An explicit path is
+    the GEMM file; another family's goes beside it -- ``scaled_mm.json`` next to
+    a ``gemm.json``, else ``<stem>.<family>.json``.
+    """
     from oasr.tune import database
 
     if out == "user":
@@ -80,7 +96,12 @@ def _resolve_out(out: str, sm: int, family: str = "gemm") -> Path:
         return p
     if out == "system":
         return database.system_path(sm, family)
-    return Path(out)
+    path = Path(out)
+    if family == "gemm":
+        return path
+    if path.name == "gemm.json":
+        return path.with_name(f"{family}.json")
+    return path.with_name(f"{path.stem}.{family}{path.suffix or '.json'}")
 
 
 def _cmd_prebuild(args) -> int:
@@ -89,13 +110,15 @@ def _cmd_prebuild(args) -> int:
     from oasr.jit.core import _get_target_sm
     from oasr.tune import prebuild as P
     from oasr.tune.build import TUNED_OPS
+    from oasr.tune.build_scaled_mm import SCALED_MM_TUNED_OPS
     from oasr.tune.census import ShapeSet
 
+    tuned = set(TUNED_OPS) | set(SCALED_MM_TUNED_OPS)
     ops = set(TUNED_OPS)
     if args.census:
         ops = {p.op for path in args.census for p in ShapeSet.load(path).points}
     jobs = args.jobs or os.cpu_count() or 8
-    print(f"[prebuild] sm{_get_target_sm()}: ops {sorted(ops & set(TUNED_OPS))}, -j{jobs}")
+    print(f"[prebuild] sm{_get_target_sm()}: ops {sorted(ops & tuned)}, -j{jobs}")
     t0 = time.time()
     results = P.prebuild(ops, jobs, progress=lambda s: print(f"[prebuild] {s}", flush=True))
     rss = P.peak_child_rss_mib()
@@ -121,7 +144,8 @@ def _cmd_build(args) -> int:
     from oasr.jit.core import _get_target_sm
     from oasr.tune import database
     from oasr.tune.build import BuildOptions, build_gemm
-    from oasr.tune.census import ShapeSet
+    from oasr.tune.build_scaled_mm import build_scaled_mm
+    from oasr.tune.census import ShapeSet, kernel_family
 
     sm = _get_target_sm()
     merged: Optional[ShapeSet] = None
@@ -150,8 +174,15 @@ def _cmd_build(args) -> int:
         else:
             uniq[key] = p
     merged.points = list(uniq.values())
-    out = _resolve_out(args.out, sm)
-    base = database.load_file(out, "gemm", sm) if (out.is_file() and not args.fresh) else None
+    families = {kernel_family(p.op) for p in merged.points}
+    want = {
+        "auto": [f for f in ("gemm", "scaled_mm") if f in families] or ["gemm"],
+        "gemm": ["gemm"],
+        "scaled_mm": ["scaled_mm"],
+    }[args.family]
+    if "scaled_mm" in want and "scaled_mm" not in families:
+        print("[build] the census has no int8 scaled_mm points (census a quantized model)")
+        return 1
     opts = BuildOptions(
         min_speedup=args.min_speedup,
         partition=args.partition,
@@ -167,9 +198,15 @@ def _cmd_build(args) -> int:
         checkpoint_path=args.checkpoint,
         progress=(lambda s: print(f"[build] {s}", file=sys.stderr, flush=True)),
     )
-    tf = build_gemm(merged, sm=sm, opts=opts, base=base)
-    database.save_file(tf, out)
-    print(f"[build] {len(tf.entries)} entries, {len(tf.configs)} configs -> {out}")
+    builders = {"gemm": build_gemm, "scaled_mm": build_scaled_mm}
+    for family in want:
+        out = _resolve_out(args.out, sm, family)
+        base = database.load_file(out, family, sm) if (out.is_file() and not args.fresh) else None
+        tf = builders[family](merged, sm=sm, opts=opts, base=base)
+        if args.note:
+            tf.provenance["notes"] = list(args.note)
+        database.save_file(tf, out)
+        print(f"[build] {family}: {len(tf.entries)} entries, {len(tf.configs)} configs -> {out}")
     return 0
 
 
@@ -263,6 +300,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--max-batch-size", type=int, default=32)
     c.add_argument("--preferred-batch-size", type=int, nargs="+")
     c.add_argument("--chunk-size", type=int)
+    c.add_argument(
+        "--quantization",
+        help="quantize online first (a scheme preset, e.g. int8_w8a8): the census then also "
+        "records the int8 scaled_mm GEMMs (a quantized checkpoint needs no flag)",
+    )
     c.add_argument("--manifest", help="JSONL manifest of representative offline traffic")
     c.add_argument("--audio-root")
     c.add_argument(
@@ -278,7 +320,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("build", help="measure a census and write a tuning file")
     b.add_argument("--census", action="append", required=True)
-    b.add_argument("--out", default="user", help="'user', 'system', or a path")
+    b.add_argument(
+        "--out",
+        default="user",
+        help="'user', 'system', or a path (the gemm file; scaled_mm.json goes beside it)",
+    )
+    b.add_argument(
+        "--family",
+        choices=("auto", "gemm", "scaled_mm"),
+        default="auto",
+        help="which kernel family's file to build (auto: every family the census has points "
+        "for -- scaled_mm when it has int8 points)",
+    )
+    b.add_argument(
+        "--note",
+        action="append",
+        help="free-text provenance note to record in the written file(s) (repeatable)",
+    )
     b.add_argument("--fresh", action="store_true", help="ignore the existing file at --out")
     b.add_argument("--min-speedup", type=float, default=1.05)
     b.add_argument("--partition", choices=("cover", "points"), default="cover")

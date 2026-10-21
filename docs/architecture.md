@@ -9,7 +9,7 @@ vLLM / SGLang, adapted to ASR (an acoustic **encoder** feeding a **decode** stag
 that is either non-autoregressive CTC/Paraformer or an autoregressive
 transducer/AED/LLM loop).
 
-## The eight seams
+## The nine seams
 
 | Axis | Base class | Registry / builder | Selected by | Detail |
 |------|-----------|--------------------|-------------|--------|
@@ -20,6 +20,7 @@ transducer/AED/LLM loop).
 | Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `oasr.engine.batching` (`register_*_policy`, `build_*_policy`) | `config.schedule_policy` / partition flags | [scheduler.md](scheduler.md) |
 | Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` | [tokenizers.md](tokenizers.md) |
 | Feature frontend | `oasr.features.ExtractorSpec` | `oasr.features` (`register_extractor`, `build_extractor`) | `FeatureConfig.feature_type`, materialized from the converter-emitted `FeatureSpec` | [features.md](features.md) |
+| Quantization scheme | `oasr.quantization.QuantMethod` (+ `ScaledMMLane`, `QuantAlgorithm`) | `oasr.quantization` (`register_quant_method`, `register_lane`, `register_quant_algorithm`) | the checkpoint's `QuantizationSpec` (native format v2), else `EngineConfig.quantization`; per layer by module path; a model declares its smoothing groups in `quantization_layout()` | [quantization.md](quantization.md) |
 
 ## The layer waist
 
@@ -27,9 +28,12 @@ Orthogonal to the seven registries — which are about *what plugs in* — is th
 one about *what every architecture is built from*. Model implementations use
 `oasr.layers`, never `nn.Linear` / `nn.Conv1d` / `nn.AvgPool1d` / `nn.LSTM` /
 `nn.RNN` / `nn.LayerNorm` / `nn.Embedding` directly.
-That is what makes a kernel improvement, CUDA-graph capture or a future
-quantized path apply to **every** architecture instead of one. The kernels
-underneath are documented in [kernels.md](kernels.md).
+That is what makes a kernel improvement, CUDA-graph capture or a quantized
+path apply to **every** architecture instead of one: `Linear`,
+`LinearActivation` and `PointwiseConv1d` are `QuantizableGemm`s, whose
+`quant_method` takes over the forward when a spec selects them
+([quantization.md](quantization.md)). The kernels underneath are documented in
+[kernels.md](kernels.md).
 
 | What | Use |
 |---|---|

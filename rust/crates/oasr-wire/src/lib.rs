@@ -488,6 +488,11 @@ pub struct ModelInfo {
     /// the front-ends convert client audio to this rate before submitting.
     #[serde(default)]
     pub sample_rate: Option<u32>,
+    /// The quantization scheme(s) the model's GEMM layers are served in
+    /// (`int8_w8a8`), or absent for full precision.  Engine-authoritative: a
+    /// checkpoint written by `oasr quantize` is quantized with no server flag.
+    #[serde(default)]
+    pub quantization: Option<String>,
 }
 
 #[cfg(test)]

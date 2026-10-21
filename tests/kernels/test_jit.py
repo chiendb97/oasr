@@ -119,6 +119,8 @@ class TestJitInfrastructure:
             "fft",
             "features",
             "transducer",
+            "quant",
+            "scaled_mm",
         }
         assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
         # Not `len(specs) == len(expected)`: three families contribute one spec

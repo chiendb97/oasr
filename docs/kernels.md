@@ -38,12 +38,13 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `include/oasr/attention/` | The CuTe fused multi-head attention (`fmha_*.h`, `cutlass_fmha_configs.h`) |
 | `include/oasr/mlp/` | The CuTe fused gated MLP (`gated_mlp_*.h`, `cutlass_gated_mlp_configs.h`) |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
+| `include/oasr/quant/`, `include/oasr/scaled_mm/` | Per-token int8 activation quantization (`quantize.cuh`; pinned numerics, bit-exact with its torch twin) and the int8 scaled GEMM: CUTLASS 2.x int8 `mma.sync` with an Sm80 EVT epilogue that dequantizes (per-token × per-channel), adds the bias and applies the activation — in the three-header layout. See [quantization.md](quantization.md) |
 | `include/oasr/{softmax,topk,fft,features}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
 | `csrc/<family>.cu` | TVM-FFI launcher |
 | `csrc/<family>_jit_binding.cu` | JIT binding exports |
 | `csrc/tvm_ffi_utils.h` | DLPack dtype dispatch, validation macros (`CHECK_GEMM_ALIGNMENT`, `CHECK_CONTIGUOUS_INPUT`, `CHECK_LAST_DIM_CONTIGUOUS_INPUT`, `CHECK_VECTOR_ALIGNED`, `FLATTENED_ROWS`), `OptionalDataPtr` |
-| `csrc/templates/` | Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`) |
+| `csrc/templates/` | Jinja2 templates for config-specific CUTLASS instantiations (`gemm_cutlass_template.cu.jinja`, `bmm_cutlass_template.cu.jinja`, `group_gemm_cutlass_template.cu.jinja`, `scaled_mm_cutlass_template.cu.jinja`) |
 | `csrc/decoder/ctc/` | GPU CTC launcher + binding (`ctc_decoder.cu`, `ctc_decoder_jit_binding.cu`); `ctc/cpu/` holds the CPU-side C++ decoders compiled into `_C.so` — greedy search, prefix beam search, WFST beam search (via k2), the streaming WFST decoder, `ContextGraph` for phrase boosting, and shared `common/utils` |
 | `csrc/decoder/wfst/` | In-tree GPU WFST decoder (TVM-FFI JIT). Its exact-semantics CPU reference oracle is **test-only** and lives separately under `csrc/tests/wfst/`, out of the production decoder library. |
 | `csrc/pybind/` | pybind11 module for the CPU decoder bindings, the alignment bindings and legacy enums (`pybind_main.cpp`, `pybind_decoder.h`, `pybind_alignment.h`) |
@@ -333,6 +334,57 @@ allocates its output tensor, and calls into the compiled module.
 lazily imports the compiled `_C` extension and delegates to a `_*Core` C++
 object.
 
+### LayerNorm with a per-token int8 output
+
+`layer_norm_quant` and `add_layer_norm_residual_quant` (`oasr/functionals/norm.py`)
+are LayerNorm and the fused add + LayerNorm with residual passthrough, emitting
+the normalized output as per-token int8 plus one fp32 scale per row for an int8
+GEMM consumer ([quantization.md](quantization.md)). That replaces two launches
+(the norm storing T, then `quantize_per_token` reading it back) with one. The
+contract is **bit-exactness with that pair**, `torch.equal` on `q`, `scale` and
+`residual_out`:
+
+```
+layer_norm_quant(x, w, b, eps, qeps)  ==  quantize_per_token(layer_norm(x, w, b, eps), None, qeps)
+```
+
+- **One kernel template, two sinks.** `layerNormKernel` and
+  `addLayerNormResidualKernel` take a `kQuantOut` parameter. The mean and
+  variance passes, the block size and the vector/scalar choice are shared. Only
+  the normalize pass's store differs. The plain kernels compile to the same
+  instructions as before.
+- **What is quantized is the T value.** Each normalized value is rounded to the
+  input dtype exactly as the store would round it. The row's amax is taken over
+  those values, and `quant::quantizeInt8` (`include/oasr/quant/quantize.cuh`)
+  quantizes the held values rather than recomputing them. A thread's first
+  vector stays in registers. Past 1024 vectors a row, the rest are staged in
+  dynamic shared memory, with an opt-in past 40 KiB.
+- **The launcher's vector/scalar choice must be LayerNorm's**, decided from
+  the input (and residual) pointers alone. It fixes each thread's accumulation
+  order and hence the bits of the mean. The int8 tensor's alignment only decides
+  whether the int8 store is 8 bytes wide.
+- **The affine's rounding is spelled out in source.** nvcc contracts
+  `n * w + b` into an FMA only when it unswitches the `bias != nullptr` branch,
+  and that is a per-instantiation decision. The plain LayerNorm contracted, the
+  first `kQuantOut` build did not, and the two then differed by one ulp in a few
+  elements per million. Each kernel now writes the rounding it compiled to before
+  the change: an `fmaf` in `layerNormKernel` and in the scalar
+  `addLayerNormResidualKernel`, `__fadd_rn` in its vector path.
+  `tests/kernels/test_norm_quant.py::TestBitExactVsUnfused::test_volume_catches_a_one_ulp_drift`
+  is the config that sees such a drift every time; a rows=1000 grid sees it in
+  about one config in seventy.
+
+In the layer, `LayerNorm.quantize_output` is armed by
+`oasr.quantization.bind_quantization`, never by hand. When armed, `forward`
+returns a `QuantizedActivation`, and so does the first element of
+`forward_add_residual`. That happens only where the fused kernel applies: CUDA,
+fp16/bf16, a contiguous input (and residual), and the `oasr` backend. Everywhere
+else the layer returns the plain tensor. `reference_layer_norm_quant` and
+`reference_add_layer_norm_residual_quant` are the torch twins: bit-exact in the
+quantize, within one int8 step overall, because torch's LayerNorm reduction is
+not the kernel's. `RMSNorm` has no quant-out variant yet; the same `kQuantOut`
+templating applies to `rmsNormKernel` / `addRmsNormResidualKernel` unchanged.
+
 ### Shape-aware backend selection
 
 `gemm`, `gemm_activation`, `bmm` and `gemm_log_softmax` route per shape.
@@ -428,6 +480,43 @@ Three rules are structural rather than tuned:
 
 `OASR_GEMM_HEURISTIC=0` disables the whole thing. Tuning a card:
 `oasr tune census` + `oasr tune build` ([autotuning.md](autotuning.md)).
+
+### Batch-invariant GEMM (`batch_invariant=True`)
+
+Every choice above depends on M, and with it the order a row is summed in
+(cuBLAS's own kernel and split, split-K, Stream-K, and `F.linear` below
+`GEMM_MIN_ROWS`). The result is an ulp of drift per row as the batch changes.
+An int8 quantizer downstream can turn that drift into a changed word
+([quantization.md](quantization.md)). `gemm(..., batch_invariant=True)` and
+`gemm_activation(..., batch_invariant=True)` **pin** the call: every output row
+is bitwise independent of M. They run only the CUTLASS 2.x **data-parallel**
+variants that `jit.gemm.is_batch_invariant` defines: `split_k == 1`, no
+Stream-K, no parallel split-K, not sliced-K (`warp_k == block_k`), at the shared
+64-wide K tile. In these variants one thread owns each output element and walks
+all of K in the same `mma.sync` order, whatever the tile, stage count or grid.
+So every member of the class returns the same bits for a row, and the selector
+may still pick the tile from M (`tests/kernels/test_gemm_batch_invariant.py`).
+
+`jit.gemm.select_batch_invariant_config` picks the config:
+
+- It keeps a measured rule's choice when that choice is already a member.
+- Otherwise it applies an occupancy rule: among grids that fit in one wave, the
+  smallest warp tile; past one wave, the least operand traffic.
+- It is a pure function of the shape and the SM count.
+- It never picks cuBLAS, split-K, Stream-K or the autotuner, even with tuning
+  enabled.
+- It falls back only to a `GEMM_DEFAULT` that is itself a member, and raises if
+  no member is compiled.
+
+On sm_120 at `embed.out` (N=256, K=4864), the pin costs 2.7-3.0× at M=64 and
+2.1× at 256. Each CTA walks all 4,864 of K alone, which takes about 15 µs. It
+costs 1.25× at 1024 and 1.02-1.20× from 2048 to 8192.
+
+`oasr.layers.Linear` and `LinearActivation` expose the pin as
+`batch_invariant = False`, set per instance. A pinned projection takes the
+pinned call at **every** M on the CUDA fp16/bf16 path, row floor included. CPU,
+fp32 and `OASR_LAYERS_BACKEND=torch` keep their routes, and `quant_method` runs
+first.
 
 ### The BMM general lane
 

@@ -303,6 +303,117 @@ def _plan(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tuple:
     return plan
 
 
+# ---------------------------------------------------------------------------
+# Batch-invariant ("pinned") dispatch
+# ---------------------------------------------------------------------------
+#
+# ``batch_invariant=True`` asks that every output row be bitwise independent of
+# M -- of how many other rows share the launch.  The ordinary plan cannot give
+# that: its choice (cuBLAS, split-K, Stream-K, a tile) is a function of M, and
+# each changes the order a row is summed in.  The pinned plan only ever names a
+# member of the class ``oasr.jit.gemm.is_batch_invariant`` defines, all of whose
+# members compute the same bits, so it may still pick its tile from M.
+#
+# It shares ``_PLANS`` with the flag in the key, and records *both* resolvers it
+# depends on (the pinned selector consults the tuned table first), for the same
+# monkeypatching reason as ``_plan``.  ``(resolver, default_resolver, kind, fn)``.
+
+
+def _plan_pinned(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tuple:
+    """Resolve -- and memoise -- the batch-invariant dispatch for one shape.
+
+    Never degrades to a variant outside the class: a failure falls back to
+    ``GEMM_DEFAULT`` only when that is itself batch-invariant (it is on every
+    CUTLASS 2.x architecture), and re-raises otherwise.
+    """
+    resolver = _jit_gemm.select_batch_invariant_config
+    default_resolver = _jit_gemm.select_default_config
+    key = (op, activation, M, N, K, dtype, True)
+    plan: Optional[tuple] = _PLANS.get(key)
+    if plan is not None and plan[0] is resolver and plan[1] is default_resolver:
+        return plan
+    try:
+        choice = resolver(op, M, N, K, dtype, _target_sm())
+        if not _jit_gemm.is_batch_invariant(choice):
+            raise RuntimeError(
+                f"{getattr(resolver, '__name__', resolver)} returned {choice!r}, "
+                f"which is not batch-invariant"
+            )
+        plan = (
+            resolver,
+            default_resolver,
+            _PLAN_CUTLASS,
+            _gemm_fn(choice.compile_name, activation),
+        )
+    except Exception:
+        if not _jit_gemm.is_batch_invariant(_jit_gemm.GEMM_DEFAULT):
+            raise
+        plan = (resolver, default_resolver, _PLAN_DEFAULT, None)
+        wkey = (op, N, K, "batch_invariant")
+        if wkey not in _PLAN_WARNED:
+            _PLAN_WARNED.add(wkey)
+            logger.warning(
+                "batch-invariant GEMM dispatch for %s N=%d K=%d could not be resolved; "
+                "using the fixed default variant, which is itself batch-invariant",
+                op,
+                N,
+                K,
+                exc_info=True,
+            )
+    if len(_PLANS) >= _PLAN_CACHE_MAX:
+        _PLANS.clear()
+    _PLANS[key] = plan
+    return plan
+
+
+def _dispatch_gemm_pinned(out, A, B, C, N, K, M) -> None:
+    """``gemm(..., batch_invariant=True)``: a CUTLASS data-parallel variant, always.
+
+    No cuBLAS, no split-K, no Stream-K -- and no ``except: use the default``
+    unless the default is in the class too, since a silent fallback to a
+    kernel whose rows depend on M is the one outcome this call exists to rule
+    out.
+    """
+    if M == 0:
+        # No rows, nothing to pin -- and the CUTLASS launchers refuse an empty
+        # grid, which the unpinned path only ever avoided by routing it to
+        # cuBLAS.
+        return
+    _, _, kind, fn = _plan_pinned("gemm", False, M, N, K, A.dtype)
+    if kind == _PLAN_CUTLASS:
+        try:
+            fn(out, A, B, C, 1)
+            return
+        except Exception:
+            if not _jit_gemm.is_batch_invariant(_jit_gemm.GEMM_DEFAULT):
+                raise
+    _default_gemm_fn()(out, A, B, C, 1)
+
+
+def _dispatch_gemm_activation_pinned(out, A, B, C, activation_type, N, K, M) -> None:
+    """``gemm_activation(..., batch_invariant=True)`` (see ``_dispatch_gemm_pinned``)."""
+    if M == 0:
+        return
+    _, _, kind, fn = _plan_pinned("gemm_activation", True, M, N, K, A.dtype)
+    if kind == _PLAN_CUTLASS:
+        try:
+            fn(out, A, B, C, activation_type, 1)
+            return
+        except Exception:
+            if not _jit_gemm.is_batch_invariant(_jit_gemm.GEMM_DEFAULT):
+                raise
+    _default_gemm_activation_fn()(out, A, B, C, activation_type, 1)
+
+
+#: Why a pinned call never goes through the autotuner, even with tuning on.
+#: The tuner times every tactic of the space -- cuBLAS, serial and parallel
+#: split-K, Stream-K -- per ``(M, N, K)`` and dispatches the fastest, so the
+#: order a row is summed in would follow M (and, between processes, timing
+#: noise), which is exactly what a ``batch_invariant=True`` caller asked to
+#: rule out.  Its choices within the class are all equally exact, so there is
+#: nothing for it to win that the selector does not already pick from.
+
+
 def _dispatch_gemm(out, A, B, C, N, K, M) -> None:
     """Shape-aware non-tuning dispatch for ``gemm``.
 
@@ -473,6 +584,8 @@ def gemm(
     B: torch.Tensor,
     C: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """General matrix multiplication: D = A @ B + C.
 
@@ -481,6 +594,13 @@ def gemm(
         B: Input tensor [N, K].
         C: Optional bias tensor [M, N].
         out: Optional pre-allocated output tensor.
+        batch_invariant: Pin the result: every output row is bitwise
+            independent of M (how many rows share the launch), at any M
+            including below the layer's row floor.  Runs only CUTLASS 2.x
+            data-parallel variants (``oasr.jit.gemm.is_batch_invariant``) --
+            never cuBLAS, split-K, Stream-K or the autotuner -- and raises
+            rather than fall back where none is compiled.  fp16/bf16 on CUDA,
+            both dims 8-aligned, like the kernel path itself.
 
     Returns:
         Output tensor [M, N].
@@ -488,6 +608,11 @@ def gemm(
     K = A.shape[-1]
     N = B.shape[0]
     A, out, M = _gemm_io(A, N, out)
+
+    if batch_invariant:
+        # Before the tuner on purpose -- see the note above _dispatch_gemm.
+        _dispatch_gemm_pinned(out, A, B, C, N, K, M)
+        return out
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner
@@ -648,6 +773,8 @@ def gemm_activation(
     C: Optional[torch.Tensor] = None,
     activation_type: int = 2,
     out: Optional[torch.Tensor] = None,
+    *,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """GEMM with fused activation: D = activation(A @ B + C).
 
@@ -658,6 +785,8 @@ def gemm_activation(
         activation_type: Activation type (0=RELU, 1=tanh-GELU, 2=SWISH,
             4=exact-erf GELU).
         out: Optional pre-allocated output tensor.
+        batch_invariant: Pin the result so every output row is bitwise
+            independent of M; see :func:`gemm`.
 
     Returns:
         Output tensor [M, N].
@@ -665,6 +794,11 @@ def gemm_activation(
     K = A.shape[-1]
     N = B.shape[0]
     A, out, M = _gemm_io(A, N, out)
+
+    if batch_invariant:
+        # Before the tuner on purpose -- see the note above _dispatch_gemm.
+        _dispatch_gemm_activation_pinned(out, A, B, C, activation_type, N, K, M)
+        return out
 
     if is_tuning_enabled():
         from oasr.tune import get_tuner

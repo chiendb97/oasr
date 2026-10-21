@@ -41,6 +41,14 @@ unaffected by their existence. Together they are what makes a new streaming cach
 | `fixed_attention_window` | A **trained** attention span. The engine pre-fills the paged K/V window so `cache_seqlens` is uniform across the cohort — the precondition for one *shared* relative-position table, since a Transformer-XL table's distances are `cache + i - j` and a per-row table would run the positional projection per row. It also makes `cache_t1` constant, so the graph cache captures one graph per batch size instead of one per `(B, cache_t1 bucket)`. |
 | `streaming_geometry(chunk_size)` | A front-end the generic `(chunk_size - 1) * sub + right_context + 1` window formula does not describe — a *cached causal* subsampling consumes exactly `chunk_size * sub` frames with no lookahead. Also the place to **refuse** a chunk size the encoder cannot serve; the backend calls it once at construction. |
 
+A fourth optional declaration is model-level: `quantization_layout()` returns a
+`QuantLayout` — the `SmoothGroup`s (which norm feeds which GEMMs, and how a
+SmoothQuant scale is absorbed) and the layers kept at full precision.  Pure data;
+the default declares nothing smoothable, and online round-to-nearest quantization
+works without it.  See [quantization.md](quantization.md).  A model that infers
+its dtype from a parameter uses `compute_dtype`, not `next(parameters()).dtype`,
+which reads int8 storage on a quantized model.
+
 `streaming_kind` must describe what *this config's weights* can actually do, not
 what the class implements. Returning `"none"` makes streaming service mode fail
 at construction with a clear message and makes `cache_spec` `None`, so no paged

@@ -33,6 +33,10 @@ class TransducerJoiner(Joiner):
         self.vocab_size = vocab_size
         self.output_linear = Linear(joiner_dim, align_out_features(vocab_size))
         self.tanh = Tanh()
+        # The fused greedy/beam decode reads these two weights raw
+        # (:meth:`additive_tensors`), so they stay full precision.
+        self.decoder_proj.quantizable = False
+        self.output_linear.quantizable = False
 
     def additive_tensors(self) -> AdditiveJoinerTensors:
         """The output head and decoder projection the fused greedy decode reads.

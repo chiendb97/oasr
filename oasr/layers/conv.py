@@ -38,6 +38,7 @@ import torch.nn.functional as F
 import oasr
 
 from ._backend import use_conv_kernel
+from ._quantizable import QuantizableGemm
 
 #: Torch equivalent of each fused-epilogue activation id.  ``gelu`` maps to the
 #: **tanh** approximation because that is what the CUDA epilogue implements
@@ -396,7 +397,7 @@ class DepthwiseConv1d(nn.Module):
         )
 
 
-class PointwiseConv1d(nn.Module):
+class PointwiseConv1d(QuantizableGemm, nn.Module):
     """Wrapper for pointwise (1x1) convolution kernel."""
 
     def __init__(
@@ -411,10 +412,15 @@ class PointwiseConv1d(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.in_features = in_channels
+        self.out_features = out_channels
         self.activation_name = activation_type
         self.activation = (
             None if activation_type is None else oasr.get_activation_type_id(activation_type)
         )
+        # This layer spells the activation as the kernel does ("gelu" is the tanh
+        # form); the quantized path takes LinearActivation's spelling.
+        self.fused_activation = "gelu_tanh" if activation_type == "gelu" else activation_type
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels, 1, device=device, dtype=dtype)
@@ -428,7 +434,13 @@ class PointwiseConv1d(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def gemm_weight(self) -> torch.Tensor:
+        """``[out_channels, in_channels]``: the ``[N, K, 1]`` filter as a GEMM weight."""
+        return self.weight.squeeze(-1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x)
         # weight: [out_channels, in_channels, 1] -> [out_channels, in_channels]
         # oasr.gemm accepts batched A (e.g. [batch, seq_len, in_channels]) and
         # preserves the leading dimensions in the output, so no manual reshape
@@ -684,8 +696,7 @@ class Glu(nn.Module):
 
     Carries no parameters — it exists so a model can reach the ``oasr.glu``
     kernel *and* still run on CPU/fp32 without the call site re-deriving the
-    backend decision.  ``F.glu(x, dim=-1)`` is the same function; the Conformer
-    convolution module calls ``oasr.glu`` directly and predates this.
+    backend decision.  ``F.glu(x, dim=-1)`` is the same function.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

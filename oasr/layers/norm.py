@@ -26,15 +26,17 @@ Constant             Value      Used by
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, cast
+from typing import Any, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import oasr
+from oasr.functionals.norm import add_layer_norm_residual_quant, layer_norm_quant
 
-from ._backend import use_norm_kernel
+from ._backend import SERVED_DTYPES, use_norm_kernel
+from ._quantizable import QuantizedActivation
 
 #: ``nn.LayerNorm``'s default epsilon.
 TORCH_EPS = 1e-5
@@ -122,6 +124,19 @@ class LayerNorm(nn.Module):
     the module docstring before accepting it for a non-PyTorch ecosystem.
     """
 
+    #: Emit the output already quantized for an int8 GEMM: ``forward`` and
+    #: ``forward_add_residual`` return a :class:`QuantizedActivation` (per-token
+    #: int8 + fp32 scale, bit-exact with ``quantize_per_token`` of the plain
+    #: output) instead of a tensor, saving the consumer its quantize launch and
+    #: the fp16 round trip.  Set by :func:`oasr.quantization.bind_quantization`
+    #: when every consumer of this norm's output is an int8 GEMM that can take a
+    #: pre-quantized input -- the model declares that.  Never set it by hand: any
+    #: other reader would be handed something that is not a tensor.  Applies
+    #: only where the fused kernel does (CUDA fp16/bf16, a contiguous input);
+    #: everywhere else the output is the plain tensor, which every such consumer
+    #: also accepts.  A class attribute, so an unarmed norm pays one read.
+    quantize_output: bool = False
+
     def __init__(
         self,
         normalized_shape: int,
@@ -140,8 +155,16 @@ class LayerNorm(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _fuses_quant(x: torch.Tensor) -> bool:
+        """The fused norm+quantize kernel's scope, given the norm kernel applies."""
+        return x.dtype in SERVED_DTYPES and x.is_contiguous()
+
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, QuantizedActivation]:
         if use_norm_kernel(x):
+            if self.quantize_output and self._fuses_quant(x):
+                q, scale = layer_norm_quant(x, self.weight, self.bias, self.eps)
+                return QuantizedActivation(data=q, scale=scale, dtype=x.dtype)
             return oasr.layer_norm(x, self.weight, self.bias, self.eps)
         return F.layer_norm(x, (self.normalized_shape,), self.weight, self.bias, self.eps)
 
@@ -159,9 +182,21 @@ class LayerNorm(nn.Module):
 
     def forward_add_residual(
         self, x: torch.Tensor, residual: torch.Tensor, alpha: float = 1.0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(LayerNorm(s), s)`` for ``s = residual + alpha * x``."""
+    ) -> Tuple[Any, torch.Tensor]:
+        """Return ``(LayerNorm(s), s)`` for ``s = residual + alpha * x``.
+
+        With :attr:`quantize_output` armed (and in the fused kernel's scope) the
+        first element is a :class:`QuantizedActivation`; ``s`` is always a tensor.
+        The first element is typed ``Any`` rather than that union because the
+        model code receiving it only hands it on to its consumer module, which
+        is what accepts either.
+        """
         if use_norm_kernel(x):
+            if self.quantize_output and self._fuses_quant(x) and residual.is_contiguous():
+                q, scale, summed = add_layer_norm_residual_quant(
+                    x, residual, self.weight, self.bias, self.eps, alpha
+                )
+                return QuantizedActivation(data=q, scale=scale, dtype=x.dtype), summed
             return cast(
                 Tuple[torch.Tensor, torch.Tensor],
                 oasr.add_layer_norm_residual(x, residual, self.weight, self.bias, self.eps, alpha),

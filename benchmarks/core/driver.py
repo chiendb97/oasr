@@ -14,11 +14,31 @@ A family module declares::
     DEFAULT_CONFIGS: dict[str, list[dict]]
     INTERLEAVE: bool                      # optional, default False
     CAUSAL_SUBROUTINES: frozenset[str]    # optional
+    REF_BACKEND: str                      # optional, default "torch"
+    ORACLE_BACKEND: str                   # optional, see below
+    TOLERANCES: dict                      # optional, see below
+    NON_GATING_BACKENDS: frozenset[str]   # optional
+    COMPARE_ALL_OUTPUTS: frozenset[str]   # optional, see below
 
     def parse_args(parser) -> None
     def resolve_configs(args, subroutine) -> list[dict]
     def build_fns(subroutine, cfg, dtype, args) -> dict[str, Callable]
     def describe(subroutine, cfg, dtype) -> Work
+
+``REF_BACKEND`` is what ``speedup_vs_ref`` divides by and, by default, what
+``--refcheck`` compares against.  A family whose speed baseline is not its
+correctness oracle names the oracle separately as ``ORACLE_BACKEND``: an arm
+``build_fns`` returns only to be compared against, never timed unless
+``--backends`` names it.  The int8 GEMM is the case -- the comparison that
+matters for speed is the fp16 GEMM it replaces, which computes something else,
+and the oracle is an exact fp64 twin that would put a meaningless row in the
+CSV.  ``--ref-backend`` still overrides both.
+
+``TOLERANCES`` maps a subroutine, or a ``(subroutine, torch.dtype)`` pair when
+the bound is an ulp of the output dtype, to ``(atol, rtol)``.  Only the first
+tensor a backend returns is compared, unless its subroutine is in
+``COMPARE_ALL_OUTPUTS`` -- for a kernel whose every output is deterministic and
+part of the contract, such as a quantizer's codes *and* scales.
 
 ``build_fns`` and ``describe`` are the enforced contract.  Under the previous
 design profile mode reached for private ``_resolve_configs`` / ``_setup_for_config``
@@ -130,6 +150,22 @@ def _first_tensor(value: Any) -> Optional[torch.Tensor]:
     return None
 
 
+def _all_tensors(value: Any) -> List[torch.Tensor]:
+    """Every tensor in whatever a backend returned, in order."""
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (tuple, list)):
+        return [t for v in value for t in _all_tensors(v)]
+    return []
+
+
+def _comparable(value: Any, all_outputs: bool) -> List[torch.Tensor]:
+    if all_outputs:
+        return _all_tensors(value)
+    first = _first_tensor(value)
+    return [] if first is None else [first]
+
+
 def _refcheck(
     fns: Dict[str, Callable[[], Any]],
     backends: List[str],
@@ -138,28 +174,37 @@ def _refcheck(
     shape: str,
     tolerance: tuple = (1e-2, 1e-2),
     non_gating: frozenset = frozenset(),
+    all_outputs: bool = False,
 ) -> Dict[str, tuple]:
     """Compare every measured backend against *ref_backend*.
 
     Returns ``{backend: (verdict, max_abs_diff)}``.  Each arm is invoked once
     here, separately from the timing loop, so an in-place kernel cannot have its
-    result overwritten before it is read.
+    result overwritten before it is read.  With *all_outputs* every returned
+    tensor is compared and the verdict is the conjunction.
     """
     out: Dict[str, tuple] = dict.fromkeys(backends, (REFCHECK_SKIP, None))
     if ref_backend not in fns:
         return out
-    reference = _first_tensor(fns[ref_backend]())
-    if reference is None:
+    reference = [t.clone() for t in _comparable(fns[ref_backend](), all_outputs)]
+    if not reference:
         return out
-    reference = reference.clone()
+    atol, rtol = tolerance
     for backend in backends:
         if backend == ref_backend or backend not in fns:
             continue
-        actual = _first_tensor(fns[backend]())
-        if actual is None:
+        actual = _comparable(fns[backend](), all_outputs)
+        if not actual:
             continue
-        atol, rtol = tolerance
-        passed, diff = check_close(actual, reference.to(actual.dtype), atol=atol, rtol=rtol)
+        if len(actual) != len(reference):
+            passed, diff = False, float("inf")
+        else:
+            checks = [
+                check_close(a, r.to(a.dtype), atol=atol, rtol=rtol)
+                for a, r in zip(actual, reference)
+            ]
+            passed = all(ok for ok, _ in checks)
+            diff = max(d for _, d in checks)
         out[backend] = (REFCHECK_PASS if passed else REFCHECK_FAIL, diff)
         if not passed:
             # A non-gating arm is compared for information, not agreement --
@@ -176,6 +221,18 @@ def _refcheck(
                     f"(max_abs_diff={diff:.6g})"
                 )
     return out
+
+
+def tolerance_for(module: Any, subroutine: str, dtype: torch.dtype) -> tuple:
+    """``(atol, rtol)``: a ``(subroutine, dtype)`` entry wins over a ``subroutine`` one."""
+    tolerances = getattr(module, "TOLERANCES", {})
+    return tolerances.get((subroutine, dtype), tolerances.get(subroutine, (1e-2, 1e-2)))
+
+
+def default_backends(module: Any, fns: Dict[str, Callable[[], Any]]) -> List[str]:
+    """The arms timed when ``--backends`` is absent: all but the refcheck oracle."""
+    oracle = getattr(module, "ORACLE_BACKEND", None)
+    return [b for b in fns if b != oracle]
 
 
 @contextlib.contextmanager
@@ -220,6 +277,10 @@ def run_sweep(
     # A family may name its own baseline: torch.nn.LSTM is cuDNN on CUDA, and
     # calling that arm "torch" would put a misleading name in the CSV.
     ref_backend = getattr(args, "ref_backend", None) or getattr(module, "REF_BACKEND", "torch")
+    oracle = (
+        getattr(args, "ref_backend", None) or getattr(module, "ORACLE_BACKEND", None) or ref_backend
+    )
+    all_outputs = subroutine in getattr(module, "COMPARE_ALL_OUTPUTS", frozenset())
     interleave = getattr(args, "interleave", None)
     if interleave is None:
         interleave = subroutine in getattr(module, "INTERLEAVE_SUBROUTINES", frozenset())
@@ -234,7 +295,7 @@ def run_sweep(
                 continue
             work = module.describe(subroutine, cfg, dtype)
 
-            requested = getattr(args, "backends", None) or list(fns)
+            requested = getattr(args, "backends", None) or default_backends(module, fns)
             backends = []
             for backend in requested:
                 if backend not in fns:
@@ -249,9 +310,15 @@ def run_sweep(
             verdicts: Dict[str, tuple] = dict.fromkeys(backends, (REFCHECK_SKIP, None))
             if getattr(args, "refcheck", False):
                 non_gating = frozenset(getattr(module, "NON_GATING_BACKENDS", frozenset()))
-                tolerance = getattr(module, "TOLERANCES", {}).get(subroutine, (1e-2, 1e-2))
                 verdicts = _refcheck(
-                    fns, backends, ref_backend, reporter, work.shape, tolerance, non_gating
+                    fns,
+                    backends,
+                    oracle,
+                    reporter,
+                    work.shape,
+                    tolerance_for(module, subroutine, dtype),
+                    non_gating,
+                    all_outputs,
                 )
                 gating_failed = any(
                     verdict == REFCHECK_FAIL and backend not in non_gating

@@ -8,6 +8,8 @@ selects which pre-compiled variant to call — no JIT during tuning.
 """
 
 import contextlib
+import dataclasses
+import functools
 import itertools
 import logging
 import os
@@ -1168,6 +1170,7 @@ def _level_configs(level: str, *, native_only: bool = False):
             return {n: c for n, c in cfgs.items() if is_native_lane(c, sm)}
         _BUILT_PRODUCTION[sm] = frozenset(cfgs)
         _COMPILED_NAMES.pop(sm, None)
+        _PINNED_CANDIDATES.pop(sm, None)
         return cfgs
     prod = get_production_configs(sm)
     return {
@@ -1615,6 +1618,7 @@ def _on_tuning_reload() -> None:
     _GEMM_HEURISTIC_RULES = _load_system_rules()
     _GEMM_HEURISTIC_RULES_SM120 = _GEMM_HEURISTIC_RULES.get(120, {})
     _COMPILED_NAMES.clear()
+    _PINNED_CANDIDATES.clear()
 
 
 def _register_reload_hook() -> None:
@@ -1635,6 +1639,10 @@ _BUILT_PRODUCTION: Dict[int, frozenset] = {}
 
 #: Families whose tuning module (the whole space) this process has loaded.
 _TUNE_LOADED: set = set()
+
+#: ``sm -> the batch-invariant configs its production module compiles`` (see
+#: :func:`batch_invariant_configs`); dropped whenever the built set may change.
+_PINNED_CANDIDATES: Dict[int, tuple] = {}
 
 
 def mark_tuning_module_loaded(sm: int) -> None:
@@ -1971,3 +1979,214 @@ def _note_uncompiled(tier: str, key, choice, sm: int) -> None:
         getattr(choice, "compile_name", choice),
         sm,
     )
+
+
+# =============================================================================
+# Batch-invariant ("pinned") selection
+# =============================================================================
+#
+# Everything above picks a config from M, and with it the order a row is summed
+# in.  cuBLAS chooses its own kernel and split from the shape; serial split-K
+# rounds each K slice's partial through the output dtype; parallel split-K sums
+# its slices in a different order from the unsplit walk; Stream-K hands each
+# tile a K range that depends on how many tiles the grid has; and below
+# ``GEMM_MIN_ROWS`` the layer does not reach this file at all (``F.linear``).
+# Each moves a row by an ulp or so when the batch around it changes -- harmless
+# in fp16 on its own, and not once an int8 quantizer rounds the next layer's
+# input: a quantized Conformer flipped words with the batch through exactly one
+# full-precision projection (``encoder.embed.out.0``, N=256 K=4864), whose rule
+# sends M <= 1024 to cuBLAS and larger M to Stream-K.
+#
+# What does not move is a CUTLASS 2.x data-parallel variant, and -- the property
+# that makes a fast selector possible -- *every* such variant returns the same
+# bits for the same row.  So a pinned call may still pick its tile from M; it
+# only has to pick within that class.
+
+
+#: The K tile of the pinned class.  Every CUTLASS 2.x tile in the space walks K
+#: in 64-wide steps, and that shared step (with the residue handled the same
+#: way) is part of why the class agrees bit for bit; a future tile with another
+#: ``block_k`` has not been characterised, so it is kept out of the class rather
+#: than assumed into it.
+_PINNED_BLOCK_K = 64
+
+
+def is_batch_invariant(choice: GemmChoice) -> bool:
+    """Whether *choice* is in the batch-invariant ("pinned") class.
+
+    Every config for which this is ``True`` computes each output row from that
+    row of A, B, the bias and K alone -- not from M, and not from which member
+    of the class ran -- so a selector may switch among them with M and a row
+    still comes out bitwise identical.
+
+    The class is the CUTLASS 2.x **data-parallel** configs: ``split_k == 1``,
+    no Stream-K, no parallel split-K, not sliced-K (``warp_k == block_k``), at
+    the shared 64-wide K tile.  In such a variant one thread owns each output
+    element and accumulates it over all of K in ``block_k`` steps, issuing the
+    same ``mma.sync`` sequence wherever its tile sits and however many tiles
+    the grid has; the epilogue (bias, activation, the cast) then runs once on
+    that fp32 accumulator.  Tile, warp and stage counts change *which* thread
+    owns an element, not the order it is summed in.  Measured on sm_120 for
+    every production variant of the class, fp16 and bf16, M from 1 to 16384
+    (``tests/kernels/test_gemm_batch_invariant.py``).
+
+    ``False`` for everything else: the ``"torch"`` / ``"fused"`` sentinels
+    (cuBLAS picks its kernel and split from M), serial and parallel split-K
+    and Stream-K (a different -- for Stream-K a grid-dependent -- partition of
+    K), sliced-K (each CTA's warps split the K tile and reduce in the
+    epilogue: a fixed order, but not the class's), and every CUTLASS 3.x
+    config, which has not been characterised.
+    """
+    return (
+        isinstance(choice, CutlassGemmConfig)
+        and choice.split_k == 1
+        and not choice.stream_k
+        and not choice.parallel_split_k
+        and choice.warp_k == choice.block_k
+        and choice.block_k == _PINNED_BLOCK_K
+    )
+
+
+def batch_invariant_configs(sm: int) -> Tuple[CutlassGemmConfig, ...]:
+    """The batch-invariant configs the *production* GEMM module of *sm* compiles.
+
+    Ordered by ``compile_name``.  Production only, never the tuning module's
+    extra variants: which tile a pinned call gets must not depend on whether
+    this process happened to load the tuning space.  The candidates come from
+    the built (or to-be-built) production set, so the epilogue constraint
+    (:func:`_epilogue_covers_warp`) and the shared-memory budget have already
+    been applied to them.  Empty when nothing qualifies; an unknown *sm*
+    raises ``ValueError`` like :func:`get_all_autotune_configs`.
+    """
+    sm = int(sm)
+    cands = _PINNED_CANDIDATES.get(sm)
+    if cands is None:
+        built = _BUILT_PRODUCTION.get(sm)
+        if built is not None:
+            space = get_unique_compile_configs(sm)
+            prod = [space[n] for n in sorted(built) if n in space]
+        else:
+            prod = [c for _, c in sorted(get_production_configs(sm).items())]
+        # ``split_k`` is a runtime argument the compile set does not pin down;
+        # the pinned dispatch always passes 1, so the candidate says so.
+        cands = tuple(
+            c
+            for c in (
+                dataclasses.replace(c, split_k=1) if isinstance(c, CutlassGemmConfig) else c
+                for c in prod
+            )
+            if is_batch_invariant(c)
+        )
+        _PINNED_CANDIDATES[sm] = cands
+    return cands
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    import torch
+
+    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
+
+
+def _current_sm_count() -> int:
+    import torch
+
+    return _sm_count(torch.cuda.current_device())
+
+
+def _pinned_occupancy_pick(
+    cands: Tuple[CutlassGemmConfig, ...], M: int, N: int, num_sms: int
+) -> CutlassGemmConfig:
+    """The occupancy rule: which member of the class to run at ``(M, N)``.
+
+    Without a K decomposition every CTA walks the whole of K, so a CTA's time
+    is set by its *warp* tile -- each warp issues ``warp_m/16 * warp_n/8`` MMAs
+    per 16-deep K step.  Measured at N=256 K=4864 on sm_120 (170 SMs), alone
+    on an SM: 15.4 us for a 16x32 warp tile, 28.6 us for 32x32, 55 us for
+    32x64 and 108 us for 64x64 or 128x32, whatever the CTA tile around it.
+    Hence:
+
+    1. Among the configs whose grid fits in **one wave** (``CTAs <= SMs``), the
+       smallest warp tile: a lone K walk is the latency floor, and a grid that
+       fits pays it once.
+    2. Ties (and there are many: the 16x64 and 32x64 tiles share a warp tile)
+       go to the least operand traffic, ``ceil(N/bn)*M + ceil(M/bm)*N`` per K
+       step -- at M=512 the 16x64 grid's doubled A re-reads cost 26% -- then
+       to the deeper pipeline, then to the name, so the pick is total.
+    3. If nothing fits in a wave, the least operand traffic, i.e. the largest
+       tile: past a wave the narrow tiles are feed-bound, not latency-bound.
+
+    Compared on the sm_120 sweep (11 variants, 5 shapes, M 1-16384) against
+    "the largest tile that still launches half a wave" (1.10x geomean regret
+    to the best member of the class, 1.87x worst), a plain wave count (1.15x /
+    1.68x) and the shipped cost model's prior (1.06x / 1.31x, but only on an
+    arch whose tuning file ships one): this rule is 1.07x / 1.58x overall and
+    1.03x / 1.24x on the embed shape, within 1% of the best at every M of
+    64-8192 there.  Its weak spot is the multi-wave regime of a *shallow* K
+    (N=2048 K=256 past M~1300), where 64x64 beats the largest tile.
+    """
+
+    def key(c: CutlassGemmConfig):
+        row_tiles = -(-M // c.block_m)
+        col_tiles = -(-N // c.block_n)
+        traffic = col_tiles * M + row_tiles * N
+        if row_tiles * col_tiles <= num_sms:
+            return (0, c.warp_m * c.warp_n, traffic, -c.kStages, c.compile_name)
+        return (1, traffic, c.warp_m * c.warp_n, -c.kStages, c.compile_name)
+
+    return min(cands, key=key)
+
+
+def select_batch_invariant_config(
+    op: str, M: int, N: int, K: int, dtype, sm: int, *, num_sms: Optional[int] = None
+) -> CutlassGemmConfig:
+    """Pick a **batch-invariant** GEMM config: a row's bits do not depend on M.
+
+    The ``batch_invariant=True`` counterpart of :func:`select_default_config`,
+    for ``op`` ``"gemm"`` or ``"gemm_activation"``.  It only ever returns a
+    member of the class :func:`is_batch_invariant` defines that this process's
+    production module compiles (:func:`batch_invariant_configs`) -- never a
+    sentinel, a split-K or Stream-K config, or a 3.x config -- and since every
+    member computes the same bits, *which* one it returns is purely a speed
+    question:
+
+    * where a **measured** tuning entry covers the shape
+      (:func:`covering_tier`) and its choice is already in the class, that
+      choice -- it was the fastest config of all, so it is the fastest member
+      too.  An unmeasured choice (the cost model's, or the ``GEMM_DEFAULT``
+      fall-through) is not kept, and neither is anything under
+      ``OASR_GEMM_HEURISTIC=0``, which returns ``GEMM_DEFAULT`` for every shape;
+    * otherwise the occupancy rule (:func:`_pinned_occupancy_pick`) over
+      ``num_sms`` -- the current CUDA device's SM count unless given.
+
+    A pure function of the shape, the tuning snapshot and the device: never of
+    CUDA-graph capture state (AGENTS.md rule 11), and memoised per shape by the
+    functional layer.  Raises ``RuntimeError`` when no member of the class is
+    compiled for *sm*: falling back to a kernel whose rows depend on M would
+    defeat the only reason to ask.
+    """
+    if op not in ("gemm", "gemm_activation"):
+        raise ValueError(
+            f"no batch-invariant GEMM selection for op={op!r}; "
+            f"only 'gemm' and 'gemm_activation' can be pinned"
+        )
+    sm = int(sm)
+    cands = batch_invariant_configs(sm)
+    if not cands:
+        raise RuntimeError(
+            f"batch_invariant=True: no batch-invariant GEMM variant is compiled for sm_{sm}. "
+            f"Pinning needs a CUTLASS 2.x data-parallel config (split_k=1, no Stream-K, no "
+            f"parallel split-K, block_k == warp_k == {_PINNED_BLOCK_K}) in the production "
+            f"module; refusing rather than running a kernel whose rows depend on M"
+        )
+    if covering_tier(op, M, N, K, dtype, sm) is not None:
+        tuned = select_default_config(op, M, N, K, dtype, sm)
+        if (
+            tuned is not GEMM_DEFAULT
+            and isinstance(tuned, CutlassGemmConfig)
+            and is_batch_invariant(tuned)
+        ):
+            return tuned
+    if num_sms is None:
+        num_sms = _current_sm_count()
+    return _pinned_occupancy_pick(cands, int(M), int(N), int(num_sms))

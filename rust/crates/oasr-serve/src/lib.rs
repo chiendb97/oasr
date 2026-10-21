@@ -129,6 +129,7 @@ async fn serve(cli: Cli) -> Result<()> {
         service_mode = ?model.service_mode,
         vocab_size = ?model.vocab_size,
         sample_rate = ?model.sample_rate,
+        quantization = ?model.quantization,
         "ASREngine loaded"
     );
 

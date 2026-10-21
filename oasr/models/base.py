@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from oasr.cache.slot_cnn import SlotCnnCache
     from oasr.cache.state import SlotTensor, StreamStateSpec
     from oasr.models.decoders import BaseDecoder
+    from oasr.quantization.layout import QuantLayout
 
 # Streaming-cache model an encoder uses, read by the engine to select a
 # ``StreamingEncoderBackend``.  Values: "paged" (engine paged-KV + slot-CNN),
@@ -174,6 +175,22 @@ class LoadReport:
 #: representable), small enough not to be an inf that could make a softmax
 #: denominator NaN.
 PAD_LOGIT = -1e4
+
+
+#: Dtypes a model computes in.  Quantized storage (int8, float8, packed fp4)
+#: is not one of them, which is why "the first parameter's dtype" is not the
+#: model's dtype once a layer is quantized.
+COMPUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+
+
+def first_compute_parameter(module: nn.Module) -> torch.Tensor:
+    """The first parameter of *module* held in a compute dtype.
+
+    Use it, not ``next(module.parameters())``, to infer the dtype (and device)
+    a module runs in: a quantized layer's ``weight`` is int8 or float8 storage.
+    Raises ``StopIteration`` if there is none.
+    """
+    return next(p for p in module.parameters() if p.dtype in COMPUTE_DTYPES)
 
 
 def align_out_features(out_features: int, alignment: int = 8) -> int:
@@ -689,6 +706,29 @@ class BaseAsrModel(nn.Module, ABC):
     def cache_spec(self) -> Optional[CacheSpec]:
         """Streaming cache descriptor, or ``None`` for an offline-only encoder."""
         return self.encoder.cache_spec
+
+    #: The :class:`~oasr.quantization.QuantizationSpec` this instance was
+    #: quantized with (set by the loader), or ``None``.
+    quantization_spec: Any = None
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        """The dtype the model computes in (not its quantized storage dtype)."""
+        return first_compute_parameter(self).dtype
+
+    def quantization_layout(self) -> "QuantLayout":
+        """What this architecture's structure allows a quantizer to do.
+
+        The default declares nothing smoothable and nothing that must stay full
+        precision: online round-to-nearest quantization still works, SmoothQuant
+        refuses the model by name.  An architecture overrides this with its
+        :class:`~oasr.quantization.layout.SmoothGroup` s (which norm feeds which
+        GEMMs, and how a smoothing scale is absorbed) and the layers it keeps at
+        full precision.  Pure data — see ``oasr/quantization/layout.py``.
+        """
+        from oasr.quantization.layout import QuantLayout
+
+        return QuantLayout()
 
     @property
     def streaming_kind(self) -> "StreamingKind":

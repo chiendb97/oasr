@@ -77,6 +77,14 @@ def checkpoint_fingerprint(path: str) -> Dict[str, Any]:
     return out
 
 
+def _quantization_config(cfg: Any) -> Optional[Dict[str, Any]]:
+    """``EngineConfig.quantization`` as JSON: ``{scheme, ignore}`` or ``None``."""
+    q = getattr(cfg, "quantization", None)
+    if q is None:
+        return None
+    return {"scheme": q.scheme, "ignore": list(q.ignore)}
+
+
 class _Pump:
     """Steps the engine; resolves offline futures and feeds stream sessions."""
 
@@ -218,6 +226,9 @@ class OasrEngineBackend(Backend):
         "use_cuda_graphs": "true | false (engine default)",
         "long_form": "window over-length audio for fixed-window frontends (false)",
         "vad": "VadConfig mapping, e.g. {mode: segment, backend: silero}",
+        "quantization": "online GEMM quantization: a scheme (int8_w8a8) or "
+        "{scheme: int8_w8a8, ignore: 'glob,glob'} (none; a quantized checkpoint "
+        "is served quantized regardless)",
         "word_timestamps": "request word timings on offline requests (false)",
         "pinned_audio": "hand the engine page-locked waveforms, as the server does (true)",
         "engine": "any other EngineConfig fields, YAML mapping",
@@ -264,6 +275,7 @@ class OasrEngineBackend(Backend):
             "use_cuda_graphs",
             "long_form",
             "vad",
+            "quantization",
         ):
             if o.get(key) is not None:
                 kw[key] = o[key]
@@ -341,6 +353,11 @@ class OasrEngineBackend(Backend):
                 "schedule_policy": cfg.schedule_policy,
                 "decode_options": dict(cfg.decode_options or {}),
                 "vad": str(cfg.vad) if cfg.vad else None,
+                # Asked for, and served: a checkpoint written by `oasr quantize`
+                # is quantized with no option, so only the second tells such a
+                # run apart from a full-precision one.
+                "quantization": _quantization_config(cfg),
+                "quantization_info": self.engine.quantization_info(),
                 "pinned_audio": bool(self.options.get("pinned_audio", True)),
                 "torch": torch.__version__,
                 "cuda": torch.version.cuda,

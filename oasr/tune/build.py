@@ -33,6 +33,7 @@ __all__ = [
     "PointResult",
     "TUNED_OPS",
     "build_gemm",
+    "decide_point",
     "measure_signature",
     "thin_census",
 ]
@@ -200,6 +201,34 @@ def _alpha_for(m: int, points: Sequence[ShapePoint]) -> float:
     return float(best.eager_fraction)
 
 
+def decide_point(
+    res: gemm_tune.CaseResult, fallback: str, alpha: float, opts: BuildOptions
+) -> Tuple[str, float, str]:
+    """One measured point's ``(choice, speedup, note)`` against the untuned *fallback*.
+
+    The winner under ``J = GPU + alpha x issue`` (ties to the structural
+    preference) replaces the fallback only past the speedup gate, the noise and
+    the single-replay check (:func:`oasr.tune.bench.replaces`).
+    """
+    winner = res.winner(alpha=alpha, tie=opts.tie)
+    base = res.results.get(fallback)
+    if winner is None:
+        return fallback, 1.0, "no candidate measured"
+    if base is None or base.status != "ok" or not math.isfinite(base.median_ms):
+        return winner.name, math.inf, "fallback not measurable"
+    if winner.name == fallback:
+        return fallback, 1.0, "fallback is fastest"
+    sp = bench.speedup(winner, base, alpha)
+    if bench.replaces(winner, base, alpha=alpha, min_speedup=opts.min_speedup):
+        return winner.name, sp, f"{sp:.2f}x vs {fallback}"
+    return (
+        fallback,
+        sp,
+        f"{winner.name} {sp:.2f}x rejected: "
+        + bench.why_not_replaced(winner, base, alpha=alpha, min_speedup=opts.min_speedup),
+    )
+
+
 def _pruned(entries, op: str, M: int, N: int, K: int, models, k: int):
     """The registry entries worth measuring at one point: top-k of each model + forced."""
     if k <= 0 or not models:
@@ -256,22 +285,7 @@ def measure_signature(
             working_set_bytes=working_set_bytes,
         )
         alpha = _alpha_for(M, points)
-        winner = res.winner(alpha=alpha, tie=opts.tie)
-        base = res.results.get(fallback)
-        if winner is None:
-            choice, sp, note = fallback, 1.0, "no candidate measured"
-        elif base is None or base.status != "ok" or not math.isfinite(base.median_ms):
-            choice, sp, note = winner.name, math.inf, "fallback not measurable"
-        elif winner.name == fallback:
-            choice, sp, note = fallback, 1.0, "fallback is fastest"
-        elif bench.replaces(winner, base, alpha=alpha, min_speedup=opts.min_speedup):
-            sp = bench.speedup(winner, base, alpha)
-            choice, note = winner.name, f"{sp:.2f}x vs {fallback}"
-        else:
-            sp = bench.speedup(winner, base, alpha)
-            choice, note = fallback, f"{winner.name} {sp:.2f}x rejected: " + bench.why_not_replaced(
-                winner, base, alpha=alpha, min_speedup=opts.min_speedup
-            )
+        choice, sp, note = decide_point(res, fallback, alpha, opts)
         w = census_ms[M].weight if M in census_ms and census_ms[M].weight > 0 else fill_w
         out.append(
             PointResult(M, M in census_ms and census_ms[M].must, alpha, res, choice, sp, note, w)

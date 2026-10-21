@@ -319,6 +319,7 @@ prepare_offline                    prepare_streaming
 | `checkpoint_name` | converter default | Filename inside `ckpt_dir`. |
 | `device` | `"cuda"` | Target device. |
 | `dtype` | `torch.float16` | Model + cache precision. |
+| `quantization` | `None` | Online quantization of the model's GEMM layers: a scheme name (`"int8_w8a8"`) or `{"scheme": ..., "ignore": "glob,..."}` (`QuantizationConfig`). `None` follows the checkpoint — one written by `oasr quantize` is served quantized with no flag, and an online request for a different scheme raises. See [quantization.md](quantization.md). |
 | `audio_scale` | `32768.0` | Multiplied into the float waveform. **Per framework** — adopted from `FeatureSpec.audio_scale` unless set explicitly. See [features.md](features.md). |
 | `service_mode` | `"streaming"` | Pins the engine to `"streaming"` or `"offline"` for its whole lifecycle; mismatched requests are rejected at admission. `"offline"` builds no streaming backend and no paged pool. |
 | `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). Also the master gate for the offline capture below. |

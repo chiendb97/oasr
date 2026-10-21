@@ -116,6 +116,15 @@ class Reporter:
             detail.append(f"{row.speedup_vs_ref:.2f}x vs {row.ref_backend}")
         if detail:
             print("         " + "  ".join(detail))
+        memory = []
+        if row.quantization:
+            memory.append(f"quant={row.quantization}")
+        if row.weight_mib is not None:
+            memory.append(f"weights={row.weight_mib:.1f}MiB")
+        if row.peak_alloc_mib is not None:
+            memory.append(f"peak_alloc={row.peak_alloc_mib:.1f}MiB")
+        if memory:
+            print("         " + "  ".join(memory))
         lat = [
             (n, v)
             for n, v in (

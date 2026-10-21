@@ -176,6 +176,16 @@ pub struct Cli {
     /// flags select, options tune, so a new knob never adds a flag.
     #[arg(long = "vad-option", value_name = "KEY=VALUE")]
     pub vad_option: Vec<String>,
+    /// Quantize the model's GEMMs at load: a scheme name such as `int8_w8a8`
+    /// (online round-to-nearest W8A8 on an fp checkpoint). Omit to follow the
+    /// checkpoint: a checkpoint written by `oasr quantize` is served quantized
+    /// without this flag.
+    #[arg(long)]
+    pub quantization: Option<String>,
+    /// Extra quantization setting, `key=value`, repeatable (e.g.
+    /// `ignore=ctc.*`). Values are passed as strings and typed by the engine.
+    #[arg(long = "quantization-option", value_name = "KEY=VALUE")]
+    pub quantization_option: Vec<String>,
     /// Maximum incremental decoder steps per tick; bounds dispatcher starvation.
     #[arg(long)]
     pub decode_steps_per_tick: Option<u32>,
@@ -624,6 +634,26 @@ impl Cli {
             }
             obj.entry("vad").or_insert(Value::Object(vad));
         }
+        // One `quantization` object, mirroring the engine's single
+        // `EngineConfig.quantization` (`QuantizationConfig.coerce`).  `scheme`
+        // is sent only when asked for: without it the engine follows the
+        // checkpoint, so one written by `oasr quantize` is served quantized with
+        // no flag at all.  Option values cross as strings, typed by the engine,
+        // for the same reason `--vad-option` / `--decode-option` do.
+        let mut quantization = serde_json::Map::new();
+        if let Some(scheme) = &self.quantization {
+            quantization.insert("scheme".to_string(), Value::String(scheme.clone()));
+        }
+        for pair in &self.quantization_option {
+            let (k, v) = pair.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--quantization-option expects KEY=VALUE, got {pair:?}")
+            })?;
+            quantization.insert(k.trim().to_string(), Value::String(v.to_string()));
+        }
+        if !quantization.is_empty() {
+            obj.entry("quantization")
+                .or_insert(Value::Object(quantization));
+        }
         if let Some(v) = self.decode_steps_per_tick {
             obj.entry("decode_steps_per_tick")
                 .or_insert(Value::Number(v.into()));
@@ -792,6 +822,108 @@ mod tests {
             .build_engine_config_json()
             .expect_err("should refuse");
         assert!(err.to_string().contains("--vad-mode"), "{err}");
+    }
+
+    /// Quantization flags land in one `quantization` object, mirroring the
+    /// engine's single `EngineConfig.quantization` field, and `scheme` is only
+    /// there when `--quantization` was given: options alone tune whatever the
+    /// checkpoint declares rather than inventing a scheme.
+    #[test]
+    fn quantization_flags_become_one_object() {
+        let json = cli(&[
+            "--quantization",
+            "int8_w8a8",
+            "--quantization-option",
+            "ignore=ctc.*,decoder.*",
+        ])
+        .build_engine_config_json()
+        .expect("build");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        let quant = value.get("quantization").expect("quantization object");
+        assert_eq!(quant["scheme"], "int8_w8a8");
+        // Values cross as strings; the engine types them, as with `--vad-option`.
+        assert_eq!(quant["ignore"], "ctc.*,decoder.*");
+        assert_eq!(quant.as_object().map(Map::len), Some(2));
+
+        let options_only: Value = serde_json::from_str(
+            &cli(&["--quantization-option", "ignore=ctc.*"])
+                .build_engine_config_json()
+                .expect("build"),
+        )
+        .expect("json");
+        let quant = options_only
+            .get("quantization")
+            .expect("quantization object");
+        assert!(quant.get("scheme").is_none(), "{quant}");
+        assert_eq!(quant["ignore"], "ctc.*");
+    }
+
+    /// No quantization flags must serialize no `quantization` key at all — not
+    /// a `null` — so the engine follows the checkpoint: an fp one stays fp, and
+    /// one written by `oasr quantize` is still served quantized.
+    #[test]
+    fn no_quantization_flags_means_no_quantization_key() {
+        let json = cli(&[]).build_engine_config_json().expect("build");
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert!(value.get("quantization").is_none());
+    }
+
+    /// A `quantization` object in `--engine-config` wins over the flags, whole,
+    /// the same `entry().or_insert()` precedence every other flag has.
+    #[test]
+    fn the_engine_config_file_wins_over_quantization_flags() {
+        let dir = std::env::temp_dir().join(format!("oasr-cfg-quant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("engine.json");
+        std::fs::write(
+            &path,
+            br#"{"ckpt_dir": "/tmp/ckpt", "quantization": {"scheme": "int8_w8a8", "ignore": "ctc.*"}}"#,
+        )
+        .unwrap();
+        let json = cli(&[
+            "--engine-config",
+            path.to_str().unwrap(),
+            "--quantization",
+            "other_scheme",
+            "--quantization-option",
+            "ignore=decoder.*",
+        ])
+        .build_engine_config_json()
+        .expect("build");
+        std::fs::remove_dir_all(&dir).ok();
+        let value: Value = serde_json::from_str(&json).expect("json");
+        assert_eq!(
+            value["quantization"],
+            serde_json::json!({"scheme": "int8_w8a8", "ignore": "ctc.*"})
+        );
+    }
+
+    /// A malformed `--quantization-option` is refused exactly as a malformed
+    /// `--vad-option` is, naming the flag, rather than dropped.
+    #[test]
+    fn malformed_quantization_options_are_rejected_like_vad_ones() {
+        let err = cli(&[
+            "--quantization",
+            "int8_w8a8",
+            "--quantization-option",
+            "ignore",
+        ])
+        .build_engine_config_json()
+        .expect_err("should refuse");
+        assert!(
+            err.to_string()
+                .contains("--quantization-option expects KEY=VALUE"),
+            "{err}"
+        );
+        let vad_err = cli(&["--vad-mode", "observe", "--vad-option", "threshold"])
+            .build_engine_config_json()
+            .expect_err("should refuse");
+        assert!(
+            vad_err
+                .to_string()
+                .contains("--vad-option expects KEY=VALUE"),
+            "{vad_err}"
+        );
     }
 
     /// The connection bound defaults above the engine's admission cap so the

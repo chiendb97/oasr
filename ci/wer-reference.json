@@ -43,6 +43,142 @@
       "insertions": 10
     },
     {
+      "key": "conformer_int8_rtn",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), int8 W8A8 round-to-nearest (online)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "int8_w8a8"
+      },
+      "error_rate_pct": 4.14,
+      "ref_units": 3403,
+      "substitutions": 108,
+      "deletions": 23,
+      "insertions": 10,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization int8_w8a8",
+      "_comment": "The fp GEMMs ahead of the int8 layers (subsampling projection, linear_pos) are pinned batch-invariant when the model is quantized, so max_batch_size 8 / 16 / 32 give identical transcripts. max_batch_size 1 still differs by a word or two: alone, attention takes the split-KV path (its grid underfills the GPU), which sums the fp32 partials in another order. Measured 4.03 / 4.14 / 4.14 / 4.14 % at max_batch_size 1 / 8 / 16 / 32 (2026-10-20, RTX 5090)."
+    },
+    {
+      "key": "conformer_w8a8_sq",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8 (alpha 0.5, 128 dev-clean utts)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        }
+      },
+      "error_rate_pct": 4.03,
+      "ref_units": 3403,
+      "substitutions": 105,
+      "deletions": 23,
+      "insertions": 9,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "The fp GEMMs ahead of the int8 layers (subsampling projection, linear_pos) are pinned batch-invariant when the model is quantized, so max_batch_size 8 / 16 / 32 give identical transcripts. max_batch_size 1 still differs by a word or two: alone, attention takes the split-KV path (its grid underfills the GPU), which sums the fp32 partials in another order. Measured 3.97 / 4.03 / 4.03 / 4.03 % at max_batch_size 1 / 8 / 16 / 32. Acceptance (maintainer, 2026-10-20): <= fp16 + 0.3 and <= RTN."
+    },
+    {
+      "key": "conformer_w8a8_sq_streaming",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8, streaming",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "service_mode": "streaming",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        }
+      },
+      "error_rate_pct": 3.7,
+      "ref_units": 3403,
+      "substitutions": 98,
+      "deletions": 16,
+      "insertions": 12,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
+      "_comment": "fp16 streaming on the same checkpoint measures 3.70 %."
+    },
+    {
+      "key": "conformer_w8a8_sq_fused",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8, FFN w_1 -> w_2 fused (static w_2 input scale, MSE clip)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8_fused",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          },
+          "static_inputs": {
+            "observer": "mse"
+          }
+        }
+      },
+      "error_rate_pct": 4.11,
+      "ref_units": 3403,
+      "substitutions": 107,
+      "deletions": 22,
+      "insertions": 11,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "The FFN's w_2 takes a calibrated static per-tensor input scale so w_1's epilogue quantizes for it; the clip is the MSE-optimal one over the calibration audio. At the calibration maximum (observer absmax) the same recipe measured 4.08 offline and 4.14 streaming (before the pins), at the 99.999th percentile 4.20 / 3.73. Measured 4.14 / 4.11 / 4.11 / 4.11 % at max_batch_size 1 / 8 / 16 / 32. Acceptance: <= fp16 + 0.3 and <= RTN."
+    },
+    {
+      "key": "conformer_w8a8_sq_fused_streaming",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8, FFN fused, streaming",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "service_mode": "streaming",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8_fused",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          },
+          "static_inputs": {
+            "observer": "mse"
+          }
+        }
+      },
+      "error_rate_pct": 3.64,
+      "ref_units": 3403,
+      "substitutions": 97,
+      "deletions": 15,
+      "insertions": 12,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
+      "_comment": "fp16 streaming on the same checkpoint measures 3.70 %; per-token SmoothQuant 3.70 %."
+    },
+    {
       "_comment": [
         "Re-recorded 2026-09-27 at 3.67 (was 3.73, 104S 10D 13I): the decoder's",
         "cross-attention K/V is now paged next to its self-attention by default",

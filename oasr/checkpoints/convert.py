@@ -33,25 +33,17 @@ def convert_to_native(
     checkpoint_name: str = "final.pt",
 ) -> Path:
     """Convert *src_dir* (WeNet / icefall / native) into a native bundle at *dst_dir*."""
-    from oasr.models.registry import check_load_report, get_model_entry, load_checkpoint_bundle
+    from oasr.models.registry import load_checkpoint_bundle, materialize_model
 
     arch, bundle = load_checkpoint_bundle(
         Path(src_dir), checkpoint_name=checkpoint_name, architecture=architecture
     )
-    entry = get_model_entry(arch)
-    model = entry.model_cls.from_config(bundle.model_config, **bundle.aux)
+    # The shared load sequence, on the host, with no dtype cast: the native copy
+    # keeps the source's precision (a quantized source stays quantized).
+    model, _config, report = materialize_model(arch, bundle)
+    if report is not None:
+        print(report.summary())
 
-    if bundle.source_format == "native":
-        from .native import load_native_weights
-
-        load_native_weights(model, dict(bundle.state_dict))
-    else:
-        report = model.load_weights(bundle.state_dict)
-        check_load_report(report, entry.converter, arch)
-        if report is not None:
-            print(report.summary())
-
-    model.eval()
     return save_native(
         Path(dst_dir),
         architecture=arch,
@@ -61,6 +53,7 @@ def convert_to_native(
         tokenizer=bundle.tokenizer,
         features=bundle.features,
         decoding=bundle.decoding,
+        quantization=model.quantization_spec,
     )
 
 

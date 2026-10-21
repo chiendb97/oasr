@@ -1,0 +1,60 @@
+# Conformer-base (d_model=256, FFN=2048): the encoder GEMMs (Linear and pointwise conv)
+# an int8_w8a8 checkpoint serves.  M = 16 (a streaming step), 128, 2048 (a micro-batch),
+# 16384 (a 64-utterance offline batch).  Each line times the CUTLASS int8 lane,
+# the torch._int_mm lane and the fp16 GEMM it replaces (speedup_vs_ref is vs fp16).
+# Run:  python benchmarks/run.py --testlist benchmarks/testlists/conformer_scaled_mm.txt \
+#           --output results.csv --refcheck
+
+# scaled_mm: int8 GEMM alone (operands pre-quantized)
+# attention qkv projection
+--family scaled_mm --subroutine scaled_mm --M 16 --N 768 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 128 --N 768 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 2048 --N 768 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 16384 --N 768 --K 256 --bias
+# attention output / conv pointwise_conv2
+--family scaled_mm --subroutine scaled_mm --M 16 --N 256 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 128 --N 256 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 2048 --N 256 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 16384 --N 256 --K 256 --bias
+# FFN w_1 (fused swish)
+--family scaled_mm --subroutine scaled_mm --M 16 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine scaled_mm --M 128 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine scaled_mm --M 2048 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine scaled_mm --M 16384 --N 2048 --K 256 --bias --activation swish
+# FFN w_2
+--family scaled_mm --subroutine scaled_mm --M 16 --N 256 --K 2048 --bias
+--family scaled_mm --subroutine scaled_mm --M 128 --N 256 --K 2048 --bias
+--family scaled_mm --subroutine scaled_mm --M 2048 --N 256 --K 2048 --bias
+--family scaled_mm --subroutine scaled_mm --M 16384 --N 256 --K 2048 --bias
+# conv pointwise_conv1 (GLU input)
+--family scaled_mm --subroutine scaled_mm --M 16 --N 512 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 128 --N 512 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 2048 --N 512 --K 256 --bias
+--family scaled_mm --subroutine scaled_mm --M 16384 --N 512 --K 256 --bias
+
+# quant_scaled_mm: quantize_per_token + int8 GEMM from the fp16 activation
+# attention qkv projection
+--family scaled_mm --subroutine quant_scaled_mm --M 16 --N 768 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 128 --N 768 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 768 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 16384 --N 768 --K 256 --bias
+# attention output / conv pointwise_conv2
+--family scaled_mm --subroutine quant_scaled_mm --M 16 --N 256 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 128 --N 256 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 256 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 16384 --N 256 --K 256 --bias
+# FFN w_1 (fused swish)
+--family scaled_mm --subroutine quant_scaled_mm --M 16 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine quant_scaled_mm --M 128 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 2048 --K 256 --bias --activation swish
+--family scaled_mm --subroutine quant_scaled_mm --M 16384 --N 2048 --K 256 --bias --activation swish
+# FFN w_2
+--family scaled_mm --subroutine quant_scaled_mm --M 16 --N 256 --K 2048 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 128 --N 256 --K 2048 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 256 --K 2048 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 16384 --N 256 --K 2048 --bias
+# conv pointwise_conv1 (GLU input)
+--family scaled_mm --subroutine quant_scaled_mm --M 16 --N 512 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 128 --N 512 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 512 --K 256 --bias
+--family scaled_mm --subroutine quant_scaled_mm --M 16384 --N 512 --K 256 --bias

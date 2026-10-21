@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import torch
 
@@ -141,6 +141,7 @@ def load_pretrained(
     cache_dir: Optional[str] = None,
     allow_patterns: Optional[List[str]] = None,
     architecture: Optional[str] = None,
+    quantization: Optional[Any] = None,
 ) -> PretrainedModel:
     """:func:`from_pretrained`, but returning the full :class:`PretrainedModel`.
 
@@ -162,7 +163,9 @@ def load_pretrained(
     arch, bundle = load_checkpoint_bundle(
         local_dir, checkpoint_name, map_location="cpu", architecture=architecture
     )
-    model, config, report = instantiate_from_bundle(arch, bundle, device=device, dtype=dtype)
+    model, config, report = instantiate_from_bundle(
+        arch, bundle, device=device, dtype=dtype, quantization=quantization
+    )
     logger.info("Loaded %r model from %s (eval mode)", arch, local_dir)
     return PretrainedModel(
         model=model,
