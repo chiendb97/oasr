@@ -19,6 +19,11 @@ void addlayernorm(TensorView output, TensorView input, TensorView residual, Tens
 void addlayernorm_residual(TensorView output, TensorView residual_out, TensorView input,
                            TensorView residual, TensorView weight, Optional bias_opt, double eps,
                            double alpha);
+void layernorm_quant(TensorView out_q, TensorView scale, TensorView input, TensorView weight,
+                     Optional bias_opt, double eps, double qeps);
+void addlayernorm_residual_quant(TensorView out_q, TensorView scale, TensorView residual_out,
+                                 TensorView input, TensorView residual, TensorView weight,
+                                 Optional bias_opt, double eps, double alpha, double qeps);
 void addrmsnorm(TensorView output, TensorView input, TensorView residual, TensorView weight,
                 Optional bias_opt, double eps, double alpha);
 void addrmsnorm_residual(TensorView output, TensorView residual_out, TensorView input,
@@ -43,6 +48,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(batchnorm1d, batchnorm1d);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(groupnorm, groupnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addlayernorm, addlayernorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addlayernorm_residual, addlayernorm_residual);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_quant, layernorm_quant);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(addlayernorm_residual_quant, addlayernorm_residual_quant);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addrmsnorm, addrmsnorm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(addrmsnorm_residual, addrmsnorm_residual);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(layernorm_activation, layernorm_activation);

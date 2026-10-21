@@ -16,19 +16,163 @@
 #include <oasr/common/types.h>
 #include <oasr/common/utils.h>
 #include <oasr/common/vec_dtypes.h>
+#include <oasr/quant/quantize.cuh>
 
 namespace oasr {
 namespace norm {
 using namespace oasr::reduction;
 
 // =============================================================================
+// Per-token int8 output (the kQuantOut variants of the LayerNorm kernels)
+//
+// A LayerNorm whose only consumers are int8 GEMMs can hand them the quantized
+// activation directly.  The contract is bit-exactness with the unfused pair:
+//
+//     LayerNormQuant(x)  ==  QuantizePerToken(LayerNorm(x))
+//
+// so the kQuantOut variant is the *same* kernel template with only the sink of
+// the normalize pass swapped: every normalized value is rounded to T exactly as
+// the store would round it, held until the row's amax is known, and the amax is
+// taken over those T values.  The quantize then reads the held values back --
+// not a recomputation, so it cannot drift from the amax -- and applies
+// ``quant::quantizeInt8`` with quantize.cuh's ``__fdiv_rn`` reciprocal and
+// scale.  The mean/variance passes, the block size and the vector/scalar choice
+// are untouched, which is what keeps the fp32 normalized values identical to
+// the unfused kernel's (and the affine's rounding is spelled out in source, so
+// the optimizer cannot round the two instantiations differently).
+// =============================================================================
+
+struct QuantOutParams {
+    int8_t* q;     // int8 rows, laid out like the input
+    float* scale;  // one fp32 scale per row
+    float eps;     // floor on a row's amax (quantize.cuh's eps)
+};
+
+// Where the normalize pass leaves a row's T values until its amax is known.
+//
+// A thread only ever reads back the vectors it produced, so no value crosses
+// threads.  The launcher sizes the block to the row (one vector per thread up
+// to 1024 vectors), so the first vector -- usually the only one -- stays in
+// registers; any further ones go to dynamic shared memory, which the launcher
+// sizes to exactly that overflow (``quantStageBytes``).
+template <typename T, int VecSize>
+struct QuantRowSink {
+    using VecT = oasr::Vec<T, VecSize>;
+
+    // The first vector as f32(T value): converted once, for the amax and the
+    // quantize alike.  Further vectors are staged as T.
+    float held[VecSize];
+    T* overflow;
+    float local_max = 0.0f;
+
+    __device__ __forceinline__ QuantRowSink() {
+        extern __shared__ __align__(16) unsigned char norm_quant_stage[];
+        overflow = reinterpret_cast<T*>(norm_quant_stage);
+    }
+
+    // Keep vector ``i`` (already rounded to T) and fold it into the amax, which
+    // is over f32(T value) -- exactly what the unfused quantize reads back.
+    __device__ __forceinline__ void put(int i, const VecT& y) {
+        const bool first = i == static_cast<int>(threadIdx.x);
+        if (!first) {
+            y.store(overflow + (i - static_cast<int>(blockDim.x)) * VecSize);
+        }
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            const float f = static_cast<float>(y[j]);
+            if (first) {
+                held[j] = f;
+            }
+            local_max = fmaxf(local_max, fabsf(f));
+        }
+    }
+
+    __device__ __forceinline__ void get(int i, float (&f)[VecSize]) const {
+        if (i == static_cast<int>(threadIdx.x)) {
+#pragma unroll
+            for (int j = 0; j < VecSize; ++j) {
+                f[j] = held[j];
+            }
+            return;
+        }
+        VecT y;
+        y.load(overflow + (i - static_cast<int>(blockDim.x)) * VecSize);
+#pragma unroll
+        for (int j = 0; j < VecSize; ++j) {
+            f[j] = static_cast<float>(y[j]);
+        }
+    }
+
+    // The row's amax, its scale, and the int8 store of the held row.
+    __device__ __forceinline__ void finish(int vec_hidden_size, int hidden_size,
+                                          const QuantOutParams& quant) const {
+        __shared__ float warp_max[WARP_SIZE];
+        const int64_t row = blockIdx.x;
+
+        // The max is exact in any order, so it needs no tree: every lane gets
+        // its warp's max by shuffles, and past one warp each warp publishes it
+        // and every thread folds the published values itself -- one barrier,
+        // where a reduce-then-broadcast costs two (the rows are short enough
+        // that barrier latency, not bandwidth, sets the time).
+        float amax = warpReduceMax(local_max);
+        if (blockDim.x > WARP_SIZE) {
+            if (threadIdx.x % WARP_SIZE == 0) {
+                warp_max[threadIdx.x / WARP_SIZE] = amax;
+            }
+            __syncthreads();
+            const int num_warps = blockDim.x / WARP_SIZE;
+            amax = warp_max[0];
+            for (int w = 1; w < num_warps; ++w) {
+                amax = fmaxf(amax, warp_max[w]);
+            }
+        }
+        amax = fmaxf(amax, quant.eps);
+        if (threadIdx.x == 0) {
+            quant.scale[row] = __fdiv_rn(amax, static_cast<float>(quant::kQuantMax));
+        }
+        const float inv = __fdiv_rn(static_cast<float>(quant::kQuantMax), amax);
+
+        int8_t* row_q = quant.q + row * hidden_size;
+        // An 8-wide row of int8 is one 8-byte store when the destination allows
+        // it; the int8 tensor's alignment is independent of the input's, so it is
+        // checked here rather than folded into the launcher's vector choice
+        // (which must stay the unfused LayerNorm's).
+        const bool q_vec = VecSize == 8 && (reinterpret_cast<uintptr_t>(row_q) % 8 == 0);
+        for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
+            float y[VecSize];
+            get(i, y);
+            alignas(8) int8_t q[VecSize];
+#pragma unroll
+            for (int j = 0; j < VecSize; ++j) {
+                q[j] = quant::quantizeInt8(y[j], inv);
+            }
+            if (q_vec) {
+                *reinterpret_cast<int2*>(row_q + i * VecSize) = *reinterpret_cast<const int2*>(q);
+            } else {
+#pragma unroll
+                for (int j = 0; j < VecSize; ++j) {
+                    row_q[i * VecSize + j] = q[j];
+                }
+            }
+        }
+    }
+};
+
+// Dynamic shared memory for the vectors a thread cannot keep in registers:
+// every vector past the block's first round.
+inline size_t quantStageBytes(int vec_hidden_size, int block_size, int vec_bytes) {
+    const int overflow = vec_hidden_size > block_size ? vec_hidden_size - block_size : 0;
+    return static_cast<size_t>(overflow) * static_cast<size_t>(vec_bytes);
+}
+
+// =============================================================================
 // LayerNorm Kernel
 // =============================================================================
 
-template <typename T, int VecSize>
+template <typename T, int VecSize, bool kQuantOut = false>
 __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ output,
                                 const T* __restrict__ weight, const T* __restrict__ bias,
-                                int hidden_size, float eps) {
+                                int hidden_size, float eps, QuantOutParams quant) {
     using VecT = oasr::Vec<T, VecSize>;
 
     const int row_idx = blockIdx.x;
@@ -66,6 +210,9 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         blockBroadcast(blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1]) +
         eps);
 
+    // kQuantOut: hold the T-rounded row instead of storing it.
+    [[maybe_unused]] QuantRowSink<T, VecSize> sink;
+
     // Phase 3: Normalize and scale using vectorized load/store
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_weight;
@@ -75,20 +222,40 @@ __global__ void layerNormKernel(const T* __restrict__ input, T* __restrict__ out
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
-            vals[j] =
-                (static_cast<float>(v_in[j]) - mean) * inv_std * static_cast<float>(v_weight[j]);
+            vals[j] = (static_cast<float>(v_in[j]) - mean) * inv_std;
         }
 
+        // The affine, with its rounding written down: ``n * w + b`` is one FMA.
+        // Left to the optimizer, the multiply and the add are contracted only
+        // when nvcc unswitches the bias branch, a per-instantiation decision it
+        // took for the plain kernel and not for the kQuantOut one -- which then
+        // differed from it by an ulp.  The FMA is what this kernel compiled to
+        // before the contraction was spelled out.
         if (bias != nullptr) {
             VecT v_bias;
             v_bias.load(bias + i * VecSize);
 #pragma unroll
             for (int j = 0; j < VecSize; j++) {
-                vals[j] += static_cast<float>(v_bias[j]);
+                vals[j] = fmaf(vals[j], static_cast<float>(v_weight[j]),
+                               static_cast<float>(v_bias[j]));
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < VecSize; j++) {
+                vals[j] *= static_cast<float>(v_weight[j]);
             }
         }
 
-        oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+        if constexpr (kQuantOut) {
+            sink.put(i, oasr::vecCast<T>(vals));
+        } else {
+            oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+        }
+    }
+
+    // Phase 4 (kQuantOut): per-token int8 of the held row.
+    if constexpr (kQuantOut) {
+        sink.finish(vec_hidden_size, hidden_size, quant);
     }
 }
 
@@ -390,15 +557,18 @@ __global__ void addLayerNormKernel(const T* __restrict__ input, const T* __restr
 // ``residual_out`` carries the *unnormalized* sum so the caller can chain it
 // as the residual for the next pre-norm sub-layer (Conformer / Transformer
 // pre-norm pattern). The normalization math keeps the sum in float; only the
-// residual output and normalized output stores round to T.
+// residual output and normalized output stores round to T.  kQuantOut swaps
+// the normalized store for the per-token int8 sink described at the top of
+// this file; ``residual_out`` is stored exactly as before.
 // =============================================================================
 
-template <typename T, int VecSize>
+template <typename T, int VecSize, bool kQuantOut = false>
 __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
                                            const T* __restrict__ residual, T* __restrict__ output,
                                            T* __restrict__ residual_out,
                                            const T* __restrict__ weight, const T* __restrict__ bias,
-                                           int hidden_size, float eps, float alpha) {
+                                           int hidden_size, float eps, float alpha,
+                                           QuantOutParams quant) {
     using VecT = oasr::Vec<T, VecSize>;
 
     const int row_idx = blockIdx.x;
@@ -456,6 +626,9 @@ __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
         blockBroadcast(blockReduceSum(local_var) / static_cast<float>(hidden_size), &smem[1]) +
         eps);
 
+    // kQuantOut: hold the T-rounded row instead of storing it.
+    [[maybe_unused]] QuantRowSink<T, VecSize> sink;
+
     // Phase 3: normalize + affine.
     for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
         VecT v_in, v_res, v_weight;
@@ -463,11 +636,19 @@ __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
         v_res.load(row_residual + i * VecSize);
         v_weight.load(weight + i * VecSize);
 
+        // The affine, with its rounding written down -- see layerNormKernel for
+        // why.  Each spelling is what that build compiled to before: the scalar
+        // kernel contracted ``n * w + b`` into one FMA, the vector kernel
+        // multiplied by the weight and then rounded the bias add on its own
+        // (``__fadd_rn`` is never contracted).
         oasr::Vec<float, VecSize> vals;
 #pragma unroll
         for (int j = 0; j < VecSize; j++) {
             float sum = static_cast<float>(v_res[j]) + alpha * static_cast<float>(v_in[j]);
-            vals[j] = (sum - mean) * inv_std * static_cast<float>(v_weight[j]);
+            vals[j] = (sum - mean) * inv_std;
+            if constexpr (VecSize > 1) {
+                vals[j] *= static_cast<float>(v_weight[j]);
+            }
         }
 
         if (bias != nullptr) {
@@ -475,11 +656,27 @@ __global__ void addLayerNormResidualKernel(const T* __restrict__ input,
             v_bias.load(bias + i * VecSize);
 #pragma unroll
             for (int j = 0; j < VecSize; j++) {
-                vals[j] += static_cast<float>(v_bias[j]);
+                if constexpr (VecSize == 1) {
+                    vals[j] = fmaf(vals[j], static_cast<float>(v_weight[j]),
+                                   static_cast<float>(v_bias[j]));
+                } else {
+                    vals[j] = __fadd_rn(vals[j], static_cast<float>(v_bias[j]));
+                }
             }
+        } else if constexpr (VecSize == 1) {
+            vals[0] *= static_cast<float>(v_weight[0]);
         }
 
-        oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+        if constexpr (kQuantOut) {
+            sink.put(i, oasr::vecCast<T>(vals));
+        } else {
+            oasr::vecCast<T>(vals).store(row_output + i * VecSize);
+        }
+    }
+
+    // Phase 4 (kQuantOut): per-token int8 of the held row.
+    if constexpr (kQuantOut) {
+        sink.finish(vec_hidden_size, hidden_size, quant);
     }
 }
 
@@ -919,13 +1116,71 @@ cudaError_t LayerNorm(const T* input, const T* weight, const T* bias, T* output,
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
         layerNormKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
-            input, output, weight, bias, static_cast<int>(hidden_size), eps);
+            input, output, weight, bias, static_cast<int>(hidden_size), eps, QuantOutParams{});
     } else {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
         layerNormKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
-            input, output, weight, bias, static_cast<int>(hidden_size), eps);
+            input, output, weight, bias, static_cast<int>(hidden_size), eps, QuantOutParams{});
     }
     return cudaGetLastError();
+}
+
+// ---- Quant-out launch ----
+
+// One block per row at LayerNorm's block size (the block size is part of the
+// numerics: it fixes the reduction order), plus the shared memory for the
+// vectors a thread cannot keep in registers.  That overflow exists only past
+// 1024 vectors a row; past the 48 KiB a kernel gets without asking (less what
+// the reductions declare statically) it opts in -- a 16-bit row wider than
+// ~28K elements on the vector path, ~21K on the scalar one.
+template <typename Kernel, typename... Args>
+inline cudaError_t launchQuantOut(Kernel kernel, unsigned int num_rows, int vec_hidden_size,
+                                  int vec_bytes, cudaStream_t stream, Args... args) {
+    constexpr size_t kDefaultDynamicSmem = 40 * 1024;
+    const int block_size = alignedBlockSize(vec_hidden_size);
+    const size_t stage_bytes = quantStageBytes(vec_hidden_size, block_size, vec_bytes);
+    if (stage_bytes > kDefaultDynamicSmem) {
+        cudaError_t err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(stage_bytes));
+        if (err != cudaSuccess) {
+            return err;
+        }
+    }
+    kernel<<<num_rows, block_size, stage_bytes, stream>>>(args...);
+    return cudaGetLastError();
+}
+
+// ---- LayerNormQuant ----
+
+// ``QuantizePerToken(LayerNorm(x))`` in one launch: ``out_q`` int8 shaped like
+// the input, ``out_scale`` one fp32 per row, ``qeps`` the amax floor.
+template <typename T>
+cudaError_t LayerNormQuant(const T* input, const T* weight, const T* bias, int8_t* out_q,
+                           float* out_scale, unsigned int num_rows, unsigned int hidden_size,
+                           float eps, float qeps, cudaStream_t stream) {
+    if (num_rows == 0) {
+        return cudaSuccess;
+    }
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+
+    // The vector/scalar choice fixes each thread's accumulation order, hence the
+    // mean and variance bits, so it must be LayerNorm's for the same input.
+    // LayerNorm also requires its T output aligned, which the freshly allocated
+    // output of the unfused pair always is.
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input);
+
+    const QuantOutParams quant{out_q, out_scale, qeps};
+    const int hidden = static_cast<int>(hidden_size);
+    T* no_output = nullptr;
+    if (use_vec) {
+        return launchQuantOut(layerNormKernel<T, VecSize, true>, num_rows, hidden / VecSize,
+                              static_cast<int>(VecSize * sizeof(T)), stream, input, no_output,
+                              weight, bias, hidden, eps, quant);
+    }
+    return launchQuantOut(layerNormKernel<T, 1, true>, num_rows, hidden,
+                          static_cast<int>(sizeof(T)), stream, input, no_output, weight, bias,
+                          hidden, eps, quant);
 }
 
 // ---- BiasNorm ----
@@ -1075,16 +1330,51 @@ cudaError_t AddLayerNormResidual(const T* input, const T* residual, const T* wei
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
-        addLayerNormResidualKernel<T, VecSize>
-            <<<num_rows, block_size, 0, stream>>>(input, residual, output, residual_out, weight,
-                                                  bias, static_cast<int>(hidden_size), eps, alpha);
+        addLayerNormResidualKernel<T, VecSize><<<num_rows, block_size, 0, stream>>>(
+            input, residual, output, residual_out, weight, bias, static_cast<int>(hidden_size), eps,
+            alpha, QuantOutParams{});
     } else {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size));
-        addLayerNormResidualKernel<T, 1>
-            <<<num_rows, block_size, 0, stream>>>(input, residual, output, residual_out, weight,
-                                                  bias, static_cast<int>(hidden_size), eps, alpha);
+        addLayerNormResidualKernel<T, 1><<<num_rows, block_size, 0, stream>>>(
+            input, residual, output, residual_out, weight, bias, static_cast<int>(hidden_size), eps,
+            alpha, QuantOutParams{});
     }
     return cudaGetLastError();
+}
+
+// ---- AddLayerNormResidualQuant ----
+
+// ``(QuantizePerToken(out), residual_out)`` for ``(out, residual_out) =
+// AddLayerNormResidual(...)``, in one launch.
+template <typename T>
+cudaError_t AddLayerNormResidualQuant(const T* input, const T* residual, const T* weight,
+                                      const T* bias, int8_t* out_q, float* out_scale,
+                                      T* residual_out, unsigned int num_rows,
+                                      unsigned int hidden_size, float eps, float alpha, float qeps,
+                                      cudaStream_t stream) {
+    if (num_rows == 0) {
+        return cudaSuccess;
+    }
+    constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
+
+    // AddLayerNormResidual's vector choice, less its (always aligned, freshly
+    // allocated) T output -- see LayerNormQuant.
+    bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
+                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
+                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(residual_out);
+
+    const QuantOutParams quant{out_q, out_scale, qeps};
+    const int hidden = static_cast<int>(hidden_size);
+    T* no_output = nullptr;
+    if (use_vec) {
+        return launchQuantOut(addLayerNormResidualKernel<T, VecSize, true>, num_rows,
+                              hidden / VecSize, static_cast<int>(VecSize * sizeof(T)), stream,
+                              input, residual, no_output, residual_out, weight, bias, hidden, eps,
+                              alpha, quant);
+    }
+    return launchQuantOut(addLayerNormResidualKernel<T, 1, true>, num_rows, hidden,
+                          static_cast<int>(sizeof(T)), stream, input, residual, no_output,
+                          residual_out, weight, bias, hidden, eps, alpha, quant);
 }
 
 // ---- AddRMSNorm ----

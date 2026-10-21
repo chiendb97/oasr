@@ -52,6 +52,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 HF = "hf"  # huggingface_hub.snapshot_download
 FILES = "files"  # a list of (url, dest-relative-path)
 LJSPEECH = "ljspeech"  # tarball -> resample -> flat wavs/
+LIBRISPEECH = "librispeech"  # asrbench's preparer: md5-checked tarball -> manifest.jsonl
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,16 @@ def _raw(repo: str, sha: str, path: str) -> str:
 
 
 _SOURCE_LIST: List[Source] = [
+    Source(
+        env="LIBRISPEECH_DEV_DIR",
+        kind=LIBRISPEECH,
+        # The quantization calibration set.  Prepared by asrbench's own
+        # preparer, so the layout (manifest.jsonl + LibriSpeech/dev-clean/) is
+        # the one `oasr quantize --calib-manifest` and the tests read.
+        revision="dev-clean",
+        approx_mib=340,
+        note="openslr SLR12 dev-clean, md5-verified by benchmarks.asrbench",
+    ),
     Source(
         env="WAV_DIR",
         kind=LJSPEECH,
@@ -427,6 +438,23 @@ def _is_present(env: str, root: Path, relpath: str) -> bool:
     return target.exists()
 
 
+def _fetch_librispeech(src: Source, dest: Path) -> None:
+    """One LibriSpeech split, prepared exactly as ``asrbench prepare`` lays it out."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from benchmarks.asrbench.datasets.librispeech import LibriSpeech  # noqa: E402
+
+    staging = dest.parent / f".{dest.name}.asrbench"
+    try:
+        prepared = LibriSpeech().prepare(staging, src.revision, download=True)
+        for child in Path(prepared.root).iterdir():
+            target = dest / child.name
+            if target.exists():
+                shutil.rmtree(target) if target.is_dir() else target.unlink()
+            shutil.move(str(child), str(target))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def _complete(src: Source, root: Path, rel: str, wav_limit: int) -> bool:
     """Is this asset finished, not merely started?
 
@@ -477,6 +505,8 @@ def fetch(
                 _fetch_files(src, dest)
             elif src.kind == LJSPEECH:
                 _fetch_ljspeech(src, dest, wav_limit)
+            elif src.kind == LIBRISPEECH:
+                _fetch_librispeech(src, dest)
             else:  # pragma: no cover — the table is closed
                 raise ValueError(f"unknown source kind {src.kind!r} for {src.env}")
         except Exception as exc:

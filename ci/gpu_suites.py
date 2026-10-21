@@ -53,6 +53,10 @@ SUITES: dict[str, list[str]] = {
     "accuracy": ["tests/accuracy"],
     # Architectures, the registry/contract ratchets and checkpoint conversion.
     "models": ["tests/models"],
+    # Quantization: specs, calibration, SmoothQuant, quantized-checkpoint export.
+    # Its kernels are in "kernels", its layer seam in "models", its engine
+    # integration in "engine" -- by the module each test imports.
+    "quantization": ["tests/quantization"],
     # The asrbench suite's own infrastructure (benchmarks/asrbench): CPU-only,
     # mock backend and generated audio, so it costs the GPU runner seconds.
     "benchmarks": ["tests/benchmarks"],

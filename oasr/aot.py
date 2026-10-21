@@ -46,8 +46,10 @@ def gen_all_modules() -> List:
     )
     from oasr.jit.norm import gen_norm_module
     from oasr.jit.pooling import gen_pooling_module
+    from oasr.jit.quant import gen_quant_module
     from oasr.jit.recurrent import gen_recurrent_module
     from oasr.jit.recurrent_step import gen_recurrent_step_modules
+    from oasr.jit.scaled_mm import gen_scaled_mm_module
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
     from oasr.jit.transducer import gen_transducer_module
@@ -73,6 +75,8 @@ def gen_all_modules() -> List:
         gen_bmm_module(),
         gen_group_gemm_module(),
         gen_gemm_log_softmax_module(),
+        gen_quant_module(),
+        gen_scaled_mm_module(),
         gen_ctc_decoder_module(),
         gen_softmax_module(),
         gen_topk_module(),

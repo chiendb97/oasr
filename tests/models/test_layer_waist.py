@@ -442,6 +442,7 @@ def test_eligible_residual_norm_paths_use_fused_waist():
         "paraformer/encoder.py": {"forward_add": 2, "forward_add_residual": 3},
         "paraformer/decoder.py": {"forward_add": 1, "forward_add_residual": 2},
         "nemotron/encoder.py": {"forward_add": 2, "forward_add_residual": 6},
+        "conformer/model.py": {"forward_add_residual": 4},
     }
     missing = []
     for relative, minimums in expected.items():
@@ -800,7 +801,14 @@ class TestKernelGapRegistry:
     #: stride and a page size that divides every K tile.  Production configs meet
     #: both constraints; small test configs may not.  The fused transducer beam
     #: selection covers V <= 1024 and beams <= 32; no in-tree model exceeds either.
-    PINNED = {"fmha-head-dim", "fmha-paged-config", "transducer-beam-topk"}
+    #: The int8 scaled GEMM is the Sm80 mma.sync kernel, which Turing cannot run:
+    #: a W8A8 layer on sm75 takes the torch reference of the pinned numerics.
+    PINNED = {
+        "fmha-head-dim",
+        "fmha-paged-config",
+        "transducer-beam-topk",
+        "scaled-mm-int8-sm75",
+    }
 
     def test_declared_gap_set_only_shrinks(self):
         from oasr.layers._backend import KERNEL_GAPS
@@ -890,12 +898,14 @@ class TestKernelGapRegistry:
         address.  An unpadded vocabulary head is fixable at the model layer
         (``oasr.models.base.align_out_features``), so it is deliberately *not*
         a declared gap — this asserts none crept back."""
-        from oasr.layers.linear import Linear as OasrLinear
+        from oasr.layers import QuantizableGemm
 
+        # Every dense-GEMM waist layer, not only ``Linear``: ``LinearActivation``
+        # and ``PointwiseConv1d`` reach the same kernels.
         offenders = [
             f"{name}: {mod.in_features} -> {mod.out_features}"
             for name, mod in _build(arch).named_modules()
-            if isinstance(mod, OasrLinear) and (mod.in_features % 8 or mod.out_features % 8)
+            if isinstance(mod, QuantizableGemm) and (mod.in_features % 8 or mod.out_features % 8)
         ]
         assert not offenders, (
             f"{arch} has projections the GEMM kernels cannot address:\n  "

@@ -408,24 +408,102 @@ def check_load_report(report: Optional[LoadReport], converter: Any, arch: str) -
         )
 
 
-def instantiate_from_bundle(
+def _online_quantization_spec(model: BaseAsrModel, quantization: Any) -> Any:
+    """The spec an online request (``EngineConfig.quantization.scheme``) asks for.
+
+    Online quantization is round-to-nearest weights with *dynamic* activation
+    scales only: a static activation scale, or SmoothQuant, needs calibration
+    data, which is ``oasr quantize``'s job.
+    """
+    scheme_name = getattr(quantization, "scheme", None)
+    if scheme_name is None:
+        return None
+    from oasr.quantization.spec import QuantizationSpec, get_scheme
+
+    scheme = get_scheme(scheme_name)
+    acts = scheme.input_activations
+    if acts is not None and not acts.dynamic:
+        raise ValueError(
+            f"quantization scheme {scheme_name!r} needs calibrated static activation scales; "
+            "write a quantized checkpoint with `oasr quantize` instead of quantizing online"
+        )
+    return QuantizationSpec.for_model(
+        model,
+        scheme,
+        ignore=tuple(getattr(quantization, "ignore", ()) or ()),
+        producer={"algorithm": "rtn", "online": True},
+    )
+
+
+def materialize_model(
     arch: str,
     bundle: "ConvertedCheckpoint",
+    *,
     device: str = "cpu",
     dtype: Optional[torch.dtype] = None,
+    quantization: Any = None,
 ) -> Tuple[BaseAsrModel, BaseModelConfig, Optional[LoadReport]]:
-    """Bundle → live, weight-loaded model in eval mode (+ the load report)."""
+    """Bundle → live, weight-loaded (and possibly quantized) model in eval mode.
+
+    The one load sequence every caller shares (the engine via
+    :func:`~oasr.models.loaders.load_pretrained`, ``oasr-convert``,
+    ``oasr quantize`` and the native round-trip tests).  With quantization, the
+    order is what makes it sound:
+
+    * **native quantized checkpoint** (``bundle.quantization``): quantized slots
+      are created *before* the strict load, so int8 tensors land in int8 slots
+      (``param.copy_`` would cast silently — the dtypes are checked first);
+    * **online** (*quantization* names a scheme): the fp weights load first — a
+      converted checkpoint's legacy remaps run inside ``_load_from_state_dict``
+      — then each selected layer quantizes its own fp32 weight, on the host;
+    * either way the dtype cast that follows leaves quantized storage and fp32
+      scales alone (``QuantizableGemm._apply``), the model moves to *device*,
+      and only then does each layer choose its kernel lane.
+
+    A checkpoint spec is authoritative: an online request for a different
+    scheme raises, the same scheme is a no-op.
+    """
     entry = get_model_entry(arch)
     model = entry.model_cls.from_config(bundle.model_config, **bundle.aux)
+
+    spec = getattr(bundle, "quantization", None)
+    online = _online_quantization_spec(model, quantization)
+    if spec is not None and online is not None:
+        wanted = {g.scheme.name for g in online.groups}
+        have = {g.scheme.name for g in spec.groups}
+        if wanted != have:
+            raise ValueError(
+                f"the checkpoint is already quantized as {sorted(have)}; it cannot be "
+                f"re-quantized online as {sorted(wanted)}"
+            )
+        online = None
 
     if bundle.source_format == "native":
         from oasr.checkpoints.native import load_native_weights
 
+        if spec is not None:
+            from oasr.quantization.apply import apply_quantization, check_quantized_state_dict
+
+            apply_quantization(model, spec, quantize=False)
+            check_quantized_state_dict(model, bundle.state_dict)
         load_native_weights(model, dict(bundle.state_dict))
         report: Optional[LoadReport] = None
     else:
+        if spec is not None:
+            raise ValueError(f"a {bundle.source_format!r} checkpoint cannot carry quantization")
         report = model.load_weights(bundle.state_dict)
         check_load_report(report, entry.converter, arch)
+
+    if online is not None:
+        from oasr.quantization.apply import apply_quantization
+
+        apply_quantization(model, online, quantize=True)
+        spec = online
+    if spec is not None:
+        from oasr.quantization.apply import finalize_quantization
+
+        finalize_quantization(model)
+        model.quantization_spec = spec
 
     # Cast on the host first, then move: a big LLM checkpoint held fp32 may
     # not fit the GPU at all (8.4B fp32 = 33.6 GB), and the bf16 transfer is
@@ -434,7 +512,26 @@ def instantiate_from_bundle(
         model = model.to(dtype=dtype)
     model = model.to(device=device)
     model.eval()
+    if spec is not None:
+        from oasr.quantization.apply import bind_quantization
+
+        bind_quantization(model)
     return model, bundle.model_config, report
+
+
+def instantiate_from_bundle(
+    arch: str,
+    bundle: "ConvertedCheckpoint",
+    device: str = "cpu",
+    dtype: Optional[torch.dtype] = None,
+    quantization: Any = None,
+) -> Tuple[BaseAsrModel, BaseModelConfig, Optional[LoadReport]]:
+    """Bundle → live, weight-loaded model in eval mode (+ the load report).
+
+    See :func:`materialize_model`; *quantization* is an
+    ``EngineConfig.quantization``-shaped object (``.scheme``, ``.ignore``).
+    """
+    return materialize_model(arch, bundle, device=device, dtype=dtype, quantization=quantization)
 
 
 def build_model_from_checkpoint(
@@ -443,6 +540,7 @@ def build_model_from_checkpoint(
     device: str = "cpu",
     dtype: Optional[torch.dtype] = None,
     architecture: Optional[str] = None,
+    quantization: Any = None,
 ) -> Tuple[BaseAsrModel, BaseModelConfig]:
     """Generic factory: checkpoint dir → ``(live model, config)`` in eval mode.
 
@@ -458,12 +556,16 @@ def build_model_from_checkpoint(
         device: Device to map tensors onto.
         dtype: Optional dtype to cast the model into after loading.
         architecture: Explicit registry key, skipping format detection.
+        quantization: Optional online quantization request (``.scheme``,
+            ``.ignore``); see :func:`materialize_model`.
     """
     # State dict host-side, model moved last — see the matching note in
     # ``loaders.load_pretrained`` (a GPU-mapped bundle would double-book VRAM).
     arch, bundle = load_checkpoint_bundle(
         ckpt_dir, checkpoint_name, map_location="cpu", architecture=architecture
     )
-    model, config, _report = instantiate_from_bundle(arch, bundle, device=device, dtype=dtype)
+    model, config, _report = instantiate_from_bundle(
+        arch, bundle, device=device, dtype=dtype, quantization=quantization
+    )
     logger.info("Loaded %r model from %s (eval mode)", arch, ckpt_dir)
     return model, config

@@ -396,15 +396,38 @@ class ShapeSet:
             return cls.from_json(json.load(f))
 
 
+#: Operand width by census dtype.  Everything but int8 (``scaled_mm``) counts as
+#: two bytes, as every census point did before the int8 family existed.
+_ITEMSIZE = {"int8": 1}
+
+#: The kernel family of a recorded op: what keeps a tuning file of its own.
+_SCALED_MM_OPS = ("scaled_mm", "scaled_mm_quant")
+
+
+def _itemsize(dtype: str) -> int:
+    return _ITEMSIZE.get(str(dtype).replace("torch.", ""), 2)
+
+
+def kernel_family(op: str) -> str:
+    """``"scaled_mm"`` for the int8 GEMM's ops, else ``"gemm"`` (the census's two families)."""
+    return "scaled_mm" if op in _SCALED_MM_OPS else "gemm"
+
+
 def _estimate_ms(op: str, M: int, N: int, K: int, batch: int, itemsize: int = 2) -> float:
     """A crude roofline, only for *ranking* points before anything is measured.
 
     ``oasr.tune.cost_model`` replaces it once calibrated; a point's weight is
     re-measured anyway, so the constants only have to order points sensibly.
+    ``itemsize`` is the operand width: 1 for an int8 ``scaled_mm`` point.
     """
     flops = 2.0 * M * N * K * batch
     bytes_ = (M * K + N * K + M * N) * itemsize * batch
     return max(flops / 100e12, bytes_ / 1.0e12) * 1e3 + 0.004
+
+
+def _weight_bytes(op: str, N: int, K: int, dtype: str, batch: int) -> int:
+    """One signature's weight bytes per forward (its share of the L2 working set)."""
+    return N * K * _itemsize(dtype) * (batch if op == "bmm" else 1)
 
 
 def census(
@@ -458,7 +481,7 @@ def census(
                 pt = points[sk] = ShapePoint(op, N, K, dtype, batch, M)
             c = p_key * calls
             pt.calls += c
-            pt.weight += c * _estimate_ms(op, M, N, K, batch)
+            pt.weight += c * _estimate_ms(op, M, N, K, batch, _itemsize(dtype))
             pt.must = pt.must or (key.captured and p_key > 0)
             if not key.captured:
                 eager_calls[sk] += c
@@ -469,14 +492,12 @@ def census(
     for sk, pt in points.items():
         pt.eager_fraction = eager_calls.get(sk, 0.0) / pt.calls if pt.calls else 0.0
 
-    keep = {sk for sk, p in points.items() if p.must}
-    keep |= _cover(points, lambda p: p.weight, coverage)
-    keep |= _cover(points, lambda p: p.calls, coverage)
+    keep = _keep(points, coverage)
     selected = [points[sk] for sk in sorted(keep, key=lambda s: (s[0], s[1], s[2], s[5]))]
 
     ws = {}
     for p in points.values():
-        ws[(p.op, p.N, p.K)] = p.N * p.K * 2 * (p.batch if p.op == "bmm" else 1)
+        ws[(p.op, p.N, p.K)] = _weight_bytes(p.op, p.N, p.K, p.dtype, p.batch)
     return ShapeSet(
         points=selected,
         working_set_bytes=int(sum(ws.values())),
@@ -489,6 +510,24 @@ def census(
             "points_seen": len(points),
         },
     )
+
+
+def _keep(points: Dict, coverage: float) -> set:
+    """The points a census keeps: every must-tune point, plus each kernel family's cover.
+
+    The coverage cut is taken per kernel family (:func:`kernel_family`), so the
+    int8 GEMMs of a quantized model neither crowd the fp GEMM points out of the
+    cut nor ride along on theirs -- each tuning file is built from its own
+    family's traffic, and an fp model's census is exactly what it was.
+    """
+    keep = {sk for sk, p in points.items() if p.must}
+    by_family: Dict[str, Dict] = defaultdict(dict)
+    for sk, p in points.items():
+        by_family[kernel_family(p.op)][sk] = p
+    for fam_points in by_family.values():
+        keep |= _cover(fam_points, lambda p: p.weight, coverage)
+        keep |= _cover(fam_points, lambda p: p.calls, coverage)
+    return keep
 
 
 def _cover(points: Dict, value, frac: float) -> set:
@@ -512,7 +551,7 @@ def from_capture(path: str) -> ShapeSet:
     pts = []
     ws = {}
     for st in GemmShapeRecorder.load_json(path):
-        ws[(st.op, st.N, st.K)] = st.N * st.K * 2 * (st.batch if st.op == "bmm" else 1)
+        ws[(st.op, st.N, st.K)] = _weight_bytes(st.op, st.N, st.K, st.dtype, st.batch)
         for m, c in st.m_counts.items():
             pts.append(
                 ShapePoint(
@@ -523,7 +562,8 @@ def from_capture(path: str) -> ShapeSet:
                     st.batch,
                     int(m),
                     float(c),
-                    float(c) * _estimate_ms(st.op, int(m), st.N, st.K, st.batch),
+                    float(c)
+                    * _estimate_ms(st.op, int(m), st.N, st.K, st.batch, _itemsize(st.dtype)),
                     False,
                     1.0,
                     ["capture"],

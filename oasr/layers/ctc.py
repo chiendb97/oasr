@@ -8,6 +8,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import oasr
 
@@ -47,7 +48,10 @@ class CtcProjection(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(*, in_features)`` → ``log_softmax`` over ``(*, out_features)``."""
-
+        if not x.is_cuda:
+            # Out of scope for the kernel (a CPU tensor): the torch path, so a
+            # CTC model also runs on CPU, as every waist layer must.
+            return F.log_softmax(F.linear(x, self.weight, self.bias), dim=-1)
         return oasr.gemm_log_softmax(x, self.weight, self.bias)
 
 

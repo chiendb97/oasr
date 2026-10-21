@@ -71,6 +71,9 @@ class ConvertedCheckpoint:
     features: Optional[FeatureSpec] = None
     decoding: DecodingDefaults = field(default_factory=DecodingDefaults)
     source_format: str = "legacy"
+    #: The checkpoint's :class:`~oasr.quantization.QuantizationSpec` (native
+    #: format v2 only), or ``None`` for full-precision weights.
+    quantization: Any = None
 
 
 def sniff_legacy_tokenizer_spec(ckpt_dir: Path) -> Optional[TokenizerSpec]:

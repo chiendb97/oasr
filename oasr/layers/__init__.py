@@ -18,6 +18,7 @@ from ._backend import (
     reset_backend_stats,
     set_layers_backend,
 )
+from ._quantizable import QuantizableGemm, QuantizedActivation
 from .activation import Gelu, Relu, Sigmoid, Tanh
 from .attention import Attention, RelPositionMultiHeadedAttention
 from .conv import (
@@ -89,6 +90,8 @@ __all__ = [
     "Mfcc",
     # Linear
     "Linear",
+    "QuantizableGemm",
+    "QuantizedActivation",
     "LinearActivation",
     "ColumnParallelLinear",
     "RowParallelLinear",

@@ -144,6 +144,20 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
                 "the pages the paged path exists to avoid"
             ),
         ),
+        KernelGap(
+            id="scaled-mm-int8-sm75",
+            what=(
+                "a W8A8 int8 quantized layer on Turing (sm75): the int8 scaled GEMM "
+                "is the CUTLASS 2.x Sm80 mma.sync kernel (16x8x32), which sm75 "
+                "cannot run"
+            ),
+            fix=(
+                "kernel: an Sm75 instantiation of include/oasr/scaled_mm/ with the "
+                "8x8x16 int8 MMA atom and its own config space in "
+                "oasr/jit/scaled_mm.py.  Until then a quantized checkpoint on sm75 "
+                "runs the torch reference of the pinned numerics -- correct, slow"
+            ),
+        ),
     )
 }
 

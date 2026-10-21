@@ -50,6 +50,11 @@ from helpers.kernels import (  # noqa: E402
     requires_sm,
     written_sentinels,
 )
+from helpers.quantization import (  # noqa: E402
+    randomize_norms,
+    tiny_conformer,
+    tiny_conformer_config,
+)
 from helpers.tolerances import tol  # noqa: E402
 
 __all__ = [
@@ -58,6 +63,9 @@ __all__ = [
     "FMHA_TOL",
     "REPO_ROOT",
     "assert_dest_passing",
+    "randomize_norms",
+    "tiny_conformer",
+    "tiny_conformer_config",
     "assert_graph_replay",
     "backend_ratio_ok",
     "capture_graph",

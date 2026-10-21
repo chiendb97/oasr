@@ -61,6 +61,7 @@ from typing import (
 
 import torch
 
+from oasr.models.base import first_compute_parameter
 from oasr.utils.staging import to_device
 
 from ..request import Request, RequestOutput
@@ -1003,7 +1004,7 @@ class TransducerDecodeStrategy(DecodeStrategy):
         if greedy is None and not beam:
             return
         joiner, _decoder = self._surface()
-        weight = next(joiner.parameters())
+        weight = first_compute_parameter(joiner)
         width = int(self._model.encoder.output_size)
         widths = {int(b) for b in batch_sizes if int(b) >= 1}
         if beam:

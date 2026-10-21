@@ -19,6 +19,13 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from benchmarks.core.driver import params_of, parse_dtype
+from benchmarks.core.footprint import (
+    model_weight_mib,
+    parse_quantization,
+    peak_alloc_mib,
+    reset_peak_memory,
+    served_quantization,
+)
 from benchmarks.core.metrics import percentile as _shared_percentile
 from benchmarks.core.report import Reporter
 from benchmarks.core.schema import WorkloadRow
@@ -493,8 +500,42 @@ def _time_streaming(
 # ---------------------------------------------------------------------------
 
 
-def _run_config(
+def _run_config(**kwargs: Any) -> None:
+    """Run one benchmark configuration, then release every engine it built.
+
+    ``shutdown`` returns the CUDA-graph pools and the pinned staging, which the
+    garbage collector never reclaims.  Without it each configuration of a sweep
+    inherited its predecessors' VRAM: their stranded pools counted in its
+    ``peak_alloc_mib``, and a VRAM-derived capacity depended on sweep order.
+    """
+    live: List[Any] = []
+    try:
+        _measure_config(live=live, **kwargs)
+    finally:
+        for engine in live:
+            engine.shutdown()
+        live.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _start_footprint(engine: Any) -> tuple[str, Optional[float]]:
+    """``(served quantization, weight MiB)``, then a fresh allocator high-water mark.
+
+    Taken after construction, so the peak is what serving costs on top of what
+    the engine holds -- not a one-time load or online-quantization transient.
+    """
+    served = served_quantization(engine)
+    if served not in ("", "none"):
+        print(f"  [INFO] served quantization: {engine.quantization_info()}")
+    weight_mib = model_weight_mib(getattr(engine, "_model", None))
+    reset_peak_memory()
+    return served, weight_mib
+
+
+def _measure_config(
     *,
+    live: List[Any],
     subroutine: str,
     ckpt_dir: str,
     audio_dir: str,
@@ -512,9 +553,13 @@ def _run_config(
     admit_mode: str = "burst",
     decode_admit_window_ms: float = 0.0,
     pinned_audio: bool = True,
+    quantization: Any = None,
     repro_command: str = "",
 ) -> None:
-    """Run one benchmark configuration and write results to *output*."""
+    """Run one benchmark configuration and write results to *output*.
+
+    Every engine built is appended to *live*, which the caller shuts down.
+    """
 
     if dtype is None:
         dtype = torch.bfloat16
@@ -582,10 +627,14 @@ def _run_config(
                 cfg_kwargs["decode_method"] = decode_method
             if use_cuda_graphs is not None:
                 cfg_kwargs["use_cuda_graphs"] = use_cuda_graphs
+            if quantization is not None:
+                cfg_kwargs["quantization"] = quantization
             cfg = EngineConfig(**cfg_kwargs)
             engine: Any = ASREngine(cfg)
+            live.append(engine)
             if not _family_matches(engine, subroutine, capability):
                 return
+            served, weight_mib = _start_footprint(engine)
             shape_str = (
                 f"N={n}, chunk={chunk_size}, block={cfg_kwargs['block_size_frames']}, "
                 f"max_bs={max_batch_size}, avg_dur={avg_dur:.1f}s"
@@ -606,10 +655,13 @@ def _run_config(
                 max_batch_frames=max_batch_frames if is_length_batch else None,
                 decode_admit_window_ms=decode_admit_window_ms,
                 **({"decode_method": decode_method} if decode_method else {}),
+                **({"quantization": quantization} if quantization is not None else {}),
             )
             engine = ASREngine(cfg)
+            live.append(engine)
             if not _family_matches(engine, subroutine, capability):
                 return
+            served, weight_mib = _start_footprint(engine)
             if is_packing:
                 shape_str = f"N={n}, pack_frames={max_packed_frames}, " f"avg_dur={avg_dur:.1f}s"
             elif is_length_batch:
@@ -648,9 +700,13 @@ def _run_config(
         traceback.print_exc()
         return
 
+    peak_mib = peak_alloc_mib()
     audio_s = sum(durations)
     wall_s = median_ms / 1000.0
     extra_metrics = extra_metrics or {}
+    quantized = served not in ("", "none")
+    if quantized:
+        shape_str += f", quant={served}"
 
     reporter.workload_row(
         WorkloadRow(
@@ -663,12 +719,16 @@ def _run_config(
                     "max_batch_size": max_batch_size,
                     "chunk_size": chunk_size if is_streaming else "",
                     "admit_mode": admit_mode if family is not None else "",
+                    # Only when quantized, so a full-precision row's params
+                    # still join against rows recorded before the column.
+                    **({"quantization": served} if quantized else {}),
                 }
             ),
             architecture=getattr(engine, "architecture", "") or "",
             ckpt=ckpt_dir,
             decode_method=str(getattr(engine, "decode_method", "") or ""),
             dtype=dtype_str,
+            quantization=served,
             max_batch_size=max_batch_size,
             chunk_size=chunk_size if is_streaming else None,
             service_mode="streaming" if is_streaming else "offline",
@@ -690,6 +750,8 @@ def _run_config(
             ticks=extra_metrics.get("ticks"),
             tick_p50_ms=extra_metrics.get("tick_p50_ms"),
             tick_p99_ms=extra_metrics.get("tick_p99_ms"),
+            weight_mib=weight_mib,
+            peak_alloc_mib=peak_mib,
             repro_command=repro_command,
         )
     )
@@ -836,6 +898,17 @@ def parse_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Hand the engine pageable waveforms -- the A/B arm, not the served path",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        metavar="Q",
+        help="Online quantization of the model's GEMMs: a scheme name (int8_w8a8) or a "
+        'JSON object such as \'{"scheme": "int8_w8a8", "ignore": "encoder.embed.*"}\'. '
+        "Default: none -- though a checkpoint written by `oasr quantize` is served "
+        "quantized regardless, which is why the `quantization` column records what "
+        "the engine served rather than this flag.",
+    )
 
 
 def run(args: argparse.Namespace, reporter: Reporter, repro_command: str = "") -> None:
@@ -862,6 +935,10 @@ def run(args: argparse.Namespace, reporter: Reporter, repro_command: str = "") -
     fst_file = _resolve_fst_file(wfst_path)
 
     dtype = parse_dtype(dtype_str)
+    try:
+        quantization = parse_quantization(getattr(args, "quantization", None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
     is_streaming = _is_streaming_subroutine(subroutine)
     default_mbs = 32 if is_streaming else 4
@@ -888,6 +965,7 @@ def run(args: argparse.Namespace, reporter: Reporter, repro_command: str = "") -
             pinned_audio=not getattr(args, "no_pinned_audio", False),
             use_cuda_graphs=(args.cuda_graphs == "on" if args.cuda_graphs else None),
             decode_admit_window_ms=getattr(args, "decode_admit_window_ms", 0.0),
+            quantization=quantization,
         )
 
 

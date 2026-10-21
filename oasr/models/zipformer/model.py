@@ -366,7 +366,7 @@ class ZipformerModel(BaseAsrModel):
     ) -> List[Tensor]:
         """Initial streaming state.  ``dtype`` defaults to the model's parameter dtype."""
         if dtype is None:
-            dtype = next(self.parameters()).dtype
+            dtype = self.compute_dtype
         return self.encoder.get_streaming_init_states(batch_size, device, dtype)
 
     def streaming_forward(

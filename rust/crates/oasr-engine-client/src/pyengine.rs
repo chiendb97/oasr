@@ -970,6 +970,9 @@ fn collect_model_info(
         // checkpoint's `FeatureSpec` during construction unless the caller pinned
         // one, so the CLI/JSON config is not a reliable source.
         sample_rate: attr_or_default(engine, "sample_rate"),
+        // The served scheme(s), read off the engine: the checkpoint's own spec
+        // is authoritative, so the `--quantization` flag alone would miss it.
+        quantization: attr_or_default(engine, "quantization"),
     })
 }
 

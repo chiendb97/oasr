@@ -120,6 +120,7 @@ WORKLOAD_COLUMNS = ENVELOPE_COLUMNS + [
     "decode_options",
     # configuration
     "dtype",
+    "quantization",
     "max_batch_size",
     "chunk_size",
     "service_mode",
@@ -163,6 +164,9 @@ WORKLOAD_COLUMNS = ENVELOPE_COLUMNS + [
     "ticks",
     "tick_p50_ms",
     "tick_p99_ms",
+    # memory
+    "weight_mib",
+    "peak_alloc_mib",
     # quality
     "metric",
     "normalizer",
@@ -214,6 +218,8 @@ _FORMATS: dict[str, str] = {
     "audio_s": ".2f",
     "wall_s": ".2f",
     "error_rate_pct": ".3f",
+    "weight_mib": ".1f",
+    "peak_alloc_mib": ".1f",
 }
 
 
@@ -319,6 +325,12 @@ class WorkloadRow:
     decode_options: str = ""
     # configuration
     dtype: str = ""
+    #: The scheme(s) the engine actually served (``ASREngine.quantization_info``),
+    #: ``"none"`` for a full-precision model, empty when the harness cannot see
+    #: an engine (the service and decoder harnesses).  What was *served*, not
+    #: what was asked: a checkpoint written by ``oasr quantize`` is quantized
+    #: with no flag at all.
+    quantization: str = ""
     max_batch_size: Optional[int] = None
     chunk_size: Optional[int] = None
     service_mode: str = ""
@@ -362,6 +374,11 @@ class WorkloadRow:
     ticks: Optional[int] = None
     tick_p50_ms: Optional[float] = None
     tick_p99_ms: Optional[float] = None
+    # memory (MiB): the model's weights (parameters + quantized layers' scales;
+    # not derived tables such as a grown positional encoding), and the CUDA
+    # allocator's high-water mark over the measured run (reset after construction).
+    weight_mib: Optional[float] = None
+    peak_alloc_mib: Optional[float] = None
     # quality
     metric: str = ""
     normalizer: str = ""

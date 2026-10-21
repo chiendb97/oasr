@@ -118,6 +118,18 @@ _ASSET_LIST: List[Asset] = [
         how="any dir of .wav files; also settable with --wav-dir",
     ),
     Asset(
+        env="LIBRISPEECH_DEV_DIR",
+        kind=AUDIO,
+        what="LibriSpeech dev-clean as asrbench prepares it (manifest.jsonl + FLAC)",
+        relpath="librispeech_dev_clean",
+        marker="manifest.jsonl",
+        how=(
+            "python -m benchmarks.asrbench prepare librispeech --subset dev-clean "
+            "--download (lands in ~/.cache/oasr/asrbench/librispeech/dev-clean); the "
+            "SmoothQuant calibration set"
+        ),
+    ),
+    Asset(
         env="AUDIO_PATH",
         kind=AUDIO,
         what="a single .wav file for the CPU decoder integration tests",

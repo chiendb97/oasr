@@ -13,13 +13,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-import oasr
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.slot_cnn import SlotCnnCache
 from oasr.layers.attention.attention import RelPositionMultiHeadedAttention
-from oasr.layers.conv import Conv2dActivation, DepthwiseConv1d, PointwiseConv1d
+from oasr.layers.conv import Conv2dActivation, DepthwiseConv1d, Glu, PointwiseConv1d
 from oasr.layers.linear import Linear, LinearActivation
-from oasr.layers.norm import GlobalCMVN, LayerNorm
+from oasr.layers.norm import GlobalCMVN, LayerNorm, RMSNorm
+from oasr.quantization.layout import GemmChain, QuantLayout, SmoothGroup
 from oasr.utils import get_norm, get_norm_activation
 
 from ..base import BaseAsrModel, BaseEncoder, LoadReport, pad_output_projection
@@ -114,6 +114,9 @@ class ConvolutionModule(nn.Module):
             conv_inner_factor * channels,
             bias=bias,
         )
+        # The waist GLU: the ``oasr.glu`` kernel on CUDA fp16/bf16, ``F.glu``
+        # elsewhere — so the module also runs on CPU.  Parameterless.
+        self.glu = Glu()
         if causal:
             padding = 0
             self.lorder = kernel_size - 1
@@ -192,7 +195,7 @@ class ConvolutionModule(nn.Module):
         else:
             new_cache = torch.zeros((0, 0, 0), dtype=x.dtype, device=x.device)
         x = self.pointwise_conv1(x)
-        x = oasr.glu(x)
+        x = self.glu(x)
         x = self.depthwise_conv(x)
         x = self.norm_activation(x)
         x = self.pointwise_conv2(x)
@@ -225,7 +228,7 @@ class ConvolutionModule(nn.Module):
 
     def _forward_packed_noncausal(self, x: torch.Tensor, layout: PackedLayout) -> torch.Tensor:
         x = self.pointwise_conv1(x)
-        x = oasr.glu(x)  # (1, T_total, C_inner)
+        x = self.glu(x)  # (1, T_total, C_inner)
         c_inner = x.size(2)
         gapped = x.new_zeros(1, layout.gapped_len, c_inner)
         gapped[0].index_copy_(0, layout.conv_gather_idx, x[0])
@@ -703,7 +706,8 @@ class ConformerEncoderLayer(nn.Module):
         cnn_cache: torch.Tensor,
     ) -> Tuple[torch.Tensor, Union[PagedKVCache, None], torch.Tensor]:
         """Pre-norm macaron+conv forward with each residual-add folded into the
-        following LayerNorm (``oasr.add_layer_norm_residual``).
+        following LayerNorm (``LayerNorm.forward_add_residual``: the fused
+        ``oasr.add_layer_norm_residual`` kernel on CUDA, its reference elsewhere).
 
         Bit-identical to :meth:`forward`'s general path: the fused kernel
         computes ``s = residual + ff_scale * sublayer`` and ``LayerNorm(s)`` in
@@ -715,45 +719,17 @@ class ConformerEncoderLayer(nn.Module):
         residual = x
         x = self.norm_ff_macaron(x)
         mac_out = self.feed_forward_macaron(x)
-        x, residual = oasr.add_layer_norm_residual(
-            mac_out,
-            residual,
-            self.norm_mha.weight,
-            self.norm_mha.bias,
-            self.norm_mha.eps,
-            self.ff_scale,
-        )
+        x, residual = self.norm_mha.forward_add_residual(mac_out, residual, self.ff_scale)
         # Self-attention: add folds into ``norm_conv``.
         x_att, new_att_cache = self.self_attn(x, mask, pos_emb, att_cache)
-        x, residual = oasr.add_layer_norm_residual(
-            x_att,
-            residual,
-            self.norm_conv.weight,
-            self.norm_conv.bias,
-            self.norm_conv.eps,
-            1.0,
-        )
+        x, residual = self.norm_conv.forward_add_residual(x_att, residual, 1.0)
         # Convolution: add folds into ``norm_ff``.
         x_conv, new_cnn_cache = self.conv_module(x, mask_pad, cnn_cache)
-        x, residual = oasr.add_layer_norm_residual(
-            x_conv,
-            residual,
-            self.norm_ff.weight,
-            self.norm_ff.bias,
-            self.norm_ff.eps,
-            1.0,
-        )
+        x, residual = self.norm_ff.forward_add_residual(x_conv, residual, 1.0)
         # FFN: add folds into ``norm_final`` (the carried residual is no longer
         # needed, so the sum output is discarded).
         ff_out = self.feed_forward(x)
-        x, _ = oasr.add_layer_norm_residual(
-            ff_out,
-            residual,
-            self.norm_final.weight,
-            self.norm_final.bias,
-            self.norm_final.eps,
-            self.ff_scale,
-        )
+        x, _ = self.norm_final.forward_add_residual(ff_out, residual, self.ff_scale)
         return x, new_att_cache, new_cnn_cache
 
     def forward(
@@ -1186,6 +1162,76 @@ class ConformerModel(BaseAsrModel):
     # Positional-encoding table is rebuilt from config; absent from checkpoints
     # and skipped by the native format.
     _computed_buffer_suffixes = ("pos_enc.pe",)
+
+    def quantization_layout(self) -> QuantLayout:
+        """Per block: which norm feeds which GEMM, and how SmoothQuant absorbs ``s``.
+
+        Pre-norm blocks (``normalize_before``) with affine norms fold into the norm
+        (``norm_affine``): macaron FFN ``w_1``, the fused QKV, the conv module's
+        first pointwise conv (only commuting ops — a zero mask, zero pad and a
+        cache ``cat`` of same-domain values — sit between ``norm_conv`` and it;
+        the CNN cache then holds smoothed values, which only this encoder reads)
+        and FFN ``w_1``.  V folds into ``linear_out`` through attention
+        (``v_to_o``).  ``w_2`` (after swish) and ``pointwise_conv2`` (after the
+        conv norm and swish) have no producer that can absorb ``s``: they carry a
+        runtime smoother.  The subsampling front-end, ``linear_pos`` (its input is
+        the sinusoidal table), the CTC head and the AED decoder stay full precision.
+
+        What the forward lets run fused: the pre-norms of the two FFNs and of
+        attention feed their GEMM and nothing else (attention reads only its
+        input's shape before ``linear_qkv``), so they may emit int8 directly;
+        ``norm_conv`` may not (the mask, pad and cache ``cat`` come first).  Each
+        FFN is a chain: ``w_1``'s activated output is ``w_2``'s input and nothing
+        else's.  The fp subsampling and positional projections are pinned
+        batch-invariant when the model is quantized.
+        """
+        groups: List[SmoothGroup] = []
+        chains: List[GemmChain] = []
+        for i, layer in enumerate(self.encoder.encoders):
+            p = f"encoder.encoders.{i}"
+
+            def norm_group(
+                norm_name: str, consumer: str, fuse: bool, layer=layer, p=p
+            ) -> SmoothGroup:
+                norm = getattr(layer, norm_name)
+                if layer.normalize_before and isinstance(norm, (LayerNorm, RMSNorm)):
+                    return SmoothGroup(f"{p}.{norm_name}", (consumer,), "norm_affine", fuse)
+                return SmoothGroup(None, (consumer,), "runtime")
+
+            if layer.feed_forward_macaron is not None:
+                ffn = f"{p}.feed_forward_macaron"
+                groups.append(norm_group("norm_ff_macaron", f"{ffn}.w_1", True))
+                groups.append(SmoothGroup(None, (f"{ffn}.w_2",), "runtime"))
+                chains.append(GemmChain(f"{ffn}.w_1", f"{ffn}.w_2"))
+            attn = layer.self_attn
+            groups.append(norm_group("norm_mha", f"{p}.self_attn.linear_qkv", True))
+            q_dim, k_dim, v_dim = attn._qkv_split
+            groups.append(
+                SmoothGroup(
+                    f"{p}.self_attn.linear_qkv",
+                    (f"{p}.self_attn.linear_out",),
+                    "v_to_o",
+                    v_rows=(q_dim + k_dim, q_dim + k_dim + v_dim),
+                    heads=(attn.h, attn.h_kv, attn.d_k),
+                )
+            )
+            if layer.conv_module is not None:
+                groups.append(norm_group("norm_conv", f"{p}.conv_module.pointwise_conv1", False))
+                groups.append(SmoothGroup(None, (f"{p}.conv_module.pointwise_conv2",), "runtime"))
+            groups.append(norm_group("norm_ff", f"{p}.feed_forward.w_1", True))
+            groups.append(SmoothGroup(None, (f"{p}.feed_forward.w_2",), "runtime"))
+            chains.append(GemmChain(f"{p}.feed_forward.w_1", f"{p}.feed_forward.w_2"))
+        return QuantLayout(
+            groups=tuple(groups),
+            keep_full_precision=("encoder.embed.*", "*.linear_pos", "ctc.*", "decoder.*"),
+            chains=tuple(chains),
+            # The fp GEMMs ahead of int8 layers, whose tuned kernels (cuBLAS,
+            # split-K, Stream-K) depend on M -- which the int8 rounding after them
+            # amplifies into flipped words: the subsampling projection (M = B x T),
+            # and the positional projection (M = the padded length, so it depends
+            # on which utterances share the batch).
+            batch_invariant=("encoder.embed.out.0", "*.linear_pos"),
+        )
 
     def load_weights(
         self,

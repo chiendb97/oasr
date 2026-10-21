@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -60,6 +60,59 @@ class TuningConfig:
         if isinstance(value, dict):
             return cls(**value)
         raise TypeError(f"tuning must be a TuningConfig or a mapping, got {type(value).__name__}")
+
+
+@dataclass
+class QuantizationConfig:
+    """Engine-level quantization of the model's GEMM layers (``oasr.quantization``).
+
+    A checkpoint written by ``oasr quantize`` is quantized already and needs no
+    config: its ``quantization`` section is authoritative.  This config asks for
+    *online* quantization of a full-precision checkpoint — round-to-nearest
+    weights with dynamic per-token activation scales, so no calibration data:
+
+    * ``scheme`` — a preset name (``"int8_w8a8"``), or ``None`` to follow the
+      checkpoint.  Naming a different scheme than a quantized checkpoint's raises.
+    * ``ignore`` — extra module-path globs kept at full precision, beyond what the
+      model's ``quantization_layout()`` already keeps.
+
+    The Rust front-end passes ``{"scheme": ..., "ignore": "a,b"}`` with string
+    values (``oasr-server --quantization int8_w8a8 --quantization-option
+    ignore=...``); ``coerce`` types them.
+    """
+
+    scheme: Optional[str] = None
+    ignore: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.ignore, str):
+            self.ignore = tuple(g.strip() for g in self.ignore.split(",") if g.strip())
+        else:
+            self.ignore = tuple(self.ignore)
+        if self.scheme is not None:
+            from oasr.quantization.spec import get_scheme
+
+            get_scheme(self.scheme)  # raise now, naming the presets, not at load
+
+    @classmethod
+    def coerce(cls, value) -> Optional["QuantizationConfig"]:
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(scheme=value)
+        if isinstance(value, dict):
+            unknown = set(value) - {"scheme", "ignore"}
+            if unknown:
+                raise ValueError(
+                    f"unknown quantization option(s) {sorted(unknown)}; expected scheme, ignore"
+                )
+            return cls(**value)
+        raise TypeError(
+            f"quantization must be a QuantizationConfig, a scheme name or a mapping, got "
+            f"{type(value).__name__}"
+        )
 
 
 @dataclass
@@ -400,6 +453,10 @@ class EngineConfig:
     # Kernel-selection tuning at construction; see TuningConfig.
     tuning: Any = None
 
+    # Online quantization of the model's GEMM layers; see QuantizationConfig.
+    # ``None`` follows the checkpoint (a quantized checkpoint stays quantized).
+    quantization: Any = None
+
     _model_config: Optional[BaseModelConfig] = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -407,6 +464,7 @@ class EngineConfig:
         # engine config round-trips without the caller importing VadConfig.
         self.vad = VadConfig.coerce(self.vad)
         self.tuning = TuningConfig.coerce(self.tuning)
+        self.quantization = QuantizationConfig.coerce(self.quantization)
         if self.service_mode not in ("streaming", "offline"):
             raise ValueError(
                 f"service_mode must be 'streaming' or 'offline', got " f"{self.service_mode!r}"

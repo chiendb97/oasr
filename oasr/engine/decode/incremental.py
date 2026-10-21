@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
+from oasr.models.base import first_compute_parameter
+
 from ..generation import select_next_tokens
 from ..request import DecodingOptions, Request, RequestOutput
 from .alignment import TokenAlignment, wants_word_timings
@@ -421,7 +423,7 @@ class IncrementalArStrategy(DecodeStrategy):
         # other than the configured device (every CPU test) would otherwise get a
         # pool it cannot write to.
         try:
-            param = next(decoder.parameters())
+            param = first_compute_parameter(decoder)
         except StopIteration:  # pragma: no cover - a decoder with no weights
             return None
         block_tokens = int(getattr(self.options, "kv_block_tokens", 16))

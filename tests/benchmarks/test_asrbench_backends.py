@@ -379,6 +379,49 @@ def test_engine_helpers_without_a_gpu(tmp_path, monkeypatch):
     assert kw["block_size_frames"] >= 32  # one paged block holds one encoder chunk
 
 
+def test_engine_backend_forwards_and_records_quantization(tmp_path):
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from benchmarks.asrbench.backends.oasr_engine import OasrEngineBackend
+    from oasr.engine.config import QuantizationConfig
+
+    ckpt = str(tmp_path)
+    kw = OasrEngineBackend({"ckpt_dir": ckpt, "quantization": "int8_w8a8"})._engine_kwargs()
+    assert kw["quantization"] == "int8_w8a8"
+    assert "quantization" not in OasrEngineBackend({"ckpt_dir": ckpt})._engine_kwargs()
+
+    served = {"schemes": ["int8_w8a8"], "layers": 72, "lanes": ["cutlass_sm80_int8"]}
+    b = OasrEngineBackend({"ckpt_dir": ckpt, "quantization": "int8_w8a8"})
+    b.engine = SimpleNamespace(
+        decode_method="ctc", capabilities=["ctc"], _model=None, quantization_info=lambda: served
+    )
+    b.config = SimpleNamespace(
+        ckpt_dir=ckpt,
+        architecture="conformer",
+        service_mode="offline",
+        max_batch_size=8,
+        chunk_size=16,
+        use_cuda_graphs=None,
+        long_form=False,
+        schedule_policy="fcfs",
+        decode_options={},
+        vad=None,
+        device="cuda",
+        dtype="torch.float16",
+        quantization=QuantizationConfig.coerce({"scheme": "int8_w8a8", "ignore": "a.*,b.*"}),
+    )
+    config = b.info().to_json()["config"]
+    assert config["quantization"] == {"scheme": "int8_w8a8", "ignore": ["a.*", "b.*"]}
+    assert config["quantization_info"] == served
+    json.dumps(config)  # what the runner writes into run.json
+
+    # A quantized checkpoint served with no option: asked for nothing, served int8.
+    b.config.quantization = None
+    config = b.info().to_json()["config"]
+    assert config["quantization"] is None and config["quantization_info"] == served
+
+
 def test_transformers_backend_refuses_streaming_statically():
     cls = backend_class("transformers")
     assert cls.mode_unsupported("streaming", {})

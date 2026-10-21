@@ -1,8 +1,9 @@
 # Shipped tuning database (system tier)
 
 One JSON file per `(arch family, kernel family)`: `sm120/gemm.json`,
-`sm120/conv1d.json`, … Read by `oasr.tune.database`; the format, the tier rules
-and the validator policy are documented there. The user tier
+`sm120/conv1d.json`, `sm120/scaled_mm.json` (the int8 W8A8 GEMM of quantized
+layers), … Read by `oasr.tune.database`; the format, the tier rules and the
+validator policy are documented there. The user tier
 (`~/.cache/oasr/tune/v2/…`, written by tuning runs on the machine that measured
 them) wins over these files per signature.
 
@@ -11,6 +12,51 @@ new one with `oasr tune build` on the target card and review the diff with
 `oasr tune diff`; do not hand-edit timings.
 
 ## Provenance of the files here
+
+### `sm120/scaled_mm.json` — Conformer int8 widths (2026-10-20)
+
+The int8 `scaled_mm` family's first file, built by `oasr tune build --family
+scaled_mm` on an otherwise idle RTX 5090 (`provenance.contended` false) from four
+censuses of the WeNet U2++ Conformer (`$CKPT_DIR`): quantized online with
+`int8_w8a8`, and the `smoothquant_w8a8_fused` checkpoint (whose FFN `w_1` is a
+quantizing `scaled_mm_quant` launch feeding `w_2`), each offline (LJSpeech-200
+durations through the length-sorted batching replay, `max_batch_size=32`) and
+streaming (chunk 16, widths 1–64) -- the same censuses `gemm.json`'s Conformer
+rows were measured from.  Six signatures: `op=scaled_mm` at `(N, K)` = `(256,
+256)`, `(256, 2048)`, `(512, 256)`, `(768, 256)`, `(2048, 256)`, and
+`op=scaled_mm_quant` at `(2048, 256)`; census points plus ladder fill, M = 16–8608,
+every production variant measured at every point (protocol 3; the quant op
+data-parallel only), numerics gated bitwise against the heuristic's variant.
+
+Five signatures are `[[null, "heuristic"]]`: the shape heuristic stays the pick
+in every region (an entry still records that it was measured, so `tuning.strict`
+passes and the report can tell measured from unseen).  `(768, 256)` takes
+`b128x128x64_w64x64x64_s5` above M = 7136, where the heuristic's 128×256 tile
+spills into a second wave (192 CTAs on 170 SMs; 1.09–1.10× at M = 8160).  No
+Stream-K tile won anywhere (K ≤ 2048: 16 int8 K-tiles, too few to amortise the
+barrier memset and the partial-tile fixup).  Regenerate in one go:
+
+```bash
+set -a; source .env; set +a
+export CUDA_VISIBLE_DEVICES=0 OASR_TUNE_USER_DB=off
+oasr quantize $CKPT_DIR /tmp/u2pp_fused --recipe smoothquant_w8a8_fused \
+    --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl
+for CK in "--ckpt-dir $CKPT_DIR --quantization int8_w8a8" "--ckpt-dir /tmp/u2pp_fused"; do
+  oasr tune census $CK --service-mode offline --max-batch-size 32 \
+      --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR \
+      --out /tmp/census_$((n++))_offline.json
+  oasr tune census $CK --service-mode streaming --max-batch-size 64 --chunk-size 16 \
+      --out /tmp/census_$((n++))_streaming.json
+done
+oasr tune build $(printf -- '--census %s ' /tmp/census_*.json) --family scaled_mm \
+    --out system --fresh --log /tmp/scaled_mm_measurements.jsonl
+oasr tune diff <previous scaled_mm.json> oasr/tune/db/sm120/scaled_mm.json
+```
+
+(`oasr tune …` / `oasr quantize …` are `python -m oasr.tune.cli …` /
+`python -m oasr.cli quantize …` where the console script is not installed.)
+`--family scaled_mm` leaves `gemm.json` alone; `--note "…"` records free text in
+the file's provenance.
 
 ### `sm120/gemm.json` — Conformer widths re-measured (2026-09-29)
 

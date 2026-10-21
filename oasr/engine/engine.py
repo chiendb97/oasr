@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -138,9 +138,13 @@ class ASREngine:
             device=device_str,
             dtype=dtype,
             architecture=config.architecture,
+            quantization=config.quantization,
         )
         model, model_config = loaded.model, loaded.config
         self._model = model
+        # Quantized layers chose their kernel lane at load; report it before
+        # anything is sized or captured, so an unservable layer is visible.
+        self._log_quantization(model)
         config._model_config = model_config
         tokenizer = self._apply_checkpoint_specs(config, loaded)
 
@@ -1450,44 +1454,62 @@ class ASREngine:
                 config.service_mode,
             )
             return
+        import time
+
         import oasr.jit.gemm as jg
+        import oasr.jit.scaled_mm as jsm
         from oasr.jit.core import _get_target_sm
 
         sm = _get_target_sm()
 
+        def covered(p) -> bool:
+            # The census records a quantized layer's int8 GEMM as its own family.
+            if p.op in jsm.SCALED_MM_OPS:
+                return jsm.covering_tier(p.op, p.M, p.N, p.K, sm) is not None
+            return jg.covering_tier(p.op, p.M, p.N, p.K, p.dtype, sm) is not None
+
         def uncovered(points):
-            return [
-                p
-                for p in points
-                if p.must and jg.covering_tier(p.op, p.M, p.N, p.K, p.dtype, sm) is None
-            ]
+            return [p for p in points if p.must and not covered(p)]
 
         missing = uncovered(ss.points)
         if tc.mode == "prewarm" and missing:
             from oasr.tune import database
             from oasr.tune.build import BuildOptions, build_gemm
-            from oasr.tune.census import ShapeSet
+            from oasr.tune.build_scaled_mm import build_scaled_mm
+            from oasr.tune.census import ShapeSet, kernel_family
 
-            sigs = {p.sig for p in missing}
-            todo = ShapeSet(
-                [p for p in ss.points if p.sig in sigs], ss.working_set_bytes, dict(ss.provenance)
-            )
-            path = database.user_path(sm, "gemm")
-            if path is None:
-                logger.warning("tuning.mode='prewarm' but the user tier is disabled; skipping")
-            else:
-                base = database.load_file(path, "gemm", sm) if path.is_file() else None
+            deadline = time.monotonic() + float(tc.budget_s)
+            built = False
+            for family, build in (("gemm", build_gemm), ("scaled_mm", build_scaled_mm)):
+                sigs = {p.sig for p in missing if kernel_family(p.op) == family}
+                if not sigs:
+                    continue
+                path = database.user_path(sm, family)
+                if path is None:
+                    logger.warning("tuning.mode='prewarm' but the user tier is disabled; skipping")
+                    break
+                todo = ShapeSet(
+                    [p for p in ss.points if p.sig in sigs],
+                    ss.working_set_bytes,
+                    dict(ss.provenance),
+                )
+                base = database.load_file(path, family, sm) if path.is_file() else None
+                budget = max(0.0, deadline - time.monotonic())  # one budget for both families
                 logger.info(
-                    "tuning %d uncovered signature(s) within %.0f s before capture",
+                    "tuning %d uncovered %s signature(s) within %.0f s before capture",
                     len(sigs),
-                    tc.budget_s,
+                    family,
+                    budget,
                 )
-                tf = build_gemm(
-                    todo, sm=sm, base=base, opts=BuildOptions(budget_s=float(tc.budget_s))
-                )
+                tf = build(todo, sm=sm, base=base, opts=BuildOptions(budget_s=budget))
                 database.save_file(tf, path)
+                built = True
+            if built:
                 database.reload()
                 missing = uncovered(ss.points)
+        note = self._quantized_tuning_note()
+        if note is not None:
+            logger.info("tuning: %s", note)
         if tc.strict and missing:
             shown = ", ".join(f"{p.op}(N={p.N},K={p.K},M={p.M})" for p in missing[:8])
             raise RuntimeError(
@@ -1507,18 +1529,98 @@ class ASREngine:
 
         with self._lock:
             epoch = database.reload()
+            if getattr(self._model, "quantization_spec", None) is not None:
+                from oasr.quantization.apply import bind_quantization
+
+                bind_quantization(self._model)
             self._model_runner.release_graphs()
             release = getattr(self._output_processor.strategy, "release_graphs", None)
             if callable(release):
                 release()
         return epoch
 
-    def tuning_report(self) -> str:
-        """Which tuning tier served this process's kernel selections, and what missed."""
-        from oasr.jit.gemm import rule_miss_report
-        from oasr.tune.database import tuning_report
+    @staticmethod
+    def _log_quantization(model) -> None:
+        if getattr(model, "quantization_spec", None) is None:
+            return
+        from oasr.quantization.apply import format_quant_report, validate_runtime
 
-        return tuning_report() + "\n" + rule_miss_report()
+        logger.info("%s", format_quant_report(validate_runtime(model)))
+
+    def quantization_info(self) -> Optional[Dict[str, Any]]:
+        """A JSON-safe summary of the model's quantization, or ``None``."""
+        from oasr.quantization.apply import describe_quantization
+
+        return describe_quantization(self._model)
+
+    @property
+    def quantization(self) -> Optional[str]:
+        """The served quantization scheme(s), comma-joined, or ``None`` (full precision).
+
+        What ``/v1/models`` reports; read off the model, because a checkpoint
+        written by ``oasr quantize`` is quantized without any engine flag.
+        """
+        info = self.quantization_info()
+        return None if info is None else ",".join(info["schemes"])
+
+    def tuning_report(self) -> str:
+        """Which tuning tier served this process's kernel selections, and what missed.
+
+        The tier counts are process-wide, so a full-precision model's report
+        leaves the int8 ``scaled_mm`` family out (another engine in the process
+        may have resolved some); a quantized model's adds one line on how its
+        quantized layers pick their tile (:meth:`_quantized_tuning_note`).
+        """
+        from oasr.jit.gemm import rule_miss_report
+        from oasr.tune.database import KERNEL_FAMILIES, tuning_report
+
+        note = self._quantized_tuning_note()
+        families = None if note is not None else [f for f in KERNEL_FAMILIES if f != "scaled_mm"]
+        report = tuning_report(families) + "\n" + rule_miss_report()
+        return report if note is None else report + "\n" + note
+
+    def _quantized_tuning_note(self) -> Optional[str]:
+        """How the quantized layers' int8 GEMMs pick their tile, as one line (``None``: fp model).
+
+        Per layer, the tuning tier with an entry for its ``scaled_mm`` signature
+        (``scaled_mm`` or, for a layer that quantizes its output for the next
+        GEMM, ``scaled_mm_quant``; N, K) -- which the census records and ``oasr
+        tune build`` measures -- else the shape heuristic.  A layer not on the
+        int8 CUTLASS lane (the torch reference, ``torch._int_mm``) has no tile to
+        pick and is counted apart.
+        """
+        from collections import Counter
+
+        from oasr.quantization import quantized_layers
+
+        layers = quantized_layers(self._model)
+        if not layers:
+            return None
+        import oasr.jit.scaled_mm as jsm
+
+        by_tier: Counter = Counter()
+        sigs = set()
+        other = 0
+        for layer in layers.values():
+            method = layer.quant_method
+            lane = getattr(method, "lane", None)
+            if lane is None or getattr(lane, "backend", None) != "cutlass":
+                other += 1
+                continue
+            op = "scaled_mm_quant" if getattr(method, "emit", None) is not None else "scaled_mm"
+            n, k = int(layer.out_features), int(layer.in_features)
+            sigs.add((op, n, k))
+            by_tier[jsm.signature_tier(op, n, k) or "heuristic"] += 1
+        tiers = ", ".join(f"{t}={by_tier[t]}" for t in ("user", "system") if by_tier.get(t))
+        line = (
+            f"scaled_mm: {len(layers)} quantized layer(s) over {len(sigs)} signature(s): "
+            f"{by_tier['user'] + by_tier['system']} with a tuning entry"
+            + (f" ({tiers})" if tiers else "")
+            + f", {by_tier['heuristic']} on the shape heuristic"
+        )
+        if other:
+            line += f", {other} not on the int8 kernel"
+        return line
 
     def export_tuning_misses(self, path: str) -> int:
         """Write this process's untuned GEMM shapes as census points for ``oasr tune build``."""

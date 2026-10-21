@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 374,
+  "total": 373,
   "files": {
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
@@ -54,7 +54,7 @@
     "oasr/layers/topk.py": 1,
     "oasr/models/base.py": 3,
     "oasr/models/conformer/convert.py": 5,
-    "oasr/models/conformer/model.py": 45,
+    "oasr/models/conformer/model.py": 44,
     "oasr/models/decoders/transformer_decoder.py": 7,
     "oasr/models/heads/ctc.py": 1,
     "oasr/models/paraformer/convert.py": 3,

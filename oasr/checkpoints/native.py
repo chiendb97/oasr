@@ -38,7 +38,11 @@ logger = logging.getLogger(__name__)
 NATIVE_CONFIG_NAME = "oasr_config.json"
 NATIVE_WEIGHTS_NAME = "model.safetensors"
 NATIVE_TOKENIZER_DIR = "tokenizer"
-FORMAT_VERSION = 1
+#: Version 2 adds an optional ``quantization`` section (and quantized tensors).
+#: It is written only for a quantized checkpoint, so a full-precision export
+#: stays readable by a version-1 reader.
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
 
 # Aux-module placeholder builders, keyed by the aux kind recorded in
 # oasr_config.json.  A placeholder only needs the right buffer shapes — the
@@ -71,11 +75,13 @@ def read_native_config(ckpt_dir: Path) -> Dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
     version = cfg.get("format_version")
-    if version != FORMAT_VERSION:
+    if version not in SUPPORTED_FORMAT_VERSIONS:
         raise ValueError(
             f"{path}: unsupported native format_version {version!r} "
-            f"(this OASR reads version {FORMAT_VERSION})"
+            f"(this OASR reads versions {SUPPORTED_FORMAT_VERSIONS})"
         )
+    if version == 1 and cfg.get("quantization") is not None:
+        raise ValueError(f"{path}: a quantization section needs format_version 2")
     return cfg
 
 
@@ -129,8 +135,14 @@ def save_native(
     tokenizer: Optional[TokenizerSpec] = None,
     features: Optional[FeatureSpec] = None,
     decoding: Optional[DecodingDefaults] = None,
+    quantization: Any = None,
 ) -> Path:
-    """Write a weight-loaded *model* (+ metadata) as a native checkpoint dir."""
+    """Write a weight-loaded *model* (+ metadata) as a native checkpoint dir.
+
+    *quantization* is the model's :class:`~oasr.quantization.QuantizationSpec`
+    when its layers are quantized; it is recorded as the ``quantization`` section
+    and makes this a format-version-2 checkpoint.
+    """
     try:
         from safetensors.torch import save_file
     except ImportError as exc:  # pragma: no cover - optional dep
@@ -170,7 +182,7 @@ def save_native(
         }
 
     config = {
-        "format_version": FORMAT_VERSION,
+        "format_version": FORMAT_VERSION if quantization is not None else 1,
         "architecture": architecture,
         "model_config": asdict(model_config),
         "aux": _describe_aux(aux or {}),
@@ -178,6 +190,8 @@ def save_native(
         "features": features.to_dict() if features is not None else None,
         "decoding": (decoding or DecodingDefaults()).to_dict(),
     }
+    if quantization is not None:
+        config["quantization"] = quantization.to_dict()
     with open(dst_dir / NATIVE_CONFIG_NAME, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     logger.info("Wrote native checkpoint to %s (%d tensors)", dst_dir, len(state))
@@ -213,6 +227,11 @@ def load_native(ckpt_dir: Path, map_location: Any = "cpu") -> ConvertedCheckpoin
 
     features = FeatureSpec.from_dict(cfg["features"]) if cfg.get("features") else None
     decoding = DecodingDefaults.from_dict(cfg.get("decoding") or {})
+    quantization = None
+    if cfg.get("quantization") is not None:
+        from oasr.quantization.spec import QuantizationSpec
+
+        quantization = QuantizationSpec.from_dict(cfg["quantization"])
 
     return ConvertedCheckpoint(
         architecture=architecture,
@@ -223,6 +242,7 @@ def load_native(ckpt_dir: Path, map_location: Any = "cpu") -> ConvertedCheckpoin
         features=features,
         decoding=decoding,
         source_format="native",
+        quantization=quantization,
     )
 
 

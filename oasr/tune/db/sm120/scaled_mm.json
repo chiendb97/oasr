@@ -1,0 +1,3695 @@
+{
+ "schema": 2,
+ "family": "scaled_mm",
+ "arch": {
+  "family": 120,
+  "lane": "sm80_int8_mma"
+ },
+ "validators": {
+  "hard": {
+   "schema": 2,
+   "family": "scaled_mm",
+   "arch_family": 120,
+   "lane": "sm80_int8_mma"
+  },
+  "soft": {
+   "nvcc": "13.2.51",
+   "cutlass": "95e7c73a46ba3b4c",
+   "sku": {
+    "name": "NVIDIA GeForce RTX 5090",
+    "sms": 170,
+    "l2": 100663296
+   },
+   "impl_hash": "321081d464f29028"
+  }
+ },
+ "provenance": {
+  "created": "2026-10-20T14:43:44+00:00",
+  "tool": "oasr tune build",
+  "bench_protocol": 3,
+  "census": {
+   "censuses": [
+    {
+     "path": "census_rtn_offline.json",
+     "service_mode": "offline",
+     "max_batch_size": 32,
+     "traffic": "manifest:benchmarks/manifests/ljspeech_200.jsonl",
+     "keys": {
+      "offline:B32xT448": 0.142857,
+      "offline:B32xT576": 0.142857,
+      "offline:B32xT704": 0.142857,
+      "offline:B32xT768": 0.142857,
+      "offline:B32xT896": 0.142857,
+      "offline:B32xT1024": 0.142857,
+      "offline:B8xT1024": 0.142857
+     },
+     "coverage": 0.97,
+     "points_seen": 55,
+     "ckpt_dir": "/data01/kilm/users/chiendb/models/asr/20210610_u2pp_conformer_exp_librispeech",
+     "quantization": "int8_w8a8"
+    },
+    {
+     "path": "census_rtn_streaming.json",
+     "service_mode": "streaming",
+     "max_batch_size": 64,
+     "traffic": "declared",
+     "keys": {
+      "streaming:B64": 0.5,
+      "streaming:B32": 0.25,
+      "streaming:B16": 0.125,
+      "streaming:B8": 0.0625,
+      "streaming:B4": 0.03125,
+      "streaming:B1": 0.015625,
+      "streaming:B2": 0.015625
+     },
+     "coverage": 0.97,
+     "points_seen": 73,
+     "ckpt_dir": "/data01/kilm/users/chiendb/models/asr/20210610_u2pp_conformer_exp_librispeech",
+     "quantization": "int8_w8a8"
+    },
+    {
+     "path": "census_fused_offline.json",
+     "service_mode": "offline",
+     "max_batch_size": 32,
+     "traffic": "manifest:benchmarks/manifests/ljspeech_200.jsonl",
+     "keys": {
+      "offline:B32xT448": 0.142857,
+      "offline:B32xT576": 0.142857,
+      "offline:B32xT704": 0.142857,
+      "offline:B32xT768": 0.142857,
+      "offline:B32xT896": 0.142857,
+      "offline:B32xT1024": 0.142857,
+      "offline:B8xT1024": 0.142857
+     },
+     "coverage": 0.97,
+     "points_seen": 55,
+     "ckpt_dir": "/tmp/claude-0/-data01-kilm-users-chiendb-projects-oasr/9840fc25-e228-42c3-a5e1-555f0de0af8d/scratchpad/u2pp_fused_mse"
+    },
+    {
+     "path": "census_fused_streaming.json",
+     "service_mode": "streaming",
+     "max_batch_size": 64,
+     "traffic": "declared",
+     "keys": {
+      "streaming:B64": 0.5,
+      "streaming:B32": 0.25,
+      "streaming:B16": 0.125,
+      "streaming:B8": 0.0625,
+      "streaming:B4": 0.03125,
+      "streaming:B1": 0.015625,
+      "streaming:B2": 0.015625
+     },
+     "coverage": 0.97,
+     "points_seen": 73,
+     "ckpt_dir": "/tmp/claude-0/-data01-kilm-users-chiendb-projects-oasr/9840fc25-e228-42c3-a5e1-555f0de0af8d/scratchpad/u2pp_fused_mse"
+    }
+   ]
+  },
+  "contended": false,
+  "elapsed_s": 7.0,
+  "fallback": "heuristic: oasr.jit.scaled_mm.heuristic_config (largest data-parallel tile launching >= half a wave of CTAs)",
+  "operands": "random int8, per-token/per-channel fp32 scales, torch.float16 bias, swish epilogue",
+  "notes": [
+   "U2++ Conformer: online int8_w8a8 and smoothquant_w8a8_fused (w_1 -> w_2 chained), offline mbs 32 + streaming chunk 16 widths 1-64; RTX 5090"
+  ]
+ },
+ "configs": {
+  "b128x128x64_w64x64x64_s5": {
+   "kind": "cutlass",
+   "lane": "sm80_int8_mma",
+   "tile": [
+    128,
+    128,
+    64
+   ],
+   "warp": [
+    64,
+    64,
+    64
+   ],
+   "stages": 5,
+   "stream_k": false
+  },
+  "heuristic": {
+   "kind": "heuristic"
+  }
+ },
+ "coverage_basis": [],
+ "entries": {
+  "scaled_mm|op=scaled_mm_quant|N=2048|K=256": {
+   "regions": [
+    [
+     null,
+     "heuristic"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['heuristic', 'b128x128x64_w64x64x64_s5', 'b16x64x128_w16x64x64_s5'] (eps 3%), 1 segment(s)",
+    "worst measured regret 16.2%",
+    "every region keeps the shape heuristic's pick: no variant beats it by 1.05x over a region",
+    "M=16*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=24: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=32*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=40: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=56: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=64*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=80: heuristic (b16x64x128_w16x64x64_s5 1.16x rejected: single replay disagrees (10.9 vs 10.2 us: self-overlap) [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=88: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=104: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=120: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=128*: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=181: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=256*: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=512*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=724: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=1024*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=2040*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=3552*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=4096: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=4576*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=5600*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=6112*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=7136*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=8160*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])"
+   ],
+   "evidence": {
+    "M=16": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00199,
+      9e-06,
+      12
+     ],
+     "heuristic": [
+      0.00199,
+      9e-06,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002481,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00357,
+      1.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=24": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001998,
+      1.8e-05,
+      12
+     ],
+     "heuristic": [
+      0.001998,
+      1.8e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002495,
+      1.1e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003582,
+      1.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=32": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002021,
+      1e-05,
+      12
+     ],
+     "heuristic": [
+      0.002021,
+      1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002498,
+      1.7e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003576,
+      1.3e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=40": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002059,
+      1.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.002059,
+      1.5e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002532,
+      9e-06,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003617,
+      1.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=56": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002151,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.002151,
+      1.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002541,
+      1.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00365,
+      1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=64": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002129,
+      2e-05,
+      13
+     ],
+     "heuristic": [
+      0.002129,
+      2e-05,
+      13
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002513,
+      1.1e-05,
+      13
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003653,
+      9e-06,
+      13
+     ],
+     "_l2": "warm"
+    },
+    "M=80": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002237,
+      2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002598,
+      6e-06,
+      12
+     ],
+     "heuristic": [
+      0.002598,
+      6e-06,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003692,
+      6e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=88": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002615,
+      1e-05,
+      12
+     ],
+     "heuristic": [
+      0.002615,
+      1e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.00342,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003682,
+      8e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=104": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002722,
+      2.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.002722,
+      2.4e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003534,
+      1.7e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003699,
+      1.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=120": {
+     "b32x64x128_w32x64x64_s5": [
+      0.00271,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.00271,
+      1.2e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003599,
+      1.2e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003633,
+      1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=128": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002683,
+      8e-06,
+      12
+     ],
+     "heuristic": [
+      0.002683,
+      8e-06,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003615,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003633,
+      1.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=181": {
+     "b64x64x128_w64x64x64_s5": [
+      0.0038,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.0038,
+      1.2e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003907,
+      1.4e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004723,
+      3.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=256": {
+     "b64x128x128_w64x64x64_s3": [
+      0.003924,
+      2.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003959,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.003959,
+      1.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004949,
+      1.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=512": {
+     "b64x128x128_w64x64x64_s3": [
+      0.004307,
+      2.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.004307,
+      2.7e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.005235,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.007386,
+      1.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=724": {
+     "b128x128x64_w64x64x64_s5": [
+      0.005452,
+      3.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.005452,
+      3.3e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007845,
+      2.9e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.008514,
+      2.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1024": {
+     "b128x128x64_w64x64x64_s5": [
+      0.005728,
+      2.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.005728,
+      2.5e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.008372,
+      3.4e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.008586,
+      2.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=2040": {
+     "b128x256x64_w64x64x64_s3": [
+      0.009036,
+      4.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.009036,
+      4.2e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.011023,
+      8.2e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.014574,
+      3.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=3552": {
+     "b128x128x64_w64x64x64_s5": [
+      0.016405,
+      0.000158,
+      15
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.017045,
+      0.000146,
+      15
+     ],
+     "heuristic": [
+      0.017045,
+      0.000146,
+      15
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.022507,
+      8.7e-05,
+      15
+     ],
+     "_l2": "warm"
+    },
+    "M=4096": {
+     "b128x256x64_w64x64x64_s3": [
+      0.017309,
+      6.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.017309,
+      6.5e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.019477,
+      6.7e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.025379,
+      6.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4576": {
+     "b128x256x64_w64x64x64_s3": [
+      0.017729,
+      8e-05,
+      12
+     ],
+     "heuristic": [
+      0.017729,
+      8e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.021139,
+      6.5e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.027279,
+      7.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=5600": {
+     "b128x256x64_w64x64x64_s3": [
+      0.025038,
+      0.00013,
+      12
+     ],
+     "heuristic": [
+      0.025038,
+      0.00013,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.025448,
+      0.000116,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.033592,
+      0.000145,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6112": {
+     "b128x256x64_w64x64x64_s3": [
+      0.024672,
+      0.000119,
+      12
+     ],
+     "heuristic": [
+      0.024672,
+      0.000119,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.025726,
+      0.000107,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.03546,
+      0.000107,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=7136": {
+     "b128x256x64_w64x64x64_s3": [
+      0.026014,
+      0.000249,
+      12
+     ],
+     "heuristic": [
+      0.026014,
+      0.000249,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.03088,
+      0.000128,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.041286,
+      0.000154,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=8160": {
+     "b128x256x64_w64x64x64_s3": [
+      0.032538,
+      0.000113,
+      12
+     ],
+     "heuristic": [
+      0.032538,
+      0.000113,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.03461,
+      0.000104,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.046858,
+      7.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    }
+   }
+  },
+  "scaled_mm|op=scaled_mm|N=2048|K=256": {
+   "regions": [
+    [
+     null,
+     "heuristic"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['heuristic', 'b128x128x64_w64x64x64_s5', 'b16x64x128_w16x64x64_s5'] (eps 3%), 1 segment(s)",
+    "worst measured regret 11.2%",
+    "every region keeps the shape heuristic's pick: no variant beats it by 1.05x over a region",
+    "M=16*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=24: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=32*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=40: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=56: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=64*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=80: heuristic (b16x64x128_w16x64x64_s5 1.11x rejected: single replay disagrees (15.2 vs 14.2 us: self-overlap) [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=88: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=104: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=120: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=128*: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=181: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=256*: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=512*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=724: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=1024*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=2040*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=3552*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=4096: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=4576*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=5600*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=6112*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=7136*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=8160*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])"
+   ],
+   "evidence": {
+    "M=16": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001843,
+      1.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.001843,
+      1.3e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002185,
+      1.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003071,
+      2.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=24": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001844,
+      2.1e-05,
+      24
+     ],
+     "heuristic": [
+      0.001844,
+      2.1e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002192,
+      1e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003084,
+      1.8e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=32": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001863,
+      1.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.001863,
+      1.4e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002216,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003087,
+      1.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=40": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001936,
+      1.7e-05,
+      13
+     ],
+     "heuristic": [
+      0.001936,
+      1.7e-05,
+      13
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002251,
+      1e-05,
+      13
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003129,
+      3.1e-05,
+      13
+     ],
+     "_l2": "warm"
+    },
+    "M=56": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002009,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.002009,
+      1.2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002234,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003155,
+      1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=64": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001984,
+      2.7e-05,
+      24
+     ],
+     "heuristic": [
+      0.001984,
+      2.7e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002239,
+      2.7e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003194,
+      2.7e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=80": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002074,
+      3e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002307,
+      3.2e-05,
+      24
+     ],
+     "heuristic": [
+      0.002307,
+      3.2e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003204,
+      1.7e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=88": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002364,
+      2.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.002364,
+      2.1e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003221,
+      1.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003229,
+      2.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=104": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002449,
+      2.3e-05,
+      18
+     ],
+     "heuristic": [
+      0.002449,
+      2.3e-05,
+      18
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003216,
+      1.6e-05,
+      18
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.00332,
+      3.2e-05,
+      18
+     ],
+     "_l2": "warm"
+    },
+    "M=120": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002441,
+      1.6e-05,
+      13
+     ],
+     "heuristic": [
+      0.002441,
+      1.6e-05,
+      13
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003174,
+      3e-05,
+      13
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003376,
+      1.6e-05,
+      13
+     ],
+     "_l2": "warm"
+    },
+    "M=128": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002409,
+      2.6e-05,
+      24
+     ],
+     "heuristic": [
+      0.002409,
+      2.6e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003161,
+      2.7e-05,
+      24
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003392,
+      2.4e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=181": {
+     "b64x64x128_w64x64x64_s5": [
+      0.003309,
+      3.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.003309,
+      3.1e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003537,
+      3.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004198,
+      1.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=256": {
+     "b64x64x128_w64x64x64_s5": [
+      0.003497,
+      3.8e-05,
+      24
+     ],
+     "heuristic": [
+      0.003497,
+      3.8e-05,
+      24
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003537,
+      3.8e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004414,
+      2.1e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=512": {
+     "b64x128x128_w64x64x64_s3": [
+      0.003907,
+      3.2e-05,
+      24
+     ],
+     "heuristic": [
+      0.003907,
+      3.2e-05,
+      24
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.004501,
+      5.7e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.006418,
+      2.7e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=724": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004771,
+      2.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.004771,
+      2.2e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.00713,
+      4.3e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007373,
+      5.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1024": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004982,
+      3.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.004982,
+      3.2e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007379,
+      5.6e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007592,
+      7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=2040": {
+     "b128x256x64_w64x64x64_s3": [
+      0.00777,
+      4.8e-05,
+      12
+     ],
+     "heuristic": [
+      0.00777,
+      4.8e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009553,
+      4.9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.012943,
+      7.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=3552": {
+     "b128x128x64_w64x64x64_s5": [
+      0.014369,
+      0.000111,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.015046,
+      4.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.015046,
+      4.9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.020262,
+      0.000131,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4096": {
+     "b128x256x64_w64x64x64_s3": [
+      0.015195,
+      5.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.015195,
+      5.3e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.016806,
+      6.6e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.022522,
+      0.000141,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4576": {
+     "b128x256x64_w64x64x64_s3": [
+      0.015359,
+      6.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.015359,
+      6.4e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.018206,
+      2.4e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.024234,
+      0.000117,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=5600": {
+     "b128x128x64_w64x64x64_s5": [
+      0.021822,
+      0.000206,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.021881,
+      8.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.021881,
+      8.4e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.029822,
+      0.00019,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6112": {
+     "b128x256x64_w64x64x64_s3": [
+      0.022364,
+      9e-05,
+      12
+     ],
+     "heuristic": [
+      0.022364,
+      9e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.022816,
+      6.3e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.032089,
+      0.000219,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=7136": {
+     "b128x256x64_w64x64x64_s3": [
+      0.022804,
+      4.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.022804,
+      4.2e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.0265,
+      0.000105,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.036519,
+      0.000127,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=8160": {
+     "b128x256x64_w64x64x64_s3": [
+      0.028332,
+      0.000249,
+      17
+     ],
+     "heuristic": [
+      0.028332,
+      0.000249,
+      17
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.029264,
+      0.000249,
+      17
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.04146,
+      0.00016,
+      17
+     ],
+     "_l2": "warm"
+    }
+   }
+  },
+  "scaled_mm|op=scaled_mm|N=256|K=2048": {
+   "regions": [
+    [
+     null,
+     "heuristic"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['heuristic'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.0%",
+    "every region keeps the shape heuristic's pick: no variant beats it by 1.05x over a region",
+    "M=16*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=24: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=32*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=40: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=56: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=64*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=80: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=88: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=104: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=120: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=128*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=181: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=256*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=512*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=724: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=1024*: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=2040*: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=3552*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=4096: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=4576*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=5600*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=6112*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=7136*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=8160*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])"
+   ],
+   "evidence": {
+    "M=16": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003272,
+      1.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.003272,
+      1.6e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004664,
+      2.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.007987,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=24": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003258,
+      2.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.003258,
+      2.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004707,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008018,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=32": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003268,
+      9e-06,
+      12
+     ],
+     "heuristic": [
+      0.003268,
+      9e-06,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004762,
+      2.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008053,
+      1.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=40": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003286,
+      2.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.003286,
+      2.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.00475,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008083,
+      2.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=56": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00331,
+      1.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.00331,
+      1.9e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004786,
+      1.2e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008204,
+      1.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=64": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00329,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.00329,
+      1.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004796,
+      1.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008235,
+      2.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=80": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003305,
+      1.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.003305,
+      1.9e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004783,
+      1.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008218,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=88": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003343,
+      2.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.003343,
+      2.6e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004802,
+      2.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008243,
+      2.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=104": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003373,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.003373,
+      1.2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004788,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00821,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=120": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00342,
+      1.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.00342,
+      1.4e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004808,
+      3.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008257,
+      1.3e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=128": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003418,
+      1.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.003418,
+      1.9e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004813,
+      2.1e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008256,
+      2.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=181": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003449,
+      2e-05,
+      12
+     ],
+     "heuristic": [
+      0.003449,
+      2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004882,
+      2.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008258,
+      2.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=256": {
+     "b16x64x128_w16x64x64_s5": [
+      0.003458,
+      1e-05,
+      12
+     ],
+     "heuristic": [
+      0.003458,
+      1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004955,
+      1.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008269,
+      3.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=512": {
+     "b16x64x128_w16x64x64_s5": [
+      0.004788,
+      4.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.004788,
+      4.2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004922,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008436,
+      1.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=724": {
+     "b32x64x128_w32x64x64_s5": [
+      0.005163,
+      1.8e-05,
+      12
+     ],
+     "heuristic": [
+      0.005163,
+      1.8e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.008352,
+      7.1e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008459,
+      2.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1024": {
+     "b32x64x128_w32x64x64_s5": [
+      0.005812,
+      4.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.005812,
+      4.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.008364,
+      2.8e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.008759,
+      2.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=2040": {
+     "b64x64x128_w64x64x64_s5": [
+      0.008664,
+      5e-05,
+      12
+     ],
+     "heuristic": [
+      0.008664,
+      5e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.00868,
+      5.2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.011716,
+      2.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=3552": {
+     "b64x128x128_w64x64x64_s3": [
+      0.010335,
+      4.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.010335,
+      4.2e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.014677,
+      4.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.017544,
+      7.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4096": {
+     "b64x128x128_w64x64x64_s3": [
+      0.011196,
+      4.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.011196,
+      4.1e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.014793,
+      7e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.017946,
+      0.000121,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4576": {
+     "b64x128x128_w64x64x64_s3": [
+      0.011939,
+      6.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.011939,
+      6.1e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.014822,
+      9.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.018264,
+      8.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=5600": {
+     "b128x128x64_w64x64x64_s5": [
+      0.014867,
+      4.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.014867,
+      4.7e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.020398,
+      5.3e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5_sk": [
+      0.024119,
+      8.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6112": {
+     "b128x128x64_w64x64x64_s5": [
+      0.014935,
+      9e-05,
+      12
+     ],
+     "heuristic": [
+      0.014935,
+      9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.020961,
+      5.1e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5_sk": [
+      0.025838,
+      0.000227,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=7136": {
+     "b128x128x64_w64x64x64_s5": [
+      0.015002,
+      3.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.015002,
+      3.6e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.022604,
+      9.7e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5_sk": [
+      0.02594,
+      0.000131,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=8160": {
+     "b128x128x64_w64x64x64_s5": [
+      0.015695,
+      0.00015,
+      19
+     ],
+     "heuristic": [
+      0.015695,
+      0.00015,
+      19
+     ],
+     "b128x128x64_w64x64x64_s5_sk": [
+      0.022257,
+      0.000135,
+      19
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.02338,
+      0.000135,
+      19
+     ],
+     "_l2": "warm"
+    }
+   }
+  },
+  "scaled_mm|op=scaled_mm|N=256|K=256": {
+   "regions": [
+    [
+     null,
+     "heuristic"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['heuristic'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.0%",
+    "every region keeps the shape heuristic's pick: no variant beats it by 1.05x over a region",
+    "M=16*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=24: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=32*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=40: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=56: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=64*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=80: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=88: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=104: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=120: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=128*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=181: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=256*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=512*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=724: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=1024*: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=2040*: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=3552*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=4096: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=4576*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=5600*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=6112*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=7136*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=8160*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])"
+   ],
+   "evidence": {
+    "M=16": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001802,
+      2e-05,
+      24
+     ],
+     "heuristic": [
+      0.001802,
+      2e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002134,
+      2.5e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00303,
+      1.4e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=24": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001784,
+      1e-05,
+      15
+     ],
+     "heuristic": [
+      0.001784,
+      1e-05,
+      15
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002132,
+      1.9e-05,
+      15
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003039,
+      2.6e-05,
+      15
+     ],
+     "_l2": "warm"
+    },
+    "M=32": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001782,
+      1.8e-05,
+      21
+     ],
+     "heuristic": [
+      0.001782,
+      1.8e-05,
+      21
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002148,
+      2e-05,
+      21
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003022,
+      9e-06,
+      21
+     ],
+     "_l2": "warm"
+    },
+    "M=40": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001781,
+      2.1e-05,
+      24
+     ],
+     "heuristic": [
+      0.001781,
+      2.1e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002132,
+      2.8e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003008,
+      1.9e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=56": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00179,
+      3.4e-05,
+      24
+     ],
+     "heuristic": [
+      0.00179,
+      3.4e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002137,
+      2.8e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003048,
+      2.5e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=64": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001758,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.001758,
+      1.2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002123,
+      1.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003051,
+      2.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=80": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00177,
+      1.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.00177,
+      1.4e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002146,
+      1.7e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003075,
+      1.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=88": {
+     "b16x64x128_w16x64x64_s5": [
+      0.0018,
+      1.5e-05,
+      21
+     ],
+     "heuristic": [
+      0.0018,
+      1.5e-05,
+      21
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002142,
+      9e-06,
+      21
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003071,
+      2.5e-05,
+      21
+     ],
+     "_l2": "warm"
+    },
+    "M=104": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001817,
+      1.8e-05,
+      12
+     ],
+     "heuristic": [
+      0.001817,
+      1.8e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002127,
+      1.7e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003061,
+      2.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=120": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001822,
+      1.8e-05,
+      21
+     ],
+     "heuristic": [
+      0.001822,
+      1.8e-05,
+      21
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002149,
+      7e-06,
+      21
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003069,
+      2.2e-05,
+      21
+     ],
+     "_l2": "warm"
+    },
+    "M=128": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001816,
+      1.8e-05,
+      18
+     ],
+     "heuristic": [
+      0.001816,
+      1.8e-05,
+      18
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002144,
+      1e-05,
+      18
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003068,
+      1.3e-05,
+      18
+     ],
+     "_l2": "warm"
+    },
+    "M=181": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001825,
+      1.1e-05,
+      14
+     ],
+     "heuristic": [
+      0.001825,
+      1.1e-05,
+      14
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002183,
+      1.4e-05,
+      14
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003075,
+      2.9e-05,
+      14
+     ],
+     "_l2": "warm"
+    },
+    "M=256": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001838,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.001838,
+      1.2e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002212,
+      1.2e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003082,
+      1.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=512": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002046,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.002046,
+      1.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002244,
+      2e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003186,
+      2.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=724": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002362,
+      1.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.002362,
+      1.2e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003216,
+      1.4e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003277,
+      1.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1024": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002491,
+      2e-05,
+      12
+     ],
+     "heuristic": [
+      0.002491,
+      2e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003231,
+      2.1e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003542,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=2040": {
+     "b64x64x128_w64x64x64_s5": [
+      0.003506,
+      3.2e-05,
+      18
+     ],
+     "heuristic": [
+      0.003506,
+      3.2e-05,
+      18
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003512,
+      3.5e-05,
+      18
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004415,
+      3.1e-05,
+      18
+     ],
+     "_l2": "warm"
+    },
+    "M=3552": {
+     "b64x128x128_w64x64x64_s3": [
+      0.004009,
+      4e-05,
+      21
+     ],
+     "heuristic": [
+      0.004009,
+      4e-05,
+      21
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.00464,
+      1.9e-05,
+      21
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.006444,
+      2.4e-05,
+      21
+     ],
+     "_l2": "warm"
+    },
+    "M=4096": {
+     "b64x128x128_w64x64x64_s3": [
+      0.004279,
+      2.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.004279,
+      2.3e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.004582,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.006569,
+      3.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4576": {
+     "b64x128x128_w64x64x64_s3": [
+      0.004275,
+      2.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.004275,
+      2.5e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.004567,
+      3.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.006592,
+      2.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=5600": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004661,
+      3.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.004661,
+      3.9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007147,
+      5.4e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007368,
+      2.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6112": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004794,
+      1.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.004794,
+      1.9e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007352,
+      1.1e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007405,
+      1.3e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=7136": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004955,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.004955,
+      1.1e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007377,
+      2.6e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007634,
+      2.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=8160": {
+     "b128x128x64_w64x64x64_s5": [
+      0.005103,
+      3.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.005103,
+      3.6e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007427,
+      4.9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007781,
+      1.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    }
+   }
+  },
+  "scaled_mm|op=scaled_mm|N=512|K=256": {
+   "regions": [
+    [
+     null,
+     "heuristic"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['heuristic'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.0%",
+    "every region keeps the shape heuristic's pick: no variant beats it by 1.05x over a region",
+    "M=30*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=32: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=48: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=60*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=64: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=80: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=96: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=120*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=128: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=240*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=256: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=480*: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=512: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=960*: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=1024: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=1920*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=2152*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=4000*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=4096: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=5024*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=6048*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=6560*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=7584*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=8608*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])"
+   ],
+   "evidence": {
+    "M=30": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001795,
+      1.7e-05,
+      18
+     ],
+     "heuristic": [
+      0.001795,
+      1.7e-05,
+      18
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002152,
+      1.7e-05,
+      18
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00304,
+      1e-05,
+      18
+     ],
+     "_l2": "warm"
+    },
+    "M=32": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001786,
+      1.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.001786,
+      1.4e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002156,
+      1.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003039,
+      2.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=48": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001806,
+      1.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.001806,
+      1.6e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002172,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003051,
+      1.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=60": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001803,
+      1.6e-05,
+      13
+     ],
+     "heuristic": [
+      0.001803,
+      1.6e-05,
+      13
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002156,
+      2.1e-05,
+      13
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003071,
+      1.8e-05,
+      13
+     ],
+     "_l2": "warm"
+    },
+    "M=64": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001795,
+      1.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.001795,
+      1.4e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002147,
+      9e-06,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003067,
+      2.6e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=80": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001819,
+      1.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.001819,
+      1.7e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002178,
+      1.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003064,
+      2.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=96": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001814,
+      1.7e-05,
+      14
+     ],
+     "heuristic": [
+      0.001814,
+      1.7e-05,
+      14
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002172,
+      1.8e-05,
+      14
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003066,
+      1e-05,
+      14
+     ],
+     "_l2": "warm"
+    },
+    "M=120": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001825,
+      7e-06,
+      12
+     ],
+     "heuristic": [
+      0.001825,
+      7e-06,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002217,
+      1.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003074,
+      2.3e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=128": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001842,
+      1.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.001842,
+      1.5e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002199,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003078,
+      1.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=240": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001935,
+      1.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.001935,
+      1.7e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002224,
+      2.1e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003175,
+      8e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=256": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001988,
+      1.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.001988,
+      1.7e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002222,
+      1.3e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003192,
+      1.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=480": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002386,
+      1.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.002386,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003195,
+      1.2e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003364,
+      1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=512": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002404,
+      1.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.002404,
+      1.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003177,
+      2.2e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003433,
+      7e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=960": {
+     "b64x64x128_w64x64x64_s5": [
+      0.003362,
+      3.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.003362,
+      3.2e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003487,
+      1.3e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.00439,
+      9e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1024": {
+     "b64x64x128_w64x64x64_s5": [
+      0.00341,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.00341,
+      1.1e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003466,
+      2.6e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004369,
+      2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1920": {
+     "b64x128x128_w64x64x64_s3": [
+      0.003895,
+      3.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.003895,
+      3.2e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.00455,
+      2.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.006373,
+      2.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=2152": {
+     "b64x128x128_w64x64x64_s3": [
+      0.003991,
+      3.5e-05,
+      14
+     ],
+     "heuristic": [
+      0.003991,
+      3.5e-05,
+      14
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.004525,
+      2.7e-05,
+      14
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.006501,
+      2.6e-05,
+      14
+     ],
+     "_l2": "warm"
+    },
+    "M=4000": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004996,
+      3.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.004996,
+      3.4e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007328,
+      3.5e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007588,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4096": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004979,
+      2.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.004979,
+      2.1e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007291,
+      1.8e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007655,
+      2.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=5024": {
+     "b128x128x64_w64x64x64_s5": [
+      0.005196,
+      1e-05,
+      12
+     ],
+     "heuristic": [
+      0.005196,
+      1e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007356,
+      2e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007775,
+      3.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6048": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007488,
+      3.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.007488,
+      3.6e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009146,
+      2.6e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.010783,
+      3.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6560": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007521,
+      4.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.007521,
+      4.6e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.00943,
+      7e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.011014,
+      4.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=7584": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007673,
+      5.5e-05,
+      12
+     ],
+     "heuristic": [
+      0.007673,
+      5.5e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009521,
+      3.1e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.011238,
+      6.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=8608": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007785,
+      2.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.007785,
+      2.4e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009637,
+      5.4e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.013607,
+      7.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    }
+   }
+  },
+  "scaled_mm|op=scaled_mm|N=768|K=256": {
+   "regions": [
+    [
+     7136,
+     "heuristic"
+    ],
+    [
+     null,
+     "b128x128x64_w64x64x64_s5"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['heuristic', 'b128x128x64_w64x64x64_s5', 'b64x128x128_w64x64x64_s3'] (eps 3%), 2 segment(s)",
+    "worst measured regret 4.1%",
+    "M=16*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=24: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=32*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=40: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=56: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=64*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=80: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=88: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=104: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=120: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=128*: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=181: heuristic (fallback is fastest [heuristic: b16x64x128_w16x64x64_s5])",
+    "M=256*: heuristic (fallback is fastest [heuristic: b32x64x128_w32x64x64_s5])",
+    "M=512*: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=724: heuristic (fallback is fastest [heuristic: b64x64x128_w64x64x64_s5])",
+    "M=1024*: heuristic (fallback is fastest [heuristic: b64x128x128_w64x64x64_s3])",
+    "M=2040*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=3552*: heuristic (fallback is fastest [heuristic: b128x128x64_w64x64x64_s5])",
+    "M=4096: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=4576*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=5600*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=6112*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=7136*: heuristic (fallback is fastest [heuristic: b128x256x64_w64x64x64_s3])",
+    "M=8160*: heuristic (b128x128x64_w64x64x64_s5 1.09x rejected: single replay disagrees (18.7 vs 18.6 us: self-overlap) [heuristic: b128x256x64_w64x64x64_s3])"
+   ],
+   "evidence": {
+    "M=16": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001805,
+      2.2e-05,
+      24
+     ],
+     "heuristic": [
+      0.001805,
+      2.2e-05,
+      24
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002143,
+      1.1e-05,
+      24
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003035,
+      1e-05,
+      24
+     ],
+     "_l2": "warm"
+    },
+    "M=24": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001795,
+      1.1e-05,
+      12
+     ],
+     "heuristic": [
+      0.001795,
+      1.1e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002124,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003008,
+      1.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=32": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001803,
+      1.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.001803,
+      1.7e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.00214,
+      1.9e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003011,
+      9e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=40": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001791,
+      1.5e-05,
+      13
+     ],
+     "heuristic": [
+      0.001791,
+      1.5e-05,
+      13
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002159,
+      1.2e-05,
+      13
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00301,
+      2.8e-05,
+      13
+     ],
+     "_l2": "warm"
+    },
+    "M=56": {
+     "b16x64x128_w16x64x64_s5": [
+      0.00182,
+      6e-06,
+      12
+     ],
+     "heuristic": [
+      0.00182,
+      6e-06,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002182,
+      7e-06,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003047,
+      1.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=64": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001829,
+      1.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.001829,
+      1.3e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002204,
+      1.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003077,
+      1.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=80": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001851,
+      1.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.001851,
+      1.6e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002212,
+      1.5e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003161,
+      1.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=88": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001872,
+      1.9e-05,
+      22
+     ],
+     "heuristic": [
+      0.001872,
+      1.9e-05,
+      22
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002222,
+      1.4e-05,
+      22
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003153,
+      1.8e-05,
+      22
+     ],
+     "_l2": "warm"
+    },
+    "M=104": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001903,
+      1.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.001903,
+      1.9e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002243,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003149,
+      1.4e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=120": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001927,
+      1.6e-05,
+      13
+     ],
+     "heuristic": [
+      0.001927,
+      1.6e-05,
+      13
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002222,
+      1.6e-05,
+      13
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003149,
+      1.3e-05,
+      13
+     ],
+     "_l2": "warm"
+    },
+    "M=128": {
+     "b16x64x128_w16x64x64_s5": [
+      0.001933,
+      1.7e-05,
+      15
+     ],
+     "heuristic": [
+      0.001933,
+      1.7e-05,
+      15
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002239,
+      2.2e-05,
+      15
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003179,
+      2.1e-05,
+      15
+     ],
+     "_l2": "warm"
+    },
+    "M=181": {
+     "b16x64x128_w16x64x64_s5": [
+      0.002137,
+      1.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.002137,
+      1.9e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.002282,
+      1.6e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.00321,
+      1.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=256": {
+     "b32x64x128_w32x64x64_s5": [
+      0.002344,
+      1.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.002344,
+      1.3e-05,
+      12
+     ],
+     "b16x64x128_w16x64x64_s5": [
+      0.003205,
+      1.1e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003226,
+      1.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=512": {
+     "b64x64x128_w64x64x64_s5": [
+      0.003324,
+      7e-06,
+      12
+     ],
+     "heuristic": [
+      0.003324,
+      7e-06,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.003513,
+      7e-06,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004143,
+      1.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=724": {
+     "b64x128x128_w64x64x64_s3": [
+      0.003494,
+      3.4e-05,
+      12
+     ],
+     "b64x64x128_w64x64x64_s5": [
+      0.003637,
+      1.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.003637,
+      1.7e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.004486,
+      3.7e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=1024": {
+     "b64x128x128_w64x64x64_s3": [
+      0.003636,
+      2.2e-05,
+      12
+     ],
+     "heuristic": [
+      0.003636,
+      2.2e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.004531,
+      1.9e-05,
+      12
+     ],
+     "b32x64x128_w32x64x64_s5": [
+      0.006014,
+      1.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=2040": {
+     "b128x128x64_w64x64x64_s5": [
+      0.004767,
+      2.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.004767,
+      2.4e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.007107,
+      2.6e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007338,
+      2.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=3552": {
+     "b128x128x64_w64x64x64_s5": [
+      0.005881,
+      3.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.005881,
+      3.6e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.007334,
+      3.5e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.008162,
+      9e-06,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4096": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007487,
+      2.7e-05,
+      12
+     ],
+     "heuristic": [
+      0.007487,
+      2.7e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009121,
+      3.8e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.010531,
+      1.8e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=4576": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007605,
+      5.4e-05,
+      12
+     ],
+     "heuristic": [
+      0.007605,
+      5.4e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009227,
+      5.9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.010886,
+      4.3e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=5600": {
+     "b128x256x64_w64x64x64_s3": [
+      0.007789,
+      4.3e-05,
+      12
+     ],
+     "heuristic": [
+      0.007789,
+      4.3e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009439,
+      4.8e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.013199,
+      3.5e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=6112": {
+     "b128x256x64_w64x64x64_s3": [
+      0.008045,
+      3.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.008045,
+      3.6e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.009723,
+      9.3e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.013819,
+      5.2e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=7136": {
+     "b128x256x64_w64x64x64_s3": [
+      0.008729,
+      5.6e-05,
+      12
+     ],
+     "heuristic": [
+      0.008729,
+      5.6e-05,
+      12
+     ],
+     "b128x128x64_w64x64x64_s5": [
+      0.010595,
+      5.5e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.014855,
+      7.1e-05,
+      12
+     ],
+     "_l2": "warm"
+    },
+    "M=8160": {
+     "b128x128x64_w64x64x64_s5": [
+      0.013374,
+      6.4e-05,
+      12
+     ],
+     "b128x256x64_w64x64x64_s3": [
+      0.014633,
+      3.9e-05,
+      12
+     ],
+     "heuristic": [
+      0.014633,
+      3.9e-05,
+      12
+     ],
+     "b64x128x128_w64x64x64_s3": [
+      0.017322,
+      5.9e-05,
+      12
+     ],
+     "_l2": "warm"
+    }
+   }
+  }
+ }
+}

@@ -195,6 +195,20 @@ def _backend_config(meta: Dict[str, Any]) -> Dict[str, Any]:
         }
         if served:
             out["served"] = [json.loads(x) for x in sorted(served)]
+    # The quantization an in-process engine reports serving.  Not in the options
+    # when the checkpoint itself is quantized (`oasr quantize`), so two runs
+    # that differ only by checkpoint precision would otherwise compare as one
+    # configuration.  Absent unless some instance served one, so runs recorded
+    # before the field existed still compare with full-precision ones.
+    quantized = {
+        json.dumps(i["info"]["config"]["quantization_info"], sort_keys=True)
+        for i in (b.get("instances") or {}).values()
+        if isinstance(i, dict)
+        and isinstance((i.get("info") or {}).get("config"), dict)
+        and i["info"]["config"].get("quantization_info")
+    }
+    if quantized:
+        out["quantization"] = [json.loads(x) for x in sorted(quantized)]
     return out
 
 

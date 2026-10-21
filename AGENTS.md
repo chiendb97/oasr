@@ -6,7 +6,7 @@ paradigms — CTC, transducer (RNN-T), AED, non-autoregressive CIF, and speech-L
 — from one engine, with custom CUDA/CUTLASS kernels exposed to Python via TVM-FFI
 JIT compilation and a Rust HTTP/gRPC serving front-end. Voice activity detection
 is an eighth registry axis on top of it, usable with or without a separate VAD
-model.
+model; quantization (W8A8 int8, SmoothQuant) is the ninth.
 
 - User-facing overview and quick start: [`README.md`](README.md)
 - Stable technical documentation: [`docs/`](docs/README.md)
@@ -23,7 +23,7 @@ model.
 
 1. **Never edit the engine core to add a variant.** Every extension lands through
    a registry — subclass a base, register under a name, select by configuration.
-   There are eight such axes; see [Architecture](#architecture).
+   There are nine such axes; see [Architecture](#architecture).
 2. **Models are built from `oasr.layers`, never from bare `nn.Linear` /
    `nn.LayerNorm` / `nn.Embedding` / `nn.Conv*`.** `tests/models/test_layer_waist.py`
    enforces this and fails on a newly registered architecture that has no tiny
@@ -134,6 +134,8 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | Rust build / test / lint | `cd rust && cargo build --release && cargo test && cargo clippy --all-targets -- -D warnings` |
 | Serve a checkpoint | `oasr-server --ckpt-dir <dir> --service-mode offline --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051` |
 | Convert a checkpoint | `oasr-convert <src> <dst>` |
+| Quantize a checkpoint (SmoothQuant W8A8) | `oasr quantize $CKPT_DIR <dst> --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl` |
+| Serve int8 without calibration | `oasr-server --ckpt-dir <dir> --quantization int8_w8a8` · `EngineConfig(quantization="int8_w8a8")` |
 | Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
 | Word timestamps | `oasr transcribe audio.mp3 --response-format verbose_json --timestamp-granularity word` |
 | Any benchmark | `python benchmarks/run.py --list` (kernels, decoders, engine, service, accuracy) |
@@ -224,7 +226,7 @@ Python functional API (oasr/functionals/<family>.py)  — @oasr_api
                             └── Pure CUDA kernels (include/oasr/<family>.cuh)
 ```
 
-### The eight extension axes
+### The nine extension axes
 
 Each is a registry. Adding a variant means subclass + register — no engine edits.
 
@@ -238,10 +240,12 @@ Each is a registry. Adding a variant means subclass + register — no engine edi
 | Tokenizer | `oasr.tokenizers.Tokenizer` | converter-emitted `TokenizerSpec.kind` |
 | Feature frontend | `oasr.features.ExtractorSpec` | `FeatureConfig.feature_type`, from `FeatureSpec` |
 | Speech detector | `oasr.vad.SpeechDetector` / `VadSpec` | `VadConfig.backend`; `None` = the decode family's own |
+| Quantization scheme | `oasr.quantization.QuantMethod` (+ `ScaledMMLane`, `QuantAlgorithm`) | the checkpoint's `QuantizationSpec` (native v2), else `EngineConfig.quantization`; per layer by module path |
 
-Orthogonal to all eight is the **layer waist**: `oasr.layers` is what every
+Orthogonal to all nine is the **layer waist**: `oasr.layers` is what every
 architecture is built from, so a kernel improvement, CUDA-graph capture or a
-future quantized path applies to all of them.
+quantized path applies to all of them (`Linear`, `LinearActivation` and
+`PointwiseConv1d` are `QuantizableGemm`s; see [`docs/quantization.md`](docs/quantization.md)).
 
 [`docs/architecture.md`](docs/architecture.md) is the authoritative map, with the
 extension cookbook for each axis.
@@ -269,7 +273,9 @@ extension cookbook for each axis.
 | `oasr/vad/` | Speech detectors (registry), the shared segmenter and the Kaldi-shaped endpointer |
 | `oasr/vad/detectors/silero.py` | Silero VAD v5 rebuilt on `oasr.layers` + the upstream weight conversion |
 | `oasr/engine/vad_stage.py` | The two engine entry points: offline splitter, per-tick streaming stage |
-| `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS` |
+| `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS`; `_quantizable.py` the quantization seam |
+| `oasr/quantization/` | The ninth axis: `spec` (formats, `QuantizationSpec`), `layout` (what a model declares), `methods/` + `kernels/lanes.py` (runtime), `calibration/` + `algorithms/` (offline), `export.py` / `cli.py` (`oasr quantize`) |
+| `oasr/functionals/{quant,scaled_mm}.py`, `include/oasr/{quant,scaled_mm}/`, `oasr/jit/scaled_mm.py` | Per-token int8 quantize and the CUTLASS 2.x int8 GEMM with its EVT dequant epilogue |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
 | `include/oasr/common/{cute_sm80,tile_rules}.h`, `oasr/jit/arch_facts.py` | The Ampere-class CuTe toolkit and tile rules the three C++ CuTe families (attention, gated MLP, recurrent step) share, and their Python mirror |
@@ -451,6 +457,35 @@ extension cookbook for each axis.
   transcript.
 - **An `EngineConfig` field for one decode family** (use `options_cls`), or **`nn.Linear` in a
   model file** (use `oasr.layers`).
+
+### Quantization
+- **`model.to(dtype)` on a quantized model.** It casts every floating tensor, fp32 scales
+  (and float8 storage) included; `QuantizableGemm._apply` moves quantized slots by device
+  only. A new quantized slot must be listed in its method's `preserved_tensors`.
+- **Creating quantized slots before a converted load.** Legacy remaps run inside
+  `_load_from_state_dict` and `param.copy_` casts fp32 into int8 silently. Quantize after the
+  fp load (online), or create slots and dtype-check before a *native* strict load —
+  `materialize_model` is the one sequence.
+- **Routing a quantized layer through the fp row floor.** `GEMM_MIN_ROWS` sends small M to
+  `F.linear`, which has no fp weight to use; the `quant_method` branch comes first.
+- **Split-K in the int8 EVT kernel.** The Sm80 EVT rejects split-K only by `assert`, which
+  NDEBUG removes; the config space excludes it. Stream-K is the supported split, and exact
+  (int32 partials) — but it loses on every Conformer shape, so only a measured tuning entry
+  picks it.
+- **Expecting a quantized model to be batch-invariant because its layers are.** Per-token
+  scales and the int32 accumulator make each quantized layer row-local, but an fp16 GEMM
+  ahead of it picks an M-dependent config (cuBLAS, split-K, Stream-K), and int8 rounding
+  amplifies its ulps. Name such GEMMs in `QuantLayout.batch_invariant` (the Conformer pins
+  `embed.out.0` and `linear_pos`). Attention still differs at batch 1 (split-KV).
+- **A static activation scale at the calibration maximum.** The median frame then spans a
+  fifth of the range: 17 dB SQNR against 30 dB per-token, +0.44 WER streaming on U2++.
+  `static_inputs` searches the clip (`observer=mse`).
+- **Declaring `fuse_output_quant` or a `GemmChain` on an output something else reads.** The
+  producer then returns a `QuantizedActivation`, which only its declared consumers accept;
+  a residual, a mask or a cache `cat` in between needs the tensor (hence no fused `norm_conv`).
+  The oracle for any fusion is the whole model armed vs disarmed, `torch.equal`.
+- **A target glob that selects a raw-read weight.** The gated MLP's gate/up and the
+  transducer joiner's fused-decode weights are `quantizable = False`; mark any new one.
 
 ### Serving
 - **Handing the engine heap audio.** After the codec, ask
@@ -664,6 +699,8 @@ Environment variables:
 | `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the fused recurrent step — whether to fuse at all |
 | `OASR_RECURRENT_BACKEND` | Which fused recurrent-step lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
+| `OASR_SCALED_MM_BACKEND` | Quantized-GEMM lane: `auto` (default) / `cutlass` (the int8 CUTLASS kernel) / `torch` (`torch._int_mm` + a torch epilogue). Naming one **requires** it |
+| `OASR_QUANT_FUSION` | `0` disarms the fused quantize producers (a norm emitting int8, a GEMM quantizing for its chained consumer): every quantized layer quantizes its own input again. Bit-identical either way (A/B, rollback) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
 | `OASR_METRICS` | `0` binds the engine-side metric collector to a no-op (front-end metrics are unaffected) |
 | `OASR_RS_BIN` | Path to an `oasr-server` executable, for `bench_service.py` |
@@ -702,6 +739,7 @@ before process start.
 | [`docs/kernels.md`](docs/kernels.md) | CUDA/CUTLASS layer, the JIT pipeline, the functional API |
 | [`docs/features.md`](docs/features.md) | Feature frontends, `FeatureSpec`, streaming framing |
 | [`docs/vad.md`](docs/vad.md) | Speech detectors, segmentation, endpointing, and the API surfaces |
+| [`docs/quantization.md`](docs/quantization.md) | W8A8 int8 at the layer waist, SmoothQuant and `oasr quantize`, native v2, kernel lanes, pinned numerics |
 | [`docs/tokenizers.md`](docs/tokenizers.md) | Tokenizer axis and `TokenizerSpec` |
 | [`docs/checkpoints.md`](docs/checkpoints.md) | Resolution precedence, converter contract, native format |
 | [`docs/cache_manager.md`](docs/cache_manager.md) | Paged and slot streaming caches |
