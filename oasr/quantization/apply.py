@@ -26,7 +26,7 @@ from typing import Dict, List, Mapping, Optional
 import torch
 from torch import nn
 
-from oasr.layers._quantizable import QuantizableGemm
+from oasr.layers._quantizable import QuantizableLayer
 
 from .layout import QuantLayout
 from .methods.base import method_for
@@ -46,21 +46,21 @@ _FUSION_ENABLED = os.environ.get("OASR_QUANT_FUSION", "1").strip().lower() not i
 )
 
 
-def quantizable_layers(model: nn.Module) -> Dict[str, QuantizableGemm]:
-    """``{path: layer}`` for every dense-GEMM waist layer that may be quantized."""
+def quantizable_layers(model: nn.Module) -> Dict[str, QuantizableLayer]:
+    """``{path: layer}`` for every GEMM / convolution waist layer that may be quantized."""
     return {
         path: module
         for path, module in model.named_modules()
-        if isinstance(module, QuantizableGemm) and getattr(module, "quantizable", True)
+        if isinstance(module, QuantizableLayer) and getattr(module, "quantizable", True)
     }
 
 
-def quantized_layers(model: nn.Module) -> Dict[str, QuantizableGemm]:
+def quantized_layers(model: nn.Module) -> Dict[str, QuantizableLayer]:
     """``{path: layer}`` for every layer with a quantization method installed."""
     return {
         path: module
         for path, module in model.named_modules()
-        if isinstance(module, QuantizableGemm) and module.quant_method is not None
+        if isinstance(module, QuantizableLayer) and module.quant_method is not None
     }
 
 
@@ -83,8 +83,8 @@ def apply_quantization(model: nn.Module, spec: QuantizationSpec, *, quantize: bo
             continue
         if layer.quant_method is not None:
             raise RuntimeError(f"{path} is already quantized")
-        method = method_for(scheme)
-        weight_fp32 = layer.gemm_weight().detach().float().clone() if quantize else None
+        method = method_for(scheme, layer)
+        weight_fp32 = layer.quant_weight().detach().float().clone() if quantize else None
         layer.quant_method = method
         method.create_weights(layer, runtime_smoothed=path in smoothed)
         if weight_fp32 is not None:
@@ -125,7 +125,7 @@ def _pin_batch_invariant(model: nn.Module) -> None:
                     f"{path} ({type(module).__name__}) cannot be pinned batch-invariant: only "
                     "a layer with a pinned kernel path (Linear, LinearActivation) can"
                 )
-            if isinstance(module, QuantizableGemm) and module.quant_method is not None:
+            if isinstance(module, QuantizableLayer) and module.quant_method is not None:
                 continue  # an int8 layer is batch-invariant already
             setattr(module, "batch_invariant", True)  # noqa: B010 - a class-declared knob
 
@@ -151,7 +151,7 @@ def bind_quantization(model: nn.Module) -> None:
     _link(model, layers)
 
 
-def _link(model: nn.Module, layers: Dict[str, QuantizableGemm]) -> None:
+def _link(model: nn.Module, layers: Dict[str, QuantizableLayer]) -> None:
     """Arm the producer -> consumer quantization the layout declares, where it can run.
 
     * A norm whose group says ``fuse_output_quant`` emits per-token 8-bit values
@@ -257,10 +257,20 @@ def validate_runtime(model: nn.Module) -> List[QuantReportRow]:
                 scheme=str(desc["scheme"]),
                 lane=desc["lane"],
                 note=str(desc["note"]),
-                shape=f"{layer.out_features}x{layer.in_features}",
+                shape=_shape(layer),
             )
         )
     return rows
+
+
+def _shape(layer: QuantizableLayer) -> str:
+    """``NxK`` for a GEMM; ``out x in x kernel`` for a convolution."""
+    shape = f"{layer.out_features}x{layer.in_features}"
+    kernel = getattr(layer, "kernel_size", None)
+    if layer.quant_kind in ("conv1d", "conv2d") and kernel is not None:
+        dims = kernel if isinstance(kernel, tuple) else (kernel,)
+        shape += "x" + "x".join(str(d) for d in dims)
+    return shape
 
 
 def format_quant_report(rows: List[QuantReportRow]) -> str:

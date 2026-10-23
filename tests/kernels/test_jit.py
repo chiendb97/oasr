@@ -131,8 +131,9 @@ class TestJitInfrastructure:
         # function of which architecture this box is.
         # Pin the *extras* by what they are instead of by how many there are.
         per_cell = ("fmha_", "gated_mlp_", "recurrent_step_")
-        # The fp8 scaled GEMM exists only where its lane does (sm89+).
-        per_arch = {"scaled_mm_fp8"}
+        # The fp8 scaled GEMM exists only where its lane does (sm89+), the int8
+        # convolution only where the int8 lane does (sm80+).
+        per_arch = {"scaled_mm_fp8", "scaled_conv"}
         extras = [n for n in names if n not in expected]
         unknown = [n for n in extras if not n.startswith(per_cell) and n not in per_arch]
         assert not unknown, f"unexpected AOT modules: {unknown}"
@@ -145,6 +146,14 @@ class TestJitInfrastructure:
 
         names = {s.name for s in gen_all_modules()}
         assert ("scaled_mm_fp8" in names) == lane_available(_get_target_sm(), "fp8")
+
+    def test_the_int8_convolution_is_registered_where_its_lane_serves_the_arch(self):
+        from oasr.aot import gen_all_modules
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.scaled_conv import lane_available
+
+        names = {s.name for s in gen_all_modules()}
+        assert ("scaled_conv" in names) == lane_available(_get_target_sm())
 
     def test_attention_cells_are_registered_where_the_lane_serves_the_arch(self):
         """An AOT set that skips attention means every engine JITs it at load.

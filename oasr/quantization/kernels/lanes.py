@@ -365,3 +365,55 @@ def choose_lane(
 def forced_backend() -> Optional[str]:
     """The backend ``OASR_SCALED_MM_BACKEND`` names, or ``None`` for ``auto``."""
     return None if _BACKEND == "auto" else _BACKEND
+
+
+class CutlassSm80Int8ConvLane:
+    """CUTLASS 2.x int8 implicit-GEMM convolution (``oasr.scaled_conv2d``).
+
+    Not a :class:`ScaledMMLane`: a convolution's operands are an NHWC activation
+    and a KRSC filter, not two matrices.  The one convolution lane; torch has no
+    int8 convolution, so ``OASR_SCALED_MM_BACKEND=torch`` runs a quantized
+    convolution on its reference (the same numerics, in fp64).
+    """
+
+    name = "cutlass_sm80_int8_conv"
+    backend = "cutlass"
+
+    @classmethod
+    def is_supported(cls, sm: int) -> Tuple[bool, str]:
+        from oasr.jit.scaled_conv import lane_available
+
+        if lane_available(sm):
+            return True, ""
+        return False, f"no int8 implicit-GEMM convolution lane is built for sm{sm}"
+
+    @classmethod
+    def is_native(cls, sm: int) -> bool:
+        from oasr.jit.scaled_conv import is_native_lane
+
+        return is_native_lane(sm)
+
+    def run1d(self, q, weight, scale, bias, activation, padding, stride, dilation, out_dtype):
+        from oasr.functionals.scaled_conv import scaled_conv1d
+
+        return scaled_conv1d(
+            q, weight, scale, bias, activation, padding, stride, dilation, out_dtype=out_dtype
+        )
+
+    def run2d(self, q, weight, scale, bias, activation, padding, stride, dilation, out_dtype):
+        from oasr.functionals.scaled_conv import scaled_conv2d
+
+        return scaled_conv2d(
+            q, weight, scale, bias, activation, padding, stride, dilation, out_dtype=out_dtype
+        )
+
+
+def choose_conv_lane(sm: int) -> Tuple[Optional[CutlassSm80Int8ConvLane], str]:
+    """``(lane, note)`` for a quantized convolution on *sm*, else ``(None, why)``."""
+    if _BACKEND == "torch":
+        return None, "reference (OASR_SCALED_MM_BACKEND=torch: torch has no int8 convolution)"
+    ok, why = CutlassSm80Int8ConvLane.is_supported(sm)
+    if not ok:
+        return None, why
+    note = "native" if CutlassSm80Int8ConvLane.is_native(sm) else f"non-native lane on sm{sm}"
+    return CutlassSm80Int8ConvLane(), note

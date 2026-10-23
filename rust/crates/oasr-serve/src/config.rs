@@ -184,7 +184,10 @@ pub struct Cli {
     #[arg(long)]
     pub quantization: Option<String>,
     /// Extra quantization setting, `key=value`, repeatable (e.g.
-    /// `ignore=ctc.*`). Values are passed as strings and typed by the engine.
+    /// `ignore=ctc.*`, `module_types=linear,pointwise_conv`,
+    /// `kv_cache=fp8_e4m3`). Values are passed as strings and typed by the
+    /// engine. Convolutions (`conv1d` / `conv2d`) need a calibrated checkpoint
+    /// from `oasr quantize --module-types`.
     #[arg(long = "quantization-option", value_name = "KEY=VALUE")]
     pub quantization_option: Vec<String>,
     /// Maximum incremental decoder steps per tick; bounds dispatcher starvation.

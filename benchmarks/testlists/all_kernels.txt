@@ -71,6 +71,8 @@
 --family quant --subroutine quantize_per_token --M 16384 --K 256
 --family scaled_mm --subroutine scaled_mm --M 2048 --N 2048 --K 256 --bias --activation swish
 --family scaled_mm --subroutine quant_scaled_mm --M 2048 --N 2048 --K 256 --bias --activation swish
+--family scaled_conv --subroutine quant_scaled_conv2d --N 8 --H 324 --W 39 --C 256 --K 256 --R 3 --S 3 --stride 2 --activation relu
+--family scaled_conv --subroutine scaled_conv1d --N 16 --H 1 --W 3000 --C 384 --K 384 --R 1 --S 3 --stride 2 --pad 1
 
 # Feature frontend
 --family feature --subroutine fbank_preprocess --batch 64 --num-frames 500 --frame-length 400 --n-fft 512

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional, Set, Tuple
 
 import torch
 
@@ -175,6 +175,66 @@ def get_scheme(name: str) -> QuantScheme:
         ) from None
 
 
+#: The layer kinds quantized when nothing names them: the dense GEMMs, exactly
+#: what quantization covered before convolutions could be selected.
+DEFAULT_MODULE_TYPES: Tuple[str, ...] = ("linear", "pointwise_conv")
+
+#: Names that stand for several kinds.
+MODULE_TYPE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "conv": ("pointwise_conv", "conv1d", "conv2d"),
+    "all": ("linear", "pointwise_conv", "conv1d", "conv2d"),
+}
+
+#: The kinds whose quantized input needs a calibrated static scale: an output
+#: pixel sums over a receptive field spanning several input pixels, so a
+#: per-token scale would not factor out of the sum.
+STATIC_INPUT_KINDS = ("conv1d", "conv2d")
+
+
+def resolve_module_types(names: Optional[Iterable[str]]) -> Tuple[str, ...]:
+    """The layer kinds *names* selects, aliases expanded, in :data:`QUANT_KINDS` order.
+
+    ``None`` is :data:`DEFAULT_MODULE_TYPES`; a comma-separated string is accepted
+    (the server passes option values as strings).  An unknown name raises.
+    """
+    from oasr.layers._quantizable import QUANT_KINDS
+
+    if names is None:
+        return DEFAULT_MODULE_TYPES
+    if isinstance(names, str):
+        names = names.split(",")
+    wanted: Set[str] = set()
+    for raw in names:
+        name = str(raw).strip()
+        if not name:
+            continue
+        if name in MODULE_TYPE_ALIASES:
+            wanted.update(MODULE_TYPE_ALIASES[name])
+        elif name in QUANT_KINDS:
+            wanted.add(name)
+        else:
+            raise ValueError(
+                f"unknown module type {name!r}; expected one of {list(QUANT_KINDS)} or an "
+                f"alias {sorted(MODULE_TYPE_ALIASES)}"
+            )
+    if not wanted:
+        raise ValueError("module_types selects no layer kind")
+    return tuple(k for k in QUANT_KINDS if k in wanted)
+
+
+def static_variant(scheme: "QuantScheme") -> "QuantScheme":
+    """*scheme*'s format with a static per-tensor activation scale (a convolution's)."""
+    acts = scheme.input_activations
+    if acts is not None and acts.granularity == "tensor" and not acts.dynamic:
+        return scheme
+    if scheme.weights.type == "int" and scheme.weights.num_bits == 8:
+        return INT8_W8A8_STATIC
+    raise ValueError(
+        f"scheme {scheme.name or scheme}: only int8 has a quantized convolution kernel "
+        "(int8_w8a8 / int8_w8a8_static); keep convolutions out of module_types"
+    )
+
+
 def check_scheme_is_batch_invariant(scheme: QuantScheme) -> None:
     """Refuse a per-tensor *dynamic* activation scale.
 
@@ -248,14 +308,17 @@ class QuantizationSpec:
         * a target that selects a layer whose weight something else reads raw
           (``quantizable = False``: the transducer decode kernels) — quantizing
           it would hand that reader 8-bit storage;
-        * a runtime-smoothed path that is not a quantized layer.
+        * a target that selects a layer no 8-bit kernel can run
+          (``quant_unsupported()``: a depthwise convolution, a stem with one input
+          channel);
+        * a runtime-smoothed path that is not a quantized GEMM.
         """
-        from oasr.layers._quantizable import QuantizableGemm
+        from oasr.layers._quantizable import QuantizableGemm, QuantizableLayer
 
-        gemms = {p: m for p, m in model.named_modules() if isinstance(m, QuantizableGemm)}
+        layers = {p: m for p, m in model.named_modules() if isinstance(m, QuantizableLayer)}
         for group in self.groups:
             for glob in group.targets:
-                hits = [p for p in gemms if fnmatch.fnmatchcase(p, glob)]
+                hits = [p for p in layers if fnmatch.fnmatchcase(p, glob)]
                 if not hits:
                     raise ValueError(
                         f"quantization target {glob!r} matches no quantizable layer of "
@@ -264,14 +327,20 @@ class QuantizationSpec:
                 for path in hits:
                     if self.is_ignored(path):
                         continue
-                    if not getattr(gemms[path], "quantizable", True):
+                    if not getattr(layers[path], "quantizable", True):
                         raise ValueError(
                             f"quantization target {glob!r} selects {path}, whose weight is "
                             "read raw by a fused kernel (quantizable=False); add it to "
                             "`ignore`"
                         )
+                    why = layers[path].quant_unsupported()
+                    if why is not None:
+                        raise ValueError(
+                            f"quantization target {glob!r} selects {path}, which cannot be "
+                            f"quantized: {why}; add it to `ignore`"
+                        )
         for path in self.runtime_smoothed:
-            if path not in gemms or self.resolve(path) is None:
+            if not isinstance(layers.get(path), QuantizableGemm) or self.resolve(path) is None:
                 raise ValueError(f"runtime_smoothed names {path!r}, which is not quantized")
 
     # -- construction ----------------------------------------------------------
@@ -283,31 +352,58 @@ class QuantizationSpec:
         *,
         ignore: Iterable[str] = (),
         producer: Optional[Mapping[str, Any]] = None,
+        module_types: Optional[Iterable[str]] = None,
     ) -> "QuantizationSpec":
-        """A spec quantizing every quantizable layer of *model* with *scheme*.
+        """A spec quantizing every quantizable layer of *model* of *module_types* with *scheme*.
+
+        *module_types* names layer kinds (``linear``, ``pointwise_conv``,
+        ``conv1d``, ``conv2d``; aliases ``conv``, ``all``); ``None`` is
+        :data:`DEFAULT_MODULE_TYPES`.  A convolution takes *scheme*'s static
+        variant (:func:`static_variant`): its input scale must be calibrated.
 
         Kept at full precision: what the model's ``quantization_layout()``
-        declares, layers whose weight is read raw (``quantizable = False``) and
-        any extra *ignore* globs.  Targets are written out as exact paths, so the
-        checkpoint records precisely what was quantized.
+        declares, layers whose weight is read raw (``quantizable = False``), layers
+        no 8-bit kernel can run (``quant_unsupported()``, recorded with the reason
+        in ``producer["skipped"]``) and any extra *ignore* globs.  Targets are
+        written out as exact paths, so the checkpoint records precisely what was
+        quantized.
         """
-        from oasr.layers._quantizable import QuantizableGemm
+        from oasr.layers._quantizable import QuantizableLayer
 
+        kinds = resolve_module_types(module_types)
         keep = tuple(_model_keep_full_precision(model)) + tuple(ignore)
-        targets = tuple(
-            p
-            for p, m in model.named_modules()
-            if isinstance(m, QuantizableGemm)
-            and getattr(m, "quantizable", True)
-            and not any(fnmatch.fnmatchcase(p, g) for g in keep)
-        )
-        if not targets:
-            raise ValueError(f"{type(model).__name__} has no quantizable layer left to quantize")
-        return cls(
-            groups=(QuantGroup(scheme, targets),),
-            ignore=tuple(ignore),
-            producer=dict(producer or {}),
-        )
+        gemm_targets, static_targets, skipped = [], [], {}
+        for p, m in model.named_modules():
+            if (
+                not isinstance(m, QuantizableLayer)
+                or m.quant_kind not in kinds
+                or not getattr(m, "quantizable", True)
+                or any(fnmatch.fnmatchcase(p, g) for g in keep)
+            ):
+                continue
+            why = m.quant_unsupported()
+            if why is not None:
+                skipped[p] = why
+            elif m.quant_kind in STATIC_INPUT_KINDS:
+                static_targets.append(p)
+            else:
+                gemm_targets.append(p)
+        if not gemm_targets and not static_targets:
+            raise ValueError(
+                f"{type(model).__name__} has no quantizable layer of kinds {list(kinds)} left "
+                "to quantize" + (f" (skipped: {skipped})" if skipped else "")
+            )
+        groups = []
+        if static_targets:
+            groups.append(QuantGroup(static_variant(scheme), tuple(static_targets)))
+        if gemm_targets:
+            groups.append(QuantGroup(scheme, tuple(gemm_targets)))
+        record = dict(producer or {})
+        if kinds != DEFAULT_MODULE_TYPES:
+            record["module_types"] = list(kinds)
+        if skipped:
+            record["skipped"] = skipped
+        return cls(groups=tuple(groups), ignore=tuple(ignore), producer=record)
 
     # -- serialization ---------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:

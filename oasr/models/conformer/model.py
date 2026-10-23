@@ -1174,8 +1174,12 @@ class ConformerModel(BaseAsrModel):
         and FFN ``w_1``.  V folds into ``linear_out`` through attention
         (``v_to_o``).  ``w_2`` (after swish) and ``pointwise_conv2`` (after the
         conv norm and swish) have no producer that can absorb ``s``: they carry a
-        runtime smoother.  The subsampling front-end, ``linear_pos`` (its input is
-        the sinusoidal table) and the CTC head stay full precision.
+        runtime smoother.  The subsampling's output projection, ``linear_pos`` (its
+        input is the sinusoidal table) and the CTC head stay full precision.  Its
+        convolutions are not dense GEMMs: they are quantized only when
+        ``module_types`` asks for ``conv2d`` (``oasr quantize --module-types``),
+        and then only the dense, int8-aligned one -- the one-channel stem has no
+        int8 kernel and is skipped.
 
         What the forward lets run fused: the pre-norms of the two FFNs and of
         attention feed their GEMM and nothing else (attention reads only its
@@ -1230,7 +1234,7 @@ class ConformerModel(BaseAsrModel):
             groups.append(norm_group("norm_ff", f"{p}.feed_forward.w_1", True))
             groups.append(SmoothGroup(None, (f"{p}.feed_forward.w_2",), "runtime"))
             chains.append(GemmChain(f"{p}.feed_forward.w_1", f"{p}.feed_forward.w_2"))
-        keep: Tuple[str, ...] = ("encoder.embed.*", "*.linear_pos", "ctc.*")
+        keep: Tuple[str, ...] = ("encoder.embed.out.*", "*.linear_pos", "ctc.*")
         decoder = getattr(self, "decoder", None)
         if isinstance(decoder, BiTransformerDecoder):
             dec = decoder.quantization_layout("decoder")

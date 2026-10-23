@@ -21,9 +21,10 @@ import torch
 from torch import nn
 
 from .algorithms.base import ForwardLoop, build_algorithm
+from .algorithms.static_inputs import uncalibrated_static_layers
 from .apply import apply_quantization, finalize_quantization, quantized_layers
 from .recipes import Recipe, get_recipe
-from .spec import QuantizationSpec, get_scheme
+from .spec import STATIC_INPUT_KINDS, QuantizationSpec, get_scheme, resolve_module_types
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ def quantize_model(
     algorithm_options: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ignore: Iterable[str] = (),
     producer: Optional[Mapping[str, Any]] = None,
+    module_types: Optional[Iterable[str]] = None,
 ) -> QuantizationSpec:
     """Quantize *model* in place with *recipe*; returns the spec it now carries.
 
@@ -45,15 +47,22 @@ def quantize_model(
         model: An fp32 master model (weights loaded, not yet quantized).
         recipe: Scheme + algorithms.
         forward_loop: Runs calibration audio through *model*; required by any
-            algorithm with ``needs_calibration``.
+            algorithm with ``needs_calibration``, and by a ``conv1d`` / ``conv2d``
+            in *module_types* (its static input scale is calibrated).
         algorithm_options: ``{algorithm name: {option: value}}``.
         ignore: Extra module-path globs to keep at full precision.
         producer: Extra provenance to record (calibration data, versions).
+        module_types: Layer kinds to quantize (``QuantizationConfig.module_types``);
+            ``None`` is the dense GEMMs.
     """
     if getattr(model, "quantization_spec", None) is not None:
         raise ValueError("the model is already quantized")
     spec = QuantizationSpec.for_model(
-        model, get_scheme(recipe.scheme), ignore=ignore, producer=producer
+        model,
+        get_scheme(recipe.scheme),
+        ignore=ignore,
+        producer=producer,
+        module_types=module_types,
     )
     spec.check_against(model)
     layout_fn = getattr(model, "quantization_layout", None)
@@ -65,6 +74,12 @@ def quantize_model(
         algorithm = build_algorithm(name, options.pop(name, None))
         if algorithm.needs_calibration and forward_loop is None:
             raise ValueError(f"recipe {recipe.name!r}: {name} needs calibration audio")
+        spec = algorithm.apply(model, layout, spec, forward_loop)
+    # A statically quantized layer the recipe did not calibrate (a convolution,
+    # whose input scale cannot be per-token) is calibrated here.
+    conv_options = options.pop("static_conv_inputs", None)
+    if uncalibrated_static_layers(model, spec):
+        algorithm = build_algorithm("static_conv_inputs", conv_options)
         spec = algorithm.apply(model, layout, spec, forward_loop)
     if options:
         raise ValueError(f"options given for algorithms not in the recipe: {sorted(options)}")
@@ -111,8 +126,13 @@ def quantize_checkpoint(
     checkpoint_name: str = "final.pt",
     device: str = "cuda",
     calibration_dtype: Optional[str] = None,
+    module_types: Optional[Iterable[str]] = None,
 ) -> Path:
     """``oasr quantize``: write a quantized native checkpoint of *src* at *dst*.
+
+    ``module_types`` selects the layer kinds to quantize (``QuantizationConfig``'s
+    names; ``None`` is the dense GEMMs).  A ``conv1d`` / ``conv2d`` kind takes a
+    calibrated static input scale, so it needs ``calib_manifest`` with any recipe.
 
     ``calibration_dtype`` (``"bfloat16"`` / ``"float16"``) keeps the fp32 master
     on the host and runs the calibration audio through a copy of it in that dtype
@@ -136,7 +156,9 @@ def quantize_checkpoint(
     # remaps and padding included); then onto the calibration device in fp32 --
     # or left on the host, with a reduced-precision twin on the device.
     model, config, _report = materialize_model(arch, bundle)
-    needs_audio = any(build_algorithm(a).needs_calibration for a in rec.algorithms)
+    needs_audio = any(build_algorithm(a).needs_calibration for a in rec.algorithms) or any(
+        k in STATIC_INPUT_KINDS for k in resolve_module_types(module_types)
+    )
     twin: Optional[nn.Module] = None
     if calib_dtype == torch.float32 or not needs_audio:
         model = model.to(device)
@@ -147,7 +169,10 @@ def quantize_checkpoint(
     producer: Dict[str, Any] = {"source": Path(src).name, "torch": torch.__version__}
     if needs_audio:
         if calib_manifest is None:
-            raise ValueError(f"recipe {recipe!r} needs --calib-manifest")
+            raise ValueError(
+                f"recipe {recipe!r} with module types {list(resolve_module_types(module_types))} "
+                "needs --calib-manifest"
+            )
         from .calibration import CheckpointFrontend, asr_forward_loop, select_manifest
 
         calibration = select_manifest(
@@ -169,6 +194,7 @@ def quantize_checkpoint(
         algorithm_options=algorithm_options,
         ignore=ignore,
         producer=producer,
+        module_types=module_types,
     )
     del twin, forward_loop
     model = model.to("cpu")

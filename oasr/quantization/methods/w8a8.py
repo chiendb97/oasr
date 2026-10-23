@@ -52,15 +52,16 @@ from oasr.functionals.quant import (
     round_to_quant,
     static_multiplier,
 )
+from oasr.functionals.scaled_conv import reference_scaled_conv1d, reference_scaled_conv2d
 from oasr.functionals.scaled_mm import reference_scaled_mm, reference_scaled_mm_quant
 from oasr.layers._backend import layers_backend, take_gap
-from oasr.layers._quantizable import QuantizedActivation
+from oasr.layers._quantizable import QuantizableConv, QuantizableGemm, QuantizedActivation
 
-from ..kernels.lanes import choose_lane, forced_backend, w8a8_format
+from ..kernels.lanes import choose_conv_lane, choose_lane, forced_backend, w8a8_format
 from .base import QuantMethod, register_quant_method
 
 if TYPE_CHECKING:  # pragma: no cover
-    from oasr.layers._quantizable import QuantizableGemm
+    from oasr.layers._quantizable import QuantizableLayer
 
     from ..spec import QuantScheme
 
@@ -131,6 +132,10 @@ class W8A8Method(QuantMethod):
     def supports(cls, scheme: "QuantScheme") -> bool:
         return w8a8_format(scheme) is not None
 
+    @classmethod
+    def serves(cls, layer: Any) -> bool:
+        return isinstance(layer, QuantizableGemm)
+
     @property
     def static(self) -> bool:
         """The activation scale is a calibrated per-tensor constant."""
@@ -138,7 +143,7 @@ class W8A8Method(QuantMethod):
         return a is not None and a.granularity == "tensor" and not a.dynamic
 
     # -- storage -------------------------------------------------------------
-    def create_weights(self, layer: "QuantizableGemm", *, runtime_smoothed: bool) -> None:
+    def create_weights(self, layer: "QuantizableLayer", *, runtime_smoothed: bool) -> None:
         module: nn.Module = layer  # type: ignore[assignment]
         old = _tensor(module, "weight")
         device = old.device
@@ -159,18 +164,18 @@ class W8A8Method(QuantMethod):
                 "input_scale", _take_installed(module, "input_scale", torch.ones(1), device)
             )
 
-    def quantize_weight(self, layer: "QuantizableGemm", weight_fp32: torch.Tensor) -> None:
+    def quantize_weight(self, layer: "QuantizableLayer", weight_fp32: torch.Tensor) -> None:
         module: nn.Module = layer  # type: ignore[assignment]
         q, scale = quantize_weight_per_channel(weight_fp32, dtype=self.storage_dtype)
         weight = _tensor(module, "weight")
         weight.data.copy_(q.reshape(weight.shape))
         _tensor(module, "weight_scale").copy_(scale)
 
-    def preserved_tensors(self, layer: "QuantizableGemm") -> Tuple[str, ...]:
+    def preserved_tensors(self, layer: "QuantizableLayer") -> Tuple[str, ...]:
         return ("weight", "weight_scale", "smooth_inv", "input_scale")
 
     # -- binding ---------------------------------------------------------------
-    def bind(self, layer: "QuantizableGemm") -> None:
+    def bind(self, layer: "QuantizableLayer") -> None:
         module: nn.Module = layer  # type: ignore[assignment]
         self.emit = None  # links are re-armed by bind_quantization
         self.input_source = None
@@ -211,7 +216,7 @@ class W8A8Method(QuantMethod):
             "in oasr.layers._backend.KERNEL_GAPS, not routed around"
         )
 
-    def quantized_input(self, layer: "QuantizableGemm") -> Optional[str]:
+    def quantized_input(self, layer: "QuantizableLayer") -> Optional[str]:
         if self.lane is None:
             return None
         if self.static:
@@ -219,28 +224,30 @@ class W8A8Method(QuantMethod):
         module: nn.Module = layer  # type: ignore[assignment]
         return None if _optional(module, "smooth_inv") is not None else "token"
 
-    def static_input(self, layer: "QuantizableGemm") -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def static_input(
+        self, layer: "QuantizableLayer"
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if self.lane is None or not self.static or self.static_mul is None:
             return None
         module: nn.Module = layer  # type: ignore[assignment]
         return self.static_mul, _tensor(module, "input_scale")
 
     def emit_for(
-        self, layer: "QuantizableGemm", consumer: str, mul: torch.Tensor, scale: torch.Tensor
+        self, layer: "QuantizableLayer", consumer: str, mul: torch.Tensor, scale: torch.Tensor
     ) -> bool:
         if self.lane is None or mul.numel() != layer.out_features:
             return False
         self.emit = OutputQuant(mul, scale, consumer)
         return True
 
-    def _multiplier(self, layer: "QuantizableGemm") -> torch.Tensor:
+    def _multiplier(self, layer: "QuantizableLayer") -> torch.Tensor:
         module: nn.Module = layer  # type: ignore[assignment]
         return static_multiplier(
             _tensor(module, "input_scale"), _optional(module, "smooth_inv"), layer.in_features
         )
 
     # -- forward ---------------------------------------------------------------
-    def apply(self, layer: "QuantizableGemm", x: Activation) -> Activation:  # type: ignore[override]
+    def apply(self, layer: "QuantizableLayer", x: Activation) -> Activation:  # type: ignore[override]
         dtype = x.dtype
         if (
             self.lane is None
@@ -264,7 +271,7 @@ class W8A8Method(QuantMethod):
             q, a_scale = quantize_per_token(
                 x, _optional(module, "smooth_inv"), dtype=self.storage_dtype
             )
-        weight, w_scale = layer.gemm_weight(), _tensor(module, "weight_scale")
+        weight, w_scale = layer.quant_weight(), _tensor(module, "weight_scale")
         bias, act = _optional(module, "bias"), layer.fused_activation
         if self.emit is not None:
             data = self.lane.run_quant(q, weight, a_scale, w_scale, bias, act, self.emit.mul, dtype)
@@ -272,7 +279,7 @@ class W8A8Method(QuantMethod):
         return self.lane.run(q, weight, a_scale, w_scale, bias, act, dtype)
 
     def apply_reference(  # type: ignore[override]
-        self, layer: "QuantizableGemm", x: Activation
+        self, layer: "QuantizableLayer", x: Activation
     ) -> Activation:
         module: nn.Module = layer  # type: ignore[assignment]
         dtype = x.dtype
@@ -287,7 +294,7 @@ class W8A8Method(QuantMethod):
             q, a_scale = reference_quantize_per_token(
                 x, _optional(module, "smooth_inv"), dtype=self.storage_dtype
             )
-        weight, w_scale = layer.gemm_weight(), _tensor(module, "weight_scale")
+        weight, w_scale = layer.quant_weight(), _tensor(module, "weight_scale")
         bias, act = _optional(module, "bias"), layer.fused_activation
         if self.emit is not None:
             mul = self.emit.mul.to(q.device)
@@ -304,7 +311,7 @@ class W8A8Method(QuantMethod):
             )
         return x.data
 
-    def describe(self, layer: "QuantizableGemm") -> Dict[str, Any]:
+    def describe(self, layer: "QuantizableLayer") -> Dict[str, Any]:
         row = super().describe(layer)
         notes = [str(row["note"])]
         if self.static:
@@ -313,6 +320,174 @@ class W8A8Method(QuantMethod):
             notes.append("quantizes its output for its consumer")
         row["note"] = "; ".join(notes)
         return row
+
+
+@register_quant_method
+class W8A8ConvMethod(W8A8Method):
+    """int8 per-output-channel weights x a static per-tensor int8 input, for a convolution.
+
+    The storage is :class:`W8A8Method`'s -- ``weight`` keeps the layer's own KRSC
+    (``Conv2d``) / KSC (``Conv1d``) shape in int8, ``weight_scale`` is one fp32 per
+    output channel, ``input_scale`` the calibrated ``[1]`` step -- so a checkpoint
+    key means the same thing quantized or not.  The input scale must be static: an
+    output pixel sums over a receptive field spanning several input pixels, so a
+    per-token scale would not factor out of the sum.
+
+    Forward: ``quantize_static`` (the layer's ``in_channels`` multiplier), then the
+    int8 implicit-GEMM convolution, whose epilogue multiplies the exact int32 sum by
+    ``input_scale * weight_scale[k]`` (folded once at :meth:`bind`), adds the bias
+    and applies the fused activation.  A convolution neither consumes a producer's
+    8-bit output nor emits one (no declared link reaches it).
+    """
+
+    def __init__(self, scheme: "QuantScheme") -> None:
+        super().__init__(scheme)
+        #: ``input_scale * weight_scale`` on the layer's device, set by :meth:`bind`.
+        self.conv_scale: Optional[torch.Tensor] = None
+
+    @classmethod
+    def supports(cls, scheme: "QuantScheme") -> bool:
+        acts = scheme.input_activations
+        return (
+            w8a8_format(scheme) == "int8"
+            and acts is not None
+            and acts.granularity == "tensor"
+            and not acts.dynamic
+        )
+
+    @classmethod
+    def serves(cls, layer: Any) -> bool:
+        return isinstance(layer, QuantizableConv)
+
+    def create_weights(self, layer: "QuantizableLayer", *, runtime_smoothed: bool) -> None:
+        why = layer.quant_unsupported()
+        if why is not None:
+            raise ValueError(f"cannot quantize this {type(layer).__name__}: {why}")
+        if runtime_smoothed:
+            raise ValueError("a convolution takes no runtime SmoothQuant smoother")
+        super().create_weights(layer, runtime_smoothed=False)
+
+    def bind(self, layer: "QuantizableLayer") -> None:  # type: ignore[override]
+        module: nn.Module = layer  # type: ignore[assignment]
+        self.emit = None
+        self.input_source = None
+        self.static_mul = self._multiplier(layer)
+        self.conv_scale = _conv_scale(module)
+        device = _tensor(module, "weight").device
+        if device.type != "cuda":
+            self.lane, self.lane_note = None, f"reference ({device.type})"
+            return
+        bias = _optional(module, "bias")
+        out_dtype = bias.dtype if bias is not None else torch.float16
+        if out_dtype not in _SERVED:
+            self.lane, self.lane_note = None, f"reference ({out_dtype})"
+            return
+        major, minor = torch.cuda.get_device_capability(device)
+        sm = major * 10 + minor
+        lane, note = choose_conv_lane(sm)
+        if lane is not None or forced_backend() == "torch":
+            self.lane, self.lane_note = lane, note  # type: ignore[assignment]
+            return
+        if sm == 75 and take_gap("scaled-conv-int8-sm75", note) is False:
+            self.lane, self.lane_note = None, "reference (declared gap scaled-conv-int8-sm75)"
+            return
+        raise RuntimeError(
+            f"no kernel serves a quantized {type(layer).__name__} on sm{sm} ({note}); a "
+            "missing kernel must be declared in oasr.layers._backend.KERNEL_GAPS, not routed "
+            "around"
+        )
+
+    def quantized_input(self, layer: "QuantizableLayer") -> Optional[str]:
+        return None
+
+    def static_input(
+        self, layer: "QuantizableLayer"
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        return None
+
+    def emit_for(
+        self, layer: "QuantizableLayer", consumer: str, mul: torch.Tensor, scale: torch.Tensor
+    ) -> bool:
+        return False
+
+    # -- forward ---------------------------------------------------------------
+    def apply(  # type: ignore[override]
+        self, layer: "QuantizableLayer", x: torch.Tensor, padding: Optional[Tuple[int, int]] = None
+    ) -> torch.Tensor:
+        dtype = x.dtype
+        if (
+            self.lane is None
+            or not x.is_cuda
+            or dtype not in _SERVED
+            or layers_backend() == "torch"
+        ):
+            return self.apply_reference(layer, x, padding=padding)
+        module: nn.Module = layer  # type: ignore[assignment]
+        if not x.is_contiguous():
+            x = x.contiguous()
+        mul = self.static_mul if self.static_mul is not None else self._multiplier(layer)
+        scale = self.conv_scale if self.conv_scale is not None else _conv_scale(module)
+        q = quantize_static(x, mul, dtype=torch.int8)
+        weight, bias, act = (
+            _tensor(module, "weight"),
+            _optional(module, "bias"),
+            layer.fused_activation,
+        )
+        lane: Any = self.lane
+        conv: Any = layer  # the geometry attributes of a Conv1d / Conv2d
+        if layer.quant_kind == "conv1d":
+            return lane.run1d(  # type: ignore[no-any-return]
+                q, weight, scale, bias, act, conv.padding, conv.stride, conv.dilation, dtype
+            )
+        pad = conv.padding if padding is None else padding
+        return lane.run2d(  # type: ignore[no-any-return]
+            q, weight, scale, bias, act, pad, conv.stride, conv.dilation, dtype
+        )
+
+    def apply_reference(  # type: ignore[override]
+        self, layer: "QuantizableLayer", x: torch.Tensor, padding: Optional[Tuple[int, int]] = None
+    ) -> torch.Tensor:
+        module: nn.Module = layer  # type: ignore[assignment]
+        dtype = x.dtype
+        q = reference_quantize_static(x, self._multiplier(layer).to(x.device), dtype=torch.int8)
+        weight, bias, act = (
+            _tensor(module, "weight"),
+            _optional(module, "bias"),
+            layer.fused_activation,
+        )
+        scale = _conv_scale(module).to(x.device)
+        conv: Any = layer  # the geometry attributes of a Conv1d / Conv2d
+        if layer.quant_kind == "conv1d":
+            return reference_scaled_conv1d(
+                q,
+                weight,
+                scale,
+                bias,
+                act,
+                conv.padding,
+                conv.stride,
+                conv.dilation,
+                out_dtype=dtype,
+            )
+        pad = conv.padding if padding is None else padding
+        return reference_scaled_conv2d(
+            q, weight, scale, bias, act, pad, conv.stride, conv.dilation, out_dtype=dtype
+        )
+
+    def describe(self, layer: "QuantizableLayer") -> Dict[str, Any]:
+        row = QuantMethod.describe(self, layer)
+        row["note"] = f"{row['note']}; static input scale; int8 convolution"
+        return row
+
+
+def _conv_scale(module: nn.Module) -> torch.Tensor:
+    """``input_scale * weight_scale``: the convolution epilogue's per-channel factor.
+
+    One IEEE fp32 multiply, computed the same way for the kernel and the reference.
+    """
+    return (
+        _tensor(module, "input_scale").float() * _tensor(module, "weight_scale").float()
+    ).contiguous()
 
 
 def _take_installed(

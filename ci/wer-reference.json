@@ -148,6 +148,41 @@
       "_comment": "The FFN's w_2 takes a calibrated static per-tensor input scale so w_1's epilogue quantizes for it; the clip is the MSE-optimal one over the calibration audio. At the calibration maximum (observer absmax) the same recipe measured 4.08 offline and 4.14 streaming (before the pins), at the 99.999th percentile 4.20 / 3.73. Measured 4.14 / 4.11 / 4.11 / 4.11 % at max_batch_size 1 / 8 / 16 / 32. Acceptance: <= fp16 + 0.3 and <= RTN."
     },
     {
+      "key": "conformer_w8a8_sq_fused_conv",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8, FFN fused, + the int8 subsampling conv2d (static input scale, MSE clip)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8_fused",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          },
+          "static_inputs": {
+            "observer": "mse"
+          }
+        },
+        "module_types": [
+          "linear",
+          "pointwise_conv",
+          "conv2d"
+        ]
+      },
+      "error_rate_pct": 4.09,
+      "ref_units": 3403,
+      "substitutions": 107,
+      "deletions": 22,
+      "insertions": 10,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --module-types linear,pointwise_conv,conv2d --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "Recorded 2026-10-23 (RTX 5090). module_types adds the dense subsampling conv (encoder.embed.convs.1, 256->256 3x3/2) on the int8 implicit-GEMM convolution; the one-channel stem has no int8 kernel and stays fp16 (skipped, recorded in the spec's producer). The same recipe without the conv measured 4.11 in the same tree, fp16 4.08."
+    },
+    {
       "key": "conformer_w8a8_sq_fused_streaming",
       "asset": "CKPT_DIR",
       "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8, FFN fused, streaming",
@@ -177,6 +212,42 @@
       "insertions": 12,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
       "_comment": "fp16 streaming on the same checkpoint measures 3.70 %; per-token SmoothQuant 3.70 %."
+    },
+    {
+      "key": "conformer_w8a8_sq_fused_conv_streaming",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), SmoothQuant int8 W8A8, FFN fused, + int8 subsampling conv2d, streaming",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "service_mode": "streaming",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8_fused",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          },
+          "static_inputs": {
+            "observer": "mse"
+          }
+        },
+        "module_types": [
+          "linear",
+          "pointwise_conv",
+          "conv2d"
+        ]
+      },
+      "error_rate_pct": 3.7,
+      "ref_units": 3403,
+      "substitutions": 99,
+      "deletions": 15,
+      "insertions": 12,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --module-types linear,pointwise_conv,conv2d --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
+      "_comment": "Recorded 2026-10-23 (RTX 5090). Without the conv 3.64, fp16 streaming 3.70."
     },
     {
       "key": "conformer_fp8_rtn",
@@ -370,6 +441,38 @@
       "insertions": 14,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/whisper_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/whisper_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
       "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Within fp16 + 0.3 but 0.12 above RTN (3.64): an alpha sweep (0.3-0.75: 3.73-3.94) and dropping each fold kind (3.73 each) found no group to blame; RTN already sits at fp16 and both change 19-24 of 200 transcripts against it."
+    },
+    {
+      "key": "whisper_w8a8_sq_conv",
+      "asset": "WHISPER_CKPT",
+      "architecture": "whisper-tiny (aed), SmoothQuant int8 W8A8 + the int8 conv1d front-end (static input scale, MSE clip)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        },
+        "module_types": [
+          "linear",
+          "pointwise_conv",
+          "conv1d"
+        ]
+      },
+      "error_rate_pct": 3.67,
+      "ref_units": 3403,
+      "substitutions": 102,
+      "deletions": 10,
+      "insertions": 13,
+      "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/whisper_sq --recipe smoothquant_w8a8 --module-types linear,pointwise_conv,conv1d --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/whisper_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "Recorded 2026-10-23 (RTX 5090). module_types adds encoder.conv1 (80->384, k3) and encoder.conv2 (384->384, k3/2). The same recipe without them 3.76, fp16 3.67."
     },
     {
       "_comment": [

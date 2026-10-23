@@ -413,12 +413,18 @@ def _online_quantization_spec(model: BaseAsrModel, quantization: Any) -> Any:
 
     Online quantization is round-to-nearest weights with *dynamic* activation
     scales only: a static activation scale, or SmoothQuant, needs calibration
-    data, which is ``oasr quantize``'s job.
+    data, which is ``oasr quantize``'s job -- and so does a ``conv1d`` / ``conv2d``
+    in ``module_types``, whose input scale must be static.
     """
     scheme_name = getattr(quantization, "scheme", None)
     if scheme_name is None:
         return None
-    from oasr.quantization.spec import QuantizationSpec, get_scheme
+    from oasr.quantization.spec import (
+        STATIC_INPUT_KINDS,
+        QuantizationSpec,
+        get_scheme,
+        resolve_module_types,
+    )
 
     scheme = get_scheme(scheme_name)
     acts = scheme.input_activations
@@ -427,11 +433,21 @@ def _online_quantization_spec(model: BaseAsrModel, quantization: Any) -> Any:
             f"quantization scheme {scheme_name!r} needs calibrated static activation scales; "
             "write a quantized checkpoint with `oasr quantize` instead of quantizing online"
         )
+    module_types = getattr(quantization, "module_types", None)
+    static_kinds = [k for k in resolve_module_types(module_types) if k in STATIC_INPUT_KINDS]
+    if static_kinds:
+        raise ValueError(
+            f"quantization module_types {list(module_types or ())} include {static_kinds}: a "
+            "convolution's input scale must be static (a per-token scale does not factor out "
+            "of a receptive field) and calibrated; write the checkpoint with `oasr quantize "
+            f"--module-types {','.join(module_types or ())}` instead of quantizing online"
+        )
     return QuantizationSpec.for_model(
         model,
         scheme,
         ignore=tuple(getattr(quantization, "ignore", ()) or ()),
         producer={"algorithm": "rtn", "online": True},
+        module_types=module_types,
     )
 
 
@@ -457,7 +473,7 @@ def materialize_model(
       converted checkpoint's legacy remaps run inside ``_load_from_state_dict``
       — then each selected layer quantizes its own fp32 weight, on the host;
     * either way the dtype cast that follows leaves quantized storage and fp32
-      scales alone (``QuantizableGemm._apply``), the model moves to *device*,
+      scales alone (``QuantizableLayer._apply``), the model moves to *device*,
       and only then does each layer choose its kernel lane.
 
     A checkpoint spec is authoritative: an online request for a different

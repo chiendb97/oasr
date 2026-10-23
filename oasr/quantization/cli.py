@@ -66,6 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="GLOB",
         help="Extra module-path glob to keep at full precision (repeatable)",
     )
+    parser.add_argument(
+        "--module-types",
+        default=None,
+        metavar="KIND[,KIND...]",
+        help=(
+            "Layer kinds to quantize: linear, pointwise_conv, conv1d, conv2d, or the aliases "
+            "conv (every convolution kind) and all (default: linear,pointwise_conv -- the "
+            "dense GEMMs).  A conv1d / conv2d takes a calibrated static input scale, so it "
+            "needs --calib-manifest with any recipe"
+        ),
+    )
     parser.add_argument("--architecture", default=None, help="Registry key override")
     parser.add_argument("--checkpoint-name", default="final.pt")
     parser.add_argument("--device", default="cuda", help="Calibration device (default cuda)")
@@ -115,6 +126,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         checkpoint_name=args.checkpoint_name,
         device=args.device,
         calibration_dtype=args.calib_dtype,
+        module_types=args.module_types.split(",") if args.module_types else None,
     )
     print(out)
     return 0

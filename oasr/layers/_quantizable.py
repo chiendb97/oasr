@@ -1,10 +1,14 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""The quantization seam of the waist's dense-GEMM layers.
+"""The quantization seam of the waist's GEMM and convolution layers.
 
 :class:`Linear`, :class:`LinearActivation` and :class:`PointwiseConv1d` are the
-three layers whose forward is ``act(x @ Wᵀ + b)``.  They mix in
-:class:`QuantizableGemm`, which gives every one of them the same two things:
+three layers whose forward is ``act(x @ Wᵀ + b)``; they mix in
+:class:`QuantizableGemm`.  The dense convolutions (:class:`Conv1d`,
+:class:`Conv2d` and their activation variants) are the same product over a
+receptive field -- an implicit GEMM -- and mix in :class:`QuantizableConv`.  Both
+derive from :class:`QuantizableLayer`, which gives every one of them the same
+things:
 
 * a ``quant_method`` slot.  ``None`` (the class default) leaves the layer
   exactly as it was; a :class:`oasr.quantization.methods.QuantMethod` installed
@@ -14,7 +18,11 @@ three layers whose forward is ``act(x @ Wᵀ + b)``.  They mix in
   state-dict keys keep working.
 * a dtype-preserving ``_apply``.  ``Module.to(dtype)`` / ``.half()`` cast every
   floating tensor, float8 storage and fp32 scales included; a quantized layer
-  moves those by device only.
+  moves those by device only;
+* a ``quant_kind`` (:data:`QUANT_KINDS`), which ``QuantizationConfig.module_types``
+  and ``oasr quantize --module-types`` select layers by, and a
+  ``quant_unsupported()`` that names why an instance has no 8-bit kernel (a
+  depthwise convolution, a channel count the int8 loads cannot address).
 
 Nothing here imports :mod:`oasr.quantization`: the layer only knows the method
 interface (``apply`` and ``preserved_tensors``).
@@ -85,12 +93,21 @@ class QuantizedActivation:
         return self.scale.numel() == self.data.numel() // max(self.data.shape[-1], 1)
 
 
-class QuantizableGemm:
-    """Mixin for a waist layer computing ``act(x @ gemm_weight()ᵀ + bias)``."""
+#: Every layer kind a quantization config can select by.  ``linear``: ``Linear`` /
+#: ``LinearActivation``; ``pointwise_conv``: ``PointwiseConv1d`` (a 1x1 convolution,
+#: i.e. a GEMM over channels); ``conv1d`` / ``conv2d``: the dense convolutions.
+QUANT_KINDS = ("linear", "pointwise_conv", "conv1d", "conv2d")
+
+
+class QuantizableLayer:
+    """Mixin for a waist layer an 8-bit quantization method can take over."""
 
     #: The installed quantization method, or ``None`` for the full-precision
     #: path.  A class attribute, so an unquantized layer pays one attribute read.
     quant_method: Optional["QuantMethod"] = None
+
+    #: Which :data:`QUANT_KINDS` entry this layer is.
+    quant_kind: str = "linear"
 
     #: ``False`` when something besides this layer's own forward reads its
     #: ``weight`` raw — a fused kernel of the parent (the gated MLP's dual-B
@@ -103,13 +120,22 @@ class QuantizableGemm:
     #: ``gelu_tanh`` = tanh approximation), or ``None``.
     fused_activation: Optional[str] = None
 
+    #: The width of the activation the quantize kernel scales: its last axis
+    #: (a GEMM's K, a convolution's input channels).
     in_features: int
     out_features: int
 
-    def gemm_weight(self) -> torch.Tensor:
-        """The weight as the ``[out_features, in_features]`` matrix of the GEMM."""
+    def quant_weight(self) -> torch.Tensor:
+        """The weight as an ``[out_features, -1]`` matrix: one row per output channel.
+
+        What per-output-channel weight quantization reduces over.
+        """
         weight: torch.Tensor = self.weight  # type: ignore[attr-defined]
-        return weight
+        return weight.reshape(weight.shape[0], -1)
+
+    def quant_unsupported(self) -> Optional[str]:
+        """Why this instance has no 8-bit kernel, or ``None``."""
+        return None
 
     def _apply(self, fn, recurse: bool = True):  # type: ignore[no-untyped-def]
         method = self.quant_method
@@ -141,6 +167,43 @@ class QuantizableGemm:
         return result
 
 
+class QuantizableGemm(QuantizableLayer):
+    """Mixin for a waist layer computing ``act(x @ gemm_weight()ᵀ + bias)``."""
+
+    def gemm_weight(self) -> torch.Tensor:
+        """The weight as the ``[out_features, in_features]`` matrix of the GEMM."""
+        weight: torch.Tensor = self.weight  # type: ignore[attr-defined]
+        return weight
+
+    def quant_weight(self) -> torch.Tensor:
+        return self.gemm_weight()
+
+
+class QuantizableConv(QuantizableLayer):
+    """Mixin for a dense channels-last convolution, ``act(conv(x, W) + bias)``.
+
+    ``weight`` is the layer's KRSC (``Conv2d``) or KSC (``Conv1d``) filter: output
+    channel first, input channel last, so :meth:`quant_weight`'s rows are the
+    per-output-channel groups and ``in_features`` is the activation's last axis.
+    The int8 kernel is an implicit GEMM over int8 NHWC input, so it needs
+    ``groups == 1``, ``in_channels % 16 == 0`` and ``out_channels % 8 == 0``.
+    """
+
+    quant_kind = "conv2d"
+    in_channels: int
+    out_channels: int
+    groups: int = 1
+
+    def quant_unsupported(self) -> Optional[str]:
+        if self.groups != 1:
+            return f"a grouped convolution (groups={self.groups}) has no int8 kernel"
+        if self.in_channels % 16:
+            return f"in_channels={self.in_channels} is not a multiple of 16 (int8 operand loads)"
+        if self.out_channels % 8:
+            return f"out_channels={self.out_channels} is not a multiple of 8 (output stores)"
+        return None
+
+
 def _reorder(store: Dict[str, Any], order: list) -> None:
     """Restore *store*'s original key order (state-dict order is observable)."""
     items = [(k, store[k]) for k in order if k in store]
@@ -149,4 +212,10 @@ def _reorder(store: Dict[str, Any], order: list) -> None:
     store.update(items)
 
 
-__all__ = ["QuantizableGemm"]
+__all__ = [
+    "QUANT_KINDS",
+    "QuantizableConv",
+    "QuantizableGemm",
+    "QuantizableLayer",
+    "QuantizedActivation",
+]

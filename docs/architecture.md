@@ -30,8 +30,9 @@ one about *what every architecture is built from*. Model implementations use
 `nn.RNN` / `nn.LayerNorm` / `nn.Embedding` directly.
 That is what makes a kernel improvement, CUDA-graph capture or a quantized
 path apply to **every** architecture instead of one: `Linear`,
-`LinearActivation` and `PointwiseConv1d` are `QuantizableGemm`s, whose
-`quant_method` takes over the forward when a spec selects them
+`LinearActivation` and `PointwiseConv1d` are `QuantizableGemm`s and `Conv1d` /
+`Conv2d` are `QuantizableConv`s, whose `quant_method` takes over the forward when
+a spec selects them (`module_types` chooses which kinds)
 ([quantization.md](quantization.md)). The kernels underneath are documented in
 [kernels.md](kernels.md).
 

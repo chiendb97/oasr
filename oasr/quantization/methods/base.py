@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """How a quantized GEMM layer stores and runs its weights.
 
-A :class:`QuantMethod` is installed on a :class:`~oasr.layers.QuantizableGemm`
+A :class:`QuantMethod` is installed on a :class:`~oasr.layers.QuantizableLayer`
 (``layer.quant_method``) and takes over its forward — vLLM's
 ``LinearMethodBase`` pattern.  Life cycle, in order:
 
@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 import torch
 
 if TYPE_CHECKING:  # pragma: no cover
-    from oasr.layers._quantizable import QuantizableGemm
+    from oasr.layers._quantizable import QuantizableLayer
 
     from ..kernels.lanes import ScaledMMLane
     from ..spec import QuantScheme
@@ -56,15 +56,20 @@ class QuantMethod(ABC):
     def supports(cls, scheme: "QuantScheme") -> bool:
         """Whether this method implements *scheme*."""
 
+    @classmethod
+    def serves(cls, layer: Any) -> bool:
+        """Whether this method runs *layer*'s kind of layer (a GEMM, a convolution)."""
+        return True
+
     @abstractmethod
-    def create_weights(self, layer: "QuantizableGemm", *, runtime_smoothed: bool) -> None:
+    def create_weights(self, layer: "QuantizableLayer", *, runtime_smoothed: bool) -> None:
         """Replace the layer's fp weight with quantized storage slots."""
 
     @abstractmethod
-    def quantize_weight(self, layer: "QuantizableGemm", weight_fp32: torch.Tensor) -> None:
-        """Fill the slots from an fp32 ``[out_features, in_features]`` weight."""
+    def quantize_weight(self, layer: "QuantizableLayer", weight_fp32: torch.Tensor) -> None:
+        """Fill the slots from the fp32 ``quant_weight()``: ``[out_features, -1]``."""
 
-    def process_weights_after_loading(self, layer: "QuantizableGemm") -> None:
+    def process_weights_after_loading(self, layer: "QuantizableLayer") -> None:
         """Host-side layout work after the slots hold their values (idempotent).
 
         Nothing by default: int8 ``[N, K]`` is already the kernel's layout.  A format
@@ -73,23 +78,26 @@ class QuantMethod(ABC):
         return None
 
     @abstractmethod
-    def bind(self, layer: "QuantizableGemm") -> None:
+    def bind(self, layer: "QuantizableLayer") -> None:
         """Choose the kernel lane for the layer's current device and shape."""
 
     @abstractmethod
-    def preserved_tensors(self, layer: "QuantizableGemm") -> Tuple[str, ...]:
+    def preserved_tensors(self, layer: "QuantizableLayer") -> Tuple[str, ...]:
         """Names of slots a dtype cast must not touch (moved by device only)."""
 
     @abstractmethod
-    def apply(self, layer: "QuantizableGemm", x: torch.Tensor) -> torch.Tensor:
-        """The quantized forward."""
+    def apply(self, layer: "QuantizableLayer", x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """The quantized forward; *kwargs* are the layer's own forward arguments
+        (a convolution's ``padding`` override)."""
 
     @abstractmethod
-    def apply_reference(self, layer: "QuantizableGemm", x: torch.Tensor) -> torch.Tensor:
+    def apply_reference(
+        self, layer: "QuantizableLayer", x: torch.Tensor, **kwargs: Any
+    ) -> torch.Tensor:
         """Torch emulation of :meth:`apply`'s numerics."""
 
     # -- links between layers (armed by ``bind_quantization`` after :meth:`bind`) --
-    def quantized_input(self, layer: "QuantizableGemm") -> Optional[str]:
+    def quantized_input(self, layer: "QuantizableLayer") -> Optional[str]:
         """The pre-quantized input this bound layer can consume, if any.
 
         ``"token"``: a :class:`~oasr.layers.QuantizedActivation` with one scale
@@ -99,7 +107,9 @@ class QuantMethod(ABC):
         """
         return None
 
-    def static_input(self, layer: "QuantizableGemm") -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def static_input(
+        self, layer: "QuantizableLayer"
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """``(multiplier, scale)`` a producer must quantize with to feed this layer.
 
         Only for a bound layer with a static input scale; ``None`` otherwise.
@@ -107,12 +117,12 @@ class QuantMethod(ABC):
         return None
 
     def emit_for(
-        self, layer: "QuantizableGemm", consumer: str, mul: torch.Tensor, scale: torch.Tensor
+        self, layer: "QuantizableLayer", consumer: str, mul: torch.Tensor, scale: torch.Tensor
     ) -> bool:
         """Quantize this layer's output for *consumer*; ``False`` if it cannot."""
         return False
 
-    def describe(self, layer: "QuantizableGemm") -> Dict[str, Any]:
+    def describe(self, layer: "QuantizableLayer") -> Dict[str, Any]:
         """One row of the quantization report."""
         note = self.lane_note
         if self.input_source is not None:
@@ -133,14 +143,25 @@ def register_quant_method(cls: Type[QuantMethod]) -> Type[QuantMethod]:
     return cls
 
 
-def method_for(scheme: "QuantScheme") -> QuantMethod:
-    """A fresh method instance implementing *scheme*; refuses an unserved scheme."""
+def method_for(scheme: "QuantScheme", layer: Any = None) -> QuantMethod:
+    """A fresh method instance implementing *scheme* for *layer*'s kind; refuses otherwise.
+
+    With no *layer*, the first method implementing *scheme* at all.
+    """
     from . import w8a8  # noqa: F401  -- registers the built-in methods
 
     for cls in _METHODS:
-        if cls.supports(scheme):
+        if cls.supports(scheme) and (layer is None or cls.serves(layer)):
             return cls(scheme)
+    kind = getattr(layer, "quant_kind", None)
+    if kind in ("conv1d", "conv2d"):
+        raise NotImplementedError(
+            f"a {kind} layer cannot be quantized with scheme {scheme.name or scheme}: a "
+            "convolution needs int8 weights and a calibrated static input scale "
+            "(int8_w8a8_static), which `oasr quantize --module-types ...` produces"
+        )
     raise NotImplementedError(
-        f"no quantization method implements scheme {scheme.name or scheme}; "
-        f"registered methods: {[c.__name__ for c in _METHODS]}"
+        f"no quantization method implements scheme {scheme.name or scheme}"
+        + (f" for a {kind} layer" if kind else "")
+        + f"; registered methods: {[c.__name__ for c in _METHODS]}"
     )

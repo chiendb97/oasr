@@ -75,6 +75,14 @@ class QuantizationConfig:
       checkpoint.  Naming a different scheme than a quantized checkpoint's raises.
     * ``ignore`` — extra module-path globs kept at full precision, beyond what the
       model's ``quantization_layout()`` already keeps.
+    * ``module_types`` — which kinds of layer to quantize: ``"linear"``
+      (``Linear`` / ``LinearActivation``), ``"pointwise_conv"`` (1x1 convolutions,
+      GEMMs over channels), ``"conv1d"``, ``"conv2d"``, or the aliases ``"conv"``
+      (every convolution kind) and ``"all"``.  ``None`` is ``("linear",
+      "pointwise_conv")``: the dense GEMMs.  A ``conv1d`` / ``conv2d`` layer needs
+      a calibrated static input scale (a per-token scale does not factor out of a
+      receptive field), so online quantization refuses them: write the checkpoint
+      with ``oasr quantize --module-types ...``.
     * ``kv_cache`` — storage of an autoregressive decoder's attention KV cache:
       ``None`` / ``"auto"`` keeps the model dtype; ``"fp8_e4m3"`` stores it as
       e4m3 with one fp32 scale per (token, kv-head), computed when the token is
@@ -84,15 +92,17 @@ class QuantizationConfig:
       A decode family with no AR KV cache, or a decoder / device / attention
       lane that cannot store or read one, refuses it at engine construction.
 
-    The Rust front-end passes ``{"scheme": ..., "ignore": "a,b", "kv_cache":
-    "fp8_e4m3"}`` with string values (``oasr-server --quantization int8_w8a8
-    --quantization-option ignore=... --quantization-option kv_cache=fp8_e4m3``);
-    ``coerce`` types them.
+    The Rust front-end passes ``{"scheme": ..., "ignore": "a,b", "module_types":
+    "linear,pointwise_conv", "kv_cache": "fp8_e4m3"}`` with string values
+    (``oasr-server --quantization int8_w8a8 --quantization-option ignore=...
+    --quantization-option module_types=... --quantization-option
+    kv_cache=fp8_e4m3``); ``coerce`` types them.
     """
 
     scheme: Optional[str] = None
     ignore: Tuple[str, ...] = ()
     kv_cache: Optional[str] = None
+    module_types: Optional[Tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.ignore, str):
@@ -111,6 +121,23 @@ class QuantizationConfig:
             from oasr.quantization.spec import get_scheme
 
             get_scheme(self.scheme)  # raise now, naming the presets, not at load
+        if self.module_types is not None:
+            from oasr.quantization.spec import resolve_module_types
+
+            # Raise now on an unknown kind; kept as given (aliases unexpanded).
+            names = (
+                self.module_types.split(",")
+                if isinstance(self.module_types, str)
+                else self.module_types
+            )
+            self.module_types = tuple(n.strip() for n in names if n.strip())
+            resolve_module_types(self.module_types)
+            if self.scheme is None:
+                raise ValueError(
+                    "quantization.module_types selects the layers online quantization "
+                    "quantizes; it needs a scheme (a quantized checkpoint's own spec "
+                    "already names its layers)"
+                )
 
     @classmethod
     def coerce(cls, value) -> Optional["QuantizationConfig"]:
@@ -121,11 +148,11 @@ class QuantizationConfig:
         if isinstance(value, str):
             return cls(scheme=value)
         if isinstance(value, dict):
-            unknown = set(value) - {"scheme", "ignore", "kv_cache"}
+            unknown = set(value) - {"scheme", "ignore", "kv_cache", "module_types"}
             if unknown:
                 raise ValueError(
                     f"unknown quantization option(s) {sorted(unknown)}; expected scheme, "
-                    "ignore, kv_cache"
+                    "ignore, module_types, kv_cache"
                 )
             return cls(**value)
         raise TypeError(

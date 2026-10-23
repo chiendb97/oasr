@@ -50,6 +50,7 @@ def gen_all_modules() -> List:
     from oasr.jit.quant import gen_quant_module
     from oasr.jit.recurrent import gen_recurrent_module
     from oasr.jit.recurrent_step import gen_recurrent_step_modules
+    from oasr.jit.scaled_conv import gen_scaled_conv_modules
     from oasr.jit.scaled_mm import gen_scaled_mm_fp8_modules, gen_scaled_mm_module
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
@@ -87,6 +88,7 @@ def gen_all_modules() -> List:
         gen_transducer_module(),
     ]
     modules += gen_scaled_mm_fp8_modules()
+    modules += gen_scaled_conv_modules()
     modules += gen_fmha_modules()
     modules += gen_fmha_kv8_modules()
     modules += gen_gated_mlp_modules()

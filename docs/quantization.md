@@ -1,7 +1,9 @@
 # Quantization
 
 OASR quantizes the dense GEMMs of the layer waist — `Linear`, `LinearActivation`
-and `PointwiseConv1d` — so every architecture inherits it.  It is the ninth
+and `PointwiseConv1d` — and, when asked, its dense convolutions — `Conv1d` and
+`Conv2d` ([Convolutions and `module_types`](#convolutions-and-module_types)) — so
+every architecture inherits it.  It is the ninth
 registry axis: a format is a preset plus a method plus its kernel lanes, an
 algorithm is a registration, and an architecture declares what its structure
 allows.  The engine core has no per-scheme branch.
@@ -34,7 +36,13 @@ engine = ASREngine(EngineConfig(ckpt_dir=..., quantization="int8_w8a8"))  # or "
 
 ```bash
 oasr-server --ckpt-dir <dir> --quantization int8_w8a8 [--quantization-option ignore=GLOB,...]
+    [--quantization-option module_types=linear,pointwise_conv]
 ```
+
+`module_types` selects layers by kind; the default is the dense GEMMs.
+Convolutions need a calibrated static scale, so online quantization refuses them
+and `oasr quantize --module-types` writes them
+([Convolutions and `module_types`](#convolutions-and-module_types)).
 
 On the U2++ Conformer (LJSpeech-200 gate, fp16): online `int8_w8a8` 4.14 % /
 3.70 % (offline / streaming), online `fp8_w8a8` 4.00 % / 3.73 %, fp16 4.08 % /
@@ -89,10 +97,10 @@ save_native(format_version=2)                 forward: [norm | producer | quanti
 | `oasr/quantization/methods/` | `QuantMethod`: storage slots, weight quantization, lane binding, forward, torch reference |
 | `oasr/quantization/kernels/lanes.py` | `ScaledMMLane`: which kernel serves a scheme on this GPU (`is_supported(sm)`, `can_implement(scheme, N, K)`) |
 | `oasr/quantization/calibration/` | Observers; `asr_forward_loop` through the checkpoint's own frontend |
-| `oasr/quantization/algorithms/` | `rtn`, `smoothquant`, `static_inputs`, registered with an `options_cls` |
+| `oasr/quantization/algorithms/` | `rtn`, `smoothquant`, `static_inputs`, `static_conv_inputs`, registered with an `options_cls` |
 | `oasr/quantization/apply.py`, `export.py`, `cli.py` | Glue, report, `oasr quantize` |
-| `oasr/layers/_quantizable.py` | `QuantizableGemm`: the `quant_method` slot and the dtype-preserving `_apply`; `QuantizedActivation` |
-| `oasr/functionals/quant.py`, `scaled_mm.py`, `norm.py` | `quantize_per_token`, `quantize_static`, `scaled_mm`, `scaled_mm_quant`, `layer_norm_quant`, `add_layer_norm_residual_quant`, and their torch twins |
+| `oasr/layers/_quantizable.py` | `QuantizableLayer` (the `quant_method` slot, `quant_kind`, `quant_unsupported()`, the dtype-preserving `_apply`) and its two halves, `QuantizableGemm` and `QuantizableConv`; `QuantizedActivation` |
+| `oasr/functionals/quant.py`, `scaled_mm.py`, `scaled_conv.py`, `norm.py` | `quantize_per_token`, `quantize_static`, `scaled_mm`, `scaled_mm_quant`, `scaled_conv2d`, `scaled_conv1d`, `layer_norm_quant`, `add_layer_norm_residual_quant`, and their torch twins |
 
 ### The layer seam
 
@@ -111,14 +119,14 @@ State dict of a quantized layer (names follow compressed-tensors):
 
 | Key | dtype | Shape |
 |---|---|---|
-| `weight` | int8 / float8_e4m3fn | the layer's own (`[N, K]`; `[N, K, 1]` for a pointwise conv) |
+| `weight` | int8 / float8_e4m3fn | the layer's own (`[N, K]`; `[N, K, 1]` for a pointwise conv; KRSC / KSC for a `Conv2d` / `Conv1d`) |
 | `weight_scale` | fp32 | `[N]` |
 | `smooth_inv` | fp32 | `[K]`, only on runtime-smoothed layers |
 | `input_scale` | fp32 | `[1]`, only with a static activation scale (`*_w8a8_static`) |
 | `bias` | served dtype | unchanged |
 
 `Module.to(dtype)` casts every floating tensor — fp32 scales included — so
-`QuantizableGemm._apply` moves quantized slots by device only.
+`QuantizableLayer._apply` moves quantized slots by device only.
 
 ### Load order
 
@@ -198,6 +206,85 @@ with no smoother, because SmoothQuant folds its scale into the norm's affine.
 `oasr.functionals.norm.add_layer_norm_residual_quant` does the same for the fused
 add + LayerNorm, and also returns the unnormalized residual sum exactly as
 `add_layer_norm_residual` stores it.
+
+## Convolutions and `module_types`
+
+`QuantizationConfig.module_types` (and `oasr quantize --module-types`) chooses
+the *kinds* of layer to quantize.  Every quantizable layer declares one
+(`QuantizableLayer.quant_kind`):
+
+| Kind | Layers | Activation scale |
+|---|---|---|
+| `linear` | `Linear`, `LinearActivation` | per token (dynamic) or static |
+| `pointwise_conv` | `PointwiseConv1d` (a 1x1 conv: a GEMM over channels) | per token (dynamic) or static |
+| `conv1d` | `Conv1d`, `Conv1dActivation` | **static** (calibrated) |
+| `conv2d` | `Conv2d`, `Conv2dActivation` | **static** (calibrated) |
+
+`conv` names every convolution kind and `all` every kind.  The default is
+`linear,pointwise_conv`, the dense GEMMs: the same set as before convolutions
+could be selected.  A kind list without `linear` quantizes no linear layer.
+
+A convolution's input scale must be **static**.  An output pixel sums over a
+receptive field spanning several input pixels, and per-token scales would not
+factor out of that sum.  So:
+
+* `QuantizationSpec.for_model` gives a selected convolution the static variant
+  of the scheme's format (`int8_w8a8_static`);
+* `oasr quantize` calibrates its scale (`static_conv_inputs`, the same clip
+  search as `static_inputs`, `observer=mse` by default; options via
+  `--option static_conv_inputs.observer=...`) with **any** recipe, so
+  `--calib-manifest` is required;
+* an online request (`EngineConfig(quantization={"scheme": ..., "module_types":
+  "conv2d"})`) is refused by name, pointing at `oasr quantize`.
+
+fp8 has no convolution kernel: a convolution kind with an fp8 scheme is refused.
+
+```bash
+oasr quantize $CKPT_DIR /path/to/u2pp_w8a8_conv --recipe smoothquant_w8a8_fused \
+    --module-types linear,pointwise_conv,conv2d --calib-manifest .../manifest.jsonl
+```
+
+Only a dense, int8-aligned convolution has a kernel: `groups == 1`,
+`in_channels % 16 == 0` and `out_channels % 8 == 0`.  Anything else is skipped,
+and `QuantizableLayer.quant_unsupported()` gives the reason, recorded in the
+spec's `producer["skipped"]`.  The usual skips are the one-channel stems of the
+Conformer, Nemotron and Zipformer subsamplings and the depthwise convolutions.
+An explicit target that names such a layer is refused.
+
+The kernel (`oasr.scaled_conv2d`; `scaled_conv1d` is the height-one problem) is
+a CUTLASS 2.x int8 implicit-GEMM forward convolution, `include/oasr/scaled_conv/`.
+It reads an NHWC int8 input and a KRSC int8 filter, accumulates exactly in int32,
+and writes fp16/bf16.  CUTLASS 2.x convolutions have no EVT epilogue, so it runs
+through `DefaultConv2dFpropWithBroadcast`:
+
+* the per-channel factor `input_scale * weight_scale[k]`, folded once at bind, is
+  the broadcast vector;
+* the bias is a zero-stride source tensor;
+* `ScaledConvOutputOp` computes `act(fma(scale, acc, bias))` with one rounding.
+
+The exact accumulator makes every tile compute the same bits, so the kernel is
+batch-invariant.  Its tile is the int8 GEMM's occupancy-sized ladder, measured
+on the U2++ and Whisper front-ends (`oasr/jit/scaled_conv.py`).  The forward is
+`quantize_static` then the convolution.  The quantize is a separate memory pass,
+and for a front-end conv whose input is large, it is most of what is left:
+
+| U2++ subsampling conv (256→256, 3x3/2), RTX 5090 | fp16 | int8 conv | int8 conv + quantize |
+|---|---|---|---|
+| batch 1 | 57 us | 11 us | 15 us (3.7x) |
+| batch 8 | 192 us | 52 us | 86 us (2.2x) |
+| batch 64 | 1001 us | 352 us | 752 us (1.3x) |
+
+Whisper's conv1d front-ends gain 2.2-2.7x with the quantize included.
+
+Accuracy on the LJSpeech-200 gate is unchanged:
+
+| Model | Without the conv | With it | fp16 |
+|---|---|---|---|
+| U2++ `smoothquant_w8a8_fused` + `conv2d` | 4.11 / 3.64 | 4.09 / 3.70 | 4.08 / 3.70 |
+| whisper-tiny `smoothquant_w8a8` + `conv1d` | 3.76 | 3.67 | 3.67 |
+
+U2++ figures are offline / streaming.  A convolution neither consumes a
+producer's 8-bit output nor emits one.
 
 ## Fewer quantize launches
 
@@ -435,12 +522,16 @@ ranges.
 | an algorithm (GPTQ, AWQ) | `algorithms/<name>.py` + `register_quant_algorithm`; reuse the observers and `quantize_weight` |
 | an architecture | `quantization_layout()` on the model — data only; online RTN works without it |
 | a GEMM-bearing layer | mix in `QuantizableGemm`, implement `gemm_weight()`, branch on `quant_method` first |
+| a convolution-bearing layer | mix in `QuantizableConv` (KRSC / KSC weight, `in_features` = input channels), branch on `quant_method` first; `W8A8ConvMethod` serves it |
+| a layer kind | a `quant_kind` in `QUANT_KINDS` (`oasr/layers/_quantizable.py`), a method whose `serves(layer)` accepts it, and — if its input scale must be static — an entry in `STATIC_INPUT_KINDS` |
 
 ## Tests and benchmarks
 
 | Where | What |
 |---|---|
 | `tests/kernels/test_quant.py` | quantize (int8 and e4m3) is bit-exact against the reference; row-local; graph replay |
+| `tests/kernels/test_scaled_conv.py` | the int8 convolution: every tile over padded / strided / dilated geometries and every activation; exact accumulator; a sample bitwise independent of the batch; conv1d; contracts |
+| `tests/quantization/test_quant_conv.py` | `module_types` (kinds, aliases, defaults, the online refusal), conv selection and skip reasons, the conv method's storage, reference, calibration, native round trip, kernel vs reference in the layer |
 | `tests/kernels/test_scaled_mm.py` | every compiled variant of both formats; exact accumulator; fp8: every tile the same bits, rows bitwise independent of the batch, the fp8-output epilogue == the unfused pair; contracts |
 | `tests/quantization/test_quant_fp8.py` | the fp8 format end to end: storage, native round trip, kernel vs reference, fused norms and chains in e4m3 == unfused, formats never mixed across a link, the fp8 clip model |
 | `tests/kernels/test_fmha_kv8.py`, `tests/engine/test_fp8_kv_cache.py` | the fp8 KV cache: quantize-on-write bit-exact, the fp8 attention read == fp16 on the dequantized cache, dense == paged == graph replay, refusals, capacity |
@@ -450,11 +541,12 @@ ranges.
 | `tests/kernels/test_gemm_batch_invariant.py`, `tests/models/test_linear_batch_invariant.py` | pinned GEMM rows bitwise independent of M; the pin bypasses the row floor |
 | `tests/kernels/tune/test_scaled_mm_tuning.py`, `tests/engine/test_tuning_scaled_mm_engine.py` | the `scaled_mm` tuning tier: resolution, capture, build, `strict` |
 | `tests/engine/test_quantized_engine.py` | capture == eager, per-layer batch invariance, a quantized checkpoint served offline and streaming |
-| `ci/wer-reference.json` | `conformer_int8_rtn`, `conformer_w8a8_sq`, `conformer_w8a8_sq_streaming`, `conformer_w8a8_sq_fused`, `conformer_w8a8_sq_fused_streaming`, `conformer_fp8_rtn`, `conformer_fp8_sq_fused`, `conformer_fp8_sq_fused_streaming`, `whisper_kv_fp8`, `llm_kv_fp8`; a row whose format the GPU cannot run (fp8 weights below sm89, fp8 KV off the C++ attention lane) is skipped with the reason |
+| `ci/wer-reference.json` | `conformer_int8_rtn`, `conformer_w8a8_sq`, `conformer_w8a8_sq_streaming`, `conformer_w8a8_sq_fused`, `conformer_w8a8_sq_fused_streaming`, `conformer_fp8_rtn`, `conformer_fp8_sq_fused`, `conformer_fp8_sq_fused_streaming`, `conformer_w8a8_sq_fused_conv`, `conformer_w8a8_sq_fused_conv_streaming`, `whisper_w8a8_sq_conv`, `whisper_kv_fp8`, `llm_kv_fp8`; a row whose format the GPU cannot run (fp8 weights below sm89, fp8 KV off the C++ attention lane) is skipped with the reason |
 
 Calibration data is the `LIBRISPEECH_DEV_DIR` asset (asrbench-prepared
 LibriSpeech dev-clean): in-domain for LibriSpeech-trained checkpoints and a
 different corpus from the LJSpeech WER gate.  The kernel benchmark families are
-`quant` (`--fp8` for e4m3) and `scaled_mm` (subroutines `scaled_mm_fp8`,
-`quant_scaled_mm_fp8`; `python benchmarks/run.py --list`); the accuracy and
+`quant` (`--fp8` for e4m3), `scaled_mm` (subroutines `scaled_mm_fp8`,
+`quant_scaled_mm_fp8`) and `scaled_conv` (`scaled_conv2d`, `quant_scaled_conv2d`,
+`scaled_conv1d`; `python benchmarks/run.py --list`); the accuracy and
 engine families take `--quantization`.

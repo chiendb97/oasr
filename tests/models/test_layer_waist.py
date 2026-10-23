@@ -808,6 +808,7 @@ class TestKernelGapRegistry:
         "fmha-paged-config",
         "transducer-beam-topk",
         "scaled-mm-int8-sm75",
+        "scaled-conv-int8-sm75",
     }
 
     def test_declared_gap_set_only_shrinks(self):
