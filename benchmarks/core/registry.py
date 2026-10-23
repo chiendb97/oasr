@@ -38,6 +38,7 @@ KERNEL_FAMILIES: Dict[str, str] = {
     "feature": "benchmarks.features.frontend",
     "quant": "benchmarks.kernels.quant",
     "scaled_mm": "benchmarks.kernels.scaled_mm",
+    "scaled_conv": "benchmarks.kernels.scaled_conv",
 }
 
 WORKLOAD_FAMILIES: Dict[str, str] = {

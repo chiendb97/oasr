@@ -158,6 +158,19 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
                 "runs the torch reference of the pinned numerics -- correct, slow"
             ),
         ),
+        KernelGap(
+            id="scaled-conv-int8-sm75",
+            what=(
+                "a quantized int8 convolution on Turing (sm75): the int8 implicit-GEMM "
+                "convolution is the CUTLASS 2.x Sm80 mma.sync kernel (16x8x32), which "
+                "sm75 cannot run"
+            ),
+            fix=(
+                "kernel: an Sm75 instantiation of include/oasr/scaled_conv/ with the "
+                "8x8x16 int8 MMA atom.  Until then a quantized convolution on sm75 runs "
+                "the torch reference of the pinned numerics -- correct, slow"
+            ),
+        ),
     )
 }
 

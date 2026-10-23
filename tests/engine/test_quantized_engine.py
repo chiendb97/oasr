@@ -89,12 +89,17 @@ class TestConfig:
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the int8 lane is a CUDA kernel")
 class TestGraphs:
-    def test_captured_quantized_forward_matches_eager(self):
-        """Capture changes launch count, never numerics — quantize kernel included."""
+    @pytest.mark.parametrize("module_types", [None, ("all",)], ids=["gemms", "all"])
+    def test_captured_quantized_forward_matches_eager(self, module_types):
+        """Capture changes launch count, never numerics — quantize kernel included.
+
+        ``all`` adds the int8 subsampling convolution (static scale, uncalibrated).
+        """
         from oasr.engine.offline_graph import FUSED, GraphedOfflineForward
 
         model = tiny_conformer(output_size=256, attention_heads=4, linear_units=256)
-        apply_quantization(model, QuantizationSpec.for_model(model, INT8_W8A8), quantize=True)
+        spec = QuantizationSpec.for_model(model, INT8_W8A8, module_types=module_types)
+        apply_quantization(model, spec, quantize=True)
         model = model.to(device="cuda", dtype=torch.float16)
         bind_quantization(model)
         assert all(
@@ -129,12 +134,17 @@ class TestBatchInvariance:
     fp8 lane sums every output in one order whatever the tile.)
     """
 
-    @pytest.mark.parametrize("scheme", [INT8_W8A8, FP8_W8A8], ids=lambda s: s.name)
-    def test_equal_input_rows_give_equal_output_rows(self, scheme):
+    @pytest.mark.parametrize(
+        "scheme,module_types",
+        [(INT8_W8A8, None), (FP8_W8A8, None), (INT8_W8A8, ("all",))],
+        ids=["int8_w8a8", "fp8_w8a8", "int8_w8a8+conv"],
+    )
+    def test_equal_input_rows_give_equal_output_rows(self, scheme, module_types):
         if scheme is FP8_W8A8 and torch.cuda.get_device_capability() < (8, 9):
             pytest.skip("fp8 tensor cores need sm89+")
         model = tiny_conformer(output_size=256, attention_heads=4, linear_units=256)
-        apply_quantization(model, QuantizationSpec.for_model(model, scheme), quantize=True)
+        spec = QuantizationSpec.for_model(model, scheme, module_types=module_types)
+        apply_quantization(model, spec, quantize=True)
         model = model.to(device="cuda", dtype=torch.float16)
         bind_quantization(model)
         seen = {}

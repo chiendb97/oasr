@@ -68,6 +68,8 @@ def _quantized_checkpoint(src: str, recipe: dict, tmp_path_factory) -> str:
             # A model whose fp32 master does not fit the GPU (a 7B LM) calibrates
             # a reduced-precision twin; the recipe names it, so the row reproduces.
             calibration_dtype=recipe.get("calib_dtype"),
+            # Which layer kinds (``oasr quantize --module-types``): convolutions too.
+            module_types=recipe.get("module_types"),
         )
         _QUANTIZED[key] = str(dst)
     return _QUANTIZED[key]

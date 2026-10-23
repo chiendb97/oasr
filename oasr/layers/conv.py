@@ -38,7 +38,7 @@ import torch.nn.functional as F
 import oasr
 
 from ._backend import use_conv_kernel
-from ._quantizable import QuantizableGemm
+from ._quantizable import QuantizableConv, QuantizableGemm
 
 #: Torch equivalent of each fused-epilogue activation id.  ``gelu`` maps to the
 #: **tanh** approximation because that is what the CUDA epilogue implements
@@ -66,16 +66,28 @@ _FUSED_CONV1D_ACTIVATION = {
     "gelu_tanh": "gelu",
 }
 
+#: Each conv activation name as a quantized layer spells it (``LinearActivation``'s
+#: names: ``gelu`` is exact erf, ``gelu_tanh`` the tanh form the conv epilogues use).
+_QUANT_ACTIVATION = {
+    "relu": "relu",
+    "swish": "swish",
+    "silu": "swish",
+    "gelu": "gelu_tanh",
+    "gelu_tanh": "gelu_tanh",
+}
 
-class Conv1d(nn.Module):
+
+class Conv1d(QuantizableConv, nn.Module):
     """Dense cross-channel convolution over packed ``(B, T, C)`` tensors.
 
     The kernel stores weights as KSC ``(out_channels, kernel_size,
     in_channels)`` so both activations and filters are directly consumable by
     the height-one CUTLASS implicit-GEMM convolution.  Standard PyTorch
     ``(out, in, kernel)`` checkpoint tensors are transposed once by the load
-    hook, never once per request.
+    hook, never once per request.  Quantizable (``quant_kind = "conv1d"``).
     """
+
+    quant_kind = "conv1d"
 
     def __init__(
         self,
@@ -102,6 +114,8 @@ class Conv1d(nn.Module):
             )
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.in_features = in_channels
+        self.out_features = out_channels
         self.kernel_size = kernel_size
         self.padding = padding
         self.stride = stride
@@ -132,6 +146,8 @@ class Conv1d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``x: (B, T, in_channels) -> (B, T_out, out_channels)``."""
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x)
         if not use_conv_kernel(x):
             return self._torch_forward(x)
         out: torch.Tensor = oasr.conv1d(
@@ -224,8 +240,11 @@ class Conv1dActivation(Conv1d):
             )
         self.activation_name = activation_type
         self.activation = oasr.get_activation_type_id(_FUSED_CONV1D_ACTIVATION[activation_type])
+        self.fused_activation = _QUANT_ACTIVATION[activation_type]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x)
         if not use_conv_kernel(x):
             return _TORCH_CONV1D_ACTIVATION[self.activation_name](self._torch_forward(x))
         out: torch.Tensor = oasr.conv1d_activation(
@@ -400,6 +419,8 @@ class DepthwiseConv1d(nn.Module):
 class PointwiseConv1d(QuantizableGemm, nn.Module):
     """Wrapper for pointwise (1x1) convolution kernel."""
 
+    quant_kind = "pointwise_conv"
+
     def __init__(
         self,
         in_channels: int,
@@ -459,7 +480,7 @@ class PointwiseConv1d(QuantizableGemm, nn.Module):
         return fused
 
 
-class Conv2d(nn.Module):
+class Conv2d(QuantizableConv, nn.Module):
     """2D convolution backed by CUTLASS Ampere Tensor Core Implicit GEMM.
 
     Tensors use NHWC layout throughout:
@@ -475,7 +496,10 @@ class Conv2d(nn.Module):
 
     Grouped convolutions use a direct NHWC CUDA kernel.  Dense 1x1 convolutions
     are GEMMs over the channel axis and dispatch through the GEMM family.
+    Quantizable (``quant_kind = "conv2d"``) when dense and int8-aligned.
     """
+
+    quant_kind = "conv2d"
 
     def __init__(
         self,
@@ -507,6 +531,8 @@ class Conv2d(nn.Module):
 
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.in_features = in_channels
+        self.out_features = out_channels
         self.kernel_size = (kernel_h, kernel_w)
         self.padding = (pad_h, pad_w)
         self.stride = (stride_h, stride_w)
@@ -556,6 +582,8 @@ class Conv2d(nn.Module):
 
     def forward(self, x: torch.Tensor, *, padding: tuple[int, int] | None = None) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x, padding=padding)
         if not self._use_kernel(x):
             return self._torch_forward(x, padding)
         pad_h, pad_w = self.padding if padding is None else padding
@@ -666,9 +694,12 @@ class Conv2dActivation(Conv2d):
             )
         self.activation_name = activation_type
         self.activation = oasr.get_activation_type_id(activation_type)
+        self.fused_activation = _QUANT_ACTIVATION[activation_type]
 
     def forward(self, x: torch.Tensor, *, padding: tuple[int, int] | None = None) -> torch.Tensor:
         """x: [N, H, W, in_channels] -> [N, P, Q, out_channels]."""
+        if self.quant_method is not None:
+            return self.quant_method.apply(self, x, padding=padding)
         if not self._use_kernel(x):
             return _TORCH_CONV_ACTIVATION[self.activation_name](self._torch_forward(x, padding))
         pad_h, pad_w = self.padding if padding is None else padding

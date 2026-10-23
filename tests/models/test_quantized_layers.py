@@ -25,10 +25,17 @@ import pytest
 import torch
 from test_layer_waist import _build, _tiny_configs
 
-from oasr.layers import Linear, LinearActivation, PointwiseConv1d, QuantizableGemm
+from oasr.layers import (
+    Linear,
+    LinearActivation,
+    PointwiseConv1d,
+    QuantizableConv,
+    QuantizableGemm,
+)
 from oasr.models.registry import list_models
 from oasr.quantization import (
     INT8_W8A8,
+    INT8_W8A8_STATIC,
     QuantGroup,
     QuantizationSpec,
     apply_quantization,
@@ -57,6 +64,23 @@ def _layers():
         "linear_activation": LinearActivation(64, 96, activation_type="swish"),
         "pointwise_conv": PointwiseConv1d(64, 96),
     }
+
+
+def _everything(model):
+    """A spec quantizing every quantizable layer: the GEMMs per token, every
+    convolution an int8 kernel serves with a static input scale (one, uncalibrated).
+    """
+    layers = quantizable_layers(model)
+    gemms = tuple(p for p, m in layers.items() if isinstance(m, QuantizableGemm))
+    convs = tuple(
+        p
+        for p, m in layers.items()
+        if isinstance(m, QuantizableConv) and m.quant_unsupported() is None
+    )
+    groups = [QuantGroup(INT8_W8A8, gemms)]
+    if convs:
+        groups.insert(0, QuantGroup(INT8_W8A8_STATIC, convs))
+    return QuantizationSpec(tuple(groups)), len(gemms) + len(convs)
 
 
 class TestStorage:
@@ -178,18 +202,14 @@ class TestArchitectures:
     @pytest.mark.parametrize("arch", list_models())
     def test_everything_quantizable_quantizes(self, arch):
         model = _build(arch)
-        layers = quantizable_layers(model)
-        assert layers, f"{arch} has no quantizable layer"
-        spec = QuantizationSpec((QuantGroup(INT8_W8A8, tuple(layers)),))
-        assert len(apply_quantization(model, spec, quantize=True)) == len(layers)
+        spec, n = _everything(model)
+        assert n, f"{arch} has no quantizable layer"
+        assert len(apply_quantization(model, spec, quantize=True)) == n
 
     @pytest.mark.parametrize("arch", ["conformer", "whisper", "paraformer"])
     def test_a_fully_quantized_encoder_runs_on_cpu(self, arch):
         model = _build(arch).eval()
-        layers = quantizable_layers(model)
-        apply_quantization(
-            model, QuantizationSpec((QuantGroup(INT8_W8A8, tuple(layers)),)), quantize=True
-        )
+        apply_quantization(model, _everything(model)[0], quantize=True)
         bind_quantization(model)
         with torch.no_grad():
             hidden, _ = model.encode_offline(torch.randn(1, 64, 80), torch.tensor([64]))

@@ -1611,8 +1611,11 @@ class ASREngine:
 
         by_tier: Counter = Counter()
         sigs = set()
-        other = 0
+        other = convs = 0
         for layer in layers.values():
+            if layer.quant_kind in ("conv1d", "conv2d"):
+                convs += 1  # the int8 convolution: no tuning family, the shape heuristic
+                continue
             method = layer.quant_method
             lane = getattr(method, "lane", None)
             if lane is None or getattr(lane, "backend", None) != "cutlass":
@@ -1632,6 +1635,8 @@ class ASREngine:
         )
         if other:
             line += f", {other} not on a CUTLASS scaled_mm lane"
+        if convs:
+            line += f"; {convs} int8 convolution(s) on the shape heuristic"
         return line
 
     def export_tuning_misses(self, path: str) -> int:

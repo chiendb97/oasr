@@ -136,6 +136,7 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | Convert a checkpoint | `oasr-convert <src> <dst>` |
 | Quantize a checkpoint (SmoothQuant W8A8) | `oasr quantize $CKPT_DIR <dst> --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl` |
 | Serve int8 without calibration | `oasr-server --ckpt-dir <dir> --quantization int8_w8a8` · `EngineConfig(quantization="int8_w8a8")` (`fp8_w8a8` on sm89+) |
+| Quantize convolutions too (calibrated static scale) | `oasr quantize $CKPT_DIR <dst> --recipe smoothquant_w8a8_fused --module-types linear,pointwise_conv,conv2d --calib-manifest ...` |
 | An fp8 KV cache for an AR decoder | `oasr-server --ckpt-dir <dir> --quantization-option kv_cache=fp8_e4m3` · `EngineConfig(quantization={"kv_cache": "fp8_e4m3"})` |
 | Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
 | Word timestamps | `oasr transcribe audio.mp3 --response-format verbose_json --timestamp-granularity word` |
@@ -246,7 +247,8 @@ Each is a registry. Adding a variant means subclass + register — no engine edi
 Orthogonal to all nine is the **layer waist**: `oasr.layers` is what every
 architecture is built from, so a kernel improvement, CUDA-graph capture or a
 quantized path applies to all of them (`Linear`, `LinearActivation` and
-`PointwiseConv1d` are `QuantizableGemm`s; see [`docs/quantization.md`](docs/quantization.md)).
+`PointwiseConv1d` are `QuantizableGemm`s, `Conv1d` / `Conv2d` `QuantizableConv`s, selected
+by `module_types`; see [`docs/quantization.md`](docs/quantization.md)).
 
 [`docs/architecture.md`](docs/architecture.md) is the authoritative map, with the
 extension cookbook for each axis.
@@ -277,6 +279,7 @@ extension cookbook for each axis.
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS`; `_quantizable.py` the quantization seam |
 | `oasr/quantization/` | The ninth axis: `spec` (formats, `QuantizationSpec`), `layout` (what a model declares), `methods/` + `kernels/lanes.py` (runtime), `calibration/` + `algorithms/` (offline), `export.py` / `cli.py` (`oasr quantize`) |
 | `oasr/functionals/{quant,scaled_mm}.py`, `include/oasr/{quant,scaled_mm}/`, `oasr/jit/scaled_mm.py` | Per-token / static 8-bit quantize (int8, fp8 e4m3) and the CUTLASS 2.x 8-bit GEMM (int8 Sm80, e4m3 Sm89) with its EVT dequant epilogue |
+| `oasr/functionals/scaled_conv.py`, `include/oasr/scaled_conv/`, `oasr/jit/scaled_conv.py` | The int8 implicit-GEMM convolution of a quantized `Conv1d` / `Conv2d` (broadcast epilogue: per-channel scale vector, zero-stride bias) |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
 | `include/oasr/common/{cute_sm80,tile_rules}.h`, `oasr/jit/arch_facts.py` | The Ampere-class CuTe toolkit and tile rules the three C++ CuTe families (attention, gated MLP, recurrent step) share, and their Python mirror |
@@ -501,6 +504,13 @@ extension cookbook for each axis.
 - **`torch._scaled_mm` row-wise scales with an fp16 output.** torch 2.12 / CUDA 13.2
   accepts it on an RTX 5090 and returns values ~64 off on unit scales, silently. The fp8
   torch lane runs tensor-wise into fp32 and dequantizes in torch.
+- **A per-token scale on a convolution's input.** An output pixel sums over a receptive
+  field spanning several input pixels, so their scales do not factor out of the sum:
+  a quantized `Conv1d` / `Conv2d` takes a calibrated static per-tensor scale
+  (`int8_w8a8_static`), which is why `module_types` refuses `conv1d` / `conv2d` online
+  and `oasr quantize` calibrates them with any recipe.  `QuantizableGemm` is the GEMM
+  seam (8-aligned, smoothable); a convolution is `QuantizableConv` -- a code path that
+  needs GEMM semantics must not widen its `isinstance` to `QuantizableLayer`.
 - **A target glob that selects a raw-read weight.** The transducer joiner's fused-decode
   weights are `quantizable = False`; mark any new one. (The gated MLP's gate/up are
   quantizable: a quantized block leaves its fused dual-B kernel for two scaled GEMMs.)

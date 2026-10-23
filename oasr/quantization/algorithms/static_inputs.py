@@ -122,43 +122,8 @@ class StaticInputs(QuantAlgorithm):
             raise ValueError(f"static_inputs: the chains mix formats {sorted(formats)}")
         fmt = formats.pop()
         static_scheme = _STATIC_SCHEME[fmt]
-        qmax = static_scheme.weights.qmax
-
-        modules = dict(model.named_modules())
-        amax_obs: Dict[str, Observer] = {p: AbsMaxPerTensor() for p in targets}
-        _run(model, modules, amax_obs, forward_loop)
-        amax = {p: float(amax_obs[p].result()) for p in targets}
-        clip = dict(amax)
-        if opts.observer != "absmax":
-            hists: Dict[str, Observer] = {
-                p: HistogramPerTensor(max(amax[p], QUANT_EPS), opts.bins) for p in targets
-            }
-            _run(model, modules, hists, forward_loop)
-            for p in targets:
-                counts = hists[p].result()
-                if opts.observer == "percentile":
-                    clip[p] = clip_percentile(counts, max(amax[p], QUANT_EPS), opts.percentile)
-                else:
-                    clip[p] = clip_mse(counts, max(amax[p], QUANT_EPS), qmax, fmt)
-
-        for path in targets:
-            c = torch.tensor([max(clip[path], QUANT_EPS)], dtype=torch.float32)
-            # Tensor / tensor: an IEEE division, as everywhere in the pinned numerics.
-            scale = c / torch.full_like(c, qmax)
-            module = modules[path]
-            if "input_scale" in module._buffers:
-                raise RuntimeError(f"{path} already has an input_scale")
-            module.register_buffer("input_scale", scale.cpu().clone())
-
         producer = dict(spec.producer)
-        record = {"observer": opts.observer, "layers": len(targets)}
-        if opts.observer == "percentile":
-            record["percentile"] = opts.percentile
-        if opts.observer != "absmax":
-            # How far below the maximum the clip sits, worst and median layer.
-            ratios = sorted(clip[p] / max(amax[p], QUANT_EPS) for p in targets)
-            record["clip_over_max"] = [round(ratios[0], 4), round(ratios[len(ratios) // 2], 4)]
-        producer["static_inputs"] = record
+        producer["static_inputs"] = calibrate_input_scales(model, targets, forward_loop, opts, fmt)
         # First match wins in ``QuantizationSpec.resolve``, so the static group goes
         # first; an exact path it now owns is also dropped from the group that had
         # it, so the written spec lists every layer once.  Globs stay as written.
@@ -173,6 +138,121 @@ class StaticInputs(QuantAlgorithm):
             groups=(QuantGroup(static_scheme, tuple(targets)),) + tuple(rest),
             producer=producer,
         )
+
+
+@register_quant_algorithm("static_conv_inputs")
+class StaticConvInputs(QuantAlgorithm):
+    """Calibrate the static input scale of every layer the spec quantizes statically.
+
+    A quantized convolution's input scale is one per-tensor constant (an output
+    pixel sums over several input pixels, so a per-token scale would not factor
+    out); ``QuantizationSpec.for_model`` gives every selected convolution its
+    format's static scheme, and this measures the scale with the same clip search
+    as :class:`StaticInputs`.  It skips a layer that already has one (a GEMM-chain
+    consumer ``static_inputs`` calibrated), so it can run after it.
+    ``quantize_model`` appends it whenever the spec has a static layer left
+    uncalibrated; its options are ``static_inputs``'.
+    """
+
+    options_cls = StaticInputsOptions
+    needs_calibration = True
+
+    def apply(
+        self,
+        model: nn.Module,
+        layout: QuantLayout,
+        spec: QuantizationSpec,
+        forward_loop: Optional[ForwardLoop],
+    ) -> QuantizationSpec:
+        opts: StaticInputsOptions = self.options or StaticInputsOptions()
+        if opts.observer not in _OBSERVERS:
+            raise ValueError(
+                f"unknown static_inputs observer {opts.observer!r}; known: {sorted(_OBSERVERS)}"
+            )
+        targets = uncalibrated_static_layers(model, spec)
+        if not targets:
+            return spec
+        if forward_loop is None:
+            raise ValueError(
+                f"{len(targets)} statically quantized layer(s) ({targets[0]}, ...) need "
+                "calibration audio for their input scale"
+            )
+        formats = {w8a8_format(spec.resolve(p)) for p in targets}  # type: ignore[arg-type]
+        if len(formats) != 1 or None in formats:
+            raise ValueError(f"static_conv_inputs: the static layers mix formats {formats}")
+        fmt = str(formats.pop())
+        producer = dict(spec.producer)
+        producer["static_conv_inputs"] = calibrate_input_scales(
+            model, targets, forward_loop, opts, fmt
+        )
+        return dataclasses.replace(spec, producer=producer)
+
+
+def uncalibrated_static_layers(model: nn.Module, spec: QuantizationSpec) -> List[str]:
+    """Paths the spec quantizes with a static input scale that do not carry one yet."""
+    from oasr.layers._quantizable import QuantizableLayer
+
+    out = []
+    for path, module in model.named_modules():
+        if not isinstance(module, QuantizableLayer):
+            continue
+        scheme = spec.resolve(path)
+        acts = None if scheme is None else scheme.input_activations
+        if acts is None or acts.dynamic or acts.granularity != "tensor":
+            continue
+        layer: nn.Module = module  # type: ignore[assignment]
+        if "input_scale" not in layer._buffers:
+            out.append(path)
+    return out
+
+
+def calibrate_input_scales(
+    model: nn.Module,
+    targets: List[str],
+    forward_loop: ForwardLoop,
+    opts: StaticInputsOptions,
+    fmt: str,
+) -> Dict[str, object]:
+    """Install a static per-tensor ``input_scale`` buffer on each of *targets*.
+
+    ``clip(|x * smooth_inv|) / Q`` over the calibration audio, the clip chosen by
+    ``opts.observer`` (module docstring).  Returns the provenance record.
+    """
+    qmax = _STATIC_SCHEME[fmt].weights.qmax
+    modules = dict(model.named_modules())
+    amax_obs: Dict[str, Observer] = {p: AbsMaxPerTensor() for p in targets}
+    _run(model, modules, amax_obs, forward_loop)
+    amax = {p: float(amax_obs[p].result()) for p in targets}
+    clip = dict(amax)
+    if opts.observer != "absmax":
+        hists: Dict[str, Observer] = {
+            p: HistogramPerTensor(max(amax[p], QUANT_EPS), opts.bins) for p in targets
+        }
+        _run(model, modules, hists, forward_loop)
+        for p in targets:
+            counts = hists[p].result()
+            if opts.observer == "percentile":
+                clip[p] = clip_percentile(counts, max(amax[p], QUANT_EPS), opts.percentile)
+            else:
+                clip[p] = clip_mse(counts, max(amax[p], QUANT_EPS), qmax, fmt)
+
+    for path in targets:
+        c = torch.tensor([max(clip[path], QUANT_EPS)], dtype=torch.float32)
+        # Tensor / tensor: an IEEE division, as everywhere in the pinned numerics.
+        scale = c / torch.full_like(c, qmax)
+        module = modules[path]
+        if "input_scale" in module._buffers:
+            raise RuntimeError(f"{path} already has an input_scale")
+        module.register_buffer("input_scale", scale.cpu().clone())
+
+    record: Dict[str, object] = {"observer": opts.observer, "layers": len(targets)}
+    if opts.observer == "percentile":
+        record["percentile"] = opts.percentile
+    if opts.observer != "absmax":
+        # How far below the maximum the clip sits, worst and median layer.
+        ratios = sorted(clip[p] / max(amax[p], QUANT_EPS) for p in targets)
+        record["clip_over_max"] = [round(ratios[0], 4), round(ratios[len(ratios) // 2], 4)]
+    return record
 
 
 #: The clip estimators ``observer`` names.
@@ -208,4 +288,10 @@ def _observe(observer: Observer, module: nn.Module):
     return hook
 
 
-__all__ = ["StaticInputs", "StaticInputsOptions"]
+__all__ = [
+    "StaticConvInputs",
+    "StaticInputs",
+    "StaticInputsOptions",
+    "calibrate_input_scales",
+    "uncalibrated_static_layers",
+]

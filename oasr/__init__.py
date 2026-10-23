@@ -101,6 +101,7 @@ from .functionals.recurrent import (
     rnn_layer,
     rnn_slot_step,
 )
+from .functionals.scaled_conv import scaled_conv1d, scaled_conv2d
 from .functionals.scaled_mm import scaled_mm, scaled_mm_quant
 from .functionals.softmax import log_softmax, masked_softmax, softmax
 from .functionals.topk import topk
@@ -276,6 +277,8 @@ __all__ = [
     "gemm_log_softmax",
     "quantize_per_token",
     "quantize_static",
+    "scaled_conv1d",
+    "scaled_conv2d",
     "scaled_mm",
     "scaled_mm_quant",
     "log_softmax",

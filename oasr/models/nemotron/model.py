@@ -269,8 +269,10 @@ class NemotronModel(BaseAsrModel):
             groups.append(SmoothGroup(None, (f"{p}.conv.pointwise_conv2",), "runtime"))
         return QuantLayout(
             groups=tuple(groups),
+            # The subsampling's convolutions are selected by ``module_types``
+            # (``conv2d``) only; its output projection stays full precision.
             keep_full_precision=(
-                "encoder.subsampling.*",
+                "encoder.subsampling.linear",
                 "*.relative_k_proj",
                 "decoder.*",
                 "joint.*",
