@@ -90,6 +90,7 @@ def set_backend_mode(mode: str) -> None:
     fmha_config_supported.cache_clear()
     fmha_backend_for.cache_clear()
     fmha_cxx_supports.cache_clear()
+    fmha_kv8_refusal.cache_clear()
     try:
         from oasr.jit import fmha as _fmha_cxx
 
@@ -595,6 +596,70 @@ def fmha_backend_for(
     ):
         return "cxx"
     return "sdpa"
+
+
+# ---------------------------------------------------------------------------
+# FP8 KV cache
+# ---------------------------------------------------------------------------
+
+
+def fmha_kv8_backend() -> str:
+    """Which lane reads an **fp8 KV cache** -- a declared rule, not a preference.
+
+    Only the C++ lane has fp8-KV variants (``oasr.jit.fmha.gen_fmha_kv8_module``),
+    so an fp8 read goes there whichever lane the process prefers for
+    served-dtype attention: under ``auto`` (which resolves to ``cute`` for
+    served-dtype calls) and under ``cxx``.  The two process modes that *name*
+    another lane keep their meaning: ``sdpa`` forces the reference, which
+    dequantizes the cache and runs SDPA (a debugging A/B, not a serving path --
+    the engine refuses ``kv_cache="fp8_e4m3"`` under it); ``cute`` requires a lane
+    that cannot read fp8, so it raises.  Shape support is a separate question,
+    :func:`fmha_kv8_refusal`.
+    """
+    mode = get_backend_mode()
+    if mode == "sdpa":
+        return "sdpa"
+    if mode == "cute":
+        raise NotImplementedError(
+            "OASR_ATTN_BACKEND=cute requires the CuTeDSL attention lane, which cannot read "
+            "an fp8 KV cache; the fp8 variants are the C++ lane's (OASR_ATTN_BACKEND=auto "
+            "or cxx)"
+        )
+    return "cxx"
+
+
+@functools.cache
+def fmha_kv8_refusal(
+    *,
+    head_dim: int,
+    dtype_str: str,
+    paged: bool = False,
+    causal: bool = False,
+    local: bool = False,
+    has_bias: bool = False,
+) -> Optional[str]:
+    """Why an fp8-KV read of this shape cannot be served on this device, or ``None``.
+
+    The reason is the error a caller sees (``oasr.fmha`` raises it) and the one
+    the engine names when it refuses ``quantization.kv_cache`` at construction:
+    a missing variant is declared, never routed around (``AGENTS.md`` rule 3).
+    """
+    cap = _capability_probe()[0]
+    if cap is None:
+        return "no CUDA device is visible"
+    try:
+        from oasr.jit import fmha as _fmha_cxx
+    except ImportError:  # pragma: no cover - the C++ lane is optional
+        return "the C++ attention lane is not available in this build"
+    return _fmha_cxx.kv8_refusal(
+        sm=cap[0] * 10 + cap[1],
+        dtype_str=dtype_str,
+        head_dim=head_dim,
+        paged=paged,
+        causal=causal,
+        local=local,
+        has_bias=has_bias,
+    )
 
 
 def get_compiled_fmha(

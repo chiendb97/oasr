@@ -34,6 +34,26 @@ RECIPES: Dict[str, Recipe] = {
             "SmoothQuant smoothing, then int8 per-channel W x per-token dynamic A",
         ),
         Recipe(
+            "fp8_w8a8_rtn",
+            "fp8_w8a8",
+            ("rtn",),
+            "fp8 e4m3 per-channel W x per-token dynamic A, round-to-nearest; no calibration "
+            "(sm89+)",
+        ),
+        Recipe(
+            "smoothquant_fp8_w8a8",
+            "fp8_w8a8",
+            ("smoothquant",),
+            "SmoothQuant smoothing, then fp8 e4m3 per-channel W x per-token dynamic A (sm89+)",
+        ),
+        Recipe(
+            "smoothquant_fp8_w8a8_fused",
+            "fp8_w8a8",
+            ("smoothquant", "static_inputs"),
+            "smoothquant_fp8_w8a8 with smoothquant_w8a8_fused's static GEMM-chain consumers, "
+            "in fp8 (sm89+)",
+        ),
+        Recipe(
             "smoothquant_w8a8_fused",
             "int8_w8a8",
             ("smoothquant", "static_inputs"),

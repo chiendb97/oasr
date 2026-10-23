@@ -146,13 +146,15 @@ def no_tf32() -> Iterator[None]:
 
 
 def asr_forward_loop(
-    calibration: CalibrationSet, frontend: CheckpointFrontend
+    calibration: CalibrationSet, frontend: CheckpointFrontend, tokenizer: Any = None
 ) -> Callable[[nn.Module], None]:
-    """``forward_loop(model)``: every calibration utterance through the encoder.
+    """``forward_loop(model)``: every calibration utterance through the model.
 
-    The encoder is what is quantized; the output head and any decoder stay full
-    precision and need no statistics, so the loop stops at ``encode_offline``.
-    Waveforms are read once and kept, so the loop can run more than once.
+    Through ``model.calibration_forward`` -- the encoder, and whatever decoder
+    the model's quantization layout covers (driven as serving drives it; a
+    text prompt is encoded with *tokenizer*, the checkpoint's) -- or, for a
+    model without one, ``encode_offline``.  Waveforms are read once and kept,
+    so the loop can run more than once.
     """
     waveforms: List[torch.Tensor] = [
         load_waveform(_resolve(calibration.audio_root, e["audio"]), frontend.sample_rate)
@@ -167,10 +169,14 @@ def asr_forward_loop(
         # (the mel matrix's spans) keyed on a version counter that inference
         # tensors do not have.
         with no_tf32(), torch.no_grad():
+            calibrate = getattr(model, "calibration_forward", None)
             for wav in waveforms:
                 feats, lengths = frontend(wav)
                 feats = feats.to(device=param.device, dtype=param.dtype)
-                model.encode_offline(feats, lengths.to(param.device))  # type: ignore[operator]
+                if calibrate is not None:
+                    calibrate(feats, lengths.to(param.device), tokenizer=tokenizer)
+                else:
+                    model.encode_offline(feats, lengths.to(param.device))  # type: ignore[operator]
 
     return forward_loop
 

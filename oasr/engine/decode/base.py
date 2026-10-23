@@ -129,6 +129,23 @@ class DecodeStrategy(ABC):
         self._clock: Optional[FrameClock] = FrameClock.resolve(
             getattr(config, "feature_config", None), model
         )
+        kv_cache = getattr(getattr(config, "quantization", None), "kv_cache", None)
+        if kv_cache is not None:
+            self._require_kv_cache(kv_cache)
+
+    def _require_kv_cache(self, kv_cache: str) -> None:
+        """Refuse ``EngineConfig.quantization.kv_cache`` unless this family can store it.
+
+        The default is the honest answer for every frame-synchronous family: there
+        is no autoregressive decoder KV cache to quantize, and accepting the
+        setting would ignore it silently.  The incremental AR families override
+        this with the real check.
+        """
+        raise ValueError(
+            f"quantization.kv_cache={kv_cache!r}: decode family {self.decode_type!r} keeps no "
+            "autoregressive decoder KV cache to store in that format. Unset kv_cache, or "
+            "serve an AED / speech-LLM decode family."
+        )
 
     # -- per-request options ------------------------------------------------
 

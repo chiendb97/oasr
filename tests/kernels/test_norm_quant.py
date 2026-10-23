@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""LayerNorm with a per-token int8 output (``oasr/functionals/norm.py``).
+"""LayerNorm with a per-token 8-bit output (``oasr/functionals/norm.py``).
 
 The contract is **bit-exactness with the unfused pair** -- ``torch.equal``, not
 a tolerance::
@@ -212,6 +212,47 @@ class TestBitExactVsUnfused:
         q, scale = layer_norm_quant(x, w, None, qeps=1e-3)
         assert not q.any()
         assert torch.equal(scale, torch.full_like(scale, _ieee_div(1e-3, INT8_QMAX)))
+
+
+_FP8 = torch.float8_e4m3fn
+
+
+class TestFp8Output:
+    """The e4m3 format: the same kernels, only the final store differs.
+
+    Bit-exact with ``quantize_per_token(..., dtype=float8_e4m3fn)`` of the plain
+    norm, compared on the bytes (fp8 has no CUDA ``torch.equal``).  The widths
+    reach the vector, scalar and shared-memory-staged paths.
+    """
+
+    @pytest.mark.parametrize("rows", (3, 1000))
+    @pytest.mark.parametrize("hidden", (256, 100, 2048, 12288, 4100))
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_layer_norm_quant(self, dtype, hidden, rows):
+        x, _, w, b = _inputs(rows, hidden, dtype, seed=hidden * 3 + rows)
+        q, scale = layer_norm_quant(x, w, b, 1e-5, dtype=_FP8)
+        q_ref, scale_ref = quantize_per_token(oasr.layer_norm(x, w, b, 1e-5), None, dtype=_FP8)
+        assert q.dtype == _FP8
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(scale, scale_ref)
+
+    @pytest.mark.parametrize("hidden", (256, 100, 12288))
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_add_layer_norm_residual_quant(self, dtype, hidden):
+        x, r, w, b = _inputs(1000, hidden, dtype, seed=hidden * 5)
+        q, scale, s = add_layer_norm_residual_quant(x, r, w, b, 1e-5, 0.5, dtype=_FP8)
+        y, s_ref = oasr.add_layer_norm_residual(x, r, w, b, 1e-5, 0.5)
+        q_ref, scale_ref = quantize_per_token(y, None, dtype=_FP8)
+        assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(scale, scale_ref) and torch.equal(s, s_ref)
+
+    def test_the_out_tensor_names_the_format(self):
+        x, _, w, b = _inputs(8, 256, torch.float16, seed=1)
+        out = torch.empty(8, 256, dtype=_FP8, device="cuda")
+        q, _ = layer_norm_quant(x, w, b, 1e-5, out=out)
+        assert q.data_ptr() == out.data_ptr()
+        ref, _ = quantize_per_token(oasr.layer_norm(x, w, b, 1e-5), None, dtype=_FP8)
+        assert torch.equal(out.view(torch.uint8), ref.view(torch.uint8))
 
 
 class TestReferenceTwins:

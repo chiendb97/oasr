@@ -61,6 +61,11 @@ __all__ = [
     "split_range",
     "fmha_coverage_report",
     "variant_symbol",
+    "resolve_config_kv8",
+    "kv8_config_supported",
+    "gen_fmha_kv8_module",
+    "gen_fmha_kv8_modules",
+    "get_fmha_kv8_fn",
 ]
 
 #: Architectures this lane compiles for.  sm_90 / sm_100 would *run* the
@@ -158,6 +163,119 @@ def resolve_config(sm: int, elem_bits: int, head_dim: int) -> FmhaTile:
             if need <= budget:
                 return FmhaTile(True, _BLOCK_M, block_n, _NUM_WARPS, stages, False, need)
     return FmhaTile(False, 0, 0, 0, 0, False, 0)
+
+
+#: fp8 elements per 128-bit cp.async; mirrors ``kFmhaKv8ElemsPerLoad``.
+KV8_ELEMS_PER_LOAD = 16
+
+
+def _kv8_smem_bytes(block_m: int, block_n: int, d: int, stages: int, elem: int) -> int:
+    """Mirror of ``oasr::attention::fmhaSmemBytesKv8`` (``head_dim_v == head_dim``)."""
+    q = block_m * d * elem
+    k8 = block_n * d * stages
+    v8 = block_n * d * stages
+    tile = block_n * d * elem
+    scales = 2 * stages * block_n * 4
+    o = block_m * d * elem
+    mainloop = q + k8 + v8 + tile + scales
+    pad = max(0, o - v8 - k8)
+    return max(mainloop + pad, o)
+
+
+def _kv8_covers(block_n: int, d: int, num_threads: int) -> bool:
+    """Mirror of ``oasr::attention::fmhaKv8Covers``."""
+    if d % KV8_ELEMS_PER_LOAD:
+        return False
+    per_row = d // KV8_ELEMS_PER_LOAD
+    if num_threads % per_row:
+        return False
+    rows = num_threads // per_row
+    return rows > 0 and block_n % rows == 0
+
+
+@functools.lru_cache(maxsize=None)
+def resolve_config_kv8(sm: int, elem_bits: int, head_dim: int) -> FmhaTile:
+    """Mirror of ``oasr::attention::fmhaResolveTileKv8`` -- the fp8-KV variants' tile.
+
+    Pinned against the C++ original by ``tests/kernels/test_fmha_kv8.py``.
+    """
+    budget = smem_budget(sm)
+    elem = elem_bits // 8
+    d = padded_head_dim(head_dim)
+    if budget <= 0 or head_dim <= 0 or elem <= 0:
+        return FmhaTile(False, 0, 0, 0, 0, False, 0)
+    for block_n in _N_BLOCK_LADDER:
+        if not _kv8_covers(block_n, d, _NUM_WARPS * 32):
+            continue
+        for stages in range(_MAX_STAGES, 0, -1):
+            need = _kv8_smem_bytes(_BLOCK_M, block_n, d, stages, elem)
+            if need <= budget:
+                return FmhaTile(True, _BLOCK_M, block_n, _NUM_WARPS, stages, False, need)
+    return FmhaTile(False, 0, 0, 0, 0, False, 0)
+
+
+def kv8_config_supported(
+    *,
+    sm: int,
+    dtype_str: str,
+    head_dim: int,
+    paged: bool = False,
+    causal: bool = False,
+    local: bool = False,
+    has_bias: bool = False,
+) -> bool:
+    """Can the fp8-KV variants serve this shape?
+
+    They are rendered for unmasked, bias-free reads of a cache -- an AR decode
+    step and an AED's cross-attention -- dense or paged.  A causal, windowed or
+    biased read over fp8 K/V has no caller (a prefill attends its own fresh
+    K/V in the served dtype) and is refused here by name rather than routed
+    anywhere else; :func:`kv8_refusal` says why.
+    """
+    return (
+        kv8_refusal(
+            sm=sm,
+            dtype_str=dtype_str,
+            head_dim=head_dim,
+            paged=paged,
+            causal=causal,
+            local=local,
+            has_bias=has_bias,
+        )
+        is None
+    )
+
+
+def kv8_refusal(
+    *,
+    sm: int,
+    dtype_str: str,
+    head_dim: int,
+    paged: bool = False,
+    causal: bool = False,
+    local: bool = False,
+    has_bias: bool = False,
+) -> Optional[str]:
+    """Why the fp8-KV variants cannot serve a shape, or ``None`` when they can."""
+    del paged  # dense and paged are both rendered
+    if dtype_str not in _DTYPES:
+        return f"the query dtype must be float16 or bfloat16, got {dtype_str}"
+    if sm not in SUPPORTED_SM:
+        return f"the C++ attention lane is compiled for {SUPPORTED_SM}, not sm_{sm}"
+    if causal or local:
+        return "a causal or windowed read of an fp8 KV cache is not rendered"
+    if has_bias:
+        return "an additive bias over an fp8 KV cache is not rendered"
+    if head_dim % KV8_ELEMS_PER_LOAD:
+        return (
+            f"head_dim {head_dim} is not a multiple of {KV8_ELEMS_PER_LOAD} (one fp8 128-bit load)"
+        )
+    if not resolve_config_kv8(sm, 16, head_dim).valid:
+        return (
+            f"no fp8-KV tile fits sm_{sm} at head_dim {head_dim} "
+            f"(padded {padded_head_dim(head_dim)}: the gather covers padded 32/64/128/256)"
+        )
+    return None
 
 
 def config_supported(
@@ -389,6 +507,88 @@ def gen_fmha_modules(cells: Optional[List[Tuple[str, int]]] = None) -> List[JitS
     return [gen_fmha_module(sm, dt, d) for dt, d in cells]
 
 
+def kv8_variant_symbol(
+    sm: int, dtype_str: str, head_dim: int, paged: bool, split: bool = False
+) -> str:
+    """The exported name of one fp8-KV variant."""
+    d = padded_head_dim(head_dim)
+    sym = f"fmha_kv8_sm{sm}_{dtype_str}_d{d}_{'paged' if paged else 'dense'}"
+    return f"{sym}_split" if split else sym
+
+
+def kv8_cell_name(sm: int, dtype_str: str, head_dim: int) -> str:
+    return f"fmha_kv8_sm{sm}_{dtype_str}_d{padded_head_dim(head_dim)}"
+
+
+@functools.lru_cache(maxsize=None)
+def gen_fmha_kv8_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
+    """Render one fp8-KV cell: dense / paged x unsplit / split, four TUs.
+
+    Its own ``.so`` rather than four more TUs in the served-dtype cell, so a
+    process that never asks for fp8 KV never compiles it.  The two cells
+    instantiate no template in common except the split combine, which has no
+    one-time state for the loader to merge across libraries.
+    """
+    if dtype_str not in _DTYPES:
+        raise ValueError(f"fmha_kv8: unsupported dtype {dtype_str!r}")
+    d = padded_head_dim(head_dim)
+    if not resolve_config_kv8(sm, 16, head_dim).valid:
+        raise RuntimeError(f"fmha_kv8: no fp8-KV tile fits sm_{sm} at head_dim {head_dim}")
+    out_dir = env.OASR_GEN_SRC_DIR / "fmha"
+    sources: List = []
+    for paged in _PAGED_MODES:
+        for split in (False, True):
+            func = kv8_variant_symbol(sm, dtype_str, head_dim, paged, split)
+            rendered = render_template(
+                "fmha_kv8_template.cu.jinja",
+                func_name=func,
+                sm_version=sm,
+                dtype=dtype_str,
+                cutlass_dtype=_DTYPES[dtype_str],
+                head_dim=d,
+                paged_kv=paged,
+                split=split,
+            )
+            path = out_dir / f"{func}.cu"
+            write_if_different(path, rendered)
+            sources.append(path)
+    sources.append(env.OASR_CSRC_DIR / "fmha_jit_binding.cu")
+    return gen_jit_spec(kv8_cell_name(sm, dtype_str, head_dim), sources)
+
+
+def gen_fmha_kv8_modules(cells: Optional[List[Tuple[str, int]]] = None) -> List[JitSpec]:
+    """AOT specs for the fp8-KV cells the shipped AR decoders read.
+
+    head_dim 64 is Whisper's decoder (fp16), 128 the Qwen2-Audio LM (bf16); both
+    dtypes of both, like :func:`gen_fmha_modules`.
+    """
+    if cells is None:
+        cells = [(dt, d) for dt in ("float16", "bfloat16") for d in (64, 128)]
+    sm = _get_target_sm()
+    if sm not in SUPPORTED_SM:
+        return []
+    return [gen_fmha_kv8_module(sm, dt, d) for dt, d in cells]
+
+
+@functools.lru_cache(maxsize=None)
+def _kv8_cell_module(sm: int, dtype_str: str, head_dim: int):
+    return gen_fmha_kv8_module(sm, dtype_str, head_dim).build_and_load()
+
+
+def get_fmha_kv8_fn(
+    *,
+    dtype_str: str,
+    head_dim: int,
+    paged: bool = False,
+    split: bool = False,
+    sm: Optional[int] = None,
+):
+    """The bound launcher for one fp8-KV variant, building its cell on first use."""
+    sm = _get_target_sm() if sm is None else sm
+    module = _kv8_cell_module(sm, dtype_str, head_dim)
+    return getattr(module, kv8_variant_symbol(sm, dtype_str, head_dim, paged, split))
+
+
 @functools.lru_cache(maxsize=None)
 def _cell_module(sm: int, dtype_str: str, head_dim: int):
     return gen_fmha_module(sm, dtype_str, head_dim).build_and_load()
@@ -473,3 +673,6 @@ def clear_caches() -> None:
     gen_fmha_module.cache_clear()
     _cell_module.cache_clear()
     _cell_available.cache_clear()
+    resolve_config_kv8.cache_clear()
+    gen_fmha_kv8_module.cache_clear()
+    _kv8_cell_module.cache_clear()

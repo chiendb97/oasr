@@ -67,6 +67,7 @@
 #include "cutlass_fmha_configs.h"
 #include "fmha_bias.h"
 #include "fmha_block.h"
+#include "fmha_kv8.h"
 #include "fmha_mask.h"
 #include "fmha_paged_kv.h"
 #include "fmha_params.h"
@@ -81,7 +82,8 @@ using namespace cute;
 
 template <int kNWarps_, int kStages_, bool Q_in_regs_, class TileShape_MNK_, int kHeadDimV_,
           class Element_, class ElementAccum_, int SmVersion_, bool Is_causal_,
-          bool Is_local_, bool Has_bias_, bool PagedKV_, bool Split_ = false>
+          bool Is_local_, bool Has_bias_, bool PagedKV_, bool Split_ = false,
+          bool KvFp8_ = false>
 struct CollectiveFmhaMainloopSm80 {
     using TileShape_MNK = TileShape_MNK_;
     using Element = Element_;
@@ -98,6 +100,9 @@ struct CollectiveFmhaMainloopSm80 {
     static constexpr bool Has_bias = Has_bias_;
     static constexpr bool PagedKV = PagedKV_;
     static constexpr bool Split = Split_;
+    //! K/V arrive as e4m3 bytes plus per-row scales and are dequantized in
+    //! shared memory before the gemms see them (`fmha_kv8.h`).
+    static constexpr bool KvFp8 = KvFp8_;
     static_assert(kStages > 0);
     static_assert(!(Is_causal && Is_local), "causal and local are exclusive");
     static_assert(!ArchTraits::kIsWarpSpecialized,
@@ -118,20 +123,30 @@ struct CollectiveFmhaMainloopSm80 {
     static constexpr int NumMmaThreads = CUTE_STATIC_V(size(TiledMma{}));
 
     // --- shared memory ----------------------------------------------------
+    //! Served-dtype K/V stages the gemms read.  The whole ring in the
+    //! served-dtype variants; with fp8 KV the ring holds bytes and this is the
+    //! single tile each stage is dequantized into, shared by K and then V.
+    static constexpr int kStagesKVElem = KvFp8 ? 1 : kStages;
     using SmemLayoutAtomQKV = typename cute_sm80::SmemLayoutAtomSwizzled<Element, kHeadDim>::type;
     using SmemLayoutQ =
         decltype(tile_to_shape(SmemLayoutAtomQKV{}, select<0, 2>(TileShape_MNK{})));
     using SmemLayoutK = decltype(tile_to_shape(
         SmemLayoutAtomQKV{},
-        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+        make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStagesKVElem>{})));
     using SmemLayoutV = SmemLayoutK;
     //! A *view* of V with its two leading modes swapped -- not a transpose, no
     //! data movement.  `ldmatrix.trans` does the rest when it is read.
     using SmemLayoutVt = decltype(composition(
         SmemLayoutV{},
         make_ordered_layout(make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}),
-                                       Int<kStages>{}),
+                                       Int<kStagesKVElem>{}),
                             Step<_2, _1, _3>{})));
+    //! The fp8 ring: `kStages` stages of plain row-major bytes (`Kv8Tile`).
+    using Kv8 = Kv8Tile<kBlockN, kHeadDim, kStages, kNWarps * 32>;
+    static_assert(!KvFp8 || !Q_in_regs,
+                  "fp8 KV keeps Q in shared memory; its ring is not the served-dtype V ring "
+                  "Q_in_regs aliases");
+    static_assert(!KvFp8 || kHeadDimV == kHeadDim, "fp8 KV has one head dim for K and V");
 
     //! With `Q_in_regs`, Q is read to registers in the prologue and the same
     //! bytes then carry the V ring.  Saves `kStages * N * D * sizeof(Element)`.
@@ -149,8 +164,21 @@ struct CollectiveFmhaMainloopSm80 {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
     };
-    using TensorStorage =
-        std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
+    //! fp8 KV.  `smem_v` / `smem_k` keep their names -- the kernel shell pads
+    //! the epilogue's `sO` overlay against exactly those two members -- and hold
+    //! the fp8 rings; `smem_kv` is the dequantized tile, `smem_*_scale` the
+    //! per-row scales of each ring stage.
+    struct TensorStorageKv8 : cute::aligned_struct<128> {
+        cute::array_aligned<ElementKV8, kStages * Kv8::kStageBytes> smem_v;
+        cute::array_aligned<ElementKV8, kStages * Kv8::kStageBytes> smem_k;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_kv;
+        cute::array_aligned<float, kStages * kBlockN> smem_k_scale;
+        cute::array_aligned<float, kStages * kBlockN> smem_v_scale;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+    };
+    using TensorStorage = std::conditional_t<
+        KvFp8, TensorStorageKv8,
+        std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>>;
 
     // --- copy atoms -------------------------------------------------------
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -220,12 +248,26 @@ struct CollectiveFmhaMainloopSm80 {
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
                                 SmemLayoutQ{});
-        Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()),
-                                SmemLayoutK{});
-        Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()),
-                                SmemLayoutV{});
-        Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()),
-                                 SmemLayoutVt{});
+        auto& smem = shared_storage.tensors.mainloop;
+        // The tiles the gemms read: the served-dtype ring, or with fp8 KV the one
+        // dequantized tile (K, then V, of the stage being consumed).
+        Element* const smem_k_elem = [&] {
+            if constexpr (KvFp8) {
+                return smem.smem_kv.data();
+            } else {
+                return smem.smem_k.data();
+            }
+        }();
+        Element* const smem_v_elem = [&] {
+            if constexpr (KvFp8) {
+                return smem.smem_kv.data();
+            } else {
+                return smem.smem_v.data();
+            }
+        }();
+        Tensor sK = make_tensor(make_smem_ptr(smem_k_elem), SmemLayoutK{});
+        Tensor sV = make_tensor(make_smem_ptr(smem_v_elem), SmemLayoutV{});
+        Tensor sVt = make_tensor(make_smem_ptr(smem_v_elem), SmemLayoutVt{});
 
         bool const is_varlen_q = params.cu_seqlens_q != nullptr;
         bool const is_varlen_k = params.cu_seqlens_k != nullptr;
@@ -320,12 +362,47 @@ struct CollectiveFmhaMainloopSm80 {
             }
         };
         auto load_K = [&](int const n_blk, int const stage, auto seqlenk_mask_type) {
-            load_KV(mKpool, sK(_, _, stage), tKgK(_, _, _, n_blk), tKsK(_, _, _, stage), n_blk,
-                    seqlenk_mask_type);
+            if constexpr (KvFp8) {
+                kv8_load_tile<Kv8, PagedKV, decltype(seqlenk_mask_type)::value>(
+                    params, /*is_v=*/false, smem.smem_k.data() + stage * Kv8::kStageBytes,
+                    smem.smem_k_scale.data() + stage * kBlockN, thread_idx, bidb, bidh_kv,
+                    n_blk, seqlen_k);
+            } else {
+                load_KV(mKpool, sK(_, _, stage), tKgK(_, _, _, n_blk), tKsK(_, _, _, stage),
+                        n_blk, seqlenk_mask_type);
+            }
         };
         auto load_V = [&](int const n_blk, int const stage, auto seqlenk_mask_type) {
-            load_KV(mVpool, sV(_, _, stage), tVgV(_, _, _, n_blk), tVsV(_, _, _, stage), n_blk,
-                    seqlenk_mask_type);
+            if constexpr (KvFp8) {
+                kv8_load_tile<Kv8, PagedKV, decltype(seqlenk_mask_type)::value>(
+                    params, /*is_v=*/true, smem.smem_v.data() + stage * Kv8::kStageBytes,
+                    smem.smem_v_scale.data() + stage * kBlockN, thread_idx, bidb, bidh_kv,
+                    n_blk, seqlen_k);
+            } else {
+                load_KV(mVpool, sV(_, _, stage), tVgV(_, _, _, n_blk), tVsV(_, _, _, stage),
+                        n_blk, seqlenk_mask_type);
+            }
+        };
+        // Which stage of the served-dtype tiles a gemm reads: the ring stage, or
+        // with fp8 KV the single dequantized tile.
+        auto elem_stage = [](int const ring_stage) {
+            return (kStages > 1 && !KvFp8) ? ring_stage : 0;
+        };
+        // fp8 KV: dequantize ring stage `ring_stage` of K or V into the tile the
+        // next gemm reads.  The caller has taken the barrier that makes the
+        // stage's scales visible; this takes the one that publishes the tile.
+        auto dequant_KV = [&](bool const is_v, int const ring_stage) {
+            if constexpr (KvFp8) {
+                ElementKV8 const* stage_bytes =
+                    (is_v ? smem.smem_v.data() : smem.smem_k.data()) +
+                    ring_stage * Kv8::kStageBytes;
+                float const* stage_scales =
+                    (is_v ? smem.smem_v_scale.data() : smem.smem_k_scale.data()) +
+                    ring_stage * kBlockN;
+                kv8_dequant_tile<Kv8, Element>(stage_bytes, stage_scales, sK(_, _, _0{}),
+                                               thread_idx);
+                __syncthreads();
+            }
         };
 
         auto preprocess_Q = [&] {
@@ -472,6 +549,7 @@ struct CollectiveFmhaMainloopSm80 {
             Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
             cute::clear(tSrS);
             sync();
+            dequant_KV(/*is_v=*/false, kStages > 1 ? smem_pipe_read : 0);
             auto load_V_next = [&] {
                 if (n_blk - kStages + 1 >= n_block_min) {
                     load_V(n_blk - kStages + 1, kStages > 1 ? smem_pipe_write : 0,
@@ -486,7 +564,7 @@ struct CollectiveFmhaMainloopSm80 {
             // k-tile's ldmatrix, so it overlaps the whole QK rather than
             // sitting in front of it.
             cute_sm80::gemm_sm80<Q_in_regs>(
-                tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, elem_stage(smem_pipe_read)),
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
                 load_V_next);
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
@@ -518,10 +596,10 @@ struct CollectiveFmhaMainloopSm80 {
             if constexpr (kStages > 1) {
                 sync();
             }
+            dequant_KV(/*is_v=*/true, kStages > 1 ? smem_pipe_read : 0);
             Tensor tOrV = thr_mma.partition_fragment_B(sVt(_, _, _0{}));
-            cute_sm80::gemm_rs_sm80(tOrO, tOrP, tOrV,
-                                    tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma,
-                                    smem_tiled_copy_V, smem_thr_copy_V);
+            cute_sm80::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, elem_stage(smem_pipe_read)),
+                                    tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             if constexpr (kStages > 1) {
                 load_K_next();
             }

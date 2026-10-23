@@ -383,3 +383,184 @@ class TestPagedStorage:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# FP8 KV (``EngineConfig.quantization.kv_cache = "fp8_e4m3"``)
+# ---------------------------------------------------------------------------
+
+
+def _fp8_mgr(blocks=16, block_tokens=4, dim=16):
+    pool = DecoderKVCacheManager.build_pool(
+        num_layers=LAYERS,
+        n_kv_head=HEADS,
+        head_dim=dim,
+        block_tokens=block_tokens,
+        max_num_blocks=blocks,
+        device=torch.device("cpu"),
+        dtype=torch.float8_e4m3fn,
+    )
+    return DecoderKVCacheManager(pool)
+
+
+def _rand(batch, t_new, dim, seed):
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(batch, HEADS, t_new, dim, generator=g) * 3
+
+
+def _quantized(x):
+    from oasr.functionals.kv_quant import QuantizedKv, reference_quantize_kv
+
+    return QuantizedKv(*reference_quantize_kv(x)).dequantize(torch.float32)
+
+
+class TestFp8Storage:
+    """Bookkeeping of a quantized cache, on CPU through the torch mirror.
+
+    What has to hold is the same contract as the served-dtype cache -- per-row
+    offsets, select, merge, page release -- plus two things of its own: the
+    prompt is *written* quantized but *attended* fresh, and what a step reads
+    back is exactly the quantization of what was written.
+    """
+
+    def _dense(self, batch, cap=16, starts=None):
+        return DecoderKv.empty(
+            LAYERS,
+            batch,
+            torch.device("cpu"),
+            starts=None if starts is None else torch.tensor(starts, dtype=torch.int32),
+            cap=cap,
+            kv_cache="fp8_e4m3",
+        )
+
+    def test_a_quantized_cache_needs_a_capacity(self):
+        with pytest.raises(ValueError, match="capacity"):
+            DecoderKv.empty(LAYERS, 1, torch.device("cpu"), kv_cache="fp8_e4m3")
+        with pytest.raises(ValueError, match="unknown kv_cache"):
+            DecoderKv.empty(LAYERS, 1, torch.device("cpu"), cap=8, kv_cache="fp4")
+
+    def test_the_prefill_attends_fresh_and_the_step_reads_the_quantization(self):
+        from oasr.functionals.kv_quant import QuantizedKv
+
+        kv = self._dense(2)
+        prompt = _rand(2, 3, DIM, seed=0)
+        assert kv.mask_kwargs(3) == {}, "a prefill is trimmed: causal over its own K/V"
+        k, v, extent = kv.append(0, prompt, prompt)
+        assert k is prompt and v is prompt and extent is None
+        kv.append(1, prompt, prompt)
+        kv.commit(3)
+
+        step = _rand(2, 1, DIM, seed=1)
+        assert set(kv.mask_kwargs(1)) == {"kv_lens"}
+        k, v, extent = kv.append(0, step, step)
+        assert isinstance(k, QuantizedKv) and k.data.dtype == torch.float8_e4m3fn
+        assert extent == 4
+        stored = k.dequantize(torch.float32)
+        assert torch.equal(stored[:, :, :3], _quantized(prompt))
+        assert torch.equal(stored[:, :, 3:4], _quantized(step))
+        assert torch.all(stored[:, :, 4:] == 0), "unused capacity stays zeroed"
+
+    def test_left_padding_keeps_its_window_through_the_prefill(self):
+        kv = self._dense(2, starts=[0, 2])
+        assert set(kv.mask_kwargs(3)) == {"kv_lens", "kv_starts"}
+
+    def test_divergent_rows_scatter_to_their_own_offsets(self):
+        a, b = self._dense(1), self._dense(1)
+        for kv, n, seed in ((a, 5, 2), (b, 2, 3)):
+            x = _rand(1, n, DIM, seed)
+            for layer in range(LAYERS):
+                kv.append(layer, x, x)
+            kv.commit(n)
+        assert a.can_merge(b)
+        merged = a.merge(b)
+        assert merged.lens_host == [5, 2] and merged.kv_cache == "fp8_e4m3"
+        step = _rand(2, 1, DIM, seed=4)
+        k, _, _ = merged.append(0, step, step)
+        stored = k.dequantize(torch.float32)
+        assert torch.equal(stored[0, :, 5], _quantized(step)[0, :, 0])
+        assert torch.equal(stored[1, :, 2], _quantized(step)[1, :, 0])
+
+    def test_select_keeps_scales_with_their_rows(self):
+        kv = self._dense(3)
+        x = _rand(3, 2, DIM, seed=5)
+        for layer in range(LAYERS):
+            kv.append(layer, x, x)
+        kv.commit(2)
+        kept = kv.select(torch.tensor([2, 0, 2]))
+        step = _rand(3, 1, DIM, seed=6)
+        k, _, _ = kept.append(0, step, step)
+        stored = k.dequantize(torch.float32)
+        want = _quantized(x)
+        assert torch.equal(stored[0, :, :2], want[2]) and torch.equal(stored[1, :, :2], want[0])
+
+    def test_a_quantized_and_a_full_precision_cache_do_not_merge(self):
+        assert not self._dense(1).can_merge(_kv(1))
+
+    def test_paged_round_trip_through_the_pool(self):
+        from oasr.functionals.kv_quant import QuantizedKv
+
+        mgr = _fp8_mgr()
+        assert mgr.quantized
+        kv = PagedDecoderKv.create(mgr, 2, torch.device("cpu"), prefill_len=3, capacity=12)
+        prompt = _rand(2, 3, 16, seed=7)
+        mask = kv.mask_kwargs(3)
+        assert "block_table" not in mask, "a quantized prefill attends its own K/V densely"
+        k, _, _ = kv.append(0, prompt, prompt)
+        assert k is prompt
+        kv.append(1, prompt, prompt)
+        kv.commit(3)
+        step = _rand(2, 1, 16, seed=8)
+        assert "block_table" in kv.mask_kwargs(1)
+        k, v, _ = kv.append(0, step, step)
+        assert isinstance(k, QuantizedKv) and isinstance(v, QuantizedKv)
+        table = kv.block_table()
+        want = torch.cat([_quantized(prompt), _quantized(step)], dim=2)
+        pool = k.dequantize(torch.float32)  # (blocks, page, H, D)
+        for b in range(2):
+            for t in range(4):
+                page, off = int(table[b, t // 4]), t % 4
+                assert torch.equal(pool[page, off], want[b, :, t])
+        kv.free()
+        assert mgr.pool.num_free_blocks == mgr.pool.num_blocks
+
+    def test_the_pool_format_and_the_decoder_must_agree(self):
+        from oasr.cache import build_kv
+
+        with pytest.raises(ValueError, match="pool is"):
+            build_kv(LAYERS, 1, torch.device("cpu"), prefill_len=2, cap=8, manager=_fp8_mgr())
+        fp_pool = DecoderKVCacheManager(
+            DecoderKVCacheManager.build_pool(
+                num_layers=LAYERS,
+                n_kv_head=HEADS,
+                head_dim=16,
+                block_tokens=4,
+                max_num_blocks=8,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        )
+        with pytest.raises(ValueError, match="pool is"):
+            build_kv(
+                LAYERS,
+                1,
+                torch.device("cpu"),
+                prefill_len=2,
+                cap=8,
+                manager=fp_pool,
+                kv_cache="fp8_e4m3",
+            )
+
+    def test_the_pool_holds_one_scale_per_slot_and_head(self):
+        mgr = _fp8_mgr(blocks=5, block_tokens=4, dim=16)
+        k, v = mgr.kv_view(0)
+        assert k.data.shape == (5, 4, HEADS, 16) and k.scale.shape == (5, 4, HEADS)
+        assert k.scale.dtype == torch.float32
+        with pytest.raises(RuntimeError, match="no scales"):
+            mgr_fp = DecoderKVCacheManager.build_pool(
+                num_layers=1,
+                n_kv_head=1,
+                head_dim=8,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+            mgr_fp.get_kv_scale_view(0)

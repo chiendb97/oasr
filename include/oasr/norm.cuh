@@ -23,9 +23,9 @@ namespace norm {
 using namespace oasr::reduction;
 
 // =============================================================================
-// Per-token int8 output (the kQuantOut variants of the LayerNorm kernels)
+// Per-token 8-bit output (the kQuantOut variants of the LayerNorm kernels)
 //
-// A LayerNorm whose only consumers are int8 GEMMs can hand them the quantized
+// A LayerNorm whose only consumers are 8-bit GEMMs can hand them the quantized
 // activation directly.  The contract is bit-exactness with the unfused pair:
 //
 //     LayerNormQuant(x)  ==  QuantizePerToken(LayerNorm(x))
@@ -35,17 +35,21 @@ using namespace oasr::reduction;
 // the store would round it, held until the row's amax is known, and the amax is
 // taken over those T values.  The quantize then reads the held values back --
 // not a recomputation, so it cannot drift from the amax -- and applies
-// ``quant::quantizeInt8`` with quantize.cuh's ``__fdiv_rn`` reciprocal and
-// scale.  The mean/variance passes, the block size and the vector/scalar choice
-// are untouched, which is what keeps the fp32 normalized values identical to
-// the unfused kernel's (and the affine's rounding is spelled out in source, so
-// the optimizer cannot round the two instantiations differently).
+// quantize.cuh's ``QuantTraits`` (int8, or fp8 e4m3 when ``QuantOutParams::fp8``)
+// with its ``__fdiv_rn`` reciprocal and scale.  The format is a runtime flag
+// read once per row, not a template parameter: it changes only the final store,
+// and a second instantiation would double every quant-out kernel.  The
+// mean/variance passes, the block size and the vector/scalar choice are
+// untouched, which is what keeps the fp32 normalized values identical to the
+// unfused kernel's (and the affine's rounding is spelled out in source, so the
+// optimizer cannot round the two instantiations differently).
 // =============================================================================
 
 struct QuantOutParams {
-    int8_t* q;     // int8 rows, laid out like the input
+    void* q;       // 8-bit rows (int8, or e4m3 when ``fp8``), laid out like the input
     float* scale;  // one fp32 scale per row
     float eps;     // floor on a row's amax (quantize.cuh's eps)
+    bool fp8;      // e4m3 (Q = 448) instead of int8 (Q = 127)
 };
 
 // Where the normalize pass leaves a row's T values until its amax is known.
@@ -103,7 +107,7 @@ struct QuantRowSink {
         }
     }
 
-    // The row's amax, its scale, and the int8 store of the held row.
+    // The row's amax, its scale, and the 8-bit store of the held row.
     __device__ __forceinline__ void finish(int vec_hidden_size, int hidden_size,
                                           const QuantOutParams& quant) const {
         __shared__ float warp_max[WARP_SIZE];
@@ -127,24 +131,29 @@ struct QuantRowSink {
             }
         }
         amax = fmaxf(amax, quant.eps);
+        const float qmax = quant.fp8 ? quant::QuantTraits<__nv_fp8_e4m3>::kMax
+                                     : quant::QuantTraits<int8_t>::kMax;
         if (threadIdx.x == 0) {
-            quant.scale[row] = __fdiv_rn(amax, static_cast<float>(quant::kQuantMax));
+            quant.scale[row] = __fdiv_rn(amax, qmax);
         }
-        const float inv = __fdiv_rn(static_cast<float>(quant::kQuantMax), amax);
+        const float inv = __fdiv_rn(qmax, amax);
 
-        int8_t* row_q = quant.q + row * hidden_size;
-        // An 8-wide row of int8 is one 8-byte store when the destination allows
-        // it; the int8 tensor's alignment is independent of the input's, so it is
+        // Both formats are one byte; the bit patterns are written as such.
+        uint8_t* row_q = static_cast<uint8_t*>(quant.q) + row * hidden_size;
+        // An 8-wide row of bytes is one 8-byte store when the destination allows
+        // it; the 8-bit tensor's alignment is independent of the input's, so it is
         // checked here rather than folded into the launcher's vector choice
         // (which must stay the unfused LayerNorm's).
         const bool q_vec = VecSize == 8 && (reinterpret_cast<uintptr_t>(row_q) % 8 == 0);
         for (int i = threadIdx.x; i < vec_hidden_size; i += blockDim.x) {
             float y[VecSize];
             get(i, y);
-            alignas(8) int8_t q[VecSize];
+            alignas(8) uint8_t q[VecSize];
 #pragma unroll
             for (int j = 0; j < VecSize; ++j) {
-                q[j] = quant::quantizeInt8(y[j], inv);
+                q[j] = quant.fp8 ? quant::QuantTraits<__nv_fp8_e4m3>::quantize(y[j], inv).__x
+                                 : static_cast<uint8_t>(
+                                       quant::QuantTraits<int8_t>::quantize(y[j], inv));
             }
             if (q_vec) {
                 *reinterpret_cast<int2*>(row_q + i * VecSize) = *reinterpret_cast<const int2*>(q);
@@ -1152,12 +1161,13 @@ inline cudaError_t launchQuantOut(Kernel kernel, unsigned int num_rows, int vec_
 
 // ---- LayerNormQuant ----
 
-// ``QuantizePerToken(LayerNorm(x))`` in one launch: ``out_q`` int8 shaped like
-// the input, ``out_scale`` one fp32 per row, ``qeps`` the amax floor.
+// ``QuantizePerToken(LayerNorm(x))`` in one launch: ``out_q`` 8-bit (int8, or e4m3
+// when ``fp8``) shaped like the input, ``out_scale`` one fp32 per row, ``qeps`` the
+// amax floor.
 template <typename T>
-cudaError_t LayerNormQuant(const T* input, const T* weight, const T* bias, int8_t* out_q,
+cudaError_t LayerNormQuant(const T* input, const T* weight, const T* bias, void* out_q,
                            float* out_scale, unsigned int num_rows, unsigned int hidden_size,
-                           float eps, float qeps, cudaStream_t stream) {
+                           float eps, float qeps, bool fp8, cudaStream_t stream) {
     if (num_rows == 0) {
         return cudaSuccess;
     }
@@ -1170,7 +1180,7 @@ cudaError_t LayerNormQuant(const T* input, const T* weight, const T* bias, int8_
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
                    (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input);
 
-    const QuantOutParams quant{out_q, out_scale, qeps};
+    const QuantOutParams quant{out_q, out_scale, qeps, fp8};
     const int hidden = static_cast<int>(hidden_size);
     T* no_output = nullptr;
     if (use_vec) {
@@ -1348,10 +1358,10 @@ cudaError_t AddLayerNormResidual(const T* input, const T* residual, const T* wei
 // AddLayerNormResidual(...)``, in one launch.
 template <typename T>
 cudaError_t AddLayerNormResidualQuant(const T* input, const T* residual, const T* weight,
-                                      const T* bias, int8_t* out_q, float* out_scale,
+                                      const T* bias, void* out_q, float* out_scale,
                                       T* residual_out, unsigned int num_rows,
                                       unsigned int hidden_size, float eps, float alpha, float qeps,
-                                      cudaStream_t stream) {
+                                      bool fp8, cudaStream_t stream) {
     if (num_rows == 0) {
         return cudaSuccess;
     }
@@ -1363,7 +1373,7 @@ cudaError_t AddLayerNormResidualQuant(const T* input, const T* residual, const T
                    (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
                    isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(residual_out);
 
-    const QuantOutParams quant{out_q, out_scale, qeps};
+    const QuantOutParams quant{out_q, out_scale, qeps, fp8};
     const int hidden = static_cast<int>(hidden_size);
     T* no_output = nullptr;
     if (use_vec) {

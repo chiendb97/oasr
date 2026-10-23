@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -43,6 +43,7 @@ from oasr.layers import (
     RowParallelLinear,
 )
 from oasr.models.base import align_out_features, init_pad_rows
+from oasr.quantization.layout import GemmChain, QuantLayout, SmoothGroup
 
 from .base import BaseDecoder, DecoderState
 
@@ -348,6 +349,77 @@ class TransformerDecoder(nn.Module):
         x = self.after_norm(x)
         return self.output_layer(x)
 
+    def quantization_layout(self, prefix: str) -> QuantLayout:
+        """This decoder's smoothing groups and chains, its modules under *prefix*.
+
+        What each :class:`DecoderLayer` forward allows (teacher-forced and
+        :meth:`forward_one_step` alike):
+
+        * ``norm1``'s output is the query *and* the key/value of self-attention
+          (``forward_one_step`` normalizes the cached history with the same norm),
+          so it feeds ``linear_q`` / ``linear_k`` / ``linear_v`` and nothing else:
+          one ``norm_affine`` group, fusable;
+        * ``norm2``'s output is only the cross-attention query (``linear_q``); the
+          cross-attention key/value read the encoder memory, a group of the model's
+          (:meth:`cross_attention_inputs`);
+        * ``norm3`` feeds only ``feed_forward.w_1``;
+        * V reaches ``linear_out`` through attention alone, in both attentions
+          (``v_to_o`` with ``linear_v`` the producer, all of its rows);
+        * ``w_1``'s ReLU is positively homogeneous, so ``w_2``'s smoothing folds
+          into ``w_1``'s rows (``producer_rows``), and nothing but ``w_2`` reads
+          ``w_1``'s activated output (a chain).
+
+        The vocabulary head stays full precision.  No full-precision GEMM sits
+        ahead of a quantized one (the input is an embedding lookup), so nothing
+        needs a batch-invariance pin.
+        """
+        groups: List[SmoothGroup] = []
+        chains: List[GemmChain] = []
+        for i, layer in enumerate(self.decoders):
+            p = f"{prefix}.decoders.{i}"
+            ffn = f"{p}.feed_forward"
+            for norm, attn, qkv in (
+                ("norm1", "self_attn", ("linear_q", "linear_k", "linear_v")),
+                ("norm2", "src_attn", ("linear_q",)),
+            ):
+                module = getattr(layer, attn)
+                groups.append(
+                    SmoothGroup(
+                        f"{p}.{norm}",
+                        tuple(f"{p}.{attn}.{name}" for name in qkv),
+                        "norm_affine",
+                        fuse_output_quant=True,
+                    )
+                )
+                groups.append(
+                    SmoothGroup(
+                        f"{p}.{attn}.linear_v",
+                        (f"{p}.{attn}.linear_out",),
+                        "v_to_o",
+                        v_rows=(0, module.linear_v.out_features),
+                        heads=(module.h, module.h, module.d_k),
+                    )
+                )
+            groups.append(
+                SmoothGroup(f"{p}.norm3", (f"{ffn}.w_1",), "norm_affine", fuse_output_quant=True)
+            )
+            groups.append(SmoothGroup(f"{ffn}.w_1", (f"{ffn}.w_2",), "producer_rows"))
+            chains.append(GemmChain(f"{ffn}.w_1", f"{ffn}.w_2"))
+        return QuantLayout(
+            groups=tuple(groups),
+            keep_full_precision=(f"{prefix}.output_layer",),
+            chains=tuple(chains),
+        )
+
+    def cross_attention_inputs(self, prefix: str) -> Tuple[str, ...]:
+        """Every GEMM that reads the encoder memory: each layer's ``src_attn``
+        ``linear_k`` and ``linear_v``."""
+        return tuple(
+            f"{prefix}.decoders.{i}.src_attn.{name}"
+            for i in range(len(self.decoders))
+            for name in ("linear_k", "linear_v")
+        )
+
     def forward_one_step(
         self,
         memory: torch.Tensor,
@@ -402,6 +474,27 @@ class BiTransformerDecoder(BaseDecoder):
     @property
     def has_reverse(self) -> bool:
         return self.right_decoder is not None
+
+    def _directions(self, prefix: str) -> List[Tuple[str, TransformerDecoder]]:
+        out = [(f"{prefix}.left_decoder", self.left_decoder)]
+        if self.right_decoder is not None:
+            out.append((f"{prefix}.right_decoder", self.right_decoder))
+        return out
+
+    def quantization_layout(self, prefix: str) -> QuantLayout:
+        """Both directions' layouts (:meth:`TransformerDecoder.quantization_layout`)."""
+        parts = [dec.quantization_layout(p) for p, dec in self._directions(prefix)]
+        return QuantLayout(
+            groups=tuple(g for part in parts for g in part.groups),
+            keep_full_precision=tuple(k for part in parts for k in part.keep_full_precision),
+            chains=tuple(c for part in parts for c in part.chains),
+        )
+
+    def cross_attention_inputs(self, prefix: str) -> Tuple[str, ...]:
+        """Every GEMM, in both directions, that reads the encoder memory."""
+        return tuple(
+            path for p, dec in self._directions(prefix) for path in dec.cross_attention_inputs(p)
+        )
 
     def init_state(
         self,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""``oasr/functionals/scaled_mm.py``: the int8 W8A8 GEMM with its dequant epilogue.
+"""``oasr/functionals/scaled_mm.py``: the 8-bit W8A8 GEMM with its dequant epilogue.
 
 Three layers of checking:
 
@@ -15,6 +15,11 @@ Three layers of checking:
 
 The epilogue fuses ``a_scale * t + bias`` into an FMA, so against the fp32 torch
 reference the output agrees to within an output ulp, not bitwise.
+
+The fp8 e4m3 lane (``TestFp8``) accumulates in fp32, so it is not exact -- but
+every one of its tiles sums each output in the same order (fast accumulation, no
+K sliced across warps, no split), so all of them compute the same bits, and the
+row-alone-vs-in-a-batch check is bitwise there too.
 """
 
 from __future__ import annotations
@@ -24,12 +29,20 @@ import torch
 from helpers import assert_dest_passing, assert_graph_replay
 
 import oasr
-from oasr.functionals.scaled_mm import _get_scaled_mm_module, activation_id, reference_scaled_mm
+from oasr.functionals.quant import static_multiplier
+from oasr.functionals.scaled_mm import (
+    _get_scaled_mm_module,
+    activation_id,
+    reference_scaled_mm,
+    reference_scaled_mm_quant,
+)
 from oasr.jit.gemm import _epilogue_covers_warp
 from oasr.jit.scaled_mm import (
     _EPILOGUE_ELEMENT_BITS,
     get_production_configs,
+    lane_available,
     scaled_mm_func_name,
+    scaled_mm_quant_func_name,
     select_config,
 )
 
@@ -169,4 +182,139 @@ class TestContract:
             expected=lambda: reference_scaled_mm(a, b, a_scale, b_scale, bias, "relu"),
             rtol=2.0**-9,
             atol=1e-3,
+        )
+
+
+_FP8 = torch.float8_e4m3fn
+
+
+def _fp8_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return lane_available(major * 10 + minor, "fp8")
+
+
+def _fp8_operands(m: int, n: int, k: int, dtype: torch.dtype, seed: int = 0):
+    """Quantized-like e4m3 operands: heavy-tailed values over the whole range."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    a = (torch.randn(m, k, generator=g, device="cuda") * 64.0).clamp(-448, 448).to(_FP8)
+    b = (torch.randn(n, k, generator=g, device="cuda") * 64.0).clamp(-448, 448).to(_FP8)
+    a_scale = torch.rand(m, generator=g, device="cuda") * 1e-3 + 1e-4
+    b_scale = torch.rand(n, generator=g, device="cuda") * 1e-3 + 1e-4
+    bias = torch.randn(n, generator=g, device="cuda").to(dtype)
+    return a, b, a_scale, b_scale, bias
+
+
+def _assert_fp8_close(got: torch.Tensor, ref: torch.Tensor) -> None:
+    """An output ulp, plus the fp32 accumulator's rounding (the reference sums exactly)."""
+    assert not torch.isnan(got).any()
+    rel = 2.0**-8 if got.dtype == torch.float16 else 2.0**-6
+    tol = ref.float().abs() * rel + 2e-3
+    diff = (got.float() - ref.float()).abs()
+    assert bool((diff <= tol).all()), f"max diff {float(diff.max())}"
+
+
+def _bytes(t: torch.Tensor) -> torch.Tensor:
+    return t.view(torch.uint8)
+
+
+@pytest.mark.skipif(not _fp8_supported(), reason="fp8 tensor cores need sm89+")
+class TestFp8:
+    @pytest.mark.parametrize("name", sorted(get_production_configs(fmt="fp8")))
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    @pytest.mark.parametrize("m,n,k", [(1710, 128, 384), (200, 264, 384), (1, 256, 2048)])
+    def test_variant(self, name, dtype, m, n, k):
+        cfg = get_production_configs(fmt="fp8")[name]
+        fn = getattr(_get_scaled_mm_module("fp8"), scaled_mm_func_name(cfg))
+        a, b, a_scale, b_scale, bias = _fp8_operands(m, n, k, dtype, seed=m + n)
+        for act in _ACTIVATIONS:
+            out = torch.full((m, n), float("nan"), dtype=dtype, device="cuda")
+            fn(out, a, b, a_scale, b_scale, bias, activation_id(act))
+            _assert_fp8_close(out, reference_scaled_mm(a, b, a_scale, b_scale, bias, act, dtype))
+
+    def test_config_space_never_splits_k(self):
+        """The summation order is a property of the config space: no sliced K, no split."""
+        cfgs = get_production_configs(fmt="fp8").values()
+        assert cfgs
+        for cfg in cfgs:
+            assert cfg.fp8 and cfg.block_k == cfg.warp_k and not cfg.stream_k, cfg
+            assert _epilogue_covers_warp(cfg.tile, element_bits=_EPILOGUE_ELEMENT_BITS), cfg
+
+    @pytest.mark.parametrize("m,n,k", [(1000, 768, 2048), (300, 896, 18944)])
+    def test_every_tile_computes_the_same_bits(self, m, n, k):
+        a, b, a_scale, b_scale, bias = _fp8_operands(m, n, k, torch.float16)
+        mod = _get_scaled_mm_module("fp8")
+        outs = {}
+        for name, cfg in get_production_configs(fmt="fp8").items():
+            out = torch.empty(m, n, dtype=torch.float16, device="cuda")
+            getattr(mod, scaled_mm_func_name(cfg))(out, a, b, a_scale, b_scale, bias, 3)
+            outs[name] = out
+        first = next(iter(outs.values()))
+        assert all(torch.equal(o, first) for o in outs.values()), "a tile summed in another order"
+
+    @pytest.mark.parametrize("n,k", [(768, 256), (256, 2048), (1024, 4096)])
+    def test_rows_are_bitwise_independent_of_the_batch(self, n, k):
+        """Every row computed in batches of 1, 16, 64 and 919 -- different tiles -- matches.
+
+        fp16 and all 1000 rows: an order difference in the fp32 sums flips an fp16
+        rounding in only ~1 output in 4000, so a few sampled rows would miss it.
+        """
+        a, b, a_scale, b_scale, bias = _fp8_operands(1000, n, k, torch.float16)
+        cuts = (0, 1, 17, 81, 1000)
+        assert len({select_config(hi - lo, n, k, fmt="fp8") for lo, hi in zip(cuts, cuts[1:])}) > 1
+        full = oasr.scaled_mm(a, b, a_scale, b_scale, bias, "swish")
+        parts = [
+            oasr.scaled_mm(
+                a[lo:hi].contiguous(), b, a_scale[lo:hi].contiguous(), b_scale, bias, "swish"
+            )
+            for lo, hi in zip(cuts, cuts[1:])
+        ]
+        assert torch.equal(torch.cat(parts), full)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_quantizing_epilogue_is_the_unfused_pair(self, dtype):
+        """Every tile's fp8-output epilogue == ``quantize_static(scaled_mm(...))``, bit for bit."""
+        m, n, k = 333, 1024, 512
+        a, b, a_scale, b_scale, bias = _fp8_operands(m, n, k, dtype)
+        out_mul = static_multiplier(torch.tensor([0.05], device="cuda"), None, n)
+        code = 0 if dtype == torch.float16 else 1
+        mod = _get_scaled_mm_module("fp8")
+        y = oasr.scaled_mm(a, b, a_scale, b_scale, bias, "swish", out_dtype=dtype)
+        unfused = oasr.quantize_static(y, out_mul, dtype=_FP8)
+        for cfg in get_production_configs(fmt="fp8").values():
+            q = torch.empty(m, n, dtype=_FP8, device="cuda")
+            getattr(mod, scaled_mm_quant_func_name(cfg))(
+                q, a, b, a_scale, b_scale, bias, out_mul, activation_id("swish"), code
+            )
+            assert torch.equal(_bytes(q), _bytes(unfused)), cfg.compile_name
+        ref = reference_scaled_mm_quant(a, b, a_scale, b_scale, bias, "swish", out_mul, dtype)
+        # The reference GEMM is exact, the kernel's fp32: within one e4m3 step.
+        diff = (q.float() - ref.float()).abs()
+        assert bool((diff <= ref.float().abs() * 2.0**-3 + 2.0**-9).all())
+
+    def test_formats_cannot_be_mixed(self):
+        a, b, a_scale, b_scale, _ = _fp8_operands(8, 256, 256, torch.float16)
+        b_int8 = torch.zeros(256, 256, dtype=torch.int8, device="cuda")
+        with pytest.raises(RuntimeError, match="A and B must be float8_e4m3fn"):
+            oasr.scaled_mm(a, b_int8, a_scale, b_scale)
+
+    def test_graph_replay_recomputes(self):
+        a, b, a_scale, b_scale, bias = _fp8_operands(256, 512, 256, torch.float16)
+        out = torch.empty(256, 512, dtype=torch.float16, device="cuda")
+
+        def launch():
+            return oasr.scaled_mm(a, b, a_scale, b_scale, bias, "relu", out=out)
+
+        def mutate():
+            a.copy_((-a.float()).to(_FP8))
+            a_scale.mul_(2.0)
+
+        assert_graph_replay(
+            launch,
+            out=out,
+            mutate=mutate,
+            expected=lambda: reference_scaled_mm(a, b, a_scale, b_scale, bias, "relu"),
+            rtol=2.0**-8,
+            atol=2e-3,
         )

@@ -141,6 +141,17 @@ class GatedMLP(nn.Module):
     GEMM's tiling freedom wins.  Outside the band the two-GEMM path below runs,
     and that path is itself fully kernel-backed — declining the fusion is a
     performance route, never a kernel gap.
+
+    **Quantized.**  All three projections are ordinary quantizable GEMMs.  The
+    fused kernel reads the gate and up weights raw, so as soon as either carries
+    a ``quant_method`` the block takes the two-GEMM path instead: each projection
+    runs its own (int8) forward -- the gate's activation fused into its scaled-GEMM
+    epilogue exactly as in the fp path -- then the elementwise multiply, then
+    ``down``.  The fused kernel is never handed int8 storage, and the
+    unquantized path is unchanged.  A quantized input (a
+    :class:`~oasr.layers.QuantizedActivation` from a norm armed by
+    ``bind_quantization``) is only ever produced when gate and up are both
+    quantized, and is handed to both.
     """
 
     def __init__(
@@ -180,10 +191,6 @@ class GatedMLP(nn.Module):
         self.add_module(
             names[2], RowParallelLinear(hidden, d_model, bias=bias, device=device, dtype=dtype)
         )
-        # ``oasr.gated_mlp`` reads the gate and up weights raw (one dual-B GEMM),
-        # so those two cannot be quantized behind its back.
-        for name in names[:2]:
-            self._modules[name].quantizable = False  # type: ignore[union-attr]
 
     def _proj(self, which: int) -> nn.Module:
         """Resolve gate / up / down by its configured name (see
@@ -192,6 +199,13 @@ class GatedMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_proj, up_proj = self._proj(0), self._proj(1)
+        if (
+            getattr(gate_proj, "quant_method", None) is not None
+            or getattr(up_proj, "quant_method", None) is not None
+        ):
+            # ``oasr.gated_mlp`` reads both weights raw: a quantized projection
+            # must run its own forward, so the block takes the two-GEMM path.
+            return self._forward_unfused(x)
         # ``_proj`` resolves through ``_modules``, so the parameter types are
         # only known to be ``Tensor | Module``; the projections are always
         # ``Linear``-shaped by construction.
@@ -203,11 +217,16 @@ class GatedMLP(nn.Module):
             x, w_gate, activation=self.activation, has_bias=b_gate is not None
         ):
             h = oasr.gated_mlp(x, w_gate, w_up, b_gate, b_up, activation=self.activation)
-        else:
-            gate: torch.Tensor = gate_proj(x)
-            if not self.fused:
-                gate = _UNFUSED_ACTIVATION[self.activation](gate)
-            h = gate * up_proj(x)
+            out: torch.Tensor = self._proj(2)(h)
+            return out
+        return self._forward_unfused(x)
+
+    def _forward_unfused(self, x: torch.Tensor) -> torch.Tensor:
+        """``down(act(gate(x)) * up(x))`` as separate GEMMs (the gate's act fused)."""
+        gate: torch.Tensor = self._proj(0)(x)
+        if not self.fused:
+            gate = _UNFUSED_ACTIVATION[self.activation](gate)
+        h = gate * self._proj(1)(x)
         out: torch.Tensor = self._proj(2)(h)
         return out
 

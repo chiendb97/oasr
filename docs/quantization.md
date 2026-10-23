@@ -6,13 +6,20 @@ registry axis: a format is a preset plus a method plus its kernel lanes, an
 algorithm is a registration, and an architecture declares what its structure
 allows.  The engine core has no per-scheme branch.
 
-Today's scheme is **W8A8 int8**: per-output-channel int8 weights and int8
-activations -- per-token *dynamic* scales (`int8_w8a8`), or a calibrated static
-per-tensor scale (`int8_w8a8_static`) -- run by a CUTLASS 2.x int8 `mma.sync` GEMM
-whose epilogue dequantizes, adds the bias and applies the layer's activation, and
-can quantize its own output for the next GEMM.  The
-format layer already describes FP8 and NVFP4 (`oasr.quantization.spec.PRESETS`);
-no method serves them yet, and asking for one is refused by name.
+Two W8A8 formats are served, by one method:
+
+* **int8** -- per-output-channel int8 weights and int8 activations, per-token
+  *dynamic* scales (`int8_w8a8`) or a calibrated static per-tensor scale
+  (`int8_w8a8_static`), run by a CUTLASS 2.x int8 `mma.sync` GEMM with an exact
+  int32 accumulator;
+* **fp8 e4m3** (`fp8_w8a8`, `fp8_w8a8_static`; sm89+) -- the same layout in
+  `float8_e4m3fn`, run by CUTLASS 2.x's Ada e4m3 `mma.sync` (sm_120 executes it
+  too) with an fp32 accumulator ([FP8](#fp8)).
+
+Either GEMM's epilogue dequantizes, adds the bias and applies the layer's
+activation, and can quantize its own output for the next GEMM.  The format layer
+also describes NVFP4 (`oasr.quantization.spec.PRESETS`); no method serves it yet,
+and asking for it is refused by name.
 
 ## Using it
 
@@ -21,13 +28,17 @@ no method serves them yet, and asking for one is refused by name.
 ```python
 from oasr.engine import ASREngine, EngineConfig
 
-engine = ASREngine(EngineConfig(ckpt_dir=..., quantization="int8_w8a8"))
+engine = ASREngine(EngineConfig(ckpt_dir=..., quantization="int8_w8a8"))  # or "fp8_w8a8"
 # or {"scheme": "int8_w8a8", "ignore": "encoder.encoders.0.*"}
 ```
 
 ```bash
 oasr-server --ckpt-dir <dir> --quantization int8_w8a8 [--quantization-option ignore=GLOB,...]
 ```
+
+On the U2++ Conformer (LJSpeech-200 gate, fp16): online `int8_w8a8` 4.14 % /
+3.70 % (offline / streaming), online `fp8_w8a8` 4.00 % / 3.73 %, fp16 4.08 % /
+3.70 %.
 
 **Offline, SmoothQuant** — calibrate, smooth, quantize, write a native checkpoint:
 
@@ -39,6 +50,8 @@ oasr quantize $CKPT_DIR /path/to/u2pp_w8a8_sq \
     [--calib-utterances 128] [--alpha 0.5] [--ignore GLOB]
 ```
 
+Recipes: `int8_w8a8_rtn`, `smoothquant_w8a8`, `smoothquant_w8a8_fused`, and the
+fp8 trio `fp8_w8a8_rtn`, `smoothquant_fp8_w8a8`, `smoothquant_fp8_w8a8_fused`.
 `--recipe smoothquant_w8a8_fused` adds a calibrated static input scale to every
 GEMM-chain consumer (the FFN's `w_2`), so `w_1` quantizes for it and the pair
 exchanges int8 ([Fewer quantize launches](#fewer-quantize-launches)): faster, and
@@ -87,19 +100,21 @@ A quantized layer keeps its type, path and state-dict key names; its
 `quant_method` (a plain object, not a module) takes over `forward` **before** the
 fp row floor (`GEMM_MIN_ROWS` would hand `F.linear` int8 storage).  CPU, fp32 and
 `OASR_LAYERS_BACKEND=torch` run `apply_reference`, the torch emulation of the same
-numerics.  Layers whose weight a fused kernel reads raw — the gated MLP's
-gate/up (one dual-B GEMM), the transducer joiner's `decoder_proj` /
-`output_linear` (the fused decode) — set `quantizable = False`, and a spec that
-selects one is refused.
+numerics.  Layers whose weight a fused kernel reads raw — the transducer
+joiner's `decoder_proj` / `output_linear` (the fused decode) — set
+`quantizable = False`, and a spec that selects one is refused.  The gated MLP's
+gate / up / down are quantizable: when gate or up carries a method, the block
+leaves its fused dual-B kernel for two scaled GEMMs (gate's SiLU in its
+epilogue), the elementwise product and `down`; unquantized it is byte-identical.
 
 State dict of a quantized layer (names follow compressed-tensors):
 
 | Key | dtype | Shape |
 |---|---|---|
-| `weight` | int8 | the layer's own (`[N, K]`; `[N, K, 1]` for a pointwise conv) |
+| `weight` | int8 / float8_e4m3fn | the layer's own (`[N, K]`; `[N, K, 1]` for a pointwise conv) |
 | `weight_scale` | fp32 | `[N]` |
 | `smooth_inv` | fp32 | `[K]`, only on runtime-smoothed layers |
-| `input_scale` | fp32 | `[1]`, only with a static activation scale (`int8_w8a8_static`) |
+| `input_scale` | fp32 | `[1]`, only with a static activation scale (`*_w8a8_static`) |
 | `bias` | served dtype | unchanged |
 
 `Module.to(dtype)` casts every floating tensor — fp32 scales included — so
@@ -125,8 +140,13 @@ full-precision export stays version 1.  Readers accept both.
 
 | Lane | SMs | Notes |
 |---|---|---|
-| `cutlass_sm80_int8` | 80, 86, 89, 120 (native); 90, 100 (the Sm80 `mma.sync` kernel, as fp16 GEMM runs there) | Default.  Needs `K % 16 == 0`, `N % 8 == 0`.  Per-token or per-tensor activation scale (a runtime switch in the epilogue).  No serial/parallel split-K (the Sm80 EVT rejects it only by an `assert` NDEBUG removes); Stream-K instead, below |
-| `torch_int_mm` | ≥ 75 | `torch._int_mm` + a torch epilogue; A/B and baseline only |
+| `cutlass_sm80_int8` | 80, 86, 89, 120 (native); 90, 100 (the Sm80 `mma.sync` kernel, as fp16 GEMM runs there) | int8.  Default.  Needs `K % 16 == 0`, `N % 8 == 0`.  Per-token or per-tensor activation scale (a runtime switch in the epilogue).  No serial/parallel split-K (the Sm80 EVT rejects it only by an `assert` NDEBUG removes); Stream-K instead, below |
+| `cutlass_sm89_fp8` | 89, 120 (native); 90, 100 (the same `mma.sync` kernel) | fp8.  Default.  Same template, epilogue and alignment; no split of any kind ([FP8](#fp8)) |
+| `torch_int_mm` | ≥ 75 | int8: `torch._int_mm` + a torch epilogue; A/B and baseline only |
+| `torch_scaled_mm` | ≥ 89 | fp8: `torch._scaled_mm` at unit tensorwise scales into fp32, then a torch epilogue; A/B and baseline only, and not batch-invariant (cuBLASLt picks its algorithm per M) |
+
+Below sm89 an fp8 scheme is refused at bind with a pointer to `int8_w8a8`: the
+GPU has no fp8 tensor cores, which is not a missing kernel.
 
 Turing (sm75) is the declared kernel gap `scaled-mm-int8-sm75`: a quantized layer
 there runs the torch reference.  `OASR_SCALED_MM_BACKEND=auto|cutlass|torch`
@@ -143,24 +163,27 @@ only on a 7B-size down-projection (N=896, K=18944, M >= 256).  So the shape
 heuristic never picks it; a measured tuning entry may.
 
 Tile selection (`oasr.jit.scaled_mm.select_config`, and `select_quant_config` for
-the int8-output launch) reads the tuning DB's `scaled_mm` family first — a
+the 8-bit-output launch) reads the tuning DB first -- the `scaled_mm` family for
+int8, `scaled_mm_fp8` (its own `scaled_mm_fp8.json`, measured on its own lane)
+for fp8 -- a
 measured entry per `(op, N, K)`, M rounded up to a region, user tier over the
 shipped `oasr/tune/db/sm<family>/scaled_mm.json` — and falls back to the shape
 heuristic: the largest data-parallel tile that still launches half a wave of
 CTAs.  A region may name the heuristic itself (`"heuristic"`: measured, nothing
 beat it), and only a measured entry picks a Stream-K tile.  Every variant computes
 the same bits, so tuning changes speed only.  The tuning census records the int8
-GEMMs (`oasr tune census --quantization int8_w8a8`), `oasr tune build` writes
-`scaled_mm.json` beside `gemm.json`, `tuning.strict` / `tuning.mode="prewarm"`
+GEMMs (`oasr tune census --quantization int8_w8a8`, or `fp8_w8a8`), `oasr tune
+build` writes `scaled_mm.json` / `scaled_mm_fp8.json` beside `gemm.json`,
+`tuning.strict` / `tuning.mode="prewarm"`
 cover them like fp GEMMs, and `ASREngine.tuning_report()` ends with how many
 quantized layers have a tuning entry and how many run on the heuristic.  See
 [`autotuning.md`](autotuning.md#the-int8-scaled-gemm-scaled_mm).
 
-Two norm kernels emit the quantized activation themselves, so a norm-fed int8
+Two norm kernels emit the quantized activation themselves, so a norm-fed 8-bit
 GEMM skips its quantize launch (bit-exact with the unfused pair; see
 [kernels.md](kernels.md#layernorm-with-a-per-token-int8-output)).
 `oasr.functionals.norm.layer_norm_quant` is LayerNorm whose output is per-token
-int8 plus a per-row fp32 scale: `quantize_per_token(layer_norm(x))` in one launch,
+int8 or e4m3 (`dtype=`) plus a per-row fp32 scale: `quantize_per_token(layer_norm(x))` in one launch,
 with no smoother, because SmoothQuant folds its scale into the norm's affine.
 `oasr.functionals.norm.add_layer_norm_residual_quant` does the same for the fused
 add + LayerNorm, and also returns the unnormalized residual sum exactly as
@@ -168,16 +191,19 @@ add + LayerNorm, and also returns the unnormalized residual sum exactly as
 
 ## Fewer quantize launches
 
-A quantized GEMM needs int8 input.  Unfused, every one pays a quantize launch
+A quantized GEMM needs 8-bit input.  Unfused, every one pays a quantize launch
 and reads its input in fp16; three mechanisms let the producer of that input
-emit int8 instead, so on the Conformer only three of a block's eight quantized
+emit it instead, so on the Conformer only three of a block's eight quantized
 GEMMs (`linear_out`, `pointwise_conv1`, `pointwise_conv2`) still quantize
 their own input.
 
 | Producer | Emits | Declared by | Armed when |
 |---|---|---|---|
-| a pre-norm (`LayerNorm.quantize_output`) | per-token int8 + scales: `layer_norm_quant` / `add_layer_norm_residual_quant` | `SmoothGroup(..., fuse_output_quant=True)` | every consumer takes a per-token pre-quantized input (a bound lane, no runtime smoother) |
-| a GEMM (`W8A8Int8Method.emit`) | int8 at its consumer's static scale: `scaled_mm_quant` | `GemmChain(producer, consumer)` | the consumer has a static input scale and both have a lane |
+| a pre-norm (`LayerNorm.quantize_output`, `quantize_dtype`) | per-token int8 / e4m3 + scales: `layer_norm_quant` / `add_layer_norm_residual_quant` | `SmoothGroup(..., fuse_output_quant=True)` | every consumer takes a per-token pre-quantized input (a bound lane, no runtime smoother) in one format |
+| a GEMM (`W8A8Method.emit`) | 8-bit at its consumer's static scale, in the producer's own format: `scaled_mm_quant` | `GemmChain(producer, consumer)` | the consumer has a static input scale, both have a lane, and both use the same format |
+
+A producer only ever emits its consumers' format; a consumer handed another
+format raises rather than reinterpret the bytes.
 
 The quantized activation travels as a `QuantizedActivation` (`data`, `scale`,
 `dtype`): what passes between producer and consumer may read its `shape` and
@@ -208,10 +234,83 @@ expected quantization error of a histogram of the calibration values (rounding
 below the clip, saturation above it); it measured 4.11 / 3.64 % against 4.20 /
 3.73 % for the percentile and 4.08 / 4.14 % for the maximum (offline / streaming).
 
+## FP8
+
+`fp8_w8a8` is int8's layout in `float8_e4m3fn` (`Q = 448`): per-channel weights,
+per-token dynamic or calibrated static activations, the same storage names, the
+same fused producers and the same recipes (`fp8_w8a8_rtn`, `smoothquant_fp8_w8a8`,
+`smoothquant_fp8_w8a8_fused`).  What differs:
+
+* **The kernel.**  The scaled-GEMM template is generic over its operands; an fp8
+  config (`CutlassScaledMmFp8Config`) names `float_e4m3_t`, an fp32 accumulator
+  and CUTLASS's Sm89 `mma.sync` (`16x8x32` e4m3), which sm_120 runs as well.  Its
+  own JIT module (`scaled_mm_fp8`) and production set (eight data-parallel tiles),
+  so an int8 user never compiles it.
+* **Batch invariance by construction, without an exact accumulator.**  fp32 sums
+  depend on their order.  CUTLASS's default Sm89 fp8 operator stages its
+  accumulation (each warp sums a K tile's MMAs into a zeroed fragment, then adds
+  it), which makes the order a function of the warp's K extent; *fast*
+  accumulation sums every MMA straight into the running fragment in K order.
+  With fast accumulation, no K sliced across warps (`block_k == warp_k`) and no
+  split, every tile sums every output in the same order, so all eight compute
+  the same bits and a row is bitwise the same alone or in any batch.  Measured:
+  tiles bit-identical at K = 2048 / 4096 / 18944, and on the U2++ gate
+  `max_batch_size` 8 / 16 / 32 give identical transcripts.  The accuracy cost of
+  fast accumulation is invisible beside the e4m3 operands (mean error identical
+  to the staged order's; 0.3-1 % of fp16 outputs one ulp off the correctly
+  rounded value, against 0.1 % staged).  The config space enforces the rule
+  (`static_assert(BK == WK)`, `_buildable`), and
+  `tests/kernels/test_scaled_mm.py::TestFp8` fails with the staged operator.
+* **Speed, on a GeForce part.**  An RTX 5090 runs fp8 with fp32 accumulation at
+  half its int8 rate: at large M the fp8 GEMM measured 1.7-2.0x the fp16 GEMM
+  and 0.55-0.62x the int8 one; at small M (weight-bandwidth-bound) the two are
+  equal and 1.3-2.5x fp16.  So on this card int8 is the faster W8A8 and fp8's
+  case is accuracy without calibration (online `fp8_w8a8` beat online int8 on
+  the U2++ gate) and portability to datacenter parts, where fp8 runs at the
+  int8 rate or faster.
+* **Calibration.**  `static_inputs` and the `mse` clip search model e4m3's
+  error: its step follows the value (`2^(floor(log2 v) - 3)`), so the bulk's
+  error barely depends on the clip and outliers are kept more often than int8's
+  uniform step allows.
+
+## FP8 KV cache
+
+`quantization.kv_cache="fp8_e4m3"` (`EngineConfig(quantization={"kv_cache":
+"fp8_e4m3"})`, `oasr-server --quantization-option kv_cache=fp8_e4m3`) stores an AR
+decoder's attention KV cache -- Whisper's self- and cross-attention, the
+Qwen2-Audio LM -- as e4m3, independently of the weight `scheme`:
+
+* **Scale.**  One fp32 power-of-two scale per (token, kv-head), computed as the
+  token is written (`kv_quant`'s `quantize_kv_store`, one launch per layer for K
+  and V): no calibration, row-local and so batch-invariant, ~0.52x the bytes of
+  fp16.  Power-of-two scales make dequantization exact, so the fp8 read is
+  bit-identical to the fp16 kernel fed the dequantized cache.
+* **Read.**  Steps read the cache through the C++ attention lane's fp8 variants
+  (`fmha_kv8_*` cells; dense and paged, unsplit and split-KV), which stage fp8 in
+  the cp.async ring and dequantize each tile in shared memory.  The arbiter
+  routes fp8 KV there as a declared rule; a causal, windowed or biased read, a
+  head dim the gather cannot tile, `OASR_ATTN_BACKEND=cute|sdpa` or a device
+  outside the lane (sm80/86/89/120) is refused by name.  Prefill attends its own
+  prompt in the served dtype; it is quantized into the cache as it is written.
+* **Capacity.**  The VRAM-derived decoder-KV budget and paged pool count fp8 plus
+  scales (Qwen2-7B 524,288 -> 270,336 bytes per token, Whisper-large-v3 163,840 ->
+  87,040), so about 1.9x more rows fit; raise `max_decode_slots` to use them.
+* **A decode family or model without an AR KV cache refuses it at construction**
+  (`BaseDecoder.kv_cache_dtypes` declares the formats a decoder stores).
+
+On the LJSpeech-200 gate: whisper-tiny 3.70 % (fp16 KV 3.67), Qwen2-Audio-7B
+(bf16) 5.44 % (bf16 KV 5.67).  Measured decode attention: Whisper-large-v3
+cross-attention at batch 16 1.6x faster than fp16 (less to read), Qwen2-7B steps
+at batch 16 1.1x, at batch 4 0.78x (little KV, so the in-shared-memory
+conversion is the critical path).  End to end it pays where the KV budget limits
+admission.  See [cache_manager.md](cache_manager.md) for the storage layout.
+
 ## Numerics
 
 Pinned, and reproduced bit for bit by the torch reference
-(`oasr.functionals.quant.reference_quantize_per_token`):
+(`oasr.functionals.quant.reference_quantize_per_token`).  For fp8, `127` reads
+`448` and the rounding is e4m3 round-to-nearest-even with saturation
+(`cvt.rn.satfinite`, torch's `clamp(±448).to(float8_e4m3fn)`):
 
 ```
 quantize (per token, row r):
@@ -231,11 +330,12 @@ epilogue:  out = round(act(fma(a_scale[m], b_scale[n] * f32(acc), bias[n])))
            a_scale[m] per token, or one per-tensor scale
 quantizing epilogue (scaled_mm_quant), for a static consumer:
            q = clamp(rint(f32(round_T(act(...))) * mul[n]), -127, 127)
+           (fp8: e4m3_rne_satfinite(f32(round_T(act(...))) * mul[n]))
 ```
 
-The int32 accumulator is exact and the activation scale is row-local (or a
-constant), so a quantized layer returns bitwise-equal rows for bitwise-equal
-inputs however the batch is made up.  That alone does not make the *model*
+The int32 accumulator is exact (fp8's has one summation order for every tile)
+and the activation scale is row-local (or a constant), so a quantized layer
+returns bitwise-equal rows for bitwise-equal inputs however the batch is made up.  That alone does not make the *model*
 batch-invariant: a full-precision GEMM's config (cuBLAS, split-K, Stream-K) is
 chosen from M by the rule table, so its rounding depends on the batch, and int8
 rounding amplifies those ulps into flipped words.  A model therefore names its
@@ -273,9 +373,41 @@ The Conformer's layout (`ConformerModel.quantization_layout`): per block,
 `norm_conv → conv_module.pointwise_conv1` and `norm_ff → feed_forward.w_1` fold
 into the norm; V folds into `linear_out`; both `w_2` and `pointwise_conv2` carry a
 runtime smoother.  The subsampling front-end, `linear_pos` (its input is the
-sinusoidal table), the CTC head and the AED decoder stay full precision.  The CNN
-cache holds post-`norm_conv` values in the smoothed domain, which is consistent
-because only this encoder reads it.
+sinusoidal table) and the CTC head stay full precision.  The CNN cache holds
+post-`norm_conv` values in the smoothed domain, which is consistent because only
+this encoder reads it.
+
+Every architecture with a real checkpoint declares its layout (pure data;
+`tests/models/test_quant_layouts.py` checks every path, and the SmoothQuant
+invariance oracle -- smoothed, unquantized output unchanged -- runs on every tiny
+config and forward path):
+
+| Architecture | Folded into the norm | `v_to_o` | `producer_rows` / runtime | Kept fp / pinned | Why it differs |
+|---|---|---|---|---|---|
+| U2++ rescoring decoder (`decoder.*`, both directions) | `norm1 → linear_q/k/v`, `norm2 → src_attn.linear_q`, `norm3 → w_1` (fusable) | self and cross `linear_v → linear_out` | `w_1 → w_2` (ReLU) + chain; every `src_attn.linear_k/v` runtime | `output_layer` | `encoder.after_norm` also feeds the fp CTC head, so the cross-attention K/V take a runtime smoother rather than change the CTC path |
+| Whisper | `self_attn_layer_norm → q/k/v`, `encoder_attn_layer_norm → q`, `final_layer_norm → fc1` (fusable); `encoder.layer_norm → every decoder encoder_attn.k/v` | `v_proj → out_proj` (all three attentions) | `fc2` runtime (exact-erf GELU before it); chain `fc1 → fc2` | none (the conv front-end and tied head are not quantizable GEMMs) | — |
+| Nemotron (encoder) | `norm_feed_forward{1,2} → linear1`, `norm_self_att → q/k/v`, `norm_conv → pointwise_conv1` (fusable: the mask, pad and cache come after the GLU) | `v_proj → o_proj` | `linear2`, `pointwise_conv2` runtime; chain `linear1 → linear2` | subsampling, `relative_k_proj`, predictor, joint, `prompt_projector`; pins `subsampling.linear`, `relative_k_proj` | — |
+| Paraformer | encoder `norm1 → linear_q_k_v`, `norm2 → w_1`; decoder `norm1 → w_1`, the FFN's inner norm `→ w_2`, `norm3 → src_attn.linear_q` | decoder `src_attn.linear_k_v` V rows `→ linear_out` | encoder `w_1 → w_2` (ReLU) + chain; encoder `linear_out`, decoder `linear_k_v` runtime | `predictor.*`, `output_layer`; pin `predictor.cif_output` | no encoder `v_to_o` (the FSMN reads V); `after_norm` cannot fold (the CIF integrates its raw output) |
+| Qwen2-Audio | tower as Whisper's encoder; LM `input_layernorm → q/k/v`, `post_attention_layernorm → gate + up` (RMSNorm γ) | LM `v_proj → o_proj`, tied per KV head (GQA) | LM `up → down` (`act(gate) * up` is linear in `up`) | `lm_head`, `multi_modal_projector`; pin `multi_modal_projector.linear` | RMSNorm has no 8-bit-emitting kernel yet, so the declared fusions do not arm |
+
+Two rules the real checkpoints taught:
+
+* **A channel calibration never saw active keeps `s = 1`.**  At `s`'s floor a
+  ReLU channel that never fired on English audio later owned its token's scale on
+  Chinese audio (`|x / s|` 1e4-2.7e5 against a median of ~2) and turned every
+  Paraformer encoder FFN to noise.
+* **The fp16 range check covers only what is stored in the served dtype**: norm
+  affines, producer biases, and a producer's weight only when it stays full
+  precision.  A layer that is both a consumer (its columns times `s`) and a
+  producer (its rows over `s`) is stored 8-bit with per-row scales.
+
+`BaseAsrModel.calibration_forward` drives calibration: the encoder by default,
+and each AED / speech-LLM decoder the way it decodes (U2++ teacher-forced over the
+greedy CTC path in both directions, Whisper and Qwen2 greedily from their prompt,
+Paraformer through CIF and its NAR pass), so decoder groups are observed.
+`oasr quantize --calib-dtype bfloat16` keeps the fp32 master on the host and
+calibrates a reduced-precision twin on the device, for a model whose fp32 master
+does not fit (a 7B LM is 33.6 GB fp32).
 
 Calibration runs one unpadded utterance at a time through the checkpoint's own
 frontend (`audio_scale` and the `FeatureSpec`, exactly as `InputProcessor`), in
@@ -288,7 +420,7 @@ ranges.
 
 | To add… | Touch |
 |---|---|
-| a format (FP8, NVFP4) | a preset in `spec.py`, a `QuantMethod` (`register_quant_method`), its lanes, its quantize kernel |
+| a format (NVFP4; FP8 is the worked example) | a preset in `spec.py`, a `QuantMethod` (`register_quant_method`) or a format of an existing one, its lanes, its quantize kernel |
 | a backend (a native sm90 int8 kernel) | a `ScaledMMLane` + `register_lane`; methods pick it through `choose_lane` |
 | an algorithm (GPTQ, AWQ) | `algorithms/<name>.py` + `register_quant_algorithm`; reuse the observers and `quantize_weight` |
 | an architecture | `quantization_layout()` on the model — data only; online RTN works without it |
@@ -298,18 +430,21 @@ ranges.
 
 | Where | What |
 |---|---|
-| `tests/kernels/test_quant.py` | quantize is bit-exact against the reference; row-local; graph replay |
-| `tests/kernels/test_scaled_mm.py` | every compiled variant; exact accumulator; bitwise batch invariance; contracts |
+| `tests/kernels/test_quant.py` | quantize (int8 and e4m3) is bit-exact against the reference; row-local; graph replay |
+| `tests/kernels/test_scaled_mm.py` | every compiled variant of both formats; exact accumulator; fp8: every tile the same bits, rows bitwise independent of the batch, the fp8-output epilogue == the unfused pair; contracts |
+| `tests/quantization/test_quant_fp8.py` | the fp8 format end to end: storage, native round trip, kernel vs reference, fused norms and chains in e4m3 == unfused, formats never mixed across a link, the fp8 clip model |
+| `tests/kernels/test_fmha_kv8.py`, `tests/engine/test_fp8_kv_cache.py` | the fp8 KV cache: quantize-on-write bit-exact, the fp8 attention read == fp16 on the dequantized cache, dense == paged == graph replay, refusals, capacity |
 | `tests/models/test_quantized_layers.py` | the seam: state dict, casts, CPU reference, kernel parity, per-architecture layout and raw readers |
 | `tests/quantization/` | spec, SmoothQuant invariance on every encoder path (per-op, fused, packed, paged streaming), export round trip, calibration frontend == engine frontend; `test_quant_fusion.py`: the static scheme, links armed where declared, fused model == unfused model bitwise, `static_inputs` and the clip searches, the pins |
 | `tests/kernels/test_norm_quant.py`, `tests/models/test_layer_norm_quant_output.py` | the fused norm kernels == LayerNorm then `quantize_per_token`, bitwise; `LayerNorm.quantize_output` |
 | `tests/kernels/test_gemm_batch_invariant.py`, `tests/models/test_linear_batch_invariant.py` | pinned GEMM rows bitwise independent of M; the pin bypasses the row floor |
 | `tests/kernels/tune/test_scaled_mm_tuning.py`, `tests/engine/test_tuning_scaled_mm_engine.py` | the `scaled_mm` tuning tier: resolution, capture, build, `strict` |
 | `tests/engine/test_quantized_engine.py` | capture == eager, per-layer batch invariance, a quantized checkpoint served offline and streaming |
-| `ci/wer-reference.json` | `conformer_int8_rtn`, `conformer_w8a8_sq`, `conformer_w8a8_sq_streaming`, `conformer_w8a8_sq_fused`, `conformer_w8a8_sq_fused_streaming` |
+| `ci/wer-reference.json` | `conformer_int8_rtn`, `conformer_w8a8_sq`, `conformer_w8a8_sq_streaming`, `conformer_w8a8_sq_fused`, `conformer_w8a8_sq_fused_streaming`, `conformer_fp8_rtn`, `conformer_fp8_sq_fused`, `conformer_fp8_sq_fused_streaming`, `whisper_kv_fp8`, `llm_kv_fp8`; a row whose format the GPU cannot run (fp8 weights below sm89, fp8 KV off the C++ attention lane) is skipped with the reason |
 
 Calibration data is the `LIBRISPEECH_DEV_DIR` asset (asrbench-prepared
 LibriSpeech dev-clean): in-domain for LibriSpeech-trained checkpoints and a
 different corpus from the LJSpeech WER gate.  The kernel benchmark families are
-`quant` and `scaled_mm` (`python benchmarks/run.py --list`); the accuracy and
+`quant` (`--fp8` for e4m3) and `scaled_mm` (subroutines `scaled_mm_fp8`,
+`quant_scaled_mm_fp8`; `python benchmarks/run.py --list`); the accuracy and
 engine families take `--quantization`.

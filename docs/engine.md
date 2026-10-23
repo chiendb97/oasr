@@ -319,7 +319,7 @@ prepare_offline                    prepare_streaming
 | `checkpoint_name` | converter default | Filename inside `ckpt_dir`. |
 | `device` | `"cuda"` | Target device. |
 | `dtype` | `torch.float16` | Model + cache precision. |
-| `quantization` | `None` | Online quantization of the model's GEMM layers: a scheme name (`"int8_w8a8"`) or `{"scheme": ..., "ignore": "glob,..."}` (`QuantizationConfig`). `None` follows the checkpoint — one written by `oasr quantize` is served quantized with no flag, and an online request for a different scheme raises. See [quantization.md](quantization.md). |
+| `quantization` | `None` | Online quantization of the model's GEMM layers: a scheme name (`"int8_w8a8"`) or `{"scheme": ..., "ignore": "glob,...", "kv_cache": ...}` (`QuantizationConfig`). `None` follows the checkpoint — one written by `oasr quantize` is served quantized with no flag, and an online request for a different scheme raises. `kv_cache="fp8_e4m3"` stores an AR decoder's KV cache in fp8 with per-(token, head) scales, independently of `scheme` ([cache_manager.md §10.6](cache_manager.md#106-fp8-kv-for-the-ar-decoders)). See [quantization.md](quantization.md). |
 | `audio_scale` | `32768.0` | Multiplied into the float waveform. **Per framework** — adopted from `FeatureSpec.audio_scale` unless set explicitly. See [features.md](features.md). |
 | `service_mode` | `"streaming"` | Pins the engine to `"streaming"` or `"offline"` for its whole lifecycle; mismatched requests are rejected at admission. `"offline"` builds no streaming backend and no paged pool. |
 | `use_cuda_graphs` | `True` | Capture the steady-state streaming encoder forward (`GraphedEncoderForward`, one graph per shape key). Also the master gate for the offline capture below. |
@@ -389,7 +389,7 @@ engine (`oasr/engine/memory.py`):
 | Left unset | Derived as |
 |---|---|
 | `max_num_blocks=None` (streaming) | `available / bytes_per_block`, capped at `max_batch_size × blocks_per_seq` |
-| `decode_kv_budget_gib=None` (AR families) | `available`, clamped up to one row so a tight card still admits work |
+| `decode_kv_budget_gib=None` (AR families) | `available`, clamped up to one row so a tight card still admits work; a row's bytes follow `quantization.kv_cache` (fp8 + scales ≈ 0.52x of fp16) |
 
 where
 

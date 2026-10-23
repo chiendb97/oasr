@@ -356,6 +356,84 @@ class IncrementalArStrategy(DecodeStrategy):
     # Decoder-KV storage
     # ------------------------------------------------------------------
 
+    @property
+    def kv_cache_format(self) -> Optional[str]:
+        """``EngineConfig.quantization.kv_cache`` (``"fp8_e4m3"``), or ``None`` for the model dtype."""
+        return getattr(getattr(self._config, "quantization", None), "kv_cache", None)
+
+    def _kv_cache_kwargs(self) -> Dict[str, Any]:
+        """What a family's ``prefill`` call adds for a quantized cache (nothing otherwise).
+
+        Empty by default so a full-precision engine calls ``prefill`` exactly as
+        it always has.
+        """
+        fmt = self.kv_cache_format
+        return {} if fmt is None else {"kv_cache_dtype": fmt}
+
+    def _require_kv_cache(self, kv_cache: str) -> None:
+        """Refuse a KV-cache format this decoder, device or attention lane cannot serve.
+
+        Each refusal names its reason, at engine construction.  Accepting the
+        setting and then storing (or reading) the cache some other way would
+        size the pool and admission for one format while serving another, which
+        is exactly the silent mismatch ``kv_cache_dtypes`` is declared to prevent.
+
+        * the decoder must declare the format (``BaseDecoder.kv_cache_dtypes``);
+        * the model must declare its decoder geometry (``decoder_cache_spec``),
+          which is what sizes the pool and is checked against the kernel;
+        * on CUDA, the decoder must run fp16/bf16 and the fp8 attention lane must
+          serve its head dim on this device, in this process's attention mode
+          (``OASR_ATTN_BACKEND=sdpa`` / ``cute`` name lanes that cannot read fp8).
+          Off CUDA the cache runs on the dequantizing reference -- the parity
+          oracle, which OASR does not target for serving.
+        """
+        decoder = self._decoder()
+        declared = tuple(getattr(decoder, "kv_cache_dtypes", ()) or ())
+        name = type(decoder).__name__ if decoder is not None else "None"
+        if kv_cache not in declared:
+            raise ValueError(
+                f"quantization.kv_cache={kv_cache!r}: the {self.decode_type!r} decoder {name} "
+                f"does not store that KV-cache format (it declares kv_cache_dtypes={declared})"
+            )
+        spec = getattr(self._model, "decoder_cache_spec", None)
+        if spec is None:
+            raise ValueError(
+                f"quantization.kv_cache={kv_cache!r}: the model declares no decoder_cache_spec, "
+                "so there is no decoder KV geometry to size or check the cache against"
+            )
+        try:
+            param = first_compute_parameter(decoder)
+        except (StopIteration, TypeError):  # pragma: no cover - a decoder with no weights
+            return
+        if param.device.type != "cuda":
+            return
+        if param.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"quantization.kv_cache={kv_cache!r}: the fp8 KV attention lane reads fp16/bf16 "
+                f"queries, and this decoder runs {param.dtype}; serve the model in float16 or "
+                "bfloat16"
+            )
+        from oasr.jit.attention import fmha_kv8_backend, fmha_kv8_refusal
+
+        try:
+            lane = fmha_kv8_backend()
+        except NotImplementedError as exc:
+            raise ValueError(f"quantization.kv_cache={kv_cache!r}: {exc}") from None
+        if lane != "cxx":
+            raise ValueError(
+                f"quantization.kv_cache={kv_cache!r}: OASR_ATTN_BACKEND=sdpa forces the "
+                "reference attention, which would dequantize the whole cache on every step; "
+                "the fp8 cache is read by the C++ lane (OASR_ATTN_BACKEND=auto or cxx)"
+            )
+        dtype_str = "float16" if param.dtype is torch.float16 else "bfloat16"
+        for paged in (False, True):
+            why = fmha_kv8_refusal(head_dim=int(spec.head_dim), dtype_str=dtype_str, paged=paged)
+            if why is not None:
+                raise ValueError(
+                    f"quantization.kv_cache={kv_cache!r}: the fp8 KV attention lane cannot "
+                    f"read this decoder's cache ({why})"
+                )
+
     def kv_manager(self) -> Optional["DecoderKVCacheManager"]:
         """The paged decoder-KV pool, built on first use, or ``None`` for dense.
 
@@ -446,11 +524,16 @@ class IncrementalArStrategy(DecodeStrategy):
             pages_per_row += -(-cross_len // block_tokens)
         blocks = rows * pages_per_row
         budget_gib = float(self._config.decode_kv_budget_gib or 0.0)
+        per_token = self._kv_bytes_per_token(spec)
         if budget_gib > 0:
-            per_token = self._kv_bytes_per_token(spec)
             if per_token:
                 blocks = min(blocks, int(budget_gib * (1024**3) / (per_token * block_tokens)))
         blocks = max(1, int(blocks))
+        # A quantized cache is an fp8 pool (with per-(slot, head) scales beside
+        # it); otherwise the K/V the forward writes are the weights' own dtype.
+        from oasr.functionals.kv_quant import kv_cache_dtype
+
+        pool_dtype = kv_cache_dtype(self.kv_cache_format) or param.dtype
         pool = DecoderKVCacheManager.build_pool(
             num_layers=int(spec.num_layers),
             n_kv_head=int(spec.n_kv_head),
@@ -459,23 +542,16 @@ class IncrementalArStrategy(DecodeStrategy):
             max_num_blocks=blocks,
             max_batch_size=rows,
             device=param.device,
-            dtype=param.dtype,
+            dtype=pool_dtype,
         )
-        gib = (
-            2
-            * int(spec.num_layers)
-            * int(spec.n_kv_head)
-            * int(spec.head_dim)
-            * blocks
-            * block_tokens
-            * param.element_size()
-        ) / float(1024**3)
+        gib = (per_token * blocks * block_tokens) / float(1024**3)
         logger.info(
-            "decoder-KV pool: %d blocks x %d tokens (%.2f GiB) for up to %d rows "
+            "decoder-KV pool: %d blocks x %d tokens (%.2f GiB, %s) for up to %d rows "
             "of %d positions%s",
             blocks,
             block_tokens,
             gib,
+            self.kv_cache_format or str(pool_dtype).replace("torch.", ""),
             rows,
             self._position_budget(),
             f" + a {cross_len}-frame cross-attention window" if cross_len else "",
@@ -588,9 +664,23 @@ class IncrementalArStrategy(DecodeStrategy):
         return self._kv_bytes_per_token(spec) * (int(self._position_budget()) + cross_len)
 
     def _kv_bytes_per_token(self, spec: Any) -> int:
-        """K and V bytes for one position across every decoder layer."""
-        itemsize = torch.empty((), dtype=self._config.dtype).element_size()
-        return int(2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize)
+        """K and V bytes for one position across every decoder layer.
+
+        With ``quantization.kv_cache="fp8_e4m3"`` that is one byte per element
+        plus a 4-byte scale per (token, kv-head) -- 1.88x fewer bytes than fp16
+        at head_dim 64, 1.94x at 128 -- and it is what the VRAM-derived budget
+        and the per-row admission count, so the setting admits more rows rather
+        than merely using less memory per row.
+        """
+        from oasr.functionals.kv_quant import kv_cache_bytes_per_token
+
+        return kv_cache_bytes_per_token(
+            num_layers=int(spec.num_layers),
+            n_kv_head=int(spec.n_kv_head),
+            head_dim=int(spec.head_dim),
+            dtype=self._config.dtype,
+            kv_cache=self.kv_cache_format,
+        )
 
     def _position_budget(self) -> int:
         """Positions one row can occupy: prompt estimate + generation cap."""

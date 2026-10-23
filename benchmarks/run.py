@@ -211,6 +211,25 @@ def _repro_command(args: argparse.Namespace, extra: list) -> str:
     return " ".join(parts)
 
 
+def _with_typed_dtype(
+    sub_parser: argparse.ArgumentParser, args: argparse.Namespace, extra: list
+) -> list:
+    """*extra*, plus a typed top-level ``--dtype`` when the family declares its own.
+
+    The run parser consumes ``--dtype`` before the family sees it, so a family
+    with its own ``--dtype`` (the workload harnesses: a list of rows) parsed only
+    its default and won the merge -- ``--family accuracy --dtype bfloat16`` ran
+    float16 and said so only in the row label.  Re-parsing the typed value
+    through the family's own option keeps its type, ``nargs`` and choices.
+    """
+    typed = getattr(args, "dtype_explicit", False)
+    family_has_dtype = any("--dtype" in a.option_strings for a in sub_parser._actions)
+    in_extra = any(t == "--dtype" or t.startswith("--dtype=") for t in extra)
+    if typed and family_has_dtype and not in_extra:
+        return [*extra, "--dtype", str(args.dtype)]
+    return extra
+
+
 def run_one(args: argparse.Namespace, extra: list, reporter: Reporter) -> None:
     """Parse the family's own flags, then hand off to the sweep or the harness."""
     module = registry.get_family(args.family)
@@ -220,7 +239,7 @@ def run_one(args: argparse.Namespace, extra: list, reporter: Reporter) -> None:
     # Strict, not parse_known_args: an unrecognised flag used to be discarded,
     # after which resolve_configs saw None, fell back to DEFAULT_CONFIGS, and the
     # line ran a full default sweep at the wrong shapes -- reported as a pass.
-    family_args = sub_parser.parse_args(extra)
+    family_args = sub_parser.parse_args(_with_typed_dtype(sub_parser, args, extra))
     merged = argparse.Namespace(**{**vars(args), **vars(family_args)})
 
     if merged.subroutine is None:

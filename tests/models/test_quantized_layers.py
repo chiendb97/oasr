@@ -196,10 +196,14 @@ class TestArchitectures:
         assert torch.isfinite(hidden).all()
 
     def test_raw_weight_readers_are_not_quantizable(self):
-        """The layers a fused kernel reads raw are exactly the ones withheld."""
+        """The layers a fused kernel reads raw are exactly the ones withheld.
+
+        The gated MLP's gate/up are *not* among them: a quantized projection
+        takes the block off the fused kernel (``GatedMLP._forward_unfused``).
+        """
         llm = quantizable_layers(_build("speech_llm"))
-        assert not any(p.endswith(("gate_proj", "up_proj")) for p in llm)
-        assert any(p.endswith("down_proj") for p in llm)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            assert any(p.endswith(name) for p in llm), name
         joiner = {p for p in quantizable_layers(_build("transducer")) if p.startswith("joiner.")}
         assert joiner == {"joiner.encoder_proj"}
 
@@ -213,7 +217,10 @@ class TestArchitectures:
         model = _build("conformer")
         spec = QuantizationSpec.for_model(model, INT8_W8A8)
         targets = set(spec.groups[0].targets)
-        assert not any(t.startswith(("encoder.embed.", "decoder.")) for t in targets)
-        assert not any(t.endswith("linear_pos") for t in targets)
-        n_blocks = _tiny_configs()["conformer"].encoder.num_blocks
-        assert len(targets) == 8 * n_blocks  # qkv, out, 2x(w_1, w_2), pw1, pw2
+        assert not any(t.startswith(("encoder.embed.", "ctc.")) for t in targets)
+        assert not any(t.endswith(("linear_pos", "output_layer")) for t in targets)
+        cfg = _tiny_configs()["conformer"]
+        dec_layers = cfg.decoder.num_blocks + cfg.decoder.r_num_blocks
+        # Encoder: qkv, out, 2x(w_1, w_2), pw1, pw2.  U2++ decoder: 2x(q, k, v,
+        # out) + w_1, w_2 per layer, both directions; the vocab heads stay fp.
+        assert len(targets) == 8 * cfg.encoder.num_blocks + 10 * dec_layers

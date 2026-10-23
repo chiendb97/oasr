@@ -50,11 +50,11 @@ void check_add_norm_inputs(TensorView output, TensorView input, TensorView resid
     }
 }
 
-// The quant-out norms write an int8 tensor and a per-row scale in place of a
-// T output.  Everything is required contiguous (not merely row-dense): the
-// int8 rows are walked in the input's memory order, so a permuted input would
-// land its rows at the wrong logical positions of a contiguous ``out_q``.
-// Returns the number of rows.
+// The quant-out norms write an 8-bit tensor (int8, or float8_e4m3fn) and a
+// per-row scale in place of a T output.  Everything is required contiguous (not
+// merely row-dense): the 8-bit rows are walked in the input's memory order, so a
+// permuted input would land its rows at the wrong logical positions of a
+// contiguous ``out_q``.  Returns the number of rows.
 int64_t check_norm_quant_args(const char* name, TensorView out_q, TensorView scale,
                               TensorView input, TensorView weight, Optional bias_opt) {
     CHECK_INPUT(input);
@@ -71,15 +71,16 @@ int64_t check_norm_quant_args(const char* name, TensorView out_q, TensorView sca
     const DLDataType dt = input.dtype();
     TVM_FFI_ICHECK((dt.code == kDLFloat || dt.code == kDLBfloat) && dt.bits == 16 && dt.lanes == 1)
         << name << ": input must be float16 or bfloat16";
-    TVM_FFI_ICHECK(out_q.dtype().code == kDLInt && out_q.dtype().bits == 8)
-        << name << ": out must be int8";
+    TVM_FFI_ICHECK((out_q.dtype().code == kDLInt || out_q.dtype().code == kDLFloat8_e4m3fn) &&
+                   out_q.dtype().bits == 8 && out_q.dtype().lanes == 1)
+        << name << ": out must be int8 or float8_e4m3fn";
     TVM_FFI_ICHECK(scale.dtype().code == kDLFloat && scale.dtype().bits == 32)
         << name << ": scale must be float32";
 
     const int64_t hidden_size = input.size(input.ndim() - 1);
     TVM_FFI_ICHECK(hidden_size > 0) << name << ": the hidden dimension must be positive";
     TVM_FFI_ICHECK(out_q.numel() == input.numel() && out_q.size(out_q.ndim() - 1) == hidden_size)
-        << name << ": out must be shaped like input (one int8 per input element)";
+        << name << ": out must be shaped like input (one byte per input element)";
     const int64_t num_rows = FLATTENED_ROWS(input);
     TVM_FFI_ICHECK(scale.numel() == num_rows)
         << name << ": scale needs one float per row (" << num_rows << "), got " << scale.numel();
@@ -348,7 +349,7 @@ void addlayernorm_residual(TensorView output, TensorView residual_out, TensorVie
 }
 
 // =============================================================================
-// LayerNorm + per-token int8 launchers
+// LayerNorm + per-token 8-bit launchers (the output tensor's dtype is the format)
 // =============================================================================
 
 void layernorm_quant(TensorView out_q, TensorView scale, TensorView input, TensorView weight,
@@ -362,9 +363,9 @@ void layernorm_quant(TensorView out_q, TensorView scale, TensorView input, Tenso
         cudaError_t status = norm::LayerNormQuant<c_type>(
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), OptionalDataPtr<const c_type>(bias_opt),
-            static_cast<int8_t*>(out_q.data_ptr()), static_cast<float*>(scale.data_ptr()),
+            out_q.data_ptr(), static_cast<float*>(scale.data_ptr()),
             static_cast<unsigned int>(num_rows), hidden_size, static_cast<float>(eps),
-            static_cast<float>(qeps), stream);
+            static_cast<float>(qeps), out_q.dtype().code == kDLFloat8_e4m3fn, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "LayerNormQuant kernel failed: " << cudaGetErrorString(status);
         return true;
@@ -394,10 +395,10 @@ void addlayernorm_residual_quant(TensorView out_q, TensorView scale, TensorView 
             static_cast<const c_type*>(input.data_ptr()),
             static_cast<const c_type*>(residual.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), OptionalDataPtr<const c_type>(bias_opt),
-            static_cast<int8_t*>(out_q.data_ptr()), static_cast<float*>(scale.data_ptr()),
+            out_q.data_ptr(), static_cast<float*>(scale.data_ptr()),
             static_cast<c_type*>(residual_out.data_ptr()), static_cast<unsigned int>(num_rows),
             hidden_size, static_cast<float>(eps), static_cast<float>(alpha),
-            static_cast<float>(qeps), stream);
+            static_cast<float>(qeps), out_q.dtype().code == kDLFloat8_e4m3fn, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "AddLayerNormResidualQuant kernel failed: " << cudaGetErrorString(status);
         return true;

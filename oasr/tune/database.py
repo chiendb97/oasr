@@ -104,7 +104,7 @@ SCHEMA = 2
 #: ``scaled_mm`` is the int8 W8A8 GEMM (``oasr.jit.scaled_mm``), whose regions
 #: may name the ``"heuristic"`` sentinel -- "measured; the shape heuristic's
 #: own pick is the best here".
-KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm")
+KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm", "scaled_mm_fp8")
 
 _USER_ENV = "OASR_TUNE_USER_DB"
 _OFF_VALUES = ("0", "off", "none", "false", "no")

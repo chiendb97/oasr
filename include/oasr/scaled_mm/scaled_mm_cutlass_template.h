@@ -1,20 +1,22 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// CUTLASS 2.x int8 scaled GEMM: ``D[M,N] = epilogue(A @ Bᵀ)`` with A ``[M, K]``
-// row-major int8 (quantized activations), B ``[N, K]`` row-major int8 (the
+// CUTLASS 2.x scaled GEMM: ``D[M,N] = epilogue(A @ Bᵀ)`` with A ``[M, K]``
+// row-major 8-bit (quantized activations), B ``[N, K]`` row-major 8-bit (the
 // ``nn.Linear`` weight layout, i.e. CUTLASS's column-major B -- no transpose, no
-// repack) and an int32 accumulator.  The epilogue tree decides the rest
-// (``scaled_mm_epilogue.h``): an fp16/bf16 output, or int8 for a consumer GEMM.
+// repack).  The config names the element and accumulator (int8 -> int32, fp8
+// e4m3 -> fp32; ``cutlass_scaled_mm_configs.h``); the epilogue tree decides the
+// rest (``scaled_mm_epilogue.h``): an fp16/bf16 output, or 8-bit for a consumer
+// GEMM.
 //
-// Two K decompositions, both exact:
+// Two K decompositions:
 //
 // * data-parallel -- one K pass per output tile, no workspace;
-// * Stream-K -- K iterations spread over every SM, partial tiles reduced through
-//   a workspace.  The partials are the int32 accumulator, so the reduction is an
-//   integer sum: any order, any split, the same bits as the data-parallel
-//   kernel.  That is what makes Stream-K safe for batch invariance here, where
-//   the fp16 GEMM's fp32 partials are not.
+// * Stream-K (int8 only) -- K iterations spread over every SM, partial tiles
+//   reduced through a workspace.  The partials are the int32 accumulator, so the
+//   reduction is an integer sum: any order, any split, the same bits as the
+//   data-parallel kernel.  That is what makes Stream-K safe for batch invariance
+//   here, where fp32 partials (the fp16 GEMM's, or fp8's) are not.
 //
 // No serial or parallel split-K: the Sm80 EVT kernel rejects them only by
 // ``assert`` (gemm_universal_with_visitor.h), which NDEBUG compiles out, so a
@@ -53,9 +55,11 @@ struct ScaledMmTileMap {
 
 template <typename Config, typename EVTD, bool kStreamK>
 struct CutlassScaledMmGemm {
-    using ElementAB = int8_t;
-    using ElementAccumulator = int32_t;
+    using ElementAB = typename Config::ElementAB;
+    using ElementAccumulator = typename Config::ElementAccumulator;
     using ElementCompute = float;
+    static_assert(!kStreamK || std::is_same_v<ElementAccumulator, int32_t>,
+                  "Stream-K is exact only over an integer accumulator");
 
     static constexpr int kAlignmentAB = 128 / cutlass::sizeof_bits<ElementAB>::value;  // 16
 

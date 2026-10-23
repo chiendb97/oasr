@@ -112,13 +112,22 @@ def clip_percentile(counts: torch.Tensor, upper: float, percentile: float) -> fl
     return upper * (idx + 1) / counts.numel()
 
 
-def clip_mse(counts: torch.Tensor, upper: float, qmax: int) -> float:
-    """The clip that minimises the expected int8 quantization error of the histogram.
+def clip_mse(counts: torch.Tensor, upper: float, qmax: float, fmt: str = "int8") -> float:
+    """The clip that minimises the expected quantization error of the histogram.
 
-    For a clip ``c`` (step ``c / qmax``), a value below ``c`` costs the rounding
-    error of a uniform step, ``step**2 / 12``; one above costs ``(|x| - c)**2``
-    (bin centres).  Every bin edge is a candidate.
+    For a clip ``c`` (scale ``c / qmax``), a value above ``c`` costs
+    ``(|x| - c)**2`` (bin centres) and one below costs the rounding error of the
+    format's step at that value, ``step**2 / 12``:
+
+    * ``int8`` -- a uniform step, ``c / qmax``;
+    * ``fp8`` (e4m3, ``qmax = 448``) -- a step relative to the value: at
+      ``v = |x| / scale``, ``2**(floor(log2 v) - 3)`` in the normal range and the
+      subnormal step ``2**-9`` below ``2**-6``.
+
+    Every bin edge is a candidate.
     """
+    if fmt not in ("int8", "fp8"):
+        raise ValueError(f"clip_mse: unknown format {fmt!r}")
     n = counts.numel()
     w = counts.double().cpu()
     centres = (torch.arange(n, dtype=torch.float64) + 0.5) * (upper / n)
@@ -132,8 +141,27 @@ def clip_mse(counts: torch.Tensor, upper: float, qmax: int) -> float:
     above1 = torch.cat([s1[1:], s1.new_zeros(1)])
     above2 = torch.cat([s2[1:], s2.new_zeros(1)])
     clip_err = above2 - 2 * clips * above1 + clips**2 * above0
-    round_err = below * (clips / qmax) ** 2 / 12.0
+    if fmt == "int8":
+        round_err = below * (clips / qmax) ** 2 / 12.0
+    else:
+        round_err = _fp8_round_err(w, centres, clips, qmax)
     return float(clips[int(torch.argmin(clip_err + round_err))])
+
+
+def _fp8_round_err(
+    w: torch.Tensor, centres: torch.Tensor, clips: torch.Tensor, qmax: float, chunk: int = 512
+) -> torch.Tensor:
+    """``sum_{centre < clip} w * step_e4m3(centre)**2 / 12`` for every candidate clip."""
+    out = torch.empty_like(clips)
+    for start in range(0, clips.numel(), chunk):
+        c = clips[start : start + chunk, None]  # [C, 1]
+        scale = c / qmax
+        v = centres[None, :] / scale  # [C, n] in e4m3 units
+        exp = torch.floor(torch.log2(v.clamp_min(2.0**-6)))
+        step = torch.exp2(exp - 3.0) * scale  # the subnormal step is 2**-9 = 2**(-6-3)
+        inside = centres[None, :] < c
+        out[start : start + chunk] = (w[None, :] * step**2 / 12.0 * inside).sum(1)
+    return out
 
 
 __all__ = [

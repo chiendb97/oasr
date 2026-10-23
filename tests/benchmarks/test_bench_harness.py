@@ -143,7 +143,13 @@ def test_quant_configs_and_work_model():
 
 def test_scaled_mm_configs_and_work_model():
     smm = _family("scaled_mm")
-    assert smm.SUBROUTINES == ["scaled_mm", "quant_scaled_mm", "ffn_chain"]
+    assert smm.SUBROUTINES == [
+        "scaled_mm",
+        "quant_scaled_mm",
+        "ffn_chain",
+        "scaled_mm_fp8",
+        "quant_scaled_mm_fp8",
+    ]
     explicit = smm.resolve_configs(
         _ns(M=16, N=768, K=256, activation="swish", bias=True), "quant_scaled_mm"
     )
@@ -177,10 +183,14 @@ def test_scaled_mm_compares_speed_against_fp16_and_correctness_against_the_twin(
         smm, dict.fromkeys(["cutlass", "torch", "fp16", "reference"])
     )
     # One GEMM: one output ulp, per dtype -- a bf16 ulp is eight fp16 ones.
-    for sub in ("scaled_mm", "quant_scaled_mm"):
+    for sub in ("scaled_mm", "quant_scaled_mm", "scaled_mm_fp8", "quant_scaled_mm_fp8"):
         fp16 = driver.tolerance_for(smm, sub, torch.float16)
         bf16 = driver.tolerance_for(smm, sub, torch.bfloat16)
         assert fp16[1] >= 2.0**-10 and bf16[1] >= 2.0**-7 and fp16 < bf16
+    # fp8 sums in fp32: more slack than the exact int8 accumulator.
+    assert driver.tolerance_for(smm, "scaled_mm_fp8", torch.float16) > driver.tolerance_for(
+        smm, "scaled_mm", torch.float16
+    )
     # The chain: one int8 step of the intermediate at a tie, whatever the dtype.
     for dtype in (torch.float16, torch.bfloat16):
         assert driver.tolerance_for(smm, "ffn_chain", dtype)[1] >= 4e-3
@@ -214,6 +224,37 @@ def test_conformer_scaled_mm_testlist_parses_and_covers_the_grid():
         for m in (16, 128, 2048, 16384)
     }
     assert seen == want and len(lines) == len(want)
+
+
+def test_a_typed_dtype_reaches_a_family_with_its_own_dtype_flag():
+    """``--family accuracy --dtype bfloat16`` used to run float16.
+
+    The run parser consumes ``--dtype``; the accuracy family declares its own (a
+    list of rows), parsed only its default, and the default won the merge.
+    """
+    from benchmarks.run import _with_typed_dtype, build_parser
+
+    acc = registry.get_family("accuracy")
+    family_parser = argparse.ArgumentParser(add_help=False)
+    acc.parse_args(family_parser)
+    main = build_parser()
+
+    args, extra = main.parse_known_args(["--family", "accuracy", "--dtype", "bfloat16"])
+    args.dtype_explicit = True
+    assert family_parser.parse_args(_with_typed_dtype(family_parser, args, extra)).dtype == [
+        "bfloat16"
+    ]
+    # Not typed: the family's own default stands.
+    args, extra = main.parse_known_args(["--family", "accuracy"])
+    args.dtype_explicit = False
+    assert family_parser.parse_args(_with_typed_dtype(family_parser, args, extra)).dtype == [
+        "float16"
+    ]
+    # A family without the flag is handed nothing it would refuse.
+    smm_parser = argparse.ArgumentParser(add_help=False)
+    _family("scaled_mm").parse_args(smm_parser)
+    args.dtype_explicit = True
+    assert _with_typed_dtype(smm_parser, args, []) == []
 
 
 # ---------------------------------------------------------------------------

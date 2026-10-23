@@ -1,16 +1,22 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""W8A8 int8: per-channel weights; per-token dynamic or static per-tensor activations.
+"""W8A8: 8-bit per-channel weights; per-token dynamic or static per-tensor activations.
+
+One method, two formats -- the scheme's ``type`` picks them: ``int`` is int8
+(``Q = 127``, an exact int32 GEMM accumulator), ``float`` is fp8 e4m3 (``Q = 448``,
+an fp32 accumulator; sm89+).  Everything else -- storage, scales, the forward,
+the fused producers -- is shared.
 
 Storage on a quantized layer (state-dict names follow compressed-tensors):
 
-* ``weight``       — int8, the layer's own shape (``[N, K]``; ``[N, K, 1]`` for a
-  pointwise conv), so a checkpoint key means the same thing quantized or not;
+* ``weight``       — int8 / float8_e4m3fn, the layer's own shape (``[N, K]``;
+  ``[N, K, 1]`` for a pointwise conv), so a checkpoint key means the same thing
+  quantized or not;
 * ``weight_scale`` — fp32 ``[N]``: ``W ≈ weight * weight_scale[:, None]``;
 * ``smooth_inv``   — fp32 ``[K]``, only on runtime-smoothed layers (SmoothQuant
   for a GEMM whose producer cannot absorb the scale);
-* ``input_scale``  — fp32 ``[1]``, only with a static activation scale: the int8
-  step of the layer's (smoothed) input, calibrated by ``oasr quantize``.
+* ``input_scale``  — fp32 ``[1]``, only with a static activation scale: the
+  quantization step of the layer's (smoothed) input, calibrated by ``oasr quantize``.
 
 Forward, by what arrives:
 
@@ -23,7 +29,7 @@ Forward, by what arrives:
 then the lane's scaled GEMM, which dequantizes, adds the bias and applies the
 layer's fused activation in one epilogue.  When this layer feeds a static
 consumer through a declared :class:`~oasr.quantization.layout.GemmChain`
-(:attr:`W8A8Int8Method.emit`, armed by ``bind_quantization``) the epilogue
+(:attr:`W8A8Method.emit`, armed by ``bind_quantization``) the epilogue
 quantizes for that consumer instead and the layer returns a
 ``QuantizedActivation``.  The output dtype is the input's.
 """
@@ -37,19 +43,20 @@ import torch
 from torch import nn
 
 from oasr.functionals.quant import (
-    INT8_QMAX,
     QUANT_EPS,
+    quant_qmax,
     quantize_per_token,
     quantize_static,
     reference_quantize_per_token,
     reference_quantize_static,
+    round_to_quant,
     static_multiplier,
 )
 from oasr.functionals.scaled_mm import reference_scaled_mm, reference_scaled_mm_quant
 from oasr.layers._backend import layers_backend, take_gap
 from oasr.layers._quantizable import QuantizedActivation
 
-from ..kernels.lanes import choose_lane, forced_backend
+from ..kernels.lanes import choose_lane, forced_backend, w8a8_format
 from .base import QuantMethod, register_quant_method
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -75,17 +82,17 @@ def _optional(module: nn.Module, name: str) -> Optional[torch.Tensor]:
 
 
 def quantize_weight_per_channel(
-    weight_fp32: torch.Tensor, eps: float = QUANT_EPS
+    weight_fp32: torch.Tensor, eps: float = QUANT_EPS, dtype: torch.dtype = torch.int8
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(q, scale)`` for a ``[N, K]`` fp32 weight: symmetric int8 per output row.
+    """``(q, scale)`` for a ``[N, K]`` fp32 weight: symmetric 8-bit per output row.
 
-    The eps floor matters: ``pad_output_projection`` pads vocabularies with
-    all-zero rows, whose amax is 0.
+    *dtype* is ``torch.int8`` or ``torch.float8_e4m3fn``.  The eps floor matters:
+    ``pad_output_projection`` pads vocabularies with all-zero rows, whose amax is 0.
     """
     w = weight_fp32.float()
     wmax = w.abs().amax(dim=1, keepdim=True).clamp_min(eps)
-    qmax = torch.full_like(wmax, float(INT8_QMAX))
-    q = torch.round(w * (qmax / wmax)).clamp_(-INT8_QMAX, INT8_QMAX).to(torch.int8)
+    qmax = torch.full_like(wmax, quant_qmax(dtype))
+    q = round_to_quant(w * (qmax / wmax), dtype)
     return q, (wmax / qmax).squeeze(1)
 
 
@@ -95,18 +102,25 @@ class OutputQuant:
 
     #: The consumer's per-channel multiplier (``static_multiplier``), fp32 ``[N]``.
     mul: torch.Tensor
-    #: The consumer's ``input_scale`` (fp32 ``[1]``): the scale the int8 output carries.
+    #: The consumer's ``input_scale`` (fp32 ``[1]``): the scale the 8-bit output carries.
     scale: torch.Tensor
     #: The consumer's module path (for the report).
     consumer: str
 
 
 @register_quant_method
-class W8A8Int8Method(QuantMethod):
-    """int8 per-channel W x int8 A, per-token dynamic or static per-tensor."""
+class W8A8Method(QuantMethod):
+    """8-bit (int8 or fp8 e4m3) per-channel W x 8-bit A, per-token dynamic or static."""
 
     def __init__(self, scheme: "QuantScheme") -> None:
         super().__init__(scheme)
+        #: ``"int8"`` or ``"fp8"``.
+        self.fmt = w8a8_format(scheme)
+        if self.fmt is None:
+            raise ValueError(f"{type(self).__name__} cannot serve scheme {scheme.name or scheme}")
+        #: The dtype the weight and the quantized activations are stored in.
+        self.storage_dtype: torch.dtype = scheme.weights.storage_dtype
+        self.quant_dtype = self.storage_dtype
         #: A static layer's quantize multiplier on its device, set by :meth:`bind`.
         self.static_mul: Optional[torch.Tensor] = None
         #: Set by ``bind_quantization`` when this layer's output feeds a static
@@ -115,21 +129,7 @@ class W8A8Int8Method(QuantMethod):
 
     @classmethod
     def supports(cls, scheme: "QuantScheme") -> bool:
-        w, a = scheme.weights, scheme.input_activations
-        return (
-            w.type == "int"
-            and w.num_bits == 8
-            and w.granularity == "channel"
-            and w.symmetric
-            and a is not None
-            and a.type == "int"
-            and a.num_bits == 8
-            and a.symmetric
-            and (
-                (a.granularity == "token" and a.dynamic)
-                or (a.granularity == "tensor" and not a.dynamic)
-            )
-        )
+        return w8a8_format(scheme) is not None
 
     @property
     def static(self) -> bool:
@@ -143,7 +143,7 @@ class W8A8Int8Method(QuantMethod):
         old = _tensor(module, "weight")
         device = old.device
         module.weight = nn.Parameter(
-            torch.zeros(old.shape, dtype=torch.int8, device=device), requires_grad=False
+            torch.zeros(old.shape, dtype=self.storage_dtype, device=device), requires_grad=False
         )
         module.register_buffer(
             "weight_scale", torch.ones(layer.out_features, dtype=torch.float32, device=device)
@@ -161,7 +161,7 @@ class W8A8Int8Method(QuantMethod):
 
     def quantize_weight(self, layer: "QuantizableGemm", weight_fp32: torch.Tensor) -> None:
         module: nn.Module = layer  # type: ignore[assignment]
-        q, scale = quantize_weight_per_channel(weight_fp32)
+        q, scale = quantize_weight_per_channel(weight_fp32, dtype=self.storage_dtype)
         weight = _tensor(module, "weight")
         weight.data.copy_(q.reshape(weight.shape))
         _tensor(module, "weight_scale").copy_(scale)
@@ -196,7 +196,13 @@ class W8A8Int8Method(QuantMethod):
                 f"{layer.out_features}x{layer.in_features} {self.scheme.name} layer on sm{sm}: "
                 f"{note}"
             )
-        if sm == 75 and take_gap("scaled-mm-int8-sm75", note) is False:
+        if self.fmt == "fp8" and sm < 89:
+            # Not a missing kernel: the GPU has no fp8 tensor cores.
+            raise RuntimeError(
+                f"scheme {self.scheme.name} needs fp8 tensor cores (sm89+), and this GPU is "
+                f"sm{sm}; quantize to int8 (int8_w8a8) instead"
+            )
+        if self.fmt == "int8" and sm == 75 and take_gap("scaled-mm-int8-sm75", note) is False:
             self.lane, self.lane_note = None, "reference (declared gap scaled-mm-int8-sm75)"
             return
         raise RuntimeError(
@@ -245,16 +251,19 @@ class W8A8Int8Method(QuantMethod):
             return self.apply_reference(layer, x)
         module: nn.Module = layer  # type: ignore[assignment]
         if isinstance(x, QuantizedActivation):
-            q, a_scale = x.data, x.scale
+            q, a_scale = self._check_format(x), x.scale
         elif self.static:
             if not x.is_contiguous():
                 x = x.contiguous()
             mul = self.static_mul if self.static_mul is not None else self._multiplier(layer)
-            q, a_scale = quantize_static(x, mul), _tensor(module, "input_scale")
+            q = quantize_static(x, mul, dtype=self.storage_dtype)
+            a_scale = _tensor(module, "input_scale")
         else:
             if not x.is_contiguous():
                 x = x.contiguous()
-            q, a_scale = quantize_per_token(x, _optional(module, "smooth_inv"))
+            q, a_scale = quantize_per_token(
+                x, _optional(module, "smooth_inv"), dtype=self.storage_dtype
+            )
         weight, w_scale = layer.gemm_weight(), _tensor(module, "weight_scale")
         bias, act = _optional(module, "bias"), layer.fused_activation
         if self.emit is not None:
@@ -268,12 +277,16 @@ class W8A8Int8Method(QuantMethod):
         module: nn.Module = layer  # type: ignore[assignment]
         dtype = x.dtype
         if isinstance(x, QuantizedActivation):
-            q, a_scale = x.data, x.scale
+            q, a_scale = self._check_format(x), x.scale
         elif self.static:
             a_scale = _tensor(module, "input_scale")
-            q = reference_quantize_static(x, self._multiplier(layer).to(x.device))
+            q = reference_quantize_static(
+                x, self._multiplier(layer).to(x.device), dtype=self.storage_dtype
+            )
         else:
-            q, a_scale = reference_quantize_per_token(x, _optional(module, "smooth_inv"))
+            q, a_scale = reference_quantize_per_token(
+                x, _optional(module, "smooth_inv"), dtype=self.storage_dtype
+            )
         weight, w_scale = layer.gemm_weight(), _tensor(module, "weight_scale")
         bias, act = _optional(module, "bias"), layer.fused_activation
         if self.emit is not None:
@@ -281,6 +294,15 @@ class W8A8Int8Method(QuantMethod):
             data = reference_scaled_mm_quant(q, weight, a_scale, w_scale, bias, act, mul, dtype)
             return QuantizedActivation(data, self.emit.scale, dtype)
         return reference_scaled_mm(q, weight, a_scale, w_scale, bias, act, out_dtype=dtype)
+
+    def _check_format(self, x: QuantizedActivation) -> torch.Tensor:
+        """The pre-quantized data, refused if it is not this layer's format."""
+        if x.data.dtype != self.storage_dtype:
+            raise RuntimeError(
+                f"a {self.scheme.name} layer was handed {x.data.dtype} activations; a producer "
+                f"armed for it must emit {self.quant_dtype}"
+            )
+        return x.data
 
     def describe(self, layer: "QuantizableGemm") -> Dict[str, Any]:
         row = super().describe(layer)

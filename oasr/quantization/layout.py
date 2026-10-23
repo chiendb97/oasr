@@ -30,11 +30,13 @@ from typing import Optional, Tuple
 
 #: How a group's smoothing vector ``s`` is absorbed (``x' = x / s``, ``W' = W·s``).
 #:
-#: * ``norm_affine``   — the producer is a LayerNorm: ``γ /= s``, ``β /= s``.
-#: * ``v_to_o``        — the producer is a fused QKV projection whose V rows feed
-#:   the consumer through attention (linear in V per channel).
-#: * ``producer_rows`` — the producer is a GEMM followed by a positively
-#:   homogeneous activation (ReLU): its output rows and bias absorb ``1/s``.
+#: * ``norm_affine``   — the producer is a LayerNorm / RMSNorm: ``γ /= s``, ``β /= s``.
+#: * ``v_to_o``        — the producer is the V projection -- the V rows of a fused
+#:   QKV projection (``v_rows``), or a separate ``v_proj`` whole -- whose output
+#:   feeds the consumer through attention (linear in V per channel).
+#: * ``producer_rows`` — the producer is a GEMM whose output reaches the consumer
+#:   through a per-channel positively homogeneous map: a ReLU, or the gated MLP's
+#:   ``act(gate) * up`` (linear in ``up``).  Its output rows and bias absorb ``1/s``.
 #: * ``runtime``       — nothing can absorb it: the consumer stores
 #:   ``smooth_inv = 1/s`` and the activation-quantize kernel applies it.
 FOLD_KINDS = ("norm_affine", "v_to_o", "producer_rows", "runtime")
@@ -52,7 +54,7 @@ class SmoothGroup:
     #: (``LayerNorm.quantize_output``).  Only for a norm producer.
     fuse_output_quant: bool = False
     #: ``v_to_o``: the slice of the producer's output rows that is V
-    #: (``(start, stop)``).
+    #: (``(start, stop)``; ``(0, out_features)`` for a separate ``v_proj``).
     v_rows: Optional[Tuple[int, int]] = None
     #: ``v_to_o``: ``(n_head, n_kv_head, head_dim)``.  Under GQA a V channel feeds
     #: ``n_head // n_kv_head`` output channels, so ``s`` is tied across them.

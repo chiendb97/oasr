@@ -200,17 +200,22 @@ class TestTiers:
 
 
 class TestShippedFiles:
-    """Every shipped ``scaled_mm.json`` names only its arch's production configs."""
+    """Every shipped ``scaled_mm[_fp8].json`` names only its arch's production configs."""
 
     def _files(self):
-        for path in sorted(db.system_dir().glob("sm*/scaled_mm.json")):
-            yield int(path.parent.name[2:]), path
+        for family, fmt in (("scaled_mm", "int8"), ("scaled_mm_fp8", "fp8")):
+            for path in sorted(db.system_dir().glob(f"sm*/{family}.json")):
+                yield int(path.parent.name[2:]), path, family, fmt
+
+    def test_the_fp8_file_ships_beside_the_int8_one(self):
+        families = {family for _, _, family, _ in self._files()}
+        assert families == {"scaled_mm", "scaled_mm_fp8"}
 
     def test_each_config_decodes_and_is_built(self):
-        for sm, path in self._files():
-            tf = db.load_file(path, "scaled_mm", sm)
+        for sm, path, family, fmt in self._files():
+            tf = db.load_file(path, family, sm)
             assert tf is not None, f"{path} failed its hard validators"
-            built = jsm.get_production_configs(sm)
+            built = jsm.get_production_configs(sm, fmt)
             for cid in tf.referenced_configs():
                 choice = jsm.choice_from_params(tf.configs[cid])
                 if choice == jsm.HEURISTIC_ID:
@@ -220,12 +225,12 @@ class TestShippedFiles:
                 assert jsm.config_id(choice) == cid, f"{path}: id of {cid} is not canonical"
 
     def test_every_entry_is_served_from_the_file(self):
-        for sm, path in self._files():
-            tf = db.load_file(path, "scaled_mm", sm)
+        for sm, path, family, fmt in self._files():
+            tf = db.load_file(path, family, sm)
             for key, entry in tf.entries.items():
                 _, f = db.parse_sig_key(key)
-                assert f["op"] in jsm.SCALED_MM_OPS
-                if f["op"] == "scaled_mm_quant":
+                assert f["op"] in jsm.FORMAT_OPS[fmt]
+                if jsm.is_quant_op(f["op"]):
                     for _, cid in entry.regions:
                         assert not tf.configs[cid].get("stream_k"), f"{path}: {key}"
                 for m_hi, _ in entry.regions:
@@ -416,3 +421,129 @@ class TestBuild:
         assert not any(
             jsm.get_production_configs(sm)[n].stream_k for n in q.results if n != "heuristic"
         )
+
+
+# -----------------------------------------------------------------------------
+# The fp8 format: its own family (scaled_mm_fp8.json), ops and lane
+# -----------------------------------------------------------------------------
+
+FP8_BIG = "b128x128x64_w64x64x64_s4_e4m3"
+FP8_SMALL = "b16x64x128_w16x16x128_s4_e4m3"
+
+
+def _fp8_file(root, op, n, k, regions, sm=SM):
+    configs = {
+        cid: (
+            {"kind": jsm.HEURISTIC_ID}
+            if cid == jsm.HEURISTIC_ID
+            else jsm.config_to_params(jsm.get_production_configs(sm, "fp8")[cid])
+        )
+        for _, cid in regions
+    }
+    tf = db.new_file("scaled_mm_fp8", sm, jsm.LANE_ID["fp8"])
+    tf.configs.update(configs)
+    tf.entries[jsm.scaled_mm_sig_key(op, n, k)] = db.Entry(regions=regions)
+    db.save_file(tf, root / f"sm{sm}" / "scaled_mm_fp8.json")
+    db.reload()
+    db.reset_tier_counts()
+    return tf
+
+
+def _fp8_capable() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return jsm.lane_available(major * 10 + minor, "fp8")
+
+
+class TestFp8Family:
+    @pytest.mark.parametrize("sm", sorted(jsm.SCALED_MM_FP8_LANE_BY_SM))
+    def test_every_fp8_config_round_trips(self, sm):
+        cfgs = jsm.get_production_configs(sm, "fp8")
+        assert cfgs
+        for cid, cfg in cfgs.items():
+            params = json.loads(json.dumps(jsm.config_to_params(cfg)))
+            assert params["lane"] == jsm.LANE_ID["fp8"]
+            assert jsm.config_from_params(params) == cfg and cfg.fp8 and cid.endswith("_e4m3")
+
+    def test_no_fp8_lane_below_sm89(self):
+        assert not jsm.lane_available(80, "fp8") and not jsm.lane_available(86, "fp8")
+        assert jsm.lane_available(89, "fp8") and jsm.is_native_lane(120, "fp8")
+        assert not jsm.is_native_lane(90, "fp8")
+
+    def test_ops_keys_and_families(self):
+        assert "scaled_mm_fp8" in db.KERNEL_FAMILIES
+        assert jsm.op_format("scaled_mm_fp8_quant") == "fp8"
+        assert jsm.scaled_mm_sig_key("scaled_mm_fp8", 256, 512).startswith("scaled_mm_fp8|")
+        assert jsm.scaled_mm_sig_key("scaled_mm", 256, 512).startswith("scaled_mm|")
+
+    def test_an_fp8_entry_is_served_to_the_fp8_op_only(self, user_db):
+        _fp8_file(user_db, "scaled_mm_fp8", N, K, [(64, FP8_BIG), (None, jsm.HEURISTIC_ID)])
+        cfg = jsm.select_config(64, N, K, SM, NUM_SMS, fmt="fp8")
+        assert jsm.config_id(cfg) == FP8_BIG
+        assert jsm.select_config(65, N, K, SM, NUM_SMS, fmt="fp8") == jsm.heuristic_config(
+            65, N, SM, NUM_SMS, fmt="fp8"
+        )
+        assert jsm.covering_tier("scaled_mm_fp8", 64, N, K, SM) == "user"
+        # The int8 op of the same shape has no entry.
+        assert jsm.covering_tier("scaled_mm", 64, N, K, SM) is None
+        assert not _select(64).fp8
+        counts = db.tier_counts()  # M=65 is the entry's heuristic region: still the user tier
+        assert counts[("scaled_mm_fp8", "scaled_mm_fp8", "user")] == 2
+
+    def test_the_heuristic_picks_fp8_tiles(self):
+        for m in (1, 300, 16384):
+            cfg = jsm.heuristic_config(m, N, SM, NUM_SMS, fmt="fp8")
+            assert cfg.fp8 and cfg.block_k == cfg.warp_k
+
+    def test_an_int8_config_in_an_fp8_entry_falls_through(self, user_db, caplog):
+        tf = db.new_file("scaled_mm_fp8", SM, jsm.LANE_ID["fp8"])
+        tf.configs[BIG] = jsm.config_to_params(jsm.get_production_configs(SM)[BIG])
+        tf.entries[jsm.scaled_mm_sig_key("scaled_mm_fp8", N, K)] = db.Entry(regions=[(None, BIG)])
+        db.save_file(tf, user_db / f"sm{SM}" / "scaled_mm_fp8.json")
+        db.reload()
+        with caplog.at_level(logging.WARNING, logger="oasr.jit.scaled_mm"):
+            cfg = jsm.select_config(512, N, K, SM, NUM_SMS, fmt="fp8")
+        assert cfg.fp8 and "int8 config" in caplog.text
+
+    def test_census_and_prebuild_know_the_fp8_ops(self):
+        from oasr.tune import census as C
+        from oasr.tune.prebuild import modules_for
+
+        assert C.kernel_family("scaled_mm_fp8") == "scaled_mm_fp8"
+        assert C.kernel_family("scaled_mm_fp8_quant") == "scaled_mm_fp8"
+        assert C._weight_bytes("scaled_mm_fp8", 256, 512, "float8_e4m3fn", 1) == 256 * 512
+        assert [n for n, _ in modules_for({"scaled_mm_fp8"})] == ["scaled_mm_fp8"]
+        assert "scaled_mm_fp8" not in [n for n, _ in modules_for({"scaled_mm"})]
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not _fp8_capable(), reason="fp8 tensor cores need sm89+")
+class TestFp8CaptureAndBuild:
+    def test_an_fp8_call_is_recorded_under_the_fp8_op(self):
+        import oasr.functionals.scaled_mm as fsm
+        from oasr.tune.capture import GemmShapeRecorder, capture_gemm_shapes
+
+        g = torch.Generator(device="cuda").manual_seed(0)
+        a = (torch.randn(40, 256, generator=g, device="cuda") * 8).to(torch.float8_e4m3fn)
+        b = (torch.randn(512, 256, generator=g, device="cuda") * 8).to(torch.float8_e4m3fn)
+        a_scale = torch.full((40,), 1e-3, device="cuda")
+        b_scale = torch.full((512,), 1e-3, device="cuda")
+        rec = GemmShapeRecorder()
+        with capture_gemm_shapes(rec):
+            fsm.scaled_mm(a, b, a_scale, b_scale, None, "swish")
+            fsm.scaled_mm_quant(
+                a, b, a_scale, b_scale, None, None, torch.ones(512, device="cuda"), torch.float16
+            )
+        stats = {st.op: st for st in rec.aggregate()}
+        assert set(stats) == {"scaled_mm_fp8", "scaled_mm_fp8_quant"}
+        assert stats["scaled_mm_fp8"].dtype == "float8_e4m3fn"
+
+    def test_numerics_gate_measures_every_fp8_variant_bit_identical(self):
+        from oasr.tune.build_scaled_mm import candidates, measure_case
+
+        sm = jsm._process_sm()
+        for op in ("scaled_mm_fp8", "scaled_mm_fp8_quant"):
+            res = measure_case(op, 200, 256, 512, sm=sm, issue_cost=False)
+            assert not res.rejected, res.rejected
+            assert set(res.results) == set(candidates(op, sm)) | {jsm.HEURISTIC_ID}

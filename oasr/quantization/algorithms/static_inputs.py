@@ -3,18 +3,19 @@
 """Calibrate static per-tensor input scales for the consumers of GEMM chains.
 
 A :class:`~oasr.quantization.layout.GemmChain` (the FFN's ``w_1`` -> ``w_2``)
-can exchange int8 -- the producer's epilogue quantizing for the consumer, with
-no fp round trip and no quantize launch -- only if the consumer's input scale is
-known before the producer runs.  A per-token scale is not: it needs the whole
-row, which no single output tile of the producer sees.  This algorithm gives
-each chain consumer a static per-tensor scale instead:
+can exchange 8-bit values -- the producer's epilogue quantizing for the
+consumer, with no fp round trip and no quantize launch -- only if the
+consumer's input scale is known before the producer runs.  A per-token scale is
+not: it needs the whole row, which no single output tile of the producer sees.
+This algorithm gives each chain consumer a static per-tensor scale instead:
 
-    input_scale = clip(|x * smooth_inv|) / 127     over the calibration audio
+    input_scale = clip(|x * smooth_inv|) / Q     over the calibration audio
 
-measured on the input the quantize kernel will see -- smoothed by the consumer's
-runtime ``smooth_inv`` when SmoothQuant installed one, so it runs after
-``smoothquant`` in a recipe -- and moves those layers to the ``int8_w8a8_static``
-scheme.  Every other layer keeps its per-token scale.
+(``Q`` = 127 for int8, 448 for fp8 e4m3) measured on the input the quantize
+kernel will see -- smoothed by the consumer's runtime ``smooth_inv`` when
+SmoothQuant installed one, so it runs after ``smoothquant`` in a recipe -- and
+moves those layers to the static scheme of their format (``int8_w8a8_static`` /
+``fp8_w8a8_static``).  Every other layer keeps its per-token scale.
 
 A static scale is batch-invariant (it is a constant), unlike a per-tensor
 *dynamic* one, which the spec refuses.  It is coarser than per-token, and *how*
@@ -29,7 +30,8 @@ maximum (``observer``):
 * ``percentile`` -- the ``percentile``-th percentile of ``|x|`` (two passes:
   the maximum, then a histogram under it);
 * ``mse`` -- the clip minimising the expected quantization error of that
-  histogram: rounding below the clip, saturation above it.
+  histogram: rounding below the clip (int8's uniform step, or fp8's step
+  relative to each value), saturation above it.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from typing import Dict, List, Optional
 import torch
 from torch import nn
 
-from oasr.functionals.quant import INT8_QMAX, QUANT_EPS
+from oasr.functionals.quant import QUANT_EPS
 
 from ..calibration.observers import (
     AbsMaxPerTensor,
@@ -50,9 +52,13 @@ from ..calibration.observers import (
     clip_mse,
     clip_percentile,
 )
+from ..kernels.lanes import w8a8_format
 from ..layout import QuantLayout
-from ..spec import INT8_W8A8_STATIC, QuantGroup, QuantizationSpec
+from ..spec import FP8_W8A8_STATIC, INT8_W8A8_STATIC, QuantGroup, QuantizationSpec
 from .base import ForwardLoop, QuantAlgorithm, register_quant_algorithm
+
+#: Each format's static scheme.
+_STATIC_SCHEME = {"int8": INT8_W8A8_STATIC, "fp8": FP8_W8A8_STATIC}
 
 
 @dataclass(frozen=True)
@@ -94,21 +100,29 @@ class StaticInputs(QuantAlgorithm):
                 "static_inputs has nothing to calibrate"
             )
         targets: List[str] = []
+        formats = set()
         for chain in layout.chains:
             p_scheme, c_scheme = spec.resolve(chain.producer), spec.resolve(chain.consumer)
             if p_scheme is None or c_scheme is None:
                 continue  # a chain with a full-precision end cannot run fused
-            w, a = c_scheme.weights, c_scheme.input_activations
-            if not (w.type == "int" and w.num_bits == 8 and a is not None and a.type == "int"):
+            fmt = w8a8_format(c_scheme)
+            if fmt is None or w8a8_format(p_scheme) != fmt:
                 raise ValueError(
-                    f"static_inputs calibrates int8 activation scales; {chain.consumer} is "
-                    f"quantized with {c_scheme.name or c_scheme}"
+                    "static_inputs calibrates the 8-bit input scale a chained producer "
+                    f"quantizes for; {chain.producer} -> {chain.consumer} is quantized with "
+                    f"{p_scheme.name or p_scheme} -> {c_scheme.name or c_scheme}"
                 )
+            formats.add(fmt)
             targets.append(chain.consumer)
         if not targets:
             raise ValueError(
                 "no GEMM chain has both ends quantized; static_inputs has nothing to do"
             )
+        if len(formats) != 1:
+            raise ValueError(f"static_inputs: the chains mix formats {sorted(formats)}")
+        fmt = formats.pop()
+        static_scheme = _STATIC_SCHEME[fmt]
+        qmax = static_scheme.weights.qmax
 
         modules = dict(model.named_modules())
         amax_obs: Dict[str, Observer] = {p: AbsMaxPerTensor() for p in targets}
@@ -125,12 +139,12 @@ class StaticInputs(QuantAlgorithm):
                 if opts.observer == "percentile":
                     clip[p] = clip_percentile(counts, max(amax[p], QUANT_EPS), opts.percentile)
                 else:
-                    clip[p] = clip_mse(counts, max(amax[p], QUANT_EPS), INT8_QMAX)
+                    clip[p] = clip_mse(counts, max(amax[p], QUANT_EPS), qmax, fmt)
 
         for path in targets:
             c = torch.tensor([max(clip[path], QUANT_EPS)], dtype=torch.float32)
             # Tensor / tensor: an IEEE division, as everywhere in the pinned numerics.
-            scale = c / torch.full_like(c, float(INT8_QMAX))
+            scale = c / torch.full_like(c, qmax)
             module = modules[path]
             if "input_scale" in module._buffers:
                 raise RuntimeError(f"{path} already has an input_scale")
@@ -156,7 +170,7 @@ class StaticInputs(QuantAlgorithm):
                 rest.append(QuantGroup(group.scheme, kept))
         return dataclasses.replace(
             spec,
-            groups=(QuantGroup(INT8_W8A8_STATIC, tuple(targets)),) + tuple(rest),
+            groups=(QuantGroup(static_scheme, tuple(targets)),) + tuple(rest),
             producer=producer,
         )
 

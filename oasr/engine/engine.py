@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import queue
 import threading
@@ -1463,7 +1464,7 @@ class ASREngine:
         sm = _get_target_sm()
 
         def covered(p) -> bool:
-            # The census records a quantized layer's int8 GEMM as its own family.
+            # The census records a quantized layer's 8-bit GEMM as its own family.
             if p.op in jsm.SCALED_MM_OPS:
                 return jsm.covering_tier(p.op, p.M, p.N, p.K, sm) is not None
             return jg.covering_tier(p.op, p.M, p.N, p.K, p.dtype, sm) is not None
@@ -1480,7 +1481,12 @@ class ASREngine:
 
             deadline = time.monotonic() + float(tc.budget_s)
             built = False
-            for family, build in (("gemm", build_gemm), ("scaled_mm", build_scaled_mm)):
+            builders = (
+                ("gemm", build_gemm),
+                ("scaled_mm", build_scaled_mm),
+                ("scaled_mm_fp8", functools.partial(build_scaled_mm, fmt="fp8")),
+            )
+            for family, build in builders:
                 sigs = {p.sig for p in missing if kernel_family(p.op) == family}
                 if not sigs:
                     continue
@@ -1494,7 +1500,7 @@ class ASREngine:
                     dict(ss.provenance),
                 )
                 base = database.load_file(path, family, sm) if path.is_file() else None
-                budget = max(0.0, deadline - time.monotonic())  # one budget for both families
+                budget = max(0.0, deadline - time.monotonic())  # one budget for every family
                 logger.info(
                     "tuning %d uncovered %s signature(s) within %.0f s before capture",
                     len(sigs),
@@ -1567,27 +1573,32 @@ class ASREngine:
         """Which tuning tier served this process's kernel selections, and what missed.
 
         The tier counts are process-wide, so a full-precision model's report
-        leaves the int8 ``scaled_mm`` family out (another engine in the process
-        may have resolved some); a quantized model's adds one line on how its
-        quantized layers pick their tile (:meth:`_quantized_tuning_note`).
+        leaves the 8-bit ``scaled_mm`` / ``scaled_mm_fp8`` families out (another
+        engine in the process may have resolved some); a quantized model's adds
+        one line on how its quantized layers pick their tile
+        (:meth:`_quantized_tuning_note`).
         """
+        import oasr.jit.scaled_mm as jsm
         from oasr.jit.gemm import rule_miss_report
         from oasr.tune.database import KERNEL_FAMILIES, tuning_report
 
         note = self._quantized_tuning_note()
-        families = None if note is not None else [f for f in KERNEL_FAMILIES if f != "scaled_mm"]
+        quant_families = set(jsm.TUNING_FAMILY.values())
+        families = (
+            None if note is not None else [f for f in KERNEL_FAMILIES if f not in quant_families]
+        )
         report = tuning_report(families) + "\n" + rule_miss_report()
         return report if note is None else report + "\n" + note
 
     def _quantized_tuning_note(self) -> Optional[str]:
-        """How the quantized layers' int8 GEMMs pick their tile, as one line (``None``: fp model).
+        """How the quantized layers' 8-bit GEMMs pick their tile, as one line (``None``: fp model).
 
-        Per layer, the tuning tier with an entry for its ``scaled_mm`` signature
-        (``scaled_mm`` or, for a layer that quantizes its output for the next
-        GEMM, ``scaled_mm_quant``; N, K) -- which the census records and ``oasr
-        tune build`` measures -- else the shape heuristic.  A layer not on the
-        int8 CUTLASS lane (the torch reference, ``torch._int_mm``) has no tile to
-        pick and is counted apart.
+        Per layer, the tuning tier with an entry for its scaled_mm signature (the
+        format's fp-output op or, for a layer that quantizes its output for the
+        next GEMM, its quantizing op; N, K) -- which the census records and ``oasr
+        tune build`` measures -- else the shape heuristic.  A layer not on a
+        CUTLASS lane (the torch reference, ``torch._int_mm``, ``torch._scaled_mm``)
+        has no tile to pick and is counted apart.
         """
         from collections import Counter
 
@@ -1607,7 +1618,8 @@ class ASREngine:
             if lane is None or getattr(lane, "backend", None) != "cutlass":
                 other += 1
                 continue
-            op = "scaled_mm_quant" if getattr(method, "emit", None) is not None else "scaled_mm"
+            ops = jsm.FORMAT_OPS[getattr(method, "fmt", None) or "int8"]
+            op = ops[1] if getattr(method, "emit", None) is not None else ops[0]
             n, k = int(layer.out_features), int(layer.in_features)
             sigs.add((op, n, k))
             by_tier[jsm.signature_tier(op, n, k) or "heuristic"] += 1
@@ -1619,7 +1631,7 @@ class ASREngine:
             + f", {by_tier['heuristic']} on the shape heuristic"
         )
         if other:
-            line += f", {other} not on the int8 kernel"
+            line += f", {other} not on a CUTLASS scaled_mm lane"
         return line
 
     def export_tuning_misses(self, path: str) -> int:

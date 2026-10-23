@@ -4,6 +4,11 @@
 
 K and V use separate contiguous tensors because the cache kernel consumes a
 ``(blocks, block_size, heads, head_dim)`` view per layer.
+
+A pool whose ``CacheConfig.dtype`` is ``torch.float8_e4m3fn`` is a **quantized**
+KV cache (an AR decoder's, ``EngineConfig.quantization.kv_cache``): beside the
+fp8 K and V it holds one fp32 scale per ``(block, slot, head)``, laid out like
+the data without its head dim.
 """
 
 from __future__ import annotations
@@ -46,6 +51,17 @@ class BlockPool:
         )
         self._k_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
         self._v_pool = torch.zeros(*pool_shape, dtype=cfg.dtype, device=cfg.device)
+        # Zeroed like the data: a masked column must still dequantize to
+        # something finite, and ``0 * 0`` is.
+        self._k_scale_pool: "torch.Tensor | None" = None
+        self._v_scale_pool: "torch.Tensor | None" = None
+        if self.quantized:
+            self._k_scale_pool = torch.zeros(
+                *pool_shape[:-1], dtype=torch.float32, device=cfg.device
+            )
+            self._v_scale_pool = torch.zeros(
+                *pool_shape[:-1], dtype=torch.float32, device=cfg.device
+            )
         self._scratch_ids: List[int] = list(
             range(cfg.max_num_blocks, cfg.max_num_blocks + int(scratch_blocks))
         )
@@ -67,6 +83,11 @@ class BlockPool:
     def config(self) -> CacheConfig:
         """The pool's cache configuration (geometry, device, dtype)."""
         return self._config
+
+    @property
+    def quantized(self) -> bool:
+        """Whether this pool stores fp8 K/V with per-(slot, head) scales."""
+        return self._config.dtype == torch.float8_e4m3fn
 
     @property
     def num_blocks(self) -> int:
@@ -184,6 +205,9 @@ class BlockPool:
         )
         self._k_pool.index_copy_(1, idx, zeros)
         self._v_pool.index_copy_(1, idx, zeros)
+        if self._k_scale_pool is not None and self._v_scale_pool is not None:
+            self._k_scale_pool.index_fill_(1, idx, 0.0)
+            self._v_scale_pool.index_fill_(1, idx, 0.0)
 
     # ------------------------------------------------------------------
     # Tensor access
@@ -207,6 +231,16 @@ class BlockPool:
             Views into ``_k_pool[layer]`` and ``_v_pool[layer]``.
         """
         return self._k_pool[layer], self._v_pool[layer]
+
+    def get_kv_scale_view(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero-copy ``(num_blocks, block_size_frames, n_kv_head)`` fp32 scale views.
+
+        Only a quantized pool has them; asking an fp16/bf16 pool raises rather
+        than inventing unit scales.
+        """
+        if self._k_scale_pool is None or self._v_scale_pool is None:
+            raise RuntimeError(f"a {self._config.dtype} KV pool has no scales")
+        return self._k_scale_pool[layer], self._v_scale_pool[layer]
 
     def get_kv_block_view(self, layer: int, block_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return direct views into K and V slabs for one layer and block.

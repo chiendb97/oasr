@@ -121,6 +121,7 @@ class TestJitInfrastructure:
             "transducer",
             "quant",
             "scaled_mm",
+            "kv_quant",
         }
         assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
         # Not `len(specs) == len(expected)`: three families contribute one spec
@@ -130,10 +131,20 @@ class TestJitInfrastructure:
         # function of which architecture this box is.
         # Pin the *extras* by what they are instead of by how many there are.
         per_cell = ("fmha_", "gated_mlp_", "recurrent_step_")
+        # The fp8 scaled GEMM exists only where its lane does (sm89+).
+        per_arch = {"scaled_mm_fp8"}
         extras = [n for n in names if n not in expected]
-        unknown = [n for n in extras if not n.startswith(per_cell)]
+        unknown = [n for n in extras if not n.startswith(per_cell) and n not in per_arch]
         assert not unknown, f"unexpected AOT modules: {unknown}"
         assert len(names) == len(set(names)), f"duplicate AOT specs: {names}"
+
+    def test_the_fp8_scaled_gemm_is_registered_where_its_lane_serves_the_arch(self):
+        from oasr.aot import gen_all_modules
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.scaled_mm import lane_available
+
+        names = {s.name for s in gen_all_modules()}
+        assert ("scaled_mm_fp8" in names) == lane_available(_get_target_sm(), "fp8")
 
     def test_attention_cells_are_registered_where_the_lane_serves_the_arch(self):
         """An AOT set that skips attention means every engine JITs it at load.

@@ -219,6 +219,89 @@ constexpr FmhaTile fmhaResolveTile(int sm, int head_dim, int head_dim_v, int ele
     return FmhaTile{false, 0, 0, 0, 0, false, 0};
 }
 
+// ---------------------------------------------------------------------------
+// FP8 KV (`KvFp8` variants)
+// ---------------------------------------------------------------------------
+
+//! fp8 elements in one 128-bit cp.async -- the K/V load granularity of the fp8 lane.
+inline constexpr int kFmhaKv8ElemsPerLoad = 16;
+
+/*! \brief Shared memory one fp8-KV tile needs, in bytes.
+ *
+ * The K and V rings hold the **fp8** bytes, so a stage costs half what it does
+ * in the served dtype; one extra served-dtype tile holds the dequantized K, then
+ * V, of the stage being consumed (`fmha_kv8.h`); and each stage carries one fp32
+ * scale per row for K and for V.  The epilogue's `sO` overlays the two rings,
+ * so the same padding rule as `fmhaSmemBytes` applies to them.
+ */
+constexpr int fmhaSmemBytesKv8(int block_m, int block_n, int head_dim_q, int head_dim_v,
+                               int num_stages, int elem_size) {
+    int const q = block_m * head_dim_q * elem_size;
+    int const k8 = block_n * head_dim_q * num_stages;
+    int const v8 = block_n * head_dim_v * num_stages;
+    int const wide = head_dim_q > head_dim_v ? head_dim_q : head_dim_v;
+    int const tile = block_n * wide * elem_size;
+    int const scales = 2 * num_stages * block_n * 4;
+    int const o = block_m * head_dim_v * elem_size;
+    int const mainloop = q + k8 + v8 + tile + scales;
+    int const pad = (o - v8 - k8) > 0 ? (o - v8 - k8) : 0;
+    int const with_pad = mainloop + pad;
+    return with_pad > o ? with_pad : o;
+}
+
+/*! \brief Can the fp8 gather cover a `(block_n, head_dim)` tile exactly?
+ *
+ * One thread loads 16 fp8 values per cp.async, so a padded row is
+ * `head_dim / 16` threads wide and 128 threads cover `2048 / head_dim` rows per
+ * pass.  The thread count must divide into whole rows, and the K tile into
+ * whole passes -- otherwise two threads would write one smem chunk (the
+ * head_dim-32 WAW race `fmha_paged_kv.h` records) or a chunk would be left
+ * unwritten.  True for padded head dims 32, 64, 128 and 256.
+ */
+constexpr bool fmhaKv8Covers(int block_n, int head_dim, int num_threads) {
+    if (head_dim % kFmhaKv8ElemsPerLoad != 0) {
+        return false;
+    }
+    int const threads_per_row = head_dim / kFmhaKv8ElemsPerLoad;
+    if (num_threads % threads_per_row != 0) {
+        return false;
+    }
+    int const rows_per_pass = num_threads / threads_per_row;
+    return rows_per_pass > 0 && block_n % rows_per_pass == 0;
+}
+
+/*! \brief `fmhaResolveTile` for the fp8-KV variants.
+ *
+ * Same ladder, same order -- widest K tile at the deepest ring that fits -- so
+ * a head dim lands on the same `block_n` as its served-dtype twin whenever the
+ * budget allows, which is what keeps the fp8 kernel bit-identical to the fp16
+ * one fed the dequantized cache (the split count and the online-softmax tiling
+ * both follow `block_n`).
+ */
+constexpr FmhaTile fmhaResolveTileKv8(int sm, int head_dim, int head_dim_v, int elem_size) {
+    constexpr int kNumWarps = 4;
+    constexpr int kBlockM = 64;
+    int const budget = fmhaSmemBudget(sm);
+    if (budget <= 0 || head_dim <= 0 || elem_size <= 0 || head_dim != head_dim_v) {
+        return FmhaTile{false, 0, 0, 0, 0, false, 0};
+    }
+    int const max_stages = FmhaArch<80>::kMaxStages;
+    for (int i = 0; i < int(sizeof(kFmhaNBlockLadder) / sizeof(int)); ++i) {
+        int const block_n = kFmhaNBlockLadder[i];
+        if (!fmhaKv8Covers(block_n, head_dim, kNumWarps * 32)) {
+            continue;
+        }
+        for (int stages = max_stages; stages >= 1; --stages) {
+            int const bytes =
+                fmhaSmemBytesKv8(kBlockM, block_n, head_dim, head_dim_v, stages, elem_size);
+            if (bytes <= budget) {
+                return FmhaTile{true, kBlockM, block_n, kNumWarps, stages, false, bytes};
+            }
+        }
+    }
+    return FmhaTile{false, 0, 0, 0, 0, false, 0};
+}
+
 /*! \brief `fmhaResolveTile` taking a *raw* head dim, padding it first. */
 constexpr FmhaTile fmhaResolveTileRaw(int sm, int head_dim_raw, int elem_size) {
     int const d = fmhaPaddedHeadDim(head_dim_raw);

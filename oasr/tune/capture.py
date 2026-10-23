@@ -41,13 +41,18 @@ _PATCH_NAMES = ("gemm", "gemm_activation", "bmm", "group_gemm", "gemm_log_softma
 # from the explicit arguments rather than from operand geometry.
 _MODULE_PATCH_NAMES = _PATCH_NAMES
 
-# The int8 W8A8 GEMM of a quantized layer (``oasr.tune`` family ``scaled_mm``).
-# The kernel lanes call ``oasr.functionals.scaled_mm.scaled_mm`` /
-# ``.scaled_mm_quant`` through the module at call time, so patching the module
-# attributes is what the census sees; ``oasr.scaled_mm`` is the exported name
-# (``scaled_mm_quant`` is not exported).  ``a`` is int8 ``[..., K]`` and ``b``
-# the ``[N, K]`` weight, as for ``gemm``; the recorded dtype is ``"int8"``.
+# The 8-bit W8A8 GEMM of a quantized layer (``oasr.tune`` families ``scaled_mm``
+# and ``scaled_mm_fp8``).  The kernel lanes call
+# ``oasr.functionals.scaled_mm.scaled_mm`` / ``.scaled_mm_quant`` through the
+# module at call time, so patching the module attributes is what the census
+# sees; ``oasr.scaled_mm`` is the exported name (``scaled_mm_quant`` is not
+# exported).  ``a`` is 8-bit ``[..., K]`` and ``b`` the ``[N, K]`` weight, as for
+# ``gemm``; the recorded dtype is ``"int8"`` or ``"float8_e4m3fn"``, and an fp8
+# call is recorded under the fp8 op (``scaled_mm_fp8`` / ``scaled_mm_fp8_quant``).
 SCALED_MM_PATCH_NAMES = ("scaled_mm", "scaled_mm_quant")
+
+#: The op an fp8-operand call to a patched scaled_mm entry is recorded as.
+_FP8_OP = {"scaled_mm": "scaled_mm_fp8", "scaled_mm_quant": "scaled_mm_fp8_quant"}
 
 _DISPATCH_PATCH_SPECS = {
     # name: (index of N, index of K, index of M) in the positional signature
@@ -207,7 +212,10 @@ def _make_wrapper(rec, op_name, fn):
                 if shp is not None:
                     A = _operand(args, kwargs, 0, "A", "a")
                     M, N, K, batch = shp
-                    rec.record(op_name, M, N, K, _dtype_str(A.dtype), batch)
+                    op = op_name
+                    if op_name in _FP8_OP and _dtype_str(A.dtype) == "float8_e4m3fn":
+                        op = _FP8_OP[op_name]
+                    rec.record(op, M, N, K, _dtype_str(A.dtype), batch)
             return fn(*args, **kwargs)
 
     return wrapper
@@ -240,8 +248,9 @@ def _make_dispatch_wrapper(rec, op_name, fn, idx):
 def capture_gemm_shapes(recorder: Optional[GemmShapeRecorder] = None):
     """Monkeypatch the OASR functional GEMM entries to record shapes for the block.
 
-    Covers the int8 ``scaled_mm`` / ``scaled_mm_quant`` of quantized layers too
-    (recorded with dtype ``"int8"``), so a census of a quantized model sees them.
+    Covers the 8-bit ``scaled_mm`` / ``scaled_mm_quant`` of quantized layers too
+    (recorded with dtype ``"int8"``, or under the fp8 ops with dtype
+    ``"float8_e4m3fn"``), so a census of a quantized model sees them.
     """
     import oasr
     import oasr.functionals.gemm as _fg

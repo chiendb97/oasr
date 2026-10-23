@@ -38,7 +38,7 @@ Python functional API (oasr/<family>.py)  — @oasr_api decorated
 | `include/oasr/attention/` | The CuTe fused multi-head attention (`fmha_*.h`, `cutlass_fmha_configs.h`) |
 | `include/oasr/mlp/` | The CuTe fused gated MLP (`gated_mlp_*.h`, `cutlass_gated_mlp_configs.h`) |
 | `include/oasr/gemm/` | `gemm.cuh` facade, `bmm.cuh`, `group_gemm.cuh` |
-| `include/oasr/quant/`, `include/oasr/scaled_mm/` | Per-token int8 activation quantization (`quantize.cuh`; pinned numerics, bit-exact with its torch twin) and the int8 scaled GEMM: CUTLASS 2.x int8 `mma.sync` with an Sm80 EVT epilogue that dequantizes (per-token × per-channel), adds the bias and applies the activation — in the three-header layout. See [quantization.md](quantization.md) |
+| `include/oasr/quant/`, `include/oasr/scaled_mm/` | Per-token and static 8-bit activation quantization, int8 and fp8 e4m3 (`quantize.cuh`'s `QuantTraits`; pinned numerics, bit-exact with the torch twins) and the 8-bit scaled GEMM: CUTLASS 2.x int8 `mma.sync` (int32 accumulator) or Ada e4m3 `mma.sync` (fp32, fast accumulation, one summation order for every tile) with an Sm80 EVT epilogue that dequantizes (per-token × per-channel), adds the bias and applies the activation — in the three-header layout, one JIT module per format. See [quantization.md](quantization.md) |
 | `include/oasr/{softmax,topk,fft,features}.cuh`, `sort/` | The remaining families |
 | `include/oasr/ctc_decoder.cuh`, `include/oasr/wfst/` | GPU decoder kernels |
 | `csrc/<family>.cu` | TVM-FFI launcher |
@@ -338,8 +338,9 @@ object.
 
 `layer_norm_quant` and `add_layer_norm_residual_quant` (`oasr/functionals/norm.py`)
 are LayerNorm and the fused add + LayerNorm with residual passthrough, emitting
-the normalized output as per-token int8 plus one fp32 scale per row for an int8
-GEMM consumer ([quantization.md](quantization.md)). That replaces two launches
+the normalized output as per-token int8 (or fp8 e4m3, by the output tensor's
+dtype -- a runtime flag in the store, not a second instantiation) plus one fp32
+scale per row for an 8-bit GEMM consumer ([quantization.md](quantization.md)). That replaces two launches
 (the norm storing T, then `quantize_per_token` reading it back) with one. The
 contract is **bit-exactness with that pair**, `torch.equal` on `q`, `scale` and
 `residual_out`:
@@ -721,6 +722,49 @@ Two implementation notes, because nothing in the C++ says them:
   one-tile-ahead register prefetch was built and measured: it bought 3–4% on
   streaming chunks and cost up to 6% on interior 2–4-tile CTAs, including a
   realistic Conformer batch, so it is not shipped (`fmha_bias.h`).
+
+#### FP8 KV variants (`fmha_kv8.h`)
+
+An autoregressive decoder's KV cache can be stored as `float8_e4m3fn` with one
+fp32 scale per `(token, kv-head)` (`EngineConfig.quantization.kv_cache =
+"fp8_e4m3"`; see [cache_manager.md](cache_manager.md#106-fp8-kv-for-the-ar-decoders)).  `oasr.fmha`
+reads such a cache when `k`/`v` are fp8 and `k_scale`/`v_scale` are given:
+
+- **Dequantized in shared memory, inside the tile loop.** `mma.sync` has no
+  fp16 x fp8 shape and quantizing Q to use the e4m3 MMA would spend the
+  precision the format keeps, so the cp.async ring carries the fp8 bytes (and
+  each row's scale, in the same commit group) and every stage is converted into
+  one served-dtype tile right before the gemm that reads it -- K, then V, one
+  tile for both.  Each thread converts the 16-byte chunks it issued itself, so
+  only the scales need the barrier the ring already takes; the conversion costs
+  one extra `__syncthreads` per gemm.  Nothing past the conversion changes.
+- **Bit-identical to the served-dtype kernel on the dequantized cache.** The
+  scales are powers of two (`include/oasr/kv_quant/kv_quant.cuh`), so `q * scale`
+  rounded to fp16/bf16 is exact, and `fmhaResolveTileKv8` walks the same ladder
+  as `fmhaResolveTile`, so a shipped head dim lands on the same K tile (the split
+  count and the online-softmax tiling both follow it).  `tests/kernels/
+  test_fmha_kv8.py` holds the lane to that at `atol=0`, dense and paged.
+- **Own cell, own variants.** `fmha_kv8_sm{SM}_{dtype}_d{D}` -- dense / paged x
+  unsplit / split, rendered from `csrc/templates/fmha_kv8_template.cu.jinja` --
+  so a process that never reads fp8 never compiles it.  Rendered for unmasked,
+  bias-free reads only (a decode step, a cross-attention read): a prefill attends
+  its own fresh K/V in the served dtype, so causal / windowed / biased fp8 reads
+  have no caller, and asking for one raises with the reason
+  (`oasr.jit.attention.fmha_kv8_refusal`), as does a padded head dim the 16-byte
+  gather cannot tile exactly (it covers padded 32 / 64 / 128 / 256).
+- **Routing is a declared rule** (`fmha_kv8_backend`): fp8 goes to this lane
+  under `auto` and `cxx`; `OASR_ATTN_BACKEND=cute` raises (that lane cannot read
+  fp8) and `sdpa` runs the dequantizing reference, which is also what CPU and an
+  fp32 query get.  The engine refuses `kv_cache` under `cute` / `sdpa`.
+
+Measured on an RTX 5090, graph-replayed decode steps (median of 15
+interleaved rounds): Whisper-large-v3 cross-attention, B16 x H20 x 1500 keys,
+**51 us vs 82 us** fp16 (1.61x); Qwen2-Audio-7B self-attention, B16 x H32 x ~800
+keys, d128, bf16, 114 us vs 120-126 us (1.05-1.10x); at B4 the same step is
+34 us vs 26-27 us (0.78x) -- with little K/V to read, the in-smem conversion is
+the critical path.  The quantize-and-scatter that writes the cache
+(`oasr.functionals.kv_quant.quantize_kv_store`) is one launch for K and V per
+layer, replacing the two `index_put_` the fp16 path issues.
 
 ### The C++ gated-MLP kernel (`include/oasr/mlp/`)
 

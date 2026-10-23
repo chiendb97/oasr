@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 import oasr
 
+from ._backend import use_gemm_log_softmax_kernel
+
 
 class CtcProjection(nn.Module):
     """Fused CTC projection: ``log_softmax(x @ weight.T + bias)``.
@@ -48,9 +50,10 @@ class CtcProjection(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(*, in_features)`` → ``log_softmax`` over ``(*, out_features)``."""
-        if not x.is_cuda:
-            # Out of scope for the kernel (a CPU tensor): the torch path, so a
-            # CTC model also runs on CPU, as every waist layer must.
+        if not use_gemm_log_softmax_kernel(x):
+            # Out of scope for the kernel (a CPU tensor, fp32 -- the calibration
+            # master runs fp32 on CUDA -- or the torch override): the torch path,
+            # so a CTC model runs wherever every other waist layer does.
             return F.log_softmax(F.linear(x, self.weight, self.bias), dim=-1)
         return oasr.gemm_log_softmax(x, self.weight, self.bias)
 

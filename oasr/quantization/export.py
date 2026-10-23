@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import torch
 from torch import nn
@@ -110,8 +110,18 @@ def quantize_checkpoint(
     architecture: Optional[str] = None,
     checkpoint_name: str = "final.pt",
     device: str = "cuda",
+    calibration_dtype: Optional[str] = None,
 ) -> Path:
-    """``oasr quantize``: write a quantized native checkpoint of *src* at *dst*."""
+    """``oasr quantize``: write a quantized native checkpoint of *src* at *dst*.
+
+    ``calibration_dtype`` (``"bfloat16"`` / ``"float16"``) keeps the fp32 master
+    on the host and runs the calibration audio through a copy of it in that dtype
+    on *device* (:func:`mirrored_forward_loop`): the statistics are taken in the
+    reduced precision, every scale, fold and weight quantization stays fp32 on the
+    host.  It is what lets a model whose fp32 master does not fit the device -- an
+    8B speech LLM is 33.6 GB -- be calibrated at all.  ``None`` / ``"float32"``
+    calibrates the fp32 master itself on *device*.
+    """
     from oasr.checkpoints.native import save_native
     from oasr.models.registry import load_checkpoint_bundle, materialize_model
 
@@ -121,14 +131,20 @@ def quantize_checkpoint(
     )
     if getattr(bundle, "quantization", None) is not None:
         raise ValueError(f"{src} is already a quantized checkpoint")
+    calib_dtype = _calibration_dtype(calibration_dtype)
     # The fp32 master, on the host, through the shared load sequence (legacy
-    # remaps and padding included); then onto the calibration device in fp32.
+    # remaps and padding included); then onto the calibration device in fp32 --
+    # or left on the host, with a reduced-precision twin on the device.
     model, config, _report = materialize_model(arch, bundle)
-    model = model.to(device)
+    needs_audio = any(build_algorithm(a).needs_calibration for a in rec.algorithms)
+    twin: Optional[nn.Module] = None
+    if calib_dtype == torch.float32 or not needs_audio:
+        model = model.to(device)
+    else:
+        twin, _, _ = materialize_model(arch, bundle, device=device, dtype=calib_dtype)
 
     forward_loop = None
     producer: Dict[str, Any] = {"source": Path(src).name, "torch": torch.__version__}
-    needs_audio = any(build_algorithm(a).needs_calibration for a in rec.algorithms)
     if needs_audio:
         if calib_manifest is None:
             raise ValueError(f"recipe {recipe!r} needs --calib-manifest")
@@ -138,8 +154,13 @@ def quantize_checkpoint(
             Path(calib_manifest), Path(audio_root) if audio_root else None, calib_utterances
         )
         frontend = CheckpointFrontend(bundle.features, torch.device(device))
-        forward_loop = asr_forward_loop(calibration, frontend)
-        producer["calibration"] = calibration.provenance
+        forward_loop = asr_forward_loop(calibration, frontend, _calibration_tokenizer(bundle))
+        if twin is not None:
+            forward_loop = mirrored_forward_loop(forward_loop, twin)
+        producer["calibration"] = {
+            **calibration.provenance,
+            "dtype": str(calib_dtype).replace("torch.", ""),
+        }
 
     spec = quantize_model(
         model,
@@ -149,6 +170,7 @@ def quantize_checkpoint(
         ignore=ignore,
         producer=producer,
     )
+    del twin, forward_loop
     model = model.to("cpu")
     out = save_native(
         Path(dst),
@@ -173,4 +195,87 @@ def quantize_checkpoint(
     return out
 
 
-__all__ = ["REPORT_NAME", "layer_report", "quantize_checkpoint", "quantize_model"]
+def _calibration_dtype(name: Optional[str]) -> torch.dtype:
+    if name is None:
+        return torch.float32
+    dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    dtype = dtypes.get(str(name).replace("torch.", ""))
+    if dtype is None:
+        raise ValueError(f"calibration dtype must be one of {sorted(dtypes)}, got {name!r}")
+    return dtype
+
+
+def _calibration_tokenizer(bundle: Any) -> Any:
+    """The checkpoint's tokenizer, for a decoder whose calibration prompt is text."""
+    spec = getattr(bundle, "tokenizer", None)
+    if spec is None:
+        return None
+    from oasr.tokenizers import build_tokenizer
+
+    try:
+        return build_tokenizer(spec)
+    except Exception as exc:  # noqa: BLE001 - only a text-prompted decoder needs it
+        logger.warning("calibration runs without the checkpoint's tokenizer: %s", exc)
+        return None
+
+
+def mirrored_forward_loop(forward_loop: ForwardLoop, twin: nn.Module) -> ForwardLoop:
+    """Run *forward_loop* on *twin* whenever an algorithm asks to run it on the master.
+
+    An algorithm hooks the master's modules and calls ``forward_loop(master)``;
+    this copies the master's current parameters and buffers into the twin (cast to
+    its dtype and device, so every fold applied so far is in the activations the
+    hooks see), mirrors the master's forward hooks onto the twin's modules at the
+    same paths, and runs the loop there.  The hooks are the algorithm's own
+    closures, so their statistics land where the algorithm reads them.
+    """
+
+    def loop(master: nn.Module) -> None:
+        _copy_state(master, twin)
+        handles = _mirror_hooks(master, twin)
+        try:
+            forward_loop(twin)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    return loop
+
+
+@torch.no_grad()
+def _copy_state(master: nn.Module, twin: nn.Module) -> None:
+    targets: Dict[str, torch.Tensor] = dict(twin.named_parameters())
+    targets.update(dict(twin.named_buffers()))
+    for name, tensor in [*master.named_parameters(), *master.named_buffers()]:
+        target = targets.get(name)
+        if target is None or not tensor.is_floating_point() or target.shape != tensor.shape:
+            continue  # an algorithm's own buffers (smooth_inv): read off the master
+        target.copy_(tensor)
+
+
+def _mirror_hooks(master: nn.Module, twin: nn.Module) -> List[Any]:
+    twin_modules = dict(twin.named_modules())
+    handles: List[Any] = []
+    for path, module in master.named_modules():
+        pre, post = module._forward_pre_hooks, module._forward_hooks
+        if not pre and not post:
+            continue
+        target = twin_modules.get(path)
+        if target is None:
+            raise RuntimeError(f"calibration twin has no module {path!r} to mirror hooks onto")
+        for key, hook in pre.items():
+            kwargs = key in module._forward_pre_hooks_with_kwargs
+            handles.append(target.register_forward_pre_hook(hook, with_kwargs=kwargs))
+        for key, hook in post.items():
+            kwargs = key in module._forward_hooks_with_kwargs
+            handles.append(target.register_forward_hook(hook, with_kwargs=kwargs))
+    return handles
+
+
+__all__ = [
+    "REPORT_NAME",
+    "layer_report",
+    "mirrored_forward_loop",
+    "quantize_checkpoint",
+    "quantize_model",
+]

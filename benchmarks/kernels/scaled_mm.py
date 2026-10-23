@@ -1,9 +1,10 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""The int8 scaled GEMM -- ``oasr/functionals/scaled_mm.py``.
+"""The 8-bit scaled GEMM -- ``oasr/functionals/scaled_mm.py``.
 
-``out = act(a_scale[m] * b_scale[n] * (a @ bᵀ)[m, n] + bias[n])`` with int8
-per-token activations and int8 per-channel weights.  Three subroutines:
+``out = act(a_scale[m] * b_scale[n] * (a @ bᵀ)[m, n] + bias[n])`` with 8-bit
+per-token activations and 8-bit per-channel weights.  Five subroutines, the
+int8 ones first:
 
 ``scaled_mm``
     The GEMM alone, operands quantized ahead of time.  What the kernel costs.
@@ -16,6 +17,11 @@ per-token activations and int8 per-channel weights.  Three subroutines:
     fused chain (``scaled_mm_quant`` quantizes ``w_1``'s output at ``w_2``'s
     static scale; no fp intermediate, no second quantize), ``dynamic`` the
     unfused per-token path it replaces, ``fp16`` the two half-precision GEMMs.
+``scaled_mm_fp8`` / ``quant_scaled_mm_fp8``
+    The same two measurements in fp8 e4m3 (sm89+): ``cutlass`` is the Sm89 fp8
+    lane, ``torch`` the ``torch._scaled_mm`` lane (``TorchScaledMMLane``), the
+    oracle the fp8 reference.  An fp8 GEMM sums in fp32, so its tolerance adds
+    that accumulation's rounding to the output ulp.
 
 Arms:
 
@@ -58,7 +64,10 @@ from benchmarks.core.metrics import gemm_flops
 from oasr.functionals.quant import reference_quantize_per_token
 from oasr.functionals.scaled_mm import activation_id, reference_scaled_mm
 
-SUBROUTINES = ["scaled_mm", "quant_scaled_mm", "ffn_chain"]
+SUBROUTINES = ["scaled_mm", "quant_scaled_mm", "ffn_chain", "scaled_mm_fp8", "quant_scaled_mm_fp8"]
+
+#: The fp8 e4m3 subroutines.
+_FP8_SUBROUTINES = ("scaled_mm_fp8", "quant_scaled_mm_fp8")
 
 #: The comparison is int8 against half precision on the same allocator state.
 INTERLEAVE = True
@@ -87,6 +96,9 @@ TOLERANCES = {
     # (``tests/quantization/test_quant_fusion.py``); this bounds the twin.
     ("ffn_chain", torch.float16): (1e-2, 1e-2),
     ("ffn_chain", torch.bfloat16): (1e-2, 1e-2),
+    # fp8 sums in fp32 against the reference's exact sum: an ulp plus that rounding.
+    **{(sub, torch.float16): (4e-3, 4e-3) for sub in _FP8_SUBROUTINES},
+    **{(sub, torch.bfloat16): (1.6e-2, 1.6e-2) for sub in _FP8_SUBROUTINES},
 }
 
 #: The output dtypes the kernel writes.
@@ -116,6 +128,8 @@ _CONFORMER: List[Dict[str, Any]] = [
 DEFAULT_CONFIGS: Dict[str, List[Dict[str, Any]]] = {
     "scaled_mm": _CONFORMER,
     "quant_scaled_mm": _CONFORMER,
+    "scaled_mm_fp8": _CONFORMER,
+    "quant_scaled_mm_fp8": _CONFORMER,
     # Conformer-base FFN: width 256, FFN 2048, swish.
     "ffn_chain": [_cfg(m, 256, 2048, "swish") for m in (16, 256, 2048, 16384)],
 }
@@ -189,6 +203,8 @@ def build_fns(
 
     if subroutine == "ffn_chain":
         return _ffn_chain_fns(cfg, dtype)
+    if subroutine in _FP8_SUBROUTINES:
+        return _fp8_fns(subroutine, x, w, bias, act, dtype, out, fp16)
 
     if subroutine == "scaled_mm":
         a_q, a_scale = oasr.quantize_per_token(x)
@@ -216,6 +232,56 @@ def build_fns(
 
     def reference() -> torch.Tensor:
         q, s = reference_quantize_per_token(x)
+        return reference_scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype)
+
+    return {"cutlass": cutlass, "torch": torch_lane, "fp16": fp16, "reference": reference}
+
+
+def _fp8_fns(
+    subroutine: str,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    act: Optional[str],
+    dtype: torch.dtype,
+    out: torch.Tensor,
+    fp16: Callable[[], Any],
+) -> Dict[str, Callable[[], Any]]:
+    from oasr.quantization.kernels import TorchScaledMMLane
+
+    major, minor = torch.cuda.get_device_capability()
+    if major * 10 + minor < 89:
+        raise ValueError(f"{subroutine}: fp8 tensor cores need sm89+")
+    fp8 = torch.float8_e4m3fn
+    w_q, w_scale = reference_quantize_per_token(w, dtype=fp8)
+    lane = TorchScaledMMLane()
+    if subroutine == "scaled_mm_fp8":
+        a_q, a_scale = oasr.quantize_per_token(x, dtype=fp8)
+        return {
+            "cutlass": lambda: oasr.scaled_mm(
+                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out
+            ),
+            "torch": lambda: lane.run(a_q, w_q, a_scale, w_scale, bias, act, dtype),
+            "fp16": fp16,
+            "reference": lambda: reference_scaled_mm(
+                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype
+            ),
+        }
+
+    M, K = x.shape
+    q_buf = torch.empty(M, K, device="cuda", dtype=fp8)
+    s_buf = torch.empty(M, device="cuda", dtype=torch.float32)
+
+    def cutlass() -> torch.Tensor:
+        q, s = oasr.quantize_per_token(x, out=q_buf, scale=s_buf)
+        return oasr.scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype, out=out)
+
+    def torch_lane() -> torch.Tensor:
+        q, s = oasr.quantize_per_token(x, out=q_buf, scale=s_buf)
+        return lane.run(q, w_q, s, w_scale, bias, act, dtype)
+
+    def reference() -> torch.Tensor:
+        q, s = reference_quantize_per_token(x, dtype=fp8)
         return reference_scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype)
 
     return {"cutlass": cutlass, "torch": torch_lane, "fp16": fp16, "reference": reference}

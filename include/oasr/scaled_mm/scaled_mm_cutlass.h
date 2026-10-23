@@ -1,7 +1,7 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Dispatch for the int8 scaled GEMM: runtime activation id -> the epilogue
+// Dispatch for the scaled GEMM: runtime activation id -> the epilogue
 // instantiation.  The tile config, the K decomposition (data-parallel or
 // Stream-K) and the output dtype are fixed by the caller (one rendered
 // translation unit per tile config).
@@ -22,7 +22,8 @@ namespace scaled_mm {
 
 // fp16/bf16 output.  ``a_per_token``: ``a_scale`` holds M floats, else one.
 template <typename Config, typename ElementD, bool kStreamK>
-ScaledMmStatus dispatchScaledMm(int activation, int8_t const* A, int8_t const* B,
+ScaledMmStatus dispatchScaledMm(int activation, typename Config::ElementAB const* A,
+                                typename Config::ElementAB const* B,
                                 float const* a_scale, bool a_per_token, float const* b_scale,
                                 ElementD const* bias, ElementD* D, int M, int N, int K, int64_t lda,
                                 int64_t ldb, int64_t ldd, cudaStream_t stream) {
@@ -42,19 +43,23 @@ ScaledMmStatus dispatchScaledMm(int activation, int8_t const* A, int8_t const* B
 #undef OASR_SCALED_MM_CASE
 }
 
-// int8 output for a consumer with a static input scale (``out_mul`` is its
-// per-channel quantize multiplier); ``ElementT`` is the dtype the fp output
-// would have had, which the activation output is rounded to first.
+// 8-bit output (the operands' format) for a consumer with a static input scale
+// (``out_mul`` is its per-channel quantize multiplier); ``ElementT`` is the dtype
+// the fp output would have had, which the activation output is rounded to first.
 template <typename Config, typename ElementT>
-ScaledMmStatus dispatchScaledMmQuant(int activation, int8_t const* A, int8_t const* B,
+ScaledMmStatus dispatchScaledMmQuant(int activation, typename Config::ElementAB const* A,
+                                     typename Config::ElementAB const* B,
                                      float const* a_scale, bool a_per_token,
                                      float const* b_scale, ElementT const* bias,
-                                     float const* out_mul, int8_t* Q, int M, int N, int K,
-                                     int64_t lda, int64_t ldb, int64_t ldq, cudaStream_t stream) {
+                                     float const* out_mul, typename Config::ElementAB* Q, int M,
+                                     int N, int K, int64_t lda, int64_t ldb, int64_t ldq,
+                                     cudaStream_t stream) {
     using ThreadMap = typename ScaledMmTileMap<Config>::type;
+    using ElementQ = typename Config::ElementAB;
 #define OASR_SCALED_MM_QUANT_CASE(ACT)                                                          \
     case static_cast<int>(ActivationType::ACT): {                                              \
-        using Epilogue = ScaledMmQuantEpilogue<ElementT, ThreadMap, ActivationType::ACT>;      \
+        using Epilogue =                                                                        \
+            ScaledMmQuantEpilogue<ElementT, ThreadMap, ActivationType::ACT, ElementQ>;          \
         return CutlassScaledMmGemm<Config, typename Epilogue::EVTD, /*kStreamK=*/false>::run(  \
             A, B, Epilogue::make_args(a_scale, a_per_token, b_scale, bias, out_mul, Q, ldq), M, \
             N, K, lda, ldb, ldq, stream);                                                       \
