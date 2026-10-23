@@ -730,6 +730,22 @@ class BaseAsrModel(nn.Module, ABC):
 
         return QuantLayout()
 
+    def calibration_forward(
+        self, features: torch.Tensor, lengths: torch.Tensor, *, tokenizer: Any = None
+    ) -> None:
+        """One calibration utterance through every path a quantizer observes.
+
+        ``oasr quantize``'s forward loop calls this per unpadded utterance with
+        the checkpoint's own features; a calibration algorithm only sees the
+        activations of the layers this reaches.  The default runs the encoder,
+        which is everything a CTC or transducer model quantizes.  A model whose
+        :meth:`quantization_layout` declares decoder groups overrides it to drive
+        that decoder too (teacher-forced or greedy on its own output); *tokenizer*
+        is the checkpoint's, for a decoder whose prompt is text.
+        """
+        del tokenizer
+        self.encode_offline(features, lengths)
+
     @property
     def streaming_kind(self) -> "StreamingKind":
         """Streaming-cache model (delegates to the encoder)."""

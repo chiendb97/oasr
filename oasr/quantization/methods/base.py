@@ -46,6 +46,10 @@ class QuantMethod(ABC):
         #: Who quantizes this layer's input when a producer does it (a fused norm,
         #: a chained GEMM); set by ``bind_quantization``, for the report.
         self.input_source: Optional[str] = None
+        #: The dtype the layer's quantized input is stored in (``torch.int8``,
+        #: ``torch.float8_e4m3fn``), or ``None`` for a method with no quantized
+        #: input.  A producer that quantizes for this layer must emit exactly it.
+        self.quant_dtype: Optional[torch.dtype] = None
 
     @classmethod
     @abstractmethod

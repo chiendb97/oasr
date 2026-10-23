@@ -19,6 +19,8 @@ from oasr.api_logging import oasr_api
 from oasr.jit.attention import (
     fmha_backend_for,
     fmha_cxx_supports,
+    fmha_kv8_backend,
+    fmha_kv8_refusal,
     get_compiled_fmha,
     select_backend,
 )
@@ -455,6 +457,8 @@ def fmha(
     out: Optional[torch.Tensor] = None,
     validate: bool = True,
     backend: Optional[str] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused multi-head attention.
 
@@ -515,12 +519,45 @@ def fmha(
         When False, skip shape/dtype validation. Caller takes responsibility
         for input correctness. Used by the engine hot path to shave a few
         microseconds per call.
+    k_scale, v_scale : Tensor, optional
+        **FP8 KV.**  When ``k``/``v`` are ``float8_e4m3fn`` (a quantized KV
+        cache, :mod:`oasr.functionals.kv_quant`), their fp32 per-(token,
+        kv-head) scales, shaped like ``k``/``v`` without the head dim.  The
+        cache is dequantized inside the kernel's tile loop -- the C++ lane's
+        fp8 variants -- and never materialised in the served dtype.  Served
+        for unmasked, bias-free reads (an AR decode step, cross-attention),
+        dense or paged; anything else raises naming what is missing
+        (:func:`oasr.jit.attention.fmha_kv8_refusal`).  CPU, fp32 queries and
+        ``backend="sdpa"`` dequantize and run the reference instead -- the
+        parity oracle, not a serving path.
 
     Returns
     -------
     out : Tensor
         ``(B, H, T_q, D)``.
     """
+    if k.dtype == torch.float8_e4m3fn or v.dtype == torch.float8_e4m3fn:
+        return _fmha_kv8(
+            q,
+            k,
+            v,
+            k_scale,
+            v_scale,
+            softmax_scale=softmax_scale,
+            attn_bias=attn_bias,
+            cache_seqlens=cache_seqlens,
+            cache_seqstarts=cache_seqstarts,
+            block_table=block_table,
+            causal=causal,
+            window_left=window_left,
+            window_right=window_right,
+            out=out,
+            validate=validate,
+            backend=backend,
+        )
+    if k_scale is not None or v_scale is not None:
+        raise ValueError("k_scale / v_scale are for an fp8 (float8_e4m3fn) KV cache")
+
     # Fast unpack -- avoid per-attribute size() calls.
     B, H, T_q, D = q.shape
     paged = block_table is not None
@@ -1079,6 +1116,166 @@ def _needs_stride_copy(t: torch.Tensor) -> bool:
     return t.stride(-1) != 1
 
 
+def _fmha_kv8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: Optional[torch.Tensor],
+    v_scale: Optional[torch.Tensor],
+    *,
+    softmax_scale: float,
+    attn_bias: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    cache_seqstarts: Optional[torch.Tensor],
+    block_table: Optional[torch.Tensor],
+    causal: bool,
+    window_left: int,
+    window_right: int,
+    out: Optional[torch.Tensor],
+    validate: bool,
+    backend: Optional[str],
+) -> torch.Tensor:
+    """:func:`fmha` over an fp8 KV cache.
+
+    Routed by a declared rule (``oasr.jit.attention.fmha_kv8_backend``), not by
+    the dense arbiter: only the C++ lane reads fp8, so the fp8 variants serve the
+    call whichever lane the process prefers for served-dtype attention, a shape
+    they do not render raises with the reason, and the reference (dequantize,
+    then SDPA) runs only where a reference is what was asked for -- CPU, an fp32
+    query, ``backend="sdpa"`` or ``OASR_ATTN_BACKEND=sdpa``.
+    """
+    paged = block_table is not None
+    if k.dtype != torch.float8_e4m3fn or v.dtype != torch.float8_e4m3fn:
+        raise ValueError("an fp8 KV cache needs both k and v in float8_e4m3fn")
+    if k_scale is None or v_scale is None:
+        raise ValueError("an fp8 KV cache needs k_scale and v_scale")
+    if validate:
+        if k.shape != v.shape or k_scale.shape != k.shape[:-1] or v_scale.shape != v.shape[:-1]:
+            raise ValueError(
+                "fp8 k/v must share a shape and each scale must be its tensor's shape without "
+                f"the head dim; got k={tuple(k.shape)} v={tuple(v.shape)} "
+                f"k_scale={tuple(k_scale.shape)} v_scale={tuple(v_scale.shape)}"
+            )
+        if k_scale.dtype != torch.float32 or v_scale.dtype != torch.float32:
+            raise ValueError("fp8 KV scales must be float32")
+        if paged and cache_seqlens is None:
+            raise ValueError("paged mode requires cache_seqlens")
+        if cache_seqstarts is not None and cache_seqlens is None:
+            raise ValueError("cache_seqstarts requires cache_seqlens (it bounds the window)")
+        if cache_seqlens is not None and cache_seqlens.dtype != torch.int32:
+            cache_seqlens = cache_seqlens.to(torch.int32)
+        if cache_seqstarts is not None and cache_seqstarts.dtype != torch.int32:
+            cache_seqstarts = cache_seqstarts.to(torch.int32)
+        if block_table is not None and block_table.dtype != torch.int32:
+            block_table = block_table.to(torch.int32)
+
+    served = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
+    if backend is None:
+        backend = fmha_kv8_backend() if served else "sdpa"
+    elif backend not in ("sdpa", "cute", "cxx"):
+        raise ValueError(f"fmha: unknown backend {backend!r}")
+    if backend == "cute":
+        raise NotImplementedError(
+            "fmha: the CuTeDSL backend cannot read an fp8 KV cache; the fp8 variants are "
+            "the C++ lane's (backend='cxx'), and backend='sdpa' is the dequantizing reference"
+        )
+    if backend == "sdpa" or not served:
+        from oasr.functionals.kv_quant import QuantizedKv
+
+        ref_dtype = q.dtype if q.dtype.is_floating_point else torch.float32
+        reference: torch.Tensor = fmha(
+            q,
+            QuantizedKv(k, k_scale).dequantize(ref_dtype),
+            QuantizedKv(v, v_scale).dequantize(ref_dtype),
+            softmax_scale=softmax_scale,
+            attn_bias=attn_bias,
+            cache_seqlens=cache_seqlens,
+            cache_seqstarts=cache_seqstarts,
+            block_table=block_table,
+            causal=causal,
+            window_left=window_left,
+            window_right=window_right,
+            out=out,
+            validate=validate,
+            backend="sdpa",
+        )
+        return reference
+
+    B, H, T_q, D = q.shape
+    local = window_left >= 0 or window_right >= 0
+    dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
+    why = fmha_kv8_refusal(
+        head_dim=D,
+        dtype_str=dtype_str,
+        paged=paged,
+        causal=causal,
+        local=local,
+        has_bias=attn_bias is not None,
+    )
+    if why is not None:
+        raise NotImplementedError(f"fmha: fp8 KV cannot be served: {why}")
+
+    if paged:
+        assert block_table is not None
+        block_size = k.size(1)
+        # The split decision sees the K extent the served-dtype path would see
+        # after squaring the table to whole K tiles (`_pad_paged_inputs`), so
+        # both decide alike for one cache; the table itself is passed as-is,
+        # because the C++ loader predicates the page-id read.
+        blocks_per_tile = max(1, _KERNEL_N_BLOCK // max(1, block_size))
+        width = -(-block_table.size(1) // blocks_per_tile) * blocks_per_tile
+        T_k = width * block_size
+    else:
+        T_k = k.size(2)
+
+    if out is None:
+        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    out_target = out
+    if _needs_stride_copy(out):
+        out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
+    if _needs_stride_copy(q):
+        q = q.contiguous()
+
+    from oasr.jit.fmha import get_fmha_kv8_fn
+
+    splits = _split_count(B=B, H=H, T_q=T_q, T_k=T_k, D=D, causal=False, local=False, kv8=True)
+    if splits > 1:
+        # Caller-owned workspace, for the reason `_call_cxx` gives (rule 11).
+        o_partial = torch.empty((splits, B, H, T_q, D), dtype=torch.float32, device=q.device)
+        lse_partial = torch.empty((splits, B, H, T_q), dtype=torch.float32, device=q.device)
+        get_fmha_kv8_fn(dtype_str=dtype_str, head_dim=D, paged=paged, split=True)(
+            out,
+            o_partial,
+            lse_partial,
+            q,
+            k,
+            v,
+            k_scale,
+            v_scale,
+            cache_seqlens,
+            cache_seqstarts,
+            block_table,
+            int(splits),
+            float(softmax_scale),
+        )
+    else:
+        get_fmha_kv8_fn(dtype_str=dtype_str, head_dim=D, paged=paged)(
+            out,
+            q,
+            k,
+            v,
+            k_scale,
+            v_scale,
+            cache_seqlens,
+            cache_seqstarts,
+            block_table,
+            float(softmax_scale),
+        )
+    if out_target is not out:
+        out_target.copy_(out)
+    return out_target
+
+
 @functools.cache
 def _multiprocessor_count() -> int:
     """SMs on the current device -- the other half of the split decision.
@@ -1089,7 +1286,9 @@ def _multiprocessor_count() -> int:
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 
 
-def _split_count(*, B: int, H: int, T_q: int, T_k: int, D: int, causal: bool, local: bool) -> int:
+def _split_count(
+    *, B: int, H: int, T_q: int, T_k: int, D: int, causal: bool, local: bool, kv8: bool = False
+) -> int:
     """How many ways to cut the K range, or 1 for the ordinary kernel.
 
     Mirrors ``oasr::attention::fmhaNumSplits``, and is pinned equal to it by
@@ -1101,9 +1300,9 @@ def _split_count(*, B: int, H: int, T_q: int, T_k: int, D: int, causal: bool, lo
     """
     if causal or local:
         return 1
-    from oasr.jit.fmha import num_splits, resolve_config
+    from oasr.jit.fmha import num_splits, resolve_config, resolve_config_kv8
 
-    tile = resolve_config(_target_sm(), 16, D)
+    tile = (resolve_config_kv8 if kv8 else resolve_config)(_target_sm(), 16, D)
     if not tile.valid:
         return 1
     m_blocks = -(-T_q // tile.block_m)

@@ -36,7 +36,7 @@ def gen_all_modules() -> List:
     from oasr.jit.ctc_decoder import gen_ctc_decoder_module
     from oasr.jit.features import gen_features_module
     from oasr.jit.fft import gen_fft_module
-    from oasr.jit.fmha import gen_fmha_modules
+    from oasr.jit.fmha import gen_fmha_kv8_modules, gen_fmha_modules
     from oasr.jit.gated_mlp import gen_gated_mlp_modules
     from oasr.jit.gemm import (
         gen_bmm_module,
@@ -44,12 +44,13 @@ def gen_all_modules() -> List:
         gen_gemm_module,
         gen_group_gemm_module,
     )
+    from oasr.jit.kv_quant import gen_kv_quant_module
     from oasr.jit.norm import gen_norm_module
     from oasr.jit.pooling import gen_pooling_module
     from oasr.jit.quant import gen_quant_module
     from oasr.jit.recurrent import gen_recurrent_module
     from oasr.jit.recurrent_step import gen_recurrent_step_modules
-    from oasr.jit.scaled_mm import gen_scaled_mm_module
+    from oasr.jit.scaled_mm import gen_scaled_mm_fp8_modules, gen_scaled_mm_module
     from oasr.jit.softmax import gen_softmax_module
     from oasr.jit.topk import gen_topk_module
     from oasr.jit.transducer import gen_transducer_module
@@ -76,6 +77,7 @@ def gen_all_modules() -> List:
         gen_group_gemm_module(),
         gen_gemm_log_softmax_module(),
         gen_quant_module(),
+        gen_kv_quant_module(),
         gen_scaled_mm_module(),
         gen_ctc_decoder_module(),
         gen_softmax_module(),
@@ -84,7 +86,9 @@ def gen_all_modules() -> List:
         gen_features_module(),
         gen_transducer_module(),
     ]
+    modules += gen_scaled_mm_fp8_modules()
     modules += gen_fmha_modules()
+    modules += gen_fmha_kv8_modules()
     modules += gen_gated_mlp_modules()
     modules += gen_recurrent_step_modules()
     return modules

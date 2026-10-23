@@ -968,6 +968,29 @@ class TestKernelAndTorchPathsAgree:
             ref = module(x)
         torch.testing.assert_close(got, ref, rtol=1e-5, atol=2e-3)
 
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_ctc_projection(self, dtype, monkeypatch):
+        """fp16/bf16 take the fused ``gemm_log_softmax``; fp32 on CUDA -- how
+        ``oasr quantize`` runs its calibration master -- must take torch, not the
+        fp16-only kernel (it used to: only a CPU tensor left the kernel path)."""
+        import oasr
+        from oasr.layers.ctc import CtcProjection
+
+        calls = []
+        kernel = oasr.gemm_log_softmax
+        monkeypatch.setattr(
+            oasr, "gemm_log_softmax", lambda *a, **k: calls.append(1) or kernel(*a, **k)
+        )
+        m = CtcProjection(64, 128).cuda().to(dtype)
+        x = torch.randn(3, 5, 64, device="cuda", dtype=dtype)
+        with torch.no_grad():
+            got = m(x)
+            with layers_backend_override("torch"):
+                ref = m(x)
+        assert calls == ([] if dtype == torch.float32 else [1])
+        tol = 1e-5 if dtype == torch.float32 else 2e-2
+        torch.testing.assert_close(got, ref, rtol=tol, atol=tol)
+
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("stride", [1, 2])
     def test_dense_conv1d(self, dtype, stride):

@@ -177,7 +177,8 @@ pub struct Cli {
     #[arg(long = "vad-option", value_name = "KEY=VALUE")]
     pub vad_option: Vec<String>,
     /// Quantize the model's GEMMs at load: a scheme name such as `int8_w8a8`
-    /// (online round-to-nearest W8A8 on an fp checkpoint). Omit to follow the
+    /// or `fp8_w8a8` (online round-to-nearest W8A8 on an fp checkpoint; fp8
+    /// needs sm89+). Omit to follow the
     /// checkpoint: a checkpoint written by `oasr quantize` is served quantized
     /// without this flag.
     #[arg(long)]

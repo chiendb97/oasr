@@ -143,6 +143,7 @@ class AedDecodeStrategy(IncrementalArStrategy):
                 capacity=prompt_ids.size(1) + max(max_new) + 1,
                 kv_manager=self.kv_manager(),
                 **({"all_positions": True} if no_speech else {}),
+                **self._kv_cache_kwargs(),
             )
         no_speech_logits = None
         if no_speech:

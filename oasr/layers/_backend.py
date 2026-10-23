@@ -437,6 +437,24 @@ def use_gemm_kernel(x: torch.Tensor, in_features: int, out_features: int) -> boo
     return True
 
 
+def use_gemm_log_softmax_kernel(x: torch.Tensor) -> bool:
+    """Should the fused CTC projection (``Linear`` -> ``log_softmax``) take its kernel?
+
+    Only CPU / fp32 / the torch override leave it: the kernel serves fp16 and bf16
+    on CUDA at every row count (no row floor -- streaming chunks are a few rows and
+    have always taken it), and an unaligned vocabulary is refused by the kernel
+    itself, since every in-tree head is padded.  fp32 on CUDA is how calibration
+    runs the fp32 master, so it must reach torch rather than the fp16-only kernel.
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    return True
+
+
 def is_row_dense(x: torch.Tensor) -> bool:
     """Do ``x``'s trailing-dim rows tile its memory exactly, in some order?
 
@@ -623,6 +641,7 @@ __all__ = [
     "use_fmha_kernel",
     "use_gated_mlp_kernel",
     "use_gemm_kernel",
+    "use_gemm_log_softmax_kernel",
     "use_norm_kernel",
     "use_pooling_kernel",
     "use_softmax_kernel",

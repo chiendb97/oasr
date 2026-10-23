@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, cast
+from typing import AbstractSet, Dict, List, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -94,10 +94,15 @@ class SmoothQuant(QuantAlgorithm):
         for group in groups:
             _validate_group(group, modules, spec)
 
+        # Every consumer of a group reads the same input, so each one is observed
+        # and the statistic is their maximum: a group whose consumers span modules
+        # (an encoder output feeding every decoder layer's cross-attention) is
+        # measured wherever the calibration loop happens to reach it.
         observers = {id(g): AbsMaxPerChannel() for g in groups}
         handles = [
-            modules[g.consumers[0]].register_forward_pre_hook(_observe(observers[id(g)]))
+            modules[c].register_forward_pre_hook(_observe(observers[id(g)]))
             for g in groups
+            for c in g.consumers
         ]
         try:
             forward_loop(model)
@@ -105,13 +110,29 @@ class SmoothQuant(QuantAlgorithm):
             for handle in handles:
                 handle.remove()
 
+        unobserved = [g for g in groups if observers[id(g)].rows == 0]
+        if unobserved:
+            raise RuntimeError(
+                f"the calibration loop never reached {len(unobserved)} smoothing group(s) "
+                f"(first: {unobserved[0].consumers[0]}); a decoder the loop does not drive "
+                "cannot be smoothed -- see BaseAsrModel.calibration_forward"
+            )
         plans: List[Tuple[SmoothGroup, torch.Tensor]] = []
         for group in groups:
             act_amax = observers[id(group)].result()
             plans.append((group, _smoothing_vector(group, act_amax, modules, opts)))
+        # A quantized producer's weight is stored as 8-bit values with fp32 per-row
+        # scales, so only a full-precision one must stay inside the served range.
+        full_precision = frozenset(
+            g.producer
+            for g, _ in plans
+            if g.producer is not None
+            and isinstance(modules[g.producer], QuantizableGemm)
+            and spec.resolve(g.producer) is None
+        )
         with torch.no_grad():
             for group, s in plans:
-                _fold(group, s, modules, opts)
+                _fold(group, s, modules, opts, full_precision=full_precision)
 
         runtime = tuple(c for g, _ in plans if g.fold == "runtime" for c in g.consumers)
         producer = dict(spec.producer)
@@ -164,6 +185,39 @@ def _validate_group(
         raise ValueError(f"norm_affine producer {group.producer} is not a LayerNorm/RMSNorm")
     if group.fold in ("v_to_o", "producer_rows") and not isinstance(producer, QuantizableGemm):
         raise ValueError(f"{group.fold} producer {group.producer} is not a QuantizableGemm")
+    width = widths.pop()
+    if group.fold == "norm_affine":
+        norm_weight = _param(cast(nn.Module, producer), "weight")
+        if norm_weight is None or norm_weight.numel() != width:
+            raise ValueError(
+                f"norm_affine producer {group.producer} has no {width}-channel affine weight "
+                f"to absorb the smoothing of {group.consumers}"
+            )
+    if group.fold == "producer_rows":
+        rows = cast(QuantizableGemm, producer).out_features
+        if rows != width:
+            raise ValueError(
+                f"producer_rows producer {group.producer} has {rows} output rows, its "
+                f"consumers read {width} channels"
+            )
+    if group.fold == "v_to_o":
+        assert group.v_rows is not None
+        r0, r1 = group.v_rows
+        rows = cast(QuantizableGemm, producer).out_features
+        if not 0 <= r0 < r1 <= rows:
+            raise ValueError(f"v_rows {group.v_rows} is outside {group.producer}'s {rows} rows")
+        heads = group.heads
+        v_width = width if heads is None else heads[1] * heads[2]
+        if heads is not None and (heads[0] * heads[2] != width or heads[0] % heads[1]):
+            raise ValueError(
+                f"v_to_o heads {heads} do not describe the {width}-channel attention output "
+                f"read by {group.consumers}"
+            )
+        if r1 - r0 != v_width:
+            raise ValueError(
+                f"v_rows {group.v_rows} ({r1 - r0} rows) is not the {v_width} V channels "
+                f"feeding {group.consumers}"
+            )
 
 
 def _gemm(modules: Dict[str, nn.Module], path: Optional[str]) -> QuantizableGemm:
@@ -208,7 +262,13 @@ def _smoothing_vector(
         assert group.heads is not None
         act, w_amax = _tie_heads(act, group.heads), _tie_heads(w_amax, group.heads)
     s = act.clamp_min(1e-12).pow(opts.alpha) / w_amax.clamp_min(1e-12).pow(1.0 - opts.alpha)
-    s = torch.where(w_amax > 0, s, torch.ones_like(s))
+    # A channel with no weight, or one the calibration audio never saw active (a
+    # ReLU that stayed off), carries nothing to balance: leave it alone.  The
+    # second matters -- the formula would send ``s`` to its floor, and the first
+    # out-of-domain input that does fire the channel is then amplified ~1e5 and
+    # owns its token's quantization scale (Paraformer's FFNs, calibrated on
+    # English, went to noise on Chinese).
+    s = torch.where((w_amax > 0) & (act > 0), s, torch.ones_like(s))
     lo = torch.full_like(s, opts.s_floor)
     bound = _producer_bound(group, modules, opts)
     if bound is not None:
@@ -267,8 +327,24 @@ def _fold(
     s: torch.Tensor,
     modules: Dict[str, nn.Module],
     opts: SmoothQuantOptions,
+    *,
+    full_precision: Optional[AbstractSet[str]] = None,
 ) -> None:
+    """Apply *group*'s fold with scale *s*, refusing a served tensor past fp16's range.
+
+    What is checked is what is *stored* in the served dtype: a norm's affine, a GEMM
+    producer's bias, and a GEMM producer's weight only when it stays full precision
+    (*full_precision*; ``None`` checks every producer weight).  A quantized
+    producer's weight becomes 8-bit values with fp32 per-row scales -- per-row
+    quantization is blind to the row scaling this fold applies -- and a layer that
+    is a consumer of one group and the producer of another has its weight scaled
+    both ways (``W * s1 / s2``), which no single group's bound can see.
+    """
     limit = opts.fp16_headroom * _FP16_MAX
+
+    def weight_if_stored(path: Optional[str], w: torch.Tensor) -> List[Optional[torch.Tensor]]:
+        return [w] if full_precision is None or path in full_precision else []
+
     consumers = [_gemm(modules, c) for c in group.consumers]
     if group.fold == "norm_affine":
         assert group.producer is not None
@@ -287,7 +363,11 @@ def _fold(
         bias = _param(cast(nn.Module, producer), "bias")
         if bias is not None:
             bias.data[r0:r1].div_(s.to(bias.dtype))
-        _check_range(group.producer, [w[r0:r1]], limit)
+        _check_range(
+            group.producer,
+            weight_if_stored(group.producer, w[r0:r1]) + [None if bias is None else bias[r0:r1]],
+            limit,
+        )
         s_out = s
         if group.heads is not None and group.heads[0] != group.heads[1]:
             s_out = _untie_heads(s, group.heads)
@@ -297,8 +377,9 @@ def _fold(
         producer = _gemm(modules, group.producer)
         w = producer.gemm_weight().data
         w.div_(s.to(w.dtype).reshape(-1, 1))
-        _divide(_param(cast(nn.Module, producer), "bias"), s)
-        _check_range(group.producer, [w], limit)
+        bias = _param(cast(nn.Module, producer), "bias")
+        _divide(bias, s)
+        _check_range(group.producer, weight_if_stored(group.producer, w) + [bias], limit)
         for layer in consumers:
             _scale_columns(layer, s)
     elif group.fold == "runtime":

@@ -39,6 +39,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/fast_math.h>
+#include <cutlass/numeric_types.h>
 
 #include <cmath>
 #include <cstdint>
@@ -59,6 +60,11 @@ using StrideBias = cute::Stride<int64_t, cute::_1, int64_t, int64_t>;
 //! `(batch, max_pages_per_seq)`.
 using ShapePageTable = cute::Shape<int32_t, int32_t>;
 using StridePageTable = cute::Stride<int64_t, cute::_1>;
+
+//! FP8 KV scales, one fp32 per `(token, kv-head)`: strides over
+//! `(seqlen, head, batch)` -- `(page offset, head, page)` for a paged pool --
+//! the same three modes K is addressed by, minus the head dim.
+using StrideKvScale = cute::Stride<int64_t, int64_t, int64_t>;
 
 /*! \brief What the caller supplies. */
 template <class Element>
@@ -115,6 +121,17 @@ struct FmhaArguments {
     float softmax_scale = 1.0f;
     int window_size_left = -1;   //!< -1 == unbounded
     int window_size_right = -1;  //!< -1 == unbounded
+
+    //! FP8 KV -- the `KvFp8` variants only, which leave `ptr_k`/`ptr_v` null.
+    //! The e4m3 bytes use `shape_k`/`stride_k`/`stride_v` (in elements, which
+    //! for fp8 are bytes); each `(token, kv-head)` vector has one fp32 scale.
+    //! Appended last so the fp16/bf16 variants' parameter layout is unchanged.
+    cutlass::float_e4m3_t const* ptr_k_fp8 = nullptr;
+    cutlass::float_e4m3_t const* ptr_v_fp8 = nullptr;
+    float const* ptr_k_scale = nullptr;
+    float const* ptr_v_scale = nullptr;
+    StrideKvScale stride_k_scale = {};
+    StrideKvScale stride_v_scale = {};
 };
 
 /*! \brief What the kernel reads. */
@@ -174,6 +191,13 @@ struct FmhaParams {
 
     int window_size_left;
     int window_size_right;
+
+    cutlass::float_e4m3_t const* ptr_k_fp8;
+    cutlass::float_e4m3_t const* ptr_v_fp8;
+    float const* ptr_k_scale;
+    float const* ptr_v_scale;
+    StrideKvScale stride_k_scale;
+    StrideKvScale stride_v_scale;
 };
 
 /*! \brief Fold the host-side constants and build the divmods. */
@@ -227,6 +251,12 @@ FmhaParams<Element> to_underlying_arguments(FmhaArguments<Element> const& args) 
         args.num_splits > 0 ? args.num_splits : 1,
         args.window_size_left,
         args.window_size_right,
+        args.ptr_k_fp8,
+        args.ptr_v_fp8,
+        args.ptr_k_scale,
+        args.ptr_v_scale,
+        args.stride_k_scale,
+        args.stride_v_scale,
     };
 }
 

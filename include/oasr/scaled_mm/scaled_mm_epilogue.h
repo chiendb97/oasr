@@ -1,7 +1,8 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Epilogue visitor trees (CUTLASS 2.x Sm80 EVT) for the int8 scaled GEMM.
+// Epilogue visitor trees (CUTLASS 2.x Sm80 EVT) for the 8-bit scaled GEMM
+// (int8 and fp8 e4m3 operands alike: the trees see only the fp32 accumulator).
 //
 // ``ScaledMmEpilogue`` -- the fp16/bf16 output of a quantized layer:
 //
@@ -10,16 +11,18 @@
 //     out = round_to_out(act(y))                 one rounding
 //
 // ``ScaledMmQuantEpilogue`` -- the same ``y`` and activation, then quantized
-// straight to int8 for a consumer GEMM with a static per-tensor input scale, so
+// straight to 8 bits for a consumer GEMM with a static per-tensor input scale, so
 // the layer's fp output and the consumer's quantize launch both disappear:
 //
 //     y_T = round_to_T(act(y))                   exactly the value the fp path stores
-//     q   = clamp(rint(f32(y_T) * out_mul[n]), -127, 127)
+//     q   = int8: clamp(rint(f32(y_T) * out_mul[n]), -127, 127)
+//           fp8:  e4m3_rne_satfinite(f32(y_T) * out_mul[n])
 //
 // ``out_mul[n] = smooth_inv[n] * (1 / input_scale)`` is the consumer's
 // per-channel quantize multiplier (``oasr.functionals.quant.static_multiplier``).
 // Rounding to T first is what makes the fused output bit-identical to the
-// unfused ``scaled_mm`` -> ``quantize_static`` pair.
+// unfused ``scaled_mm`` -> ``quantize_static`` pair (``quantize.cuh``'s
+// ``QuantTraits``: the same IEEE multiply, the same rounding).
 //
 // The order of the shared part follows vLLM's ``ScaledEpilogueBias``.  Bias
 // absent is a null pointer, which the row-broadcast visitor reads as its zero
@@ -29,6 +32,7 @@
 
 #include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
+#include <cutlass/float8.h>
 #include <cutlass/functional.h>
 
 #include <oasr/common/types.h>
@@ -153,7 +157,45 @@ struct ScaledMmEpilogue {
     }
 };
 
-template <typename ElementT, typename OutputTileThreadMap, ActivationType act>
+// ``clamp(y * m, -448, 448)`` per element, an IEEE multiply; the e4m3 store's
+// round-to-nearest-even conversion (``cvt.rn.satfinite.e4m3x2.f32``, as
+// ``quantize.cuh`` uses) then rounds it, so the clamp only makes the saturation
+// explicit.
+template <class T>
+struct MulSatFp8;
+
+template <int N>
+struct MulSatFp8<cutlass::Array<float, N>> {
+    CUTLASS_DEVICE
+    cutlass::Array<float, N> operator()(cutlass::Array<float, N> const& y,
+                                        cutlass::Array<float, N> const& mul) const {
+        cutlass::Array<float, N> q;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < N; ++i) {
+            q[i] = fminf(fmaxf(__fmul_rn(y[i], mul[i]), -448.0f), 448.0f);
+        }
+        return q;
+    }
+};
+
+// The per-element quantize of each 8-bit output format.
+template <typename ElementQ>
+struct ScaledMmQuantize;
+
+template <>
+struct ScaledMmQuantize<int8_t> {
+    template <class T>
+    using Fn = MulRintClampInt8<T>;
+};
+
+template <>
+struct ScaledMmQuantize<cutlass::float_e4m3_t> {
+    template <class T>
+    using Fn = MulSatFp8<T>;
+};
+
+template <typename ElementT, typename OutputTileThreadMap, ActivationType act,
+          typename ElementQ = int8_t>
 struct ScaledMmQuantEpilogue {
     using Dequant = ScaledMmDequant<OutputTileThreadMap, ElementT>;
 
@@ -166,19 +208,19 @@ struct ScaledMmQuantEpilogue {
     // The consumer's per-channel quantize multiplier.
     using OutMul = cutlass::epilogue::threadblock::VisitorRowBroadcast<
         OutputTileThreadMap, float, cute::Stride<cute::_0, cute::_1, cute::_0>>;
-    using Compute3 =
-        cutlass::epilogue::threadblock::VisitorCompute<MulRintClampInt8, int8_t, float,
-                                                       cutlass::FloatRoundStyle::round_to_nearest>;
+    using Compute3 = cutlass::epilogue::threadblock::VisitorCompute<
+        ScaledMmQuantize<ElementQ>::template Fn, ElementQ, float,
+        cutlass::FloatRoundStyle::round_to_nearest>;
     using EVTQuant = cutlass::epilogue::threadblock::Sm80EVT<Compute3, EVTAct, OutMul>;
 
     using D = cutlass::epilogue::threadblock::VisitorAuxStore<
-        OutputTileThreadMap, int8_t, cutlass::FloatRoundStyle::round_to_nearest,
+        OutputTileThreadMap, ElementQ, cutlass::FloatRoundStyle::round_to_nearest,
         cute::Stride<int64_t, cute::_1, cute::_0>>;
     using EVTD = cutlass::epilogue::threadblock::Sm80EVT<D, EVTQuant>;
 
     static typename EVTD::Arguments make_args(float const* a_scale, bool a_per_token,
                                               float const* b_scale, ElementT const* bias,
-                                              float const* out_mul, int8_t* out, int64_t ldq) {
+                                              float const* out_mul, ElementQ* out, int64_t ldq) {
         typename EVTAct::Arguments act_args{
             Dequant::make_args(a_scale, a_per_token, b_scale, bias), {}};
         typename OutMul::Arguments mul_args{out_mul};

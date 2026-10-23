@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from oasr.api_logging import oasr_api
-from oasr.functionals.quant import QUANT_EPS, reference_quantize_per_token
+from oasr.functionals.quant import QUANT_EPS, quant_qmax, reference_quantize_per_token
 
 
 @functools.cache
@@ -285,11 +285,15 @@ def add_layer_norm_residual(
 
 
 def _quant_outputs(
-    input: torch.Tensor, out: Optional[torch.Tensor], scale: Optional[torch.Tensor]
+    input: torch.Tensor,
+    out: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+    dtype: torch.dtype = torch.int8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``quantize_per_token``'s destinations: int8 like *input*, fp32 per row."""
+    """``quantize_per_token``'s destinations: 8-bit (*dtype*) like *input*, fp32 per row."""
     if out is None:
-        out = torch.empty(input.shape, dtype=torch.int8, device=input.device)
+        quant_qmax(dtype)  # refuses a format the kernels do not write
+        out = torch.empty(input.shape, dtype=dtype, device=input.device)
     if scale is None:
         scale = torch.empty(input.shape[:-1], dtype=torch.float32, device=input.device)
     return out, scale
@@ -304,13 +308,14 @@ def layer_norm_quant(
     qeps: float = QUANT_EPS,
     out: Optional[torch.Tensor] = None,
     scale: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.int8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """LayerNorm emitting per-token int8 directly: one launch for the norm and quantize.
+    """LayerNorm emitting per-token 8-bit values directly: one launch for norm and quantize.
 
     Bit-exact with the unfused pair::
 
-        layer_norm_quant(x, w, b, eps, qeps)
-            == quantize_per_token(layer_norm(x, w, b, eps), None, qeps)
+        layer_norm_quant(x, w, b, eps, qeps, dtype=d)
+            == quantize_per_token(layer_norm(x, w, b, eps), None, qeps, dtype=d)
 
     The normalized value is rounded to the input dtype before it is quantized,
     exactly as the stored norm output would be, and the quantize follows
@@ -323,14 +328,16 @@ def layer_norm_quant(
         bias: Optional LayerNorm offset ``[hidden]``.
         eps: LayerNorm epsilon.
         qeps: Floor on each row's amax (:data:`oasr.functionals.quant.QUANT_EPS`).
-        out: Optional pre-allocated int8 tensor shaped like *input*.
+        out: Optional pre-allocated 8-bit tensor shaped like *input*; its dtype
+            wins over *dtype*.
         scale: Optional pre-allocated fp32 tensor, one entry per row.
+        dtype: ``torch.int8`` or ``torch.float8_e4m3fn``, when *out* is not given.
 
     Returns:
-        ``(q, scale)``: int8 shaped like *input* and the fp32 per-row scale,
-        shaped ``input.shape[:-1]`` (as :func:`oasr.quantize_per_token`).
+        ``(q, scale)``: 8-bit values shaped like *input* and the fp32 per-row
+        scale, shaped ``input.shape[:-1]`` (as :func:`oasr.quantize_per_token`).
     """
-    out, scale = _quant_outputs(input, out, scale)
+    out, scale = _quant_outputs(input, out, scale, dtype)
     _get_norm_module().layernorm_quant(out, scale, input, weight, bias, eps, qeps)
     return out, scale
 
@@ -347,13 +354,14 @@ def add_layer_norm_residual_quant(
     out: Optional[torch.Tensor] = None,
     scale: Optional[torch.Tensor] = None,
     residual_out: Optional[torch.Tensor] = None,
+    dtype: torch.dtype = torch.int8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`add_layer_norm_residual` whose normalized output is per-token int8.
+    """:func:`add_layer_norm_residual` whose normalized output is per-token 8-bit.
 
     Bit-exact with the unfused pair: for ``(y, s) = add_layer_norm_residual(
     input, residual, weight, bias, eps, alpha)`` this returns
-    ``(*quantize_per_token(y, None, qeps), s)``.  ``residual_out`` (``s``) is
-    stored exactly as :func:`add_layer_norm_residual` stores it.
+    ``(*quantize_per_token(y, None, qeps, dtype=dtype), s)``.  ``residual_out``
+    (``s``) is stored exactly as :func:`add_layer_norm_residual` stores it.
 
     Args:
         input: Sub-layer output ``[..., hidden]``, fp16/bf16, contiguous.
@@ -363,14 +371,16 @@ def add_layer_norm_residual_quant(
         eps: LayerNorm epsilon.
         alpha: Scale applied to *input* before the residual add.
         qeps: Floor on each row's amax.
-        out: Optional pre-allocated int8 tensor shaped like *input*.
+        out: Optional pre-allocated 8-bit tensor shaped like *input*; its dtype
+            wins over *dtype*.
         scale: Optional pre-allocated fp32 tensor, one entry per row.
         residual_out: Optional pre-allocated sum (``s``) tensor.
+        dtype: ``torch.int8`` or ``torch.float8_e4m3fn``, when *out* is not given.
 
     Returns:
         ``(q, scale, residual_out)``.
     """
-    out, scale = _quant_outputs(input, out, scale)
+    out, scale = _quant_outputs(input, out, scale, dtype)
     if residual_out is None:
         residual_out = torch.empty_like(input)
     _get_norm_module().addlayernorm_residual_quant(
@@ -393,15 +403,18 @@ def reference_layer_norm_quant(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
     qeps: float = QUANT_EPS,
+    dtype: torch.dtype = torch.int8,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Torch twin of :func:`layer_norm_quant`, on any device.
 
     The quantize half is :func:`oasr.functionals.quant.reference_quantize_per_token`
     and bit-exact given the same normalized values; the LayerNorm half is torch's
     reduction, not the kernel's, so a normalized value can differ by one ulp of
-    the input dtype -- and its int8 code by one step -- from the kernel.
+    the input dtype -- and its 8-bit code by one step -- from the kernel.
     """
-    return reference_quantize_per_token(_reference_layer_norm(input, weight, bias, eps), None, qeps)
+    return reference_quantize_per_token(
+        _reference_layer_norm(input, weight, bias, eps), None, qeps, dtype=dtype
+    )
 
 
 def reference_add_layer_norm_residual_quant(
@@ -412,6 +425,7 @@ def reference_add_layer_norm_residual_quant(
     eps: float = 1e-5,
     alpha: float = 1.0,
     qeps: float = QUANT_EPS,
+    dtype: torch.dtype = torch.int8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Torch twin of :func:`add_layer_norm_residual_quant`, on any device.
 
@@ -422,7 +436,7 @@ def reference_add_layer_norm_residual_quant(
     summed = residual.float() + alpha * input.float()
     bias_float = None if bias is None else bias.float()
     normalized = F.layer_norm(summed, (input.size(-1),), weight.float(), bias_float, eps)
-    q, scale = reference_quantize_per_token(normalized.to(input.dtype), None, qeps)
+    q, scale = reference_quantize_per_token(normalized.to(input.dtype), None, qeps, dtype=dtype)
     return q, scale, summed.to(input.dtype)
 
 

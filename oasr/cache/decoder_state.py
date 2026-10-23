@@ -15,12 +15,24 @@ address — the condition for capturing the step.
 
 Unused capacity is zeroed because attention reads the final in-bounds tile past
 the logical length; uninitialized values there could propagate NaNs.
+
+**FP8 KV** (``EngineConfig.quantization.kv_cache = "fp8_e4m3"``).  Both storage
+modes can hold the cache as ``float8_e4m3fn`` plus one fp32 scale per
+``(token, kv-head)``, written by one fused quantize-and-scatter launch per layer
+(:func:`~oasr.functionals.kv_quant.quantize_kv_store`).  ``append`` then hands
+the attention :class:`~oasr.functionals.kv_quant.QuantizedKv` pairs, which the
+fused kernel dequantizes inside its tile loop -- never an fp16 copy of the cache.
+The one exception is the **prefill**: the prompt's tokens are quantized into the
+cache as they are written, but the prompt attends its own *fresh* K/V in the
+served dtype (``mask_kwargs`` / ``append`` treat an empty quantized cache as
+trimmed), so a causal, left-padded prompt never needs an fp8 kernel with masks
+that no step uses.
 """
 
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -93,6 +105,14 @@ class _RowIndexed:
         self.lens = self.lens + t_new
         self.lens_host = [n + t_new for n in self.lens_host]
 
+    def _fresh_quantized_prefill(self) -> bool:
+        """An empty quantized cache: the forward about to run is a prefill.
+
+        Its tokens are quantized into the cache as they are written, but it
+        attends them fresh, in the served dtype (see the module docstring).
+        """
+        return bool(getattr(self, "quantized", False)) and self.max_len == 0
+
     def _check_live(self) -> None:
         if self.consumed:
             raise RuntimeError(
@@ -126,6 +146,10 @@ class DecoderKv(_RowIndexed):
         Capacity-buffer width for *newly allocated* layers; ``None`` selects
         legacy cat-growth.  An individual layer's real width is its buffer's,
         which can already be wider after a grow.
+    kv_cache : str | None
+        ``"fp8_e4m3"`` stores ``k``/``v`` as ``float8_e4m3fn`` with per-(row,
+        head, position) fp32 scales in ``k_scale``/``v_scale`` (``(B, H_kv,
+        width)``); ``None`` is the model's own dtype.  Needs capacity mode.
     """
 
     k: List[Optional[torch.Tensor]]
@@ -139,6 +163,30 @@ class DecoderKv(_RowIndexed):
     #: ``None``, and the first symptom without this is SDPA reporting that its
     #: ``key`` argument is not a tensor, several frames from the real mistake.
     consumed: bool = False
+    kv_cache: Optional[str] = None
+    k_scale: List[Optional[torch.Tensor]] = field(default_factory=list)
+    v_scale: List[Optional[torch.Tensor]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.kv_cache is not None:
+            from oasr.functionals.kv_quant import kv_cache_dtype
+
+            kv_cache_dtype(self.kv_cache)  # raise now on an unknown format
+            if self.cap is None:
+                raise ValueError(
+                    "a quantized decoder KV cache needs a capacity buffer (prefill with "
+                    "capacity=...): legacy cat-growth would re-quantize nothing and copy "
+                    "the whole cache per token"
+                )
+        n = len(self.k)
+        if len(self.k_scale) != n:
+            self.k_scale = [None] * n
+        if len(self.v_scale) != n:
+            self.v_scale = [None] * n
+
+    @property
+    def quantized(self) -> bool:
+        return self.kv_cache is not None
 
     # ------------------------------------------------------------------
     # Construction
@@ -153,11 +201,13 @@ class DecoderKv(_RowIndexed):
         *,
         starts: Optional[torch.Tensor] = None,
         cap: Optional[int] = None,
+        kv_cache: Optional[str] = None,
     ) -> "DecoderKv":
         """A group with no keys cached yet.
 
         ``starts`` is the left-padding vector, known at prefill from the prompt's
         validity mask; families with a fixed-length prompt pass ``None``.
+        ``kv_cache`` quantizes the cache (see the class docstring).
         """
         return cls(
             k=[None] * num_layers,
@@ -166,6 +216,7 @@ class DecoderKv(_RowIndexed):
             lens_host=[0] * batch_size,
             starts=None if starts is None else starts.to(torch.int32),
             cap=None if cap is None else int(cap),
+            kv_cache=None if kv_cache in (None, "auto") else kv_cache,
         )
 
     # ------------------------------------------------------------------
@@ -184,6 +235,7 @@ class DecoderKv(_RowIndexed):
         redundant length vector there would only move the call onto a different
         attention backend for identical math.
         """
+        trimmed = trimmed or self._fresh_quantized_prefill()
         if (self.cap is None or trimmed) and self.starts is None:
             return {}
         return self._window(t_new)
@@ -215,6 +267,8 @@ class DecoderKv(_RowIndexed):
         """
         self._check_live()
         t_new = k_new.size(2)
+        if self.quantized:
+            return self._append_quantized(layer, k_new, v_new, trim=trim)
         if self.cap is None:
             return self._append_legacy(layer, k_new, v_new)
         if trim and self.max_len:
@@ -259,6 +313,58 @@ class DecoderKv(_RowIndexed):
         store[layer] = fresh
         self.cap = max(int(self.cap or 0), width)
         return fresh
+
+    def _append_quantized(
+        self, layer: int, k_new: torch.Tensor, v_new: torch.Tensor, *, trim: bool
+    ) -> Tuple[Any, Any, Optional[int]]:
+        """Quantize this layer's new K/V into the fp8 capacity buffers.
+
+        One launch for K and V, at each row's own offset (``lens[b] + t``), so a
+        uniform group and a merged one take the same path.  A prefill gets its
+        fresh K/V back (it attends them in the served dtype); a step gets the
+        whole buffers as :class:`~oasr.functionals.kv_quant.QuantizedKv`, plus the
+        logical extent, exactly as the fp16 path hands over its capacity buffer.
+        """
+        from oasr.functionals.kv_quant import QuantizedKv, quantize_kv_store
+
+        if trim and self.max_len:
+            raise RuntimeError("trim is for a prefill: every row must still be empty")
+        t_new = k_new.size(2)
+        fresh = trim or self.max_len == 0
+        extent = self.max_len + t_new
+        buf_k, scale_k = self._buffer_quantized(layer, k_new, extent)
+        buf_v, scale_v = self._buffer_quantized(layer, v_new, extent, value=True)
+        pos = self._scatter_index(t_new).reshape(-1)
+        quantize_kv_store(k_new, buf_k, scale_k, v_new, buf_v, scale_v, pos=pos)
+        if fresh:
+            return k_new, v_new, None
+        return QuantizedKv(buf_k, scale_k), QuantizedKv(buf_v, scale_v), extent
+
+    def _buffer_quantized(
+        self, layer: int, like: torch.Tensor, needed: int, value: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """This layer's fp8 capacity buffer and its scales, allocated or grown."""
+        from oasr.functionals.kv_quant import kv_cache_dtype
+
+        store = self.v if value else self.k
+        scales = self.v_scale if value else self.k_scale
+        buf, sc = store[layer], scales[layer]
+        if buf is not None and sc is not None and buf.size(2) >= needed:
+            return buf, sc
+        width = max(int(self.cap or 0), needed)
+        if buf is not None:
+            width = max(width, -(-needed // _GROW_ROUND) * _GROW_ROUND)
+        batch, h_kv, _, head_dim = like.shape
+        dtype = kv_cache_dtype(self.kv_cache)
+        fresh = torch.zeros(batch, h_kv, width, head_dim, dtype=dtype, device=like.device)
+        fresh_sc = torch.zeros(batch, h_kv, width, dtype=torch.float32, device=like.device)
+        if buf is not None and sc is not None:
+            fresh[:, :, : buf.size(2)] = buf
+            fresh_sc[:, :, : sc.size(2)] = sc
+        store[layer] = fresh
+        scales[layer] = fresh_sc
+        self.cap = max(int(self.cap or 0), width)
+        return fresh, fresh_sc
 
     def _scatter_index(self, t_new: int) -> torch.Tensor:
         """``(B, t_new)`` write positions for rows at different offsets."""
@@ -306,13 +412,20 @@ class DecoderKv(_RowIndexed):
         """Rows ``keep`` (repeats allowed — that is what expands a beam grid)."""
         self._check_live()
         keep_host = keep.tolist()
+
+        def rows(ts: List[Optional[torch.Tensor]]) -> List[Optional[torch.Tensor]]:
+            return [None if t is None else t.index_select(0, keep) for t in ts]
+
         return DecoderKv(
-            k=[None if t is None else t.index_select(0, keep) for t in self.k],
-            v=[None if t is None else t.index_select(0, keep) for t in self.v],
+            k=rows(self.k),
+            v=rows(self.v),
             lens=self.lens.index_select(0, keep),
             lens_host=[self.lens_host[i] for i in keep_host],
             starts=None if self.starts is None else self.starts.index_select(0, keep),
             cap=self.cap,
+            kv_cache=self.kv_cache,
+            k_scale=rows(self.k_scale),
+            v_scale=rows(self.v_scale),
         )
 
     def can_merge(self, other: "DecoderKv") -> bool:
@@ -328,6 +441,8 @@ class DecoderKv(_RowIndexed):
         if self.num_layers != other.num_layers:
             return False
         if (self.starts is None) != (other.starts is None):
+            return False
+        if self.kv_cache != other.kv_cache:
             return False
         return all((a is None) == (b is None) for a, b in zip(self.k, other.k))
 
@@ -357,6 +472,8 @@ class DecoderKv(_RowIndexed):
         )
         k = _consume_cat(self.k, other.k, width)
         v = _consume_cat(self.v, other.v, width)
+        k_scale = _consume_cat(self.k_scale, other.k_scale, width)
+        v_scale = _consume_cat(self.v_scale, other.v_scale, width)
         self.consumed = other.consumed = True
         starts = None
         if self.starts is not None and other.starts is not None:
@@ -368,6 +485,9 @@ class DecoderKv(_RowIndexed):
             lens_host=list(self.lens_host) + list(other.lens_host),
             starts=starts,
             cap=width,
+            kv_cache=self.kv_cache,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
 
@@ -502,6 +622,11 @@ class PagedDecoderKv(_RowIndexed):
     def manager(self) -> "DecoderKVCacheManager":
         return self._mgr
 
+    @property
+    def quantized(self) -> bool:
+        """Whether the pool stores fp8 K/V (``kv_view`` returns ``QuantizedKv``)."""
+        return bool(self._mgr.quantized)
+
     def block_table(self) -> torch.Tensor:
         """``(B, max_blocks)`` int32 table, rebuilt only when the pages change."""
         if self._table is None:
@@ -526,7 +651,7 @@ class PagedDecoderKv(_RowIndexed):
         there, which is an illegal access rather than a wrong answer.
         """
         self._grow_to([n + t_new for n in self.lens_host])
-        if trimmed:
+        if trimmed or self._fresh_quantized_prefill():
             return {} if self.starts is None else self._window(t_new)
         kwargs = self._window(t_new)
         kwargs["block_table"] = self.block_table()
@@ -556,10 +681,22 @@ class PagedDecoderKv(_RowIndexed):
         # Idempotent, so layers 1..n-1 cost one comparison each.
         t_new = k_new.size(2)
         self._grow_to([n + t_new for n in self.lens_host])
+        index = self._write_index(t_new)
+        if self.quantized:
+            from oasr.functionals.kv_quant import quantize_kv_store
+
+            # One launch quantizes and scatters both halves; the prompt of a
+            # prefill attends its own fresh K/V (see the module docstring).
+            fresh = trim or self.max_len == 0
+            k_slots, k_scale, v_slots, v_scale = self._mgr.slot_views(layer)
+            quantize_kv_store(k_new, k_slots, k_scale, v_new, v_slots, v_scale, pos=index)
+            if fresh:
+                return k_new, v_new, None
+            k_q, v_q = self._mgr.kv_view(layer)
+            return k_q, v_q, None
         k_pool, v_pool = self._mgr.kv_view(layer)
         # Frame-major is the pool's layout, and for K/V that came out of a head
         # split it is also the original one, so this permute is a view.
-        index = self._write_index(t_new)
         h_kv, head_dim = k_pool.size(2), k_pool.size(3)
         k_pool.view(-1, h_kv, head_dim)[index] = k_new.permute(0, 2, 1, 3).reshape(
             -1, h_kv, head_dim
@@ -697,14 +834,28 @@ def build_kv(
     cap: Optional[int],
     manager: Optional["DecoderKVCacheManager"] = None,
     starts: Optional[torch.Tensor] = None,
+    kv_cache: Optional[str] = None,
 ) -> Any:
     """Storage for one freshly prefilled group — paged when a pool is given.
 
     One call site per decoder so the choice between the two is made in one place
-    and neither decoder grows a branch on it.
+    and neither decoder grows a branch on it.  ``kv_cache`` (``"fp8_e4m3"``)
+    quantizes a dense cache; a paged one is quantized iff its pool is, and the
+    two must agree -- a mismatch is a wiring bug, not something to resolve
+    quietly in either direction.
     """
+    if kv_cache == "auto":
+        kv_cache = None
     if manager is None:
-        return DecoderKv.empty(num_layers, batch_size, device, starts=starts, cap=cap)
+        return DecoderKv.empty(
+            num_layers, batch_size, device, starts=starts, cap=cap, kv_cache=kv_cache
+        )
+    if bool(manager.quantized) != (kv_cache is not None):
+        raise ValueError(
+            f"kv_cache={kv_cache!r} but the decoder-KV pool is "
+            f"{'fp8' if manager.quantized else str(manager.pool.config.dtype)}; the pool is "
+            "built for the configured KV format and the decoder must be told the same one"
+        )
     if cap is None:
         raise ValueError(
             "paged decoder KV needs a capacity: the pool reserves each row's "
@@ -767,7 +918,10 @@ def _consume_cat(
             out.append(None)
             continue
         n_left = left.size(0)
-        merged = left.new_zeros(n_left + right.size(0), left.size(1), width, left.size(3))
+        # ``(B, H, width, ...)``: K/V carry a head dim, fp8 scales do not.
+        merged = left.new_zeros(
+            (n_left + right.size(0), left.size(1), width) + tuple(left.shape[3:])
+        )
         merged[:n_left, :, : left.size(2)] = left
         merged[n_left:, :, : right.size(2)] = right
         out.append(merged)
@@ -782,10 +936,15 @@ def consume_cat_rows(a: List[torch.Tensor], b: List[torch.Tensor]) -> List[torch
     (an AED's cross-attention K/V), which merge by plain concatenation because
     their token axis does not grow.
     """
-    out: List[torch.Tensor] = []
+    from oasr.functionals.kv_quant import QuantizedKv
+
+    out: List[Any] = []
     for i in range(len(a)):
         left, right = a[i], b[i]
         a[i] = b[i] = None  # type: ignore[call-overload]
-        out.append(torch.cat([left, right], dim=0))
+        if isinstance(left, QuantizedKv):
+            out.append(QuantizedKv.cat([left, right], dim=0))
+        else:
+            out.append(torch.cat([left, right], dim=0))
         del left, right
     return out

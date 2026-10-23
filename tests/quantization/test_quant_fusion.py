@@ -8,7 +8,7 @@ Three mechanisms let a quantized layer receive its input already in int8:
   (``LayerNorm.quantize_output``);
 * a declared :class:`~oasr.quantization.GemmChain` whose consumer has a static
   input scale makes the producer's epilogue quantize for it
-  (``W8A8Int8Method.emit``);
+  (``W8A8Method.emit``);
 * the ``static_inputs`` algorithm calibrates that static scale.
 
 The property that makes all three safe to ship: every fused kernel is

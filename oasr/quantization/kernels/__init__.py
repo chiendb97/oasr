@@ -4,18 +4,24 @@
 
 from .lanes import (
     CutlassSm80Int8Lane,
+    CutlassSm89Fp8Lane,
     ScaledMMLane,
     TorchIntMMLane,
+    TorchScaledMMLane,
     choose_lane,
     forced_backend,
     register_lane,
+    w8a8_format,
 )
 
 __all__ = [
     "CutlassSm80Int8Lane",
+    "CutlassSm89Fp8Lane",
     "ScaledMMLane",
     "TorchIntMMLane",
+    "TorchScaledMMLane",
     "choose_lane",
     "forced_backend",
     "register_lane",
+    "w8a8_format",
 ]

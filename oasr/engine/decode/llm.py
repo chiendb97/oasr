@@ -164,6 +164,7 @@ class LlmDecodeStrategy(IncrementalArStrategy):
                 valid,
                 capacity=inputs.size(1) + max(max_new) + 1,
                 kv_manager=self.kv_manager(),
+                **self._kv_cache_kwargs(),
             )
         return Prefill(state=state, logits=logits, max_new=max_new)
 

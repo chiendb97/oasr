@@ -153,6 +153,8 @@ class Qwen2Lm(BaseDecoder):
     #: decoder-only LM has no cross-attention cache — so a step is capturable
     #: given paged KV.
     supports_step_graphs = True
+    #: fp8 KV, dense or paged; grouped KV (``h_kv < h``) is read in the kernel.
+    kv_cache_dtypes = ("fp8_e4m3",)
 
     def __init__(self, cfg: SpeechLlmModelConfig) -> None:
         super().__init__()
@@ -212,6 +214,7 @@ class Qwen2Lm(BaseDecoder):
         valid: torch.Tensor,
         capacity: Optional[int] = None,
         kv_manager: Optional["DecoderKVCacheManager"] = None,
+        kv_cache_dtype: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation over a **left-padded** embedded prompt.
 
@@ -227,6 +230,12 @@ class Qwen2Lm(BaseDecoder):
 
         ``kv_manager`` (optional, requires ``capacity``): page the KV out of a
         shared pool instead of preallocating a per-group buffer.
+
+        ``kv_cache_dtype`` (``"fp8_e4m3"``): store the KV as fp8 with
+        per-(token, kv-head) scales (a paged pool must have been built fp8).
+        The prompt is quantized into the cache as it is written but attends its
+        own fresh K/V -- causal and left-padded -- in the served dtype; every
+        step reads the fp8 cache.
         """
         B, P, _ = inputs_embeds.shape
         n = len(self.layers)
@@ -241,6 +250,7 @@ class Qwen2Lm(BaseDecoder):
             # convention puts every row's real prompt flush against the right of
             # the ``(B, P)`` grid, so the valid window is ``[P - len, len)``.
             starts=(P - valid.sum(dim=1)).to(torch.int32),
+            kv_cache=kv_cache_dtype,
         )
         # HF masked-generate positions: cumsum - 1, pads clamped to 0.  For the
         # real (right-flush) region that is exactly ``lens - starts`` counted from

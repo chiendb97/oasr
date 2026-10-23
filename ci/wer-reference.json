@@ -179,6 +179,87 @@
       "_comment": "fp16 streaming on the same checkpoint measures 3.70 %; per-token SmoothQuant 3.70 %."
     },
     {
+      "key": "conformer_fp8_rtn",
+      "architecture": "conformer (WeNet U2++), fp8 e4m3 W8A8 round-to-nearest (online)",
+      "asset": "CKPT_DIR",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "fp8_w8a8"
+      },
+      "error_rate_pct": 4.0,
+      "ref_units": 3403,
+      "substitutions": 105,
+      "deletions": 21,
+      "insertions": 10,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization fp8_w8a8",
+      "_comment": "Needs fp8 tensor cores (sm89+; skipped below). Recorded 2026-10-21 on an RTX 5090. No calibration, and below online int8 (4.14) and fp16 (4.08). Identical transcripts at max_batch_size 8 / 16 / 32 (the fp8 lane sums every tile in one order); 4.08 at 1 (attention's split-KV, as for fp16). Streaming 3.73 (98S 16D 13I)."
+    },
+    {
+      "key": "conformer_fp8_sq_fused",
+      "architecture": "conformer (WeNet U2++), SmoothQuant fp8 e4m3 W8A8, FFN w_1 -> w_2 fused (static w_2 input scale, MSE clip)",
+      "asset": "CKPT_DIR",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_fp8_w8a8_fused",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          },
+          "static_inputs": {
+            "observer": "mse"
+          }
+        }
+      },
+      "error_rate_pct": 4.03,
+      "ref_units": 3403,
+      "substitutions": 107,
+      "deletions": 20,
+      "insertions": 10,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fp8_fused --recipe smoothquant_fp8_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fp8_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "Needs fp8 tensor cores (sm89+). The fp8 twin of conformer_w8a8_sq_fused (4.11): every pre-norm emits e4m3, w_1's epilogue quantizes for w_2 at its static scale. smoothquant_fp8_w8a8 (no static scales) measured 4.06 / 3.73."
+    },
+    {
+      "key": "conformer_fp8_sq_fused_streaming",
+      "architecture": "conformer (WeNet U2++), SmoothQuant fp8 e4m3 W8A8, FFN fused, streaming",
+      "asset": "CKPT_DIR",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "service_mode": "streaming",
+      "quantize_recipe": {
+        "recipe": "smoothquant_fp8_w8a8_fused",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          },
+          "static_inputs": {
+            "observer": "mse"
+          }
+        }
+      },
+      "error_rate_pct": 3.7,
+      "ref_units": 3403,
+      "substitutions": 97,
+      "deletions": 15,
+      "insertions": 14,
+      "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fp8_fused --recipe smoothquant_fp8_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fp8_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
+      "_comment": "Needs fp8 tensor cores (sm89+)."
+    },
+    {
       "_comment": [
         "Re-recorded 2026-09-27 at 3.67 (was 3.73, 104S 10D 13I): the decoder's",
         "cross-attention K/V is now paged next to its self-attention by default",
@@ -202,6 +283,93 @@
       "substitutions": 103,
       "deletions": 10,
       "insertions": 12
+    },
+    {
+      "key": "whisper_kv_fp8",
+      "asset": "WHISPER_CKPT",
+      "architecture": "whisper-tiny (aed), fp8 e4m3 KV cache",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "kv_cache": "fp8_e4m3"
+      },
+      "error_rate_pct": 3.7,
+      "ref_units": 3403,
+      "substitutions": 103,
+      "deletions": 9,
+      "insertions": 14,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization '{\"kv_cache\": \"fp8_e4m3\"}'",
+      "_comment": "Self- and cross-attention KV stored e4m3 with a power-of-two fp32 scale per (token, kv-head); fp16 weights. Recorded 2026-10-21 (RTX 5090): 9/200 transcripts differ from the fp16-KV row (3.67). Needs the C++ attention lane (sm80/86/89/120)."
+    },
+    {
+      "key": "whisper_int8_rtn",
+      "asset": "WHISPER_CKPT",
+      "architecture": "whisper-tiny (aed), int8 W8A8 round-to-nearest (online)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "int8_w8a8"
+      },
+      "error_rate_pct": 3.64,
+      "ref_units": 3403,
+      "substitutions": 102,
+      "deletions": 9,
+      "insertions": 13,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization int8_w8a8",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). 64 quantized layers (encoder and decoder; the conv front-end and the tied head are not quantizable GEMMs)."
+    },
+    {
+      "key": "whisper_fp8_rtn",
+      "asset": "WHISPER_CKPT",
+      "architecture": "whisper-tiny (aed), fp8 e4m3 W8A8 round-to-nearest (online)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "fp8_w8a8"
+      },
+      "error_rate_pct": 3.67,
+      "ref_units": 3403,
+      "substitutions": 102,
+      "deletions": 10,
+      "insertions": 13,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization fp8_w8a8",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Needs fp8 tensor cores (sm89+)."
+    },
+    {
+      "key": "whisper_w8a8_sq",
+      "asset": "WHISPER_CKPT",
+      "architecture": "whisper-tiny (aed), SmoothQuant int8 W8A8",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        }
+      },
+      "error_rate_pct": 3.76,
+      "ref_units": 3403,
+      "substitutions": 103,
+      "deletions": 11,
+      "insertions": 14,
+      "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/whisper_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/whisper_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Within fp16 + 0.3 but 0.12 above RTN (3.64): an alpha sweep (0.3-0.75: 3.73-3.94) and dropping each fold kind (3.73 each) found no group to blame; RTN already sits at fp16 and both change 19-24 of 200 transcripts against it."
     },
     {
       "_comment": [
@@ -428,6 +596,103 @@
       "insertions": 11
     },
     {
+      "key": "nemotron_fp8_rtn",
+      "asset": "NEMOTRON_CKPT",
+      "architecture": "nemotron-3.5-asr-streaming-0.6b, fp8 e4m3 W8A8 round-to-nearest (online)",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "fp8_w8a8"
+      },
+      "error_rate_pct": 2.67,
+      "ref_units": 3403,
+      "substitutions": 71,
+      "deletions": 9,
+      "insertions": 11,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization fp8_w8a8",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). 240 quantized encoder layers. Needs fp8 tensor cores (sm89+). Online int8 RTN misses the fp16 + 0.3 bar here (2.94 / 2.76 streaming: the first FFN's linear1 alone drops the encoder-output SQNR to 16.2 dB); fp8, SmoothQuant or int8 with ignore=*.feed_forward1.* pass."
+    },
+    {
+      "key": "nemotron_int8_rtn_noff1",
+      "asset": "NEMOTRON_CKPT",
+      "architecture": "nemotron-3.5-asr-streaming-0.6b, int8 W8A8 round-to-nearest (online), FFN1 kept fp16",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "int8_w8a8",
+        "ignore": "*.feed_forward1.*"
+      },
+      "error_rate_pct": 2.5,
+      "ref_units": 3403,
+      "substitutions": 68,
+      "deletions": 7,
+      "insertions": 10,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --quantization '{\"scheme\": \"int8_w8a8\", \"ignore\": \"*.feed_forward1.*\"}'",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). The documented remedy for online int8 on this model: plain int8_w8a8 measured 2.94 (77S 11D 12I)."
+    },
+    {
+      "key": "nemotron_w8a8_sq",
+      "asset": "NEMOTRON_CKPT",
+      "architecture": "nemotron-3.5-asr-streaming-0.6b, SmoothQuant int8 W8A8",
+      "decode_method": null,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        }
+      },
+      "error_rate_pct": 2.38,
+      "ref_units": 3403,
+      "substitutions": 65,
+      "deletions": 7,
+      "insertions": 9,
+      "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/nemotron_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/nemotron_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Below fp16 (2.59) with every encoder GEMM quantized, FFN1 included."
+    },
+    {
+      "key": "nemotron_w8a8_sq_streaming",
+      "asset": "NEMOTRON_CKPT",
+      "architecture": "nemotron-3.5-asr-streaming-0.6b, SmoothQuant int8 W8A8, streaming",
+      "decode_method": null,
+      "service_mode": "streaming",
+      "chunk_size": 16,
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        }
+      },
+      "error_rate_pct": 2.38,
+      "ref_units": 3403,
+      "substitutions": 66,
+      "deletions": 5,
+      "insertions": 10,
+      "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/nemotron_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/nemotron_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming --chunk-size 16",
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout)."
+    },
+    {
       "_comment": [
         "Recorded 2026-08-16 — the first WER the `llm` family has ever had, and",
         "the reason it now has one: it is the family whose decode path H11",
@@ -479,6 +744,83 @@
       "substitutions": 63,
       "deletions": 50,
       "insertions": 77
+    },
+    {
+      "key": "llm_kv_fp8",
+      "asset": "SPEECH_LLM_CKPT",
+      "architecture": "qwen2-audio-7b-instruct (speech_llm), fp8 e4m3 KV cache",
+      "decode_method": null,
+      "decode_options": {
+        "prompt": "Transcribe the audio into text. Output only the transcription, with no extra words."
+      },
+      "dtype": "bfloat16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "kv_cache": "fp8_e4m3"
+      },
+      "error_rate_pct": 5.44,
+      "ref_units": 3403,
+      "substitutions": 62,
+      "deletions": 49,
+      "insertions": 74,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --dtype bfloat16 --max-batch-size 16 --decode-option 'prompt=Transcribe the audio into text. Output only the transcription, with no extra words.' --quantization '{\"kv_cache\": \"fp8_e4m3\"}'",
+      "_comment": "The LM's GQA KV stored e4m3 with a power-of-two fp32 scale per (token, kv-head); bf16 weights. Recorded 2026-10-21 (RTX 5090); the bf16-KV arm measured 5.67 in the same tree (the llm row's 5.58 is from 2026-08-16), 10/200 transcripts differ. Before 2026-10-21 `run.py --family accuracy --dtype bfloat16` silently ran float16 (the run parser swallowed --dtype); fixed, so the command above measures bf16."
+    },
+    {
+      "key": "llm_int8_rtn",
+      "asset": "SPEECH_LLM_CKPT",
+      "architecture": "qwen2-audio-7b-instruct (speech_llm), int8 W8A8 round-to-nearest (online)",
+      "decode_method": null,
+      "decode_options": {
+        "prompt": "Transcribe the audio into text. Output only the transcription, with no extra words."
+      },
+      "dtype": "bfloat16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantization": {
+        "scheme": "int8_w8a8"
+      },
+      "error_rate_pct": 5.88,
+      "ref_units": 3403,
+      "substitutions": 63,
+      "deletions": 68,
+      "insertions": 69,
+      "recorded_with": "python benchmarks/run.py --family accuracy --ckpt-dir $ASSET --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --dtype bfloat16 --max-batch-size 16 --decode-option 'prompt=Transcribe the audio into text. Output only the transcription, with no extra words.' --quantization int8_w8a8",
+      "_comment": "Recorded 2026-10-21 (RTX 5090), bf16 activations; the bf16 arm measured 5.67 (65S 51D 77I) in the same tree. 416 quantized layers (tower and LM, the gated MLP included; lm_head and the projector stay bf16): weights 16016 -> 9247 MiB. Online fp8_w8a8 measured 6.02 (65S 62D 78I), fp8 weights + fp8 KV 5.79."
+    },
+    {
+      "key": "llm_w8a8_sq",
+      "asset": "SPEECH_LLM_CKPT",
+      "architecture": "qwen2-audio-7b-instruct (speech_llm), SmoothQuant int8 W8A8 (bf16 calibration twin)",
+      "decode_method": null,
+      "decode_options": {
+        "prompt": "Transcribe the audio into text. Output only the transcription, with no extra words."
+      },
+      "dtype": "bfloat16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "quantize_recipe": {
+        "recipe": "smoothquant_w8a8",
+        "calib_asset": "LIBRISPEECH_DEV_DIR",
+        "calib_utterances": 128,
+        "calib_dtype": "bfloat16",
+        "options": {
+          "smoothquant": {
+            "alpha": 0.5
+          }
+        }
+      },
+      "error_rate_pct": 5.14,
+      "ref_units": 3403,
+      "substitutions": 57,
+      "deletions": 47,
+      "insertions": 71,
+      "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/qwen_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl --calib-dtype bfloat16 && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/qwen_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --dtype bfloat16 --max-batch-size 16 --decode-option 'prompt=Transcribe the audio into text. Output only the transcription, with no extra words.'",
+      "_comment": "Recorded 2026-10-21 (RTX 5090), bf16 activations; the bf16 arm measured 5.67 (65S 51D 77I) in the same tree. The fp32 master (33.6 GB) does not fit the GPU: calibration runs a bf16 twin on the device, the folds the fp32 master on the host (5 min, 141 GB host RAM free)."
     }
   ]
 }

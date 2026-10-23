@@ -32,6 +32,8 @@ from .apply import (
 from .layout import FOLD_KINDS, GemmChain, QuantLayout, SmoothGroup
 from .methods import QuantMethod, method_for, register_quant_method
 from .spec import (
+    FP8_W8A8,
+    FP8_W8A8_STATIC,
     INT8_W8A8,
     INT8_W8A8_STATIC,
     PRESETS,
@@ -44,6 +46,8 @@ from .spec import (
 
 __all__ = [
     "FOLD_KINDS",
+    "FP8_W8A8",
+    "FP8_W8A8_STATIC",
     "GemmChain",
     "INT8_W8A8",
     "INT8_W8A8_STATIC",

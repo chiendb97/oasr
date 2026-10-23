@@ -154,20 +154,23 @@ def bind_quantization(model: nn.Module) -> None:
 def _link(model: nn.Module, layers: Dict[str, QuantizableGemm]) -> None:
     """Arm the producer -> consumer quantization the layout declares, where it can run.
 
-    * A norm whose group says ``fuse_output_quant`` emits per-token int8 when
-      every consumer can take it (a bound lane, a per-token scale, no runtime
-      smoother left to apply): one launch instead of norm + quantize per GEMM.
+    * A norm whose group says ``fuse_output_quant`` emits per-token 8-bit values
+      when every consumer can take them (a bound lane, a per-token scale, no
+      runtime smoother left to apply, one quantized dtype the norm can write):
+      one launch instead of norm + quantize per GEMM.
     * A :class:`~oasr.quantization.layout.GemmChain` whose consumer has a static
       input scale makes the producer's epilogue quantize for it: the pair
-      exchanges int8 and the consumer's quantize launch disappears.
+      exchanges 8-bit values (both layers must use the same format) and the
+      consumer's quantize launch disappears.
 
     Anything that cannot run fused stays unfused -- correct, just slower -- and
     the report says which inputs were quantized by whom.
     """
     modules = dict(model.named_modules())
     for module in modules.values():
-        if "quantize_output" in vars(module):
-            del module.quantize_output  # back to the class default (False)
+        for knob in ("quantize_output", "quantize_dtype"):
+            if knob in vars(module):
+                delattr(module, knob)  # back to the class default (off, int8)
     layout = _layout_of(model)
     if layout is None or not _FUSION_ENABLED:
         return
@@ -178,13 +181,18 @@ def _link(model: nn.Module, layers: Dict[str, QuantizableGemm]) -> None:
         if norm is None or not hasattr(type(norm), "quantize_output"):
             continue
         consumers = [layers.get(c) for c in group.consumers]
-        if all(
+        if not all(
             c is not None
             and c.quant_method is not None
             and c.quant_method.quantized_input(c) == "token"
             for c in consumers
         ):
+            continue
+        dtypes = {c.quant_method.quant_dtype for c in consumers}  # type: ignore[union-attr]
+        emits = getattr(type(norm), "quantize_output_dtypes", (torch.int8,))
+        if len(dtypes) == 1 and next(iter(dtypes)) in emits:
             setattr(norm, "quantize_output", True)  # noqa: B010 - a class-declared knob
+            setattr(norm, "quantize_dtype", next(iter(dtypes)))  # noqa: B010
             for c in consumers:
                 assert c is not None and c.quant_method is not None
                 c.quant_method.input_source = f"its norm ({group.producer})"
@@ -195,6 +203,8 @@ def _link(model: nn.Module, layers: Dict[str, QuantizableGemm]) -> None:
         assert producer.quant_method is not None and consumer.quant_method is not None
         if consumer.quant_method.quantized_input(consumer) != "tensor":
             continue
+        if producer.quant_method.quant_dtype != consumer.quant_method.quant_dtype:
+            continue  # the epilogue writes the producer's own format
         static = consumer.quant_method.static_input(consumer)
         if static is None:
             continue

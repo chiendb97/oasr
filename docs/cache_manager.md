@@ -574,6 +574,52 @@ runtime, transcripts unchanged; see `docs/models.md` for the geometry.
   pointers) prefer holding it on the engine `Request` object — keep the
   cache layer single-purpose.
 
+### 10.6 FP8 KV for the AR decoders
+
+`EngineConfig(quantization={"kv_cache": "fp8_e4m3"})` (or `oasr-server
+--quantization-option kv_cache=fp8_e4m3`) stores the decoder KV — the
+self-attention cache **and** an AED's cross-attention K/V — as
+`float8_e4m3fn` with one fp32 scale per `(token, kv-head)`.  Both storage
+modes:
+
+| | data | scales |
+|---|---|---|
+| paged (`BlockPool` with `dtype=float8_e4m3fn`) | `(layers, blocks, page, H_kv, D)` fp8 | `(layers, blocks, page, H_kv)` fp32, zeroed like the data |
+| dense (`DecoderKv(kv_cache="fp8_e4m3")`) | `(B, H_kv, cap, D)` fp8 per layer | `(B, H_kv, cap)` fp32 per layer |
+
+- **Written by one launch per layer.** `quantize_kv_store` computes each
+  vector's scale from that vector alone (the least power of two putting its
+  amax inside ±448 — no calibration, batch-invariant) and scatters K and V to
+  the row's own positions, paged by flat slot or dense by offset.
+- **Read by the attention kernel, never dequantized wholesale.** `append` hands
+  the attention `QuantizedKv` (data + scales) where it handed a tensor;
+  `oasr.layers.Attention` passes it to the fp8 variants of the C++ lane
+  ([kernels.md](kernels.md#fp8-kv-variants-fmha_kv8h)), which dequantize per
+  tile in shared memory.
+- **A prefill attends its prompt fresh.** The prompt's K/V are quantized into
+  the cache as they are written, but an empty quantized cache answers
+  `mask_kwargs` / `append` as if trimmed, so the prompt's own causal,
+  left-padded attention runs in the served dtype; every later step reads the
+  fp8 cache.  (Whisper's prompt still reads the *cross* K/V through the fp8
+  path — they are cached.)
+- **Bookkeeping is unchanged.** `select` / `merge` move scales with their rows;
+  paged pages are freed the same way; a dense cache needs a capacity buffer.
+  The pool's format and the decoder's must agree (`build_kv` raises
+  otherwise).  Step graphs capture the quantize-and-scatter and the fp8 read
+  like any other kernel, and replay is bit-identical to the eager step.
+- **Sizing counts it.** `IncrementalArStrategy._kv_bytes_per_token` is
+  `2 · layers · H_kv · (D + 4)` bytes instead of `2 · layers · H_kv · D · 2` —
+  1.88x fewer at `D = 64`, 1.94x at `D = 128` — so the VRAM-derived
+  `decode_kv_budget_gib` affords that many more rows and the pool built from
+  a byte budget holds that many more blocks.  Rows actually admitted are still
+  capped by `max_decode_slots` (default `max_batch_size`): raise it to spend the
+  room.
+- **Refused where it cannot be served**, at engine construction, by name: a
+  decode family with no AR cache, a decoder that does not list the format in
+  `kv_cache_dtypes`, an fp32 model on CUDA, a head dim the fp8 gather cannot
+  tile, or `OASR_ATTN_BACKEND=cute|sdpa`.  The word-timing alignment pass is
+  one teacher-forced forward that stores nothing and keeps the served dtype.
+
 ## 11. Quick Reference
 
 ```text

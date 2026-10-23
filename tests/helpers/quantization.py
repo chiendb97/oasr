@@ -52,13 +52,13 @@ def tiny_conformer(**overrides: Any):
 
 
 def randomize_norms(model: torch.nn.Module, seed: int = 1) -> None:
-    """Give every LayerNorm a non-trivial affine (γ in [0.5, 2], β in [-0.5, 0.5])."""
-    from oasr.layers.norm import LayerNorm
+    """Give every LayerNorm / RMSNorm a non-trivial affine (γ in [0.5, 2], β in [-0.5, 0.5])."""
+    from oasr.layers.norm import LayerNorm, RMSNorm
 
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for module in model.modules():
-            if isinstance(module, LayerNorm):
+            if isinstance(module, (LayerNorm, RMSNorm)):
                 module.weight.copy_(torch.rand(module.weight.shape, generator=g) * 1.5 + 0.5)
                 if module.bias is not None:
                     module.bias.copy_(torch.rand(module.bias.shape, generator=g) - 0.5)

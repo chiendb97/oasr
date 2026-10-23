@@ -35,21 +35,37 @@ if _BACKEND not in _BACKENDS:
     raise ValueError(f"OASR_SCALED_MM_BACKEND={_BACKEND!r}; expected one of {_BACKENDS}")
 
 
+def w8a8_format(scheme: "QuantScheme") -> Optional[str]:
+    """``"int8"`` / ``"fp8"`` for a W8A8 scheme the scaled GEMMs serve, else ``None``.
+
+    Per-channel symmetric 8-bit weights x 8-bit activations of the same type, with
+    a per-token dynamic or one static per-tensor activation scale.
+    """
+    w, a = scheme.weights, scheme.input_activations
+    if (
+        a is None
+        or w.num_bits != 8
+        or a.num_bits != 8
+        or w.type != a.type
+        or w.granularity != "channel"
+        or not (w.symmetric and a.symmetric)
+    ):
+        return None
+    if not (
+        (a.granularity == "token" and a.dynamic) or (a.granularity == "tensor" and not a.dynamic)
+    ):
+        return None
+    return "int8" if w.type == "int" else "fp8"
+
+
 def _is_int8_w8a8(scheme: "QuantScheme") -> bool:
     """int8 per-channel W x int8 A: per-token dynamic, or one static per-tensor scale."""
-    w, a = scheme.weights, scheme.input_activations
-    return (
-        w.type == "int"
-        and w.num_bits == 8
-        and w.granularity == "channel"
-        and a is not None
-        and a.type == "int"
-        and a.num_bits == 8
-        and (
-            (a.granularity == "token" and a.dynamic)
-            or (a.granularity == "tensor" and not a.dynamic)
-        )
-    )
+    return w8a8_format(scheme) == "int8"
+
+
+def _is_fp8_w8a8(scheme: "QuantScheme") -> bool:
+    """e4m3 per-channel W x e4m3 A: per-token dynamic, or one static per-tensor scale."""
+    return w8a8_format(scheme) == "fp8"
 
 
 class ScaledMMLane(ABC):
@@ -86,7 +102,7 @@ class ScaledMMLane(ABC):
         activation: Optional[str],
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """The GEMM: int8 ``a`` ``[..., K]``, int8 ``b`` ``[N, K]``; returns ``[..., N]``.
+        """The GEMM: 8-bit ``a`` ``[..., K]``, 8-bit ``b`` ``[N, K]``; returns ``[..., N]``.
 
         ``a_scale`` holds one scale per row of *a*, or one per-tensor scale.
         """
@@ -102,15 +118,17 @@ class ScaledMMLane(ABC):
         out_mul: torch.Tensor,
         round_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """The GEMM, its output quantized for a static-scale consumer (int8 ``[..., N]``).
+        """The GEMM, its output quantized for a static-scale consumer (``[..., N]``).
 
-        ``quantize_static(run(...), out_mul)`` by default -- bit-identical to a
-        lane that fuses it.
+        In the operands' format.  ``quantize_static(run(...), out_mul)`` by default
+        -- bit-identical to a lane that fuses it.
         """
         from oasr.functionals.quant import quantize_static
 
         q: torch.Tensor = quantize_static(
-            self.run(a, b, a_scale, b_scale, bias, activation, round_dtype), out_mul
+            self.run(a, b, a_scale, b_scale, bias, activation, round_dtype),
+            out_mul,
+            dtype=a.dtype,
         )
         return q
 
@@ -206,8 +224,111 @@ class TorchIntMMLane(ScaledMMLane):
         return y.to(out_dtype).reshape(*a.shape[:-1], b.shape[0])
 
 
+class CutlassSm89Fp8Lane(ScaledMMLane):
+    """CUTLASS 2.x fp8 e4m3 ``mma.sync`` (Ada's, run by sm_120 too) with the same EVT epilogue.
+
+    An fp32 accumulator with one summation order for every tile, so the lane is
+    batch-invariant (``oasr/jit/scaled_mm.py``).  Below sm89 there are no fp8
+    tensor cores: :meth:`is_supported` says so, and the method refuses the scheme.
+    """
+
+    name = "cutlass_sm89_fp8"
+    backend = "cutlass"
+
+    @classmethod
+    def is_supported(cls, sm: int) -> Tuple[bool, str]:
+        from oasr.jit.scaled_mm import lane_available
+
+        if lane_available(sm, "fp8"):
+            return True, ""
+        return False, f"no fp8 mma.sync lane is built for sm{sm} (fp8 tensor cores need sm89+)"
+
+    @classmethod
+    def is_native(cls, sm: int) -> bool:
+        from oasr.jit.scaled_mm import is_native_lane
+
+        return is_native_lane(sm, "fp8")
+
+    @classmethod
+    def can_implement(
+        cls, scheme: "QuantScheme", n: int, k: int, out_dtype: torch.dtype
+    ) -> Tuple[bool, str]:
+        from oasr.jit.scaled_mm import K_ALIGNMENT, N_ALIGNMENT
+
+        if not _is_fp8_w8a8(scheme):
+            return False, "serves e4m3 per-channel W x e4m3 A (per-token dynamic or static) only"
+        if out_dtype not in (torch.float16, torch.bfloat16):
+            return False, f"output dtype {out_dtype} (fp16/bf16 only)"
+        if k % K_ALIGNMENT or n % N_ALIGNMENT:
+            return False, f"N={n} K={k}: needs K % {K_ALIGNMENT} == 0 and N % {N_ALIGNMENT} == 0"
+        return True, ""
+
+    def run(self, a, b, a_scale, b_scale, bias, activation, out_dtype):
+        return _smm.scaled_mm(a, b, a_scale, b_scale, bias, activation, out_dtype=out_dtype)
+
+    def run_quant(self, a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype):
+        return _smm.scaled_mm_quant(a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype)
+
+
+class TorchScaledMMLane(ScaledMMLane):
+    """``torch._scaled_mm`` (cuBLASLt fp8) plus a torch dequant epilogue.
+
+    A baseline and A/B arm, not the default.  The GEMM runs with unit per-tensor
+    scales and an fp32 output -- the plain fp32 sum of the e4m3 products -- and
+    the per-token x per-channel dequant, bias and activation follow in torch.
+    cuBLASLt's *rowwise* scaling is not used: on this torch build
+    (2.12 / CUDA 13.2, RTX 5090) it accepts an fp16 output and returns values
+    ~64 off on unit scales, silently, so a lane built on it would be wrong.
+    Not batch-invariant: cuBLASLt picks its algorithm per M.
+    """
+
+    name = "torch_scaled_mm"
+    backend = "torch"
+
+    @classmethod
+    def is_supported(cls, sm: int) -> Tuple[bool, str]:
+        return (sm >= 89), ("" if sm >= 89 else f"sm{sm} has no fp8 tensor cores")
+
+    @classmethod
+    def can_implement(
+        cls, scheme: "QuantScheme", n: int, k: int, out_dtype: torch.dtype
+    ) -> Tuple[bool, str]:
+        if not _is_fp8_w8a8(scheme):
+            return False, "serves e4m3 per-channel W x e4m3 A (per-token dynamic or static) only"
+        if k % 16 or n % 16:
+            return False, f"N={n} K={k}: torch._scaled_mm needs both 16-aligned"
+        return True, ""
+
+    def run(self, a, b, a_scale, b_scale, bias, activation, out_dtype):
+        k = a.shape[-1]
+        a2 = a.reshape(-1, k)
+        one = _unit_scale(a.device)
+        acc = torch._scaled_mm(a2, b.t(), scale_a=one, scale_b=one, out_dtype=torch.float32)
+        y = acc * b_scale.reshape(1, -1) * a_scale.reshape(-1, 1)
+        if bias is not None:
+            y = y + bias.float()
+        y = _TORCH_ACTIVATION[activation](y)
+        return y.to(out_dtype).reshape(*a.shape[:-1], b.shape[0])
+
+
+_UNIT_SCALES: dict = {}
+
+
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    """A cached fp32 scalar ``1.0`` on *device* (one allocation per device, capture-safe)."""
+    one = _UNIT_SCALES.get(device)
+    if one is None:
+        one = _UNIT_SCALES[device] = torch.ones((), dtype=torch.float32, device=device)
+    return one
+
+
 #: Priority order for ``auto``.
-_LANES: List[Type[ScaledMMLane]] = [CutlassSm80Int8Lane, TorchIntMMLane]
+_LANES: List[Type[ScaledMMLane]] = [
+    CutlassSm80Int8Lane,
+    CutlassSm89Fp8Lane,
+    TorchIntMMLane,
+    TorchScaledMMLane,
+]
 
 
 def register_lane(cls: Type[ScaledMMLane], *, first: bool = False) -> Type[ScaledMMLane]:

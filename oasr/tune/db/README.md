@@ -2,7 +2,7 @@
 
 One JSON file per `(arch family, kernel family)`: `sm120/gemm.json`,
 `sm120/conv1d.json`, `sm120/scaled_mm.json` (the int8 W8A8 GEMM of quantized
-layers), … Read by `oasr.tune.database`; the format, the tier rules and the
+layers), `sm120/scaled_mm_fp8.json` (the fp8 e4m3 one), … Read by `oasr.tune.database`; the format, the tier rules and the
 validator policy are documented there. The user tier
 (`~/.cache/oasr/tune/v2/…`, written by tuning runs on the machine that measured
 them) wins over these files per signature.
@@ -13,7 +13,26 @@ new one with `oasr tune build` on the target card and review the diff with
 
 ## Provenance of the files here
 
-### `sm120/scaled_mm.json` — Conformer int8 widths (2026-10-20)
+### `sm120/scaled_mm_fp8.json` — Conformer fp8 widths (2026-10-21)
+
+The fp8 family's first file (lane `sm89_fp8_mma`), built by `oasr tune build
+--family scaled_mm_fp8` on an otherwise idle RTX 5090 from the same four census
+shapes as `scaled_mm.json` below, in fp8: the U2++ Conformer quantized online
+with `fp8_w8a8`, and the `smoothquant_fp8_w8a8_fused` checkpoint, each offline
+(`max_batch_size=32`) and streaming (chunk 16, widths 1–64).  Every fp8 variant
+computes the same bits (one summation order for every tile), so the bitwise
+numerics gate holds as for int8.  The heuristic keeps small and mid M; at large M
+(above M = 2040–7136 depending on the width) `b64x64x64_w32x32x64_s6_e4m3` wins
+every signature where the heuristic picks a 128-wide tile -- the 64×64 tile keeps
+two CTAs per SM at fp8's half-rate fp32 accumulation.  Regenerate as below with
+`--quantization fp8_w8a8`, `--recipe smoothquant_fp8_w8a8_fused` and
+`--family scaled_mm_fp8`.
+
+### `sm120/scaled_mm.json` — Conformer int8 widths (2026-10-20; re-measured 2026-10-21)
+
+Re-measured on 2026-10-21 after the scaled-mm headers became element-generic
+(the `impl_hash` validator marked the file stale): the same decisions, region
+for region.
 
 The int8 `scaled_mm` family's first file, built by `oasr tune build --family
 scaled_mm` on an otherwise idle RTX 5090 (`provenance.contended` false) from four

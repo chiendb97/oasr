@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import assets
 import pytest
@@ -64,6 +65,9 @@ def _quantized_checkpoint(src: str, recipe: dict, tmp_path_factory) -> str:
             calib_manifest=str(Path(calib) / "manifest.jsonl"),
             calib_utterances=int(recipe.get("calib_utterances", 128)),
             algorithm_options=recipe.get("options"),
+            # A model whose fp32 master does not fit the GPU (a 7B LM) calibrates
+            # a reduced-precision twin; the recipe names it, so the row reproduces.
+            calibration_dtype=recipe.get("calib_dtype"),
         )
         _QUANTIZED[key] = str(dst)
     return _QUANTIZED[key]
@@ -112,11 +116,42 @@ class TestManifest:
         )
 
 
+def _unservable_here(spec) -> Optional[str]:
+    """Why this GPU cannot run the row's format at all, or ``None``.
+
+    Asked of the code, not recorded in the row: an fp8 weight scheme needs the
+    fp8 GEMM lane (fp8 tensor cores, sm89+), an fp8 KV cache the C++ attention
+    lane.  Neither is a missing asset or a defect -- the engine refuses such a
+    configuration by name at construction -- so the row is skipped with the reason.
+    """
+    import oasr.jit.scaled_mm as jsm
+    from oasr.jit.core import _get_target_sm
+    from oasr.quantization.recipes import get_recipe
+    from oasr.quantization.spec import get_scheme
+
+    sm = _get_target_sm()
+    quant = dict(spec.get("quantization") or {})
+    scheme = quant.get("scheme")
+    if spec.get("quantize_recipe"):
+        scheme = get_recipe(spec["quantize_recipe"]["recipe"]).scheme
+    if scheme and get_scheme(scheme).weights.type == "float" and not jsm.lane_available(sm, "fp8"):
+        return f"{scheme} needs fp8 tensor cores (sm89+); this GPU is sm{sm}"
+    if quant.get("kv_cache") == "fp8_e4m3":
+        from oasr.jit.fmha import SUPPORTED_SM
+
+        if sm not in SUPPORTED_SM:
+            return f"an fp8 KV cache needs the C++ attention lane ({SUPPORTED_SM}), not sm{sm}"
+    return None
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize("spec", ENTRIES, ids=[e["key"] for e in ENTRIES])
 def test_wer_has_not_regressed(spec, device, tmp_path_factory):
     """Measure the manifest and compare against the recorded rate."""
     assets.require(spec["asset"], REFERENCE["audio_asset"])
+    reason = _unservable_here(spec)
+    if reason is not None:
+        pytest.skip(reason)
     ckpt = assets.resolve(spec["asset"])
     # A quantized row measures a checkpoint ``oasr quantize`` writes from the
     # asset, built here rather than stored, so it always reflects the current
@@ -167,8 +202,14 @@ def test_wer_has_not_regressed(spec, device, tmp_path_factory):
         cfg_kwargs["quantization"] = dict(spec["quantization"])
 
     engine = ASREngine(EngineConfig(**cfg_kwargs))
-    if spec.get("quantization") or spec.get("quantize_recipe"):
+    quant = dict(spec.get("quantization") or {})
+    if quant.get("scheme") or spec.get("quantize_recipe"):
         assert engine.quantization_info() is not None, f"{spec['key']} measured an fp model"
+    # A KV-cache format is not a weight scheme, so ``quantization_info`` cannot
+    # see it; ask the strategy that stores the cache instead.
+    if quant.get("kv_cache"):
+        served = getattr(engine._output_processor.strategy, "kv_cache_format", None)
+        assert served == quant["kv_cache"], f"{spec['key']} measured a {served!r} KV cache"
     try:
         waves, _ = load_audio(entries, engine.sample_rate)
         hyps, _ = transcribe(engine, waves, spec["max_batch_size"], streaming=mode == "streaming")

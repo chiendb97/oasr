@@ -9,6 +9,7 @@
     oasr tune build --census a.json --census b.json --out system   # the shipped file
     oasr tune census --ckpt-dir CKPT --quantization int8_w8a8 --out q.json  # a quantized model
     oasr tune build --census q.json --family scaled_mm --out user  # its int8 GEMMs only
+    oasr tune census --ckpt-dir CKPT --quantization fp8_w8a8 --out f.json   # fp8 (sm89+)
     oasr tune diff oasr/tune/db/sm120/gemm.json ~/.cache/oasr/tune/v2/sm120/gemm.json
     oasr tune status
     oasr tune export-misses --out misses.json               # after a workload ran
@@ -16,19 +17,21 @@
 ``build`` measures on the GPU it runs on and writes the file for that GPU's
 architecture family; a shipped file for another family is built on that family
 (``ci/modal_app.py``'s tune entry point runs one per GPU of the matrix).  A census
-of a quantized model also holds int8 ``scaled_mm`` points: ``build`` then writes
-``scaled_mm.json`` beside ``gemm.json`` (``--family`` restricts it to one).
+of a quantized model also holds 8-bit points: ``build`` then writes
+``scaled_mm.json`` (int8) or ``scaled_mm_fp8.json`` (fp8) beside ``gemm.json``
+(``--family`` restricts it to one).
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 def _cmd_census(args) -> int:
@@ -71,9 +74,15 @@ def _cmd_census(args) -> int:
     ss.save(args.out)
     sigs = ss.signatures()
     int8 = sum(1 for sig in sigs if C.kernel_family(sig[0]) == "scaled_mm")
+    fp8 = sum(1 for sig in sigs if C.kernel_family(sig[0]) == "scaled_mm_fp8")
+    quant = ", ".join(
+        part
+        for part in (f"{int8} int8 scaled_mm" if int8 else "", f"{fp8} fp8" if fp8 else "")
+        if part
+    )
     print(
         f"[census] {len(ss.points)} points over {len(sigs)} signatures"
-        + (f" ({int8} int8 scaled_mm)" if int8 else "")
+        + (f" ({quant})" if quant else "")
         + f", {sum(p.must for p in ss.points)} must-tune; weights "
         f"{ss.working_set_bytes / 2**20:.1f} MiB -> {args.out}"
     )
@@ -176,13 +185,15 @@ def _cmd_build(args) -> int:
     merged.points = list(uniq.values())
     families = {kernel_family(p.op) for p in merged.points}
     want = {
-        "auto": [f for f in ("gemm", "scaled_mm") if f in families] or ["gemm"],
+        "auto": [f for f in ("gemm", "scaled_mm", "scaled_mm_fp8") if f in families] or ["gemm"],
         "gemm": ["gemm"],
         "scaled_mm": ["scaled_mm"],
+        "scaled_mm_fp8": ["scaled_mm_fp8"],
     }[args.family]
-    if "scaled_mm" in want and "scaled_mm" not in families:
-        print("[build] the census has no int8 scaled_mm points (census a quantized model)")
-        return 1
+    for family, what in (("scaled_mm", "int8"), ("scaled_mm_fp8", "fp8")):
+        if family in want and family not in families:
+            print(f"[build] the census has no {what} {family} points (census a quantized model)")
+            return 1
     opts = BuildOptions(
         min_speedup=args.min_speedup,
         partition=args.partition,
@@ -198,7 +209,11 @@ def _cmd_build(args) -> int:
         checkpoint_path=args.checkpoint,
         progress=(lambda s: print(f"[build] {s}", file=sys.stderr, flush=True)),
     )
-    builders = {"gemm": build_gemm, "scaled_mm": build_scaled_mm}
+    builders: Dict[str, Callable[..., Any]] = {
+        "gemm": build_gemm,
+        "scaled_mm": build_scaled_mm,
+        "scaled_mm_fp8": functools.partial(build_scaled_mm, fmt="fp8"),
+    }
     for family in want:
         out = _resolve_out(args.out, sm, family)
         base = database.load_file(out, family, sm) if (out.is_file() and not args.fresh) else None
@@ -323,14 +338,14 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument(
         "--out",
         default="user",
-        help="'user', 'system', or a path (the gemm file; scaled_mm.json goes beside it)",
+        help="'user', 'system', or a path (the gemm file; scaled_mm[_fp8].json go beside it)",
     )
     b.add_argument(
         "--family",
-        choices=("auto", "gemm", "scaled_mm"),
+        choices=("auto", "gemm", "scaled_mm", "scaled_mm_fp8"),
         default="auto",
         help="which kernel family's file to build (auto: every family the census has points "
-        "for -- scaled_mm when it has int8 points)",
+        "for -- scaled_mm when it has int8 points, scaled_mm_fp8 when it has fp8 ones)",
     )
     b.add_argument(
         "--note",

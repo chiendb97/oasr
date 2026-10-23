@@ -69,6 +69,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture", default=None, help="Registry key override")
     parser.add_argument("--checkpoint-name", default="final.pt")
     parser.add_argument("--device", default="cuda", help="Calibration device (default cuda)")
+    parser.add_argument(
+        "--calib-dtype",
+        default=None,
+        choices=("float32", "bfloat16", "float16"),
+        help=(
+            "Run the calibration audio through a copy of the model in this dtype on "
+            "--device while the fp32 master (every scale, fold and weight quantization) "
+            "stays on the host -- for a model whose fp32 master does not fit the device "
+            "(default: calibrate the fp32 master on --device)"
+        ),
+    )
     return parser
 
 
@@ -103,6 +114,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         architecture=args.architecture,
         checkpoint_name=args.checkpoint_name,
         device=args.device,
+        calibration_dtype=args.calib_dtype,
     )
     print(out)
     return 0

@@ -143,6 +143,16 @@ is its own kernel family with its own file, keyed by op and width:
   measured at every point (the set is eight tiles — no pruning, no cost model),
   numerics-gated **bitwise** against the heuristic's variant, and partitioned
   against a `heuristic` pseudo-arm (`oasr/tune/build_scaled_mm.py`).
+- **fp8: a family of its own.** The fp8 e4m3 GEMM (`fp8_w8a8`) keeps its entries
+  in `scaled_mm_fp8.json` (family `scaled_mm_fp8`, lane `sm89_fp8_mma`), keyed
+  `scaled_mm_fp8|op=scaled_mm_fp8|N=..|K=..` and `op=scaled_mm_fp8_quant`; the
+  recorder files an fp8-operand call under those ops (dtype `float8_e4m3fn`),
+  `oasr tune census --quantization fp8_w8a8` probes it, and `oasr tune build`
+  (`--family scaled_mm_fp8`) measures its eight tiles the same way. Its tiles
+  also compute the same bits as each other (one summation order, see
+  [quantization.md](quantization.md#fp8)), so the bitwise numerics gate holds.
+  The shipped `sm120/scaled_mm_fp8.json` covers the Conformer widths: at large
+  M the 64x64 tile beats the heuristic's 128-wide ones on every signature.
 - **The engine.** `TuningConfig(strict=True)` raises on an uncovered int8
   must-tune point as on a GEMM one, `mode="prewarm"` measures it into the user
   tier before capture (one `budget_s` for both families), and the tuning report

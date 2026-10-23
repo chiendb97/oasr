@@ -23,13 +23,18 @@ is what leaves a decode step with nothing at a per-batch address.
 
 The block tables / ``cache_seqlens`` this manager produces feed the same paged
 FMHA path the encoder uses (``oasr.fmha`` with ``block_table``).
+
+A pool built with ``dtype=torch.float8_e4m3fn`` stores the KV **quantized**
+(``EngineConfig.quantization.kv_cache = "fp8_e4m3"``): :meth:`kv_view` then
+returns :class:`~oasr.functionals.kv_quant.QuantizedKv` pairs, which the paged
+attention reads and dequantizes inside its tile loop.
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 
@@ -83,7 +88,8 @@ class DecoderKVCacheManager:
         self._pool = pool
         self._block_tokens = pool.config.block_size_frames
         self._slots: Dict[str, _SlotState] = {}
-        self._views: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._views: Dict[int, Tuple[Any, Any]] = {}
+        self._slot_views: Dict[int, Tuple[torch.Tensor, ...]] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -93,6 +99,11 @@ class DecoderKVCacheManager:
     @property
     def pool(self) -> BlockPool:
         return self._pool
+
+    @property
+    def quantized(self) -> bool:
+        """Whether the pool stores fp8 K/V with per-(token, head) scales."""
+        return bool(self._pool.quantized)
 
     def num_active(self) -> int:
         return len(self._slots)
@@ -221,19 +232,51 @@ class DecoderKVCacheManager:
             )
         return torch.tensor([self._slots[rid].seqlen for rid in request_ids], dtype=torch.int32)
 
-    def kv_view(self, layer: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def kv_view(self, layer: int) -> Tuple[Any, Any]:
         """Full-pool ``(K, V)`` views for one decoder layer (paged FMHA input).
 
         Memoized: the pool's backing tensors never move, so the views never
         change, and an AR decode step asks for every layer's on every step —
         rebuilding them there is two tensor allocations per layer per step for an
         answer that is a constant.
+
+        A quantized pool answers with two
+        :class:`~oasr.functionals.kv_quant.QuantizedKv` — fp8 data plus its
+        ``(blocks, page, H_kv)`` scales — which :class:`oasr.layers.Attention`
+        takes in place of a tensor.
         """
         view = self._views.get(layer)
         if view is None:
-            view = self._pool.get_kv_view(layer)
+            k, v = self._pool.get_kv_view(layer)
+            if self.quantized:
+                from oasr.functionals.kv_quant import QuantizedKv
+
+                ks, vs = self._pool.get_kv_scale_view(layer)
+                view = (QuantizedKv(k, ks), QuantizedKv(v, vs))
+            else:
+                view = (k, v)
             self._views[layer] = view
         return view
+
+    def slot_views(self, layer: int) -> Tuple[torch.Tensor, ...]:
+        """``(k, k_scale, v, v_scale)`` of a quantized pool, as the store kernel addresses them.
+
+        ``(1, H_kv, slots, D)`` and ``(1, H_kv, slots)``: one shared row whose
+        slot axis is the flattened ``(block, offset)`` index
+        (:func:`~oasr.cache.paged_kv.flat_write_index`).  Views, memoized for the
+        same reason as :meth:`kv_view`.
+        """
+        views = self._slot_views.get(layer)
+        if views is None:
+            k, v = self.kv_view(layer)
+            out = []
+            for part in (k, v):
+                blocks, page, heads, dim = part.data.shape
+                out.append(part.data.view(1, blocks * page, heads, dim).permute(0, 2, 1, 3))
+                out.append(part.scale.view(1, blocks * page, heads).permute(0, 2, 1))
+            views = tuple(out)
+            self._slot_views[layer] = views
+        return views
 
     # ------------------------------------------------------------------
     # Helpers

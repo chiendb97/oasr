@@ -69,10 +69,12 @@ def modules_for(ops: Iterable[str]) -> List[Tuple[str, Any]]:
         specs.append(("gemm_log_softmax", jg.gen_gemm_log_softmax_module()))
         specs.append(("softmax", gen_softmax_module()))
     if ops & set(SCALED_MM_TUNED_OPS):
-        # One module holds every int8 variant, fp- and int8-output launchers alike.
-        from oasr.jit.scaled_mm import gen_scaled_mm_module
+        # One module per format holds every variant, fp- and 8-bit-output launchers alike.
+        from oasr.jit.scaled_mm import FORMAT_OPS, MODULE_NAME, gen_scaled_mm_module
 
-        specs.append(("scaled_mm", gen_scaled_mm_module()))
+        for fmt, fmt_ops in FORMAT_OPS.items():
+            if ops & set(fmt_ops):
+                specs.append((MODULE_NAME[fmt], gen_scaled_mm_module(fmt)))
     return specs
 
 

@@ -1175,7 +1175,7 @@ class ConformerModel(BaseAsrModel):
         (``v_to_o``).  ``w_2`` (after swish) and ``pointwise_conv2`` (after the
         conv norm and swish) have no producer that can absorb ``s``: they carry a
         runtime smoother.  The subsampling front-end, ``linear_pos`` (its input is
-        the sinusoidal table), the CTC head and the AED decoder stay full precision.
+        the sinusoidal table) and the CTC head stay full precision.
 
         What the forward lets run fused: the pre-norms of the two FFNs and of
         attention feed their GEMM and nothing else (attention reads only its
@@ -1184,6 +1184,15 @@ class ConformerModel(BaseAsrModel):
         FFN is a chain: ``w_1``'s activated output is ``w_2``'s input and nothing
         else's.  The fp subsampling and positional projections are pinned
         batch-invariant when the model is quantized.
+
+        The U2++ attention decoder, when loaded, declares its own groups
+        (:meth:`~oasr.models.decoders.transformer_decoder.TransformerDecoder.
+        quantization_layout`; its vocabulary heads stay full precision).  Its
+        cross-attention ``linear_k`` / ``linear_v`` read the encoder output, which
+        the full-precision CTC head reads too: folding their smoothing into
+        ``after_norm`` would have to fold it into the CTC head as well, moving
+        the production CTC path's rounding for a rescoring-only gain, so that
+        group is smoothed at run time instead (one multiply in the quantize).
         """
         groups: List[SmoothGroup] = []
         chains: List[GemmChain] = []
@@ -1221,9 +1230,17 @@ class ConformerModel(BaseAsrModel):
             groups.append(norm_group("norm_ff", f"{p}.feed_forward.w_1", True))
             groups.append(SmoothGroup(None, (f"{p}.feed_forward.w_2",), "runtime"))
             chains.append(GemmChain(f"{p}.feed_forward.w_1", f"{p}.feed_forward.w_2"))
+        keep: Tuple[str, ...] = ("encoder.embed.*", "*.linear_pos", "ctc.*")
+        decoder = getattr(self, "decoder", None)
+        if isinstance(decoder, BiTransformerDecoder):
+            dec = decoder.quantization_layout("decoder")
+            groups.extend(dec.groups)
+            chains.extend(dec.chains)
+            keep += dec.keep_full_precision
+            groups.append(SmoothGroup(None, decoder.cross_attention_inputs("decoder"), "runtime"))
         return QuantLayout(
             groups=tuple(groups),
-            keep_full_precision=("encoder.embed.*", "*.linear_pos", "ctc.*", "decoder.*"),
+            keep_full_precision=keep,
             chains=tuple(chains),
             # The fp GEMMs ahead of int8 layers, whose tuned kernels (cuBLAS,
             # split-K, Stream-K) depend on M -- which the int8 rounding after them
@@ -1232,6 +1249,44 @@ class ConformerModel(BaseAsrModel):
             # on which utterances share the batch).
             batch_invariant=("encoder.embed.out.0", "*.linear_pos"),
         )
+
+    def calibration_forward(
+        self, features: torch.Tensor, lengths: torch.Tensor, *, tokenizer=None
+    ) -> None:
+        """Encoder; with the U2++ decoder, one rescoring pass over the CTC best path.
+
+        The decoder is driven the way ``ctc_aed_rescoring`` drives it -- teacher
+        forced over a CTC hypothesis, both directions -- with the greedy CTC path
+        (blank 0, repeats collapsed) as the one hypothesis.
+        """
+        del tokenizer
+        hidden, out_lengths = self.encode_offline(features, lengths)
+        decoder = getattr(self, "decoder", None)
+        if not isinstance(decoder, BiTransformerDecoder):
+            return
+        from ..decoders.transformer_decoder import add_sos_eos, reverse_pad_list
+
+        cfg = decoder.config
+        best = self.ctc(hidden).argmax(dim=-1)  # (B, T)
+        hyps = []
+        for b in range(best.size(0)):
+            path = best[b, : int(out_lengths[b])].tolist()
+            hyps.append([t for i, t in enumerate(path) if t != 0 and (i == 0 or t != path[i - 1])])
+        width = max(1, max(len(h) for h in hyps))
+        ys = torch.full((len(hyps), width), -1, dtype=torch.long)
+        for b, h in enumerate(hyps):
+            if h:
+                ys[b, : len(h)] = torch.tensor(h).clamp_max(cfg.vocab_size - 1)
+        ys = ys.to(hidden.device)
+        ys_lens = (ys != -1).sum(dim=1)
+        # WeNet's convention when a config leaves them unset: sos = eos = vocab - 1.
+        sos = cfg.sos_id if cfg.sos_id >= 0 else cfg.vocab_size - 1
+        eos = cfg.eos_id if cfg.eos_id >= 0 else cfg.vocab_size - 1
+        ys_in, _ = add_sos_eos(ys, sos, eos, -1)
+        r_ys_in = None
+        if decoder.has_reverse:
+            r_ys_in, _ = add_sos_eos(reverse_pad_list(ys, ys_lens, -1), sos, eos, -1)
+        decoder(hidden, out_lengths, ys_in, ys_lens + 1, r_ys_in)
 
     def load_weights(
         self,

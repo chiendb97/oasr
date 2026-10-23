@@ -59,20 +59,25 @@ def _config(**tuning):
 
 
 def _int8_census(op="scaled_mm"):
-    return ShapeSet([ShapePoint(op, N, K, "int8", 1, M, 1.0, 1.0, True)], N * K)
+    dtype = "float8_e4m3fn" if jsm.op_format(op) == "fp8" else "int8"
+    return ShapeSet([ShapePoint(op, N, K, dtype, 1, M, 1.0, 1.0, True)], N * K)
 
 
 def _cover(root, op="scaled_mm", n=N, k=K, cid=jsm.HEURISTIC_ID):
+    """A user-tier entry for each op, in the file of the op's format."""
     sm = _sm()
-    tf = db.new_file("scaled_mm", sm, jsm.SCALED_MM_LANE)
-    for o, nn, kk in [(op, n, k)] if isinstance(op, str) else op:
+    ops = [(op, n, k)] if isinstance(op, str) else op
+    fmt = jsm.op_format(ops[0][0])
+    family = jsm.TUNING_FAMILY[fmt]
+    tf = db.new_file(family, sm, jsm.LANE_ID[fmt])
+    for o, nn, kk in ops:
         tf.entries[jsm.scaled_mm_sig_key(o, nn, kk)] = db.Entry(regions=[(None, cid)])
     tf.configs[cid] = (
         {"kind": cid}
         if cid == jsm.HEURISTIC_ID
-        else jsm.config_to_params(jsm.get_production_configs(sm)[cid])
+        else jsm.config_to_params(jsm.get_production_configs(sm, fmt)[cid])
     )
-    db.save_file(tf, root / f"sm{sm}" / "scaled_mm.json")
+    db.save_file(tf, root / f"sm{sm}" / f"{family}.json")
     db.reload()
 
 

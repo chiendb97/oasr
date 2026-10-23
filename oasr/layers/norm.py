@@ -124,18 +124,23 @@ class LayerNorm(nn.Module):
     the module docstring before accepting it for a non-PyTorch ecosystem.
     """
 
-    #: Emit the output already quantized for an int8 GEMM: ``forward`` and
+    #: Emit the output already quantized for an 8-bit GEMM: ``forward`` and
     #: ``forward_add_residual`` return a :class:`QuantizedActivation` (per-token
-    #: int8 + fp32 scale, bit-exact with ``quantize_per_token`` of the plain
-    #: output) instead of a tensor, saving the consumer its quantize launch and
-    #: the fp16 round trip.  Set by :func:`oasr.quantization.bind_quantization`
-    #: when every consumer of this norm's output is an int8 GEMM that can take a
-    #: pre-quantized input -- the model declares that.  Never set it by hand: any
-    #: other reader would be handed something that is not a tensor.  Applies
-    #: only where the fused kernel does (CUDA fp16/bf16, a contiguous input);
-    #: everywhere else the output is the plain tensor, which every such consumer
-    #: also accepts.  A class attribute, so an unarmed norm pays one read.
+    #: 8-bit values in :attr:`quantize_dtype` + fp32 scale, bit-exact with
+    #: ``quantize_per_token`` of the plain output) instead of a tensor, saving the
+    #: consumer its quantize launch and the fp16 round trip.  Set by
+    #: :func:`oasr.quantization.bind_quantization` when every consumer of this
+    #: norm's output is an 8-bit GEMM that can take a pre-quantized input -- the
+    #: model declares that.  Never set it by hand: any other reader would be
+    #: handed something that is not a tensor.  Applies only where the fused
+    #: kernel does (CUDA fp16/bf16, a contiguous input); everywhere else the
+    #: output is the plain tensor, which every such consumer also accepts.  A
+    #: class attribute, so an unarmed norm pays one read.
     quantize_output: bool = False
+    #: The format an armed norm emits (set with :attr:`quantize_output`).
+    quantize_dtype: torch.dtype = torch.int8
+    #: The formats the fused kernels write.
+    quantize_output_dtypes = (torch.int8, torch.float8_e4m3fn)
 
     def __init__(
         self,
@@ -163,7 +168,9 @@ class LayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, QuantizedActivation]:
         if use_norm_kernel(x):
             if self.quantize_output and self._fuses_quant(x):
-                q, scale = layer_norm_quant(x, self.weight, self.bias, self.eps)
+                q, scale = layer_norm_quant(
+                    x, self.weight, self.bias, self.eps, dtype=self.quantize_dtype
+                )
                 return QuantizedActivation(data=q, scale=scale, dtype=x.dtype)
             return oasr.layer_norm(x, self.weight, self.bias, self.eps)
         return F.layer_norm(x, (self.normalized_shape,), self.weight, self.bias, self.eps)
@@ -194,7 +201,7 @@ class LayerNorm(nn.Module):
         if use_norm_kernel(x):
             if self.quantize_output and self._fuses_quant(x) and residual.is_contiguous():
                 q, scale, summed = add_layer_norm_residual_quant(
-                    x, residual, self.weight, self.bias, self.eps, alpha
+                    x, residual, self.weight, self.bias, self.eps, alpha, dtype=self.quantize_dtype
                 )
                 return QuantizedActivation(data=q, scale=scale, dtype=x.dtype), summed
             return cast(

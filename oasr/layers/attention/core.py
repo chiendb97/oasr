@@ -81,6 +81,17 @@ head_dim 128 on the 99 KB parts).
 
 ``OASR_LAYERS_BACKEND=torch`` forces SDPA here too, so the waist's debugging
 switch covers attention as well as GEMM and norm.
+
+FP8 KV cache
+------------
+``k``/``v`` may arrive as :class:`~oasr.functionals.kv_quant.QuantizedKv` --
+an AR decoder's cache stored as e4m3 with per-(token, head) scales
+(``EngineConfig.quantization.kv_cache``).  That is a *storage* decision the
+caller made, like paging, so there are no policy rules: on CUDA in a served
+dtype it goes to the fp8 variants of the C++ lane, which dequantize inside the
+tile loop, and a mask they do not render (causal, a window, a bias) raises
+rather than being served some other way.  CPU, fp32 and
+``OASR_LAYERS_BACKEND=torch`` dequantize and run SDPA -- the parity oracle.
 """
 
 from __future__ import annotations
@@ -90,6 +101,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from oasr.functionals.kv_quant import QuantizedKv
 
 from .._backend import (
     FMHA_CAUSAL_WINDOW_MIN_MACS,
@@ -259,6 +272,19 @@ class Attention(nn.Module):
         if kv_extent is not None and kv_lens is None:
             raise ValueError("kv_extent requires kv_lens — the length is what bounds the loop")
 
+        if isinstance(k, QuantizedKv) or isinstance(v, QuantizedKv):
+            return self._forward_quantized_kv(
+                q,
+                k,
+                v,
+                kv_lens=kv_lens,
+                kv_starts=kv_starts,
+                block_table=block_table,
+                attn_bias=attn_bias,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+            )
+
         if block_table is not None:
             if kv_lens is None:
                 raise ValueError(
@@ -342,6 +368,57 @@ class Attention(nn.Module):
             is_causal=is_causal,
             scale=self.softmax_scale,
             enable_gqa=self.num_kv_heads != self.num_heads,
+        )
+        return out
+
+    def _forward_quantized_kv(
+        self,
+        q: torch.Tensor,
+        k: QuantizedKv,
+        v: QuantizedKv,
+        *,
+        kv_lens: Optional[torch.Tensor],
+        kv_starts: Optional[torch.Tensor],
+        block_table: Optional[torch.Tensor],
+        attn_bias: Optional[torch.Tensor],
+        attn_mask: Optional[torch.Tensor],
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """Attention over an fp8 KV cache (see the module docstring).
+
+        The whole capacity buffer or pool is handed over with ``kv_lens``, never
+        a slice, so ``kv_extent`` has nothing to add here.
+        """
+        from oasr.functionals.attention import fmha
+
+        if not isinstance(k, QuantizedKv) or not isinstance(v, QuantizedKv):
+            raise TypeError("an fp8 KV cache quantizes K and V together")
+        if attn_mask is not None:
+            raise ValueError(
+                "attn_mask cannot be applied to an fp8 KV cache: bound the keys with "
+                "kv_lens / kv_starts instead"
+            )
+        if block_table is not None and kv_lens is None:
+            raise ValueError("block_table requires kv_lens")
+        reference = (
+            self.backend == "sdpa"
+            or not use_fmha_kernel()
+            or (not q.is_cuda and not out_of_scope("CPU tensor"))
+            or (q.dtype not in SERVED_DTYPES and not out_of_scope(f"dtype {q.dtype}"))
+        )
+        out: torch.Tensor = fmha(
+            q,
+            k.data,
+            v.data,
+            k_scale=k.scale,
+            v_scale=v.scale,
+            softmax_scale=self.softmax_scale,
+            attn_bias=attn_bias,
+            cache_seqlens=kv_lens,
+            cache_seqstarts=kv_starts,
+            block_table=block_table,
+            causal=is_causal,
+            backend="sdpa" if reference else None,
         )
         return out
 

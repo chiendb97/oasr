@@ -396,12 +396,18 @@ class ShapeSet:
             return cls.from_json(json.load(f))
 
 
-#: Operand width by census dtype.  Everything but int8 (``scaled_mm``) counts as
-#: two bytes, as every census point did before the int8 family existed.
-_ITEMSIZE = {"int8": 1}
+#: Operand width by census dtype.  Everything but the 8-bit formats (``scaled_mm``,
+#: ``scaled_mm_fp8``) counts as two bytes, as every census point did before the
+#: int8 family existed.
+_ITEMSIZE = {"int8": 1, "float8_e4m3fn": 1}
 
-#: The kernel family of a recorded op: what keeps a tuning file of its own.
-_SCALED_MM_OPS = ("scaled_mm", "scaled_mm_quant")
+#: The kernel family of a recorded 8-bit op: what keeps a tuning file of its own.
+_SCALED_MM_FAMILY = {
+    "scaled_mm": "scaled_mm",
+    "scaled_mm_quant": "scaled_mm",
+    "scaled_mm_fp8": "scaled_mm_fp8",
+    "scaled_mm_fp8_quant": "scaled_mm_fp8",
+}
 
 
 def _itemsize(dtype: str) -> int:
@@ -409,8 +415,8 @@ def _itemsize(dtype: str) -> int:
 
 
 def kernel_family(op: str) -> str:
-    """``"scaled_mm"`` for the int8 GEMM's ops, else ``"gemm"`` (the census's two families)."""
-    return "scaled_mm" if op in _SCALED_MM_OPS else "gemm"
+    """``"scaled_mm"`` / ``"scaled_mm_fp8"`` for the 8-bit GEMMs' ops, else ``"gemm"``."""
+    return _SCALED_MM_FAMILY.get(op, "gemm")
 
 
 def _estimate_ms(op: str, M: int, N: int, K: int, batch: int, itemsize: int = 2) -> float:
@@ -418,7 +424,7 @@ def _estimate_ms(op: str, M: int, N: int, K: int, batch: int, itemsize: int = 2)
 
     ``oasr.tune.cost_model`` replaces it once calibrated; a point's weight is
     re-measured anyway, so the constants only have to order points sensibly.
-    ``itemsize`` is the operand width: 1 for an int8 ``scaled_mm`` point.
+    ``itemsize`` is the operand width: 1 for an 8-bit ``scaled_mm`` point.
     """
     flops = 2.0 * M * N * K * batch
     bytes_ = (M * K + N * K + M * N) * itemsize * batch

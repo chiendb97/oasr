@@ -29,13 +29,15 @@ strategy refuses ``beam_size > 1`` at construction.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 
+from oasr.quantization.layout import GemmChain, QuantLayout, SmoothGroup
+
 from ..base import BaseAsrModel, LoadReport, align_out_features, pad_output_projection
 from .config import NemotronEncoderConfig, NemotronModelConfig
-from .encoder import NemotronEncoder
+from .encoder import NemotronEncoder, NemotronEncoderLayer
 from .predictor import NemotronPromptProjector, NemotronRnntJoint, NemotronRnntPredictor
 from .subsampling import NemotronSubsampling
 
@@ -199,6 +201,84 @@ class NemotronModel(BaseAsrModel):
         )
         fused: torch.Tensor = self.prompt_projector(hidden, prompt_ids)
         return fused
+
+    # -- quantization -------------------------------------------------------
+
+    def quantization_layout(self) -> QuantLayout:
+        """The FastConformer encoder; predictor, joint and prompt projector stay fp.
+
+        Read off :class:`~oasr.models.nemotron.encoder.NemotronEncoderLayer`
+        (``forward`` and ``forward_chunk`` take the same path):
+
+        * ``norm_feed_forward1`` / ``norm_feed_forward2`` feed only their FFN's
+          ``linear1``; SiLU sits between ``linear1`` and ``linear2``, so
+          ``linear2`` is smoothed at run time, and nothing but ``linear2`` reads
+          ``linear1``'s activated output (a chain);
+        * ``norm_self_att`` feeds ``q_proj`` / ``k_proj`` / ``v_proj`` and nothing
+          else (the Transformer-XL bias projects the positional table, not this);
+        * V reaches ``o_proj`` only through attention -- the bias terms touch the
+          query side, the silent-row ``masked_fill`` zeroes whole rows -- and the
+          paged K/V cache holds V in the smoothed domain, read back only by this
+          attention (``v_to_o``, ``v_proj`` the whole producer);
+        * ``norm_conv`` feeds only ``conv.pointwise_conv1``: unlike the WeNet
+          Conformer, the mask, the causal pad and the streaming cache ``cat`` all
+          come *after* the GLU, so this norm may emit int8; ``pointwise_conv2``
+          follows LayerNorm + SiLU and is smoothed at run time;
+        * ``norm_out``'s output is the next block's residual stream: no group.
+
+        Kept full precision: the subsampling stack's ``linear`` (the first layer),
+        ``relative_k_proj`` (its input is the sinusoidal table), the LSTM
+        predictor (``decoder``), the ``joint`` and the language-prompt projector.
+        Pinned batch-invariant when quantized: the subsampling projection
+        (``M = B x T``) and ``relative_k_proj`` (``M = 2L - 1`` with ``L`` the
+        padded length, so it depends on what shares the batch) -- the two fp
+        GEMMs ahead of int8 layers.
+        """
+        groups: List[SmoothGroup] = []
+        chains: List[GemmChain] = []
+        encoder = cast(NemotronEncoder, self.encoder)
+        for i, layer in enumerate(cast(Iterable[NemotronEncoderLayer], encoder.layers)):
+            p = f"encoder.layers.{i}"
+            attn = layer.self_attn
+            for ff in ("feed_forward1", "feed_forward2"):
+                groups.append(
+                    SmoothGroup(f"{p}.norm_{ff}", (f"{p}.{ff}.linear1",), "norm_affine", True)
+                )
+                groups.append(SmoothGroup(None, (f"{p}.{ff}.linear2",), "runtime"))
+                chains.append(GemmChain(f"{p}.{ff}.linear1", f"{p}.{ff}.linear2"))
+            groups.append(
+                SmoothGroup(
+                    f"{p}.norm_self_att",
+                    tuple(f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")),
+                    "norm_affine",
+                    fuse_output_quant=True,
+                )
+            )
+            groups.append(
+                SmoothGroup(
+                    f"{p}.self_attn.v_proj",
+                    (f"{p}.self_attn.o_proj",),
+                    "v_to_o",
+                    v_rows=(0, attn.v_proj.out_features),
+                    heads=(attn.num_heads, attn.num_heads, attn.head_dim),
+                )
+            )
+            groups.append(
+                SmoothGroup(f"{p}.norm_conv", (f"{p}.conv.pointwise_conv1",), "norm_affine", True)
+            )
+            groups.append(SmoothGroup(None, (f"{p}.conv.pointwise_conv2",), "runtime"))
+        return QuantLayout(
+            groups=tuple(groups),
+            keep_full_precision=(
+                "encoder.subsampling.*",
+                "*.relative_k_proj",
+                "decoder.*",
+                "joint.*",
+                "prompt_projector.*",
+            ),
+            chains=tuple(chains),
+            batch_invariant=("encoder.subsampling.linear", "*.relative_k_proj"),
+        )
 
     # -- weights --------------------------------------------------------------
 

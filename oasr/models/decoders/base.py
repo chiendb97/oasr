@@ -100,6 +100,14 @@ class BaseDecoder(nn.Module, ABC):
     #: static buffer. Per-group side caches make graph capture unsafe.
     supports_step_graphs: ClassVar[bool] = False
 
+    #: Quantized KV-cache formats :meth:`prefill` can store when handed a
+    #: ``kv_cache_dtype`` (``EngineConfig.quantization.kv_cache``; ``"fp8_e4m3"``
+    #: is the one that exists).  Declared for the same reason as
+    #: ``supports_paged_kv``: a decoder that ignored the argument would keep an
+    #: fp16 cache while the engine sized its pool and its admission for fp8, so
+    #: the strategy refuses the setting at construction for one that does not.
+    kv_cache_dtypes: ClassVar[Tuple[str, ...]] = ()
+
     @abstractmethod
     def init_state(
         self,

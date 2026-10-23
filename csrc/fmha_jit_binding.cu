@@ -36,7 +36,25 @@ using oasr::attention::FmhaTile;
  * The resolver is `constexpr` over `sm`, so this is the one place the module is
  * not specialised to `OASR_TARGET_SM`.  It is host code and launches nothing.
  */
-FmhaTile resolve_for(int sm, int head_dim_padded, int head_dim_v, int elem_size) {
+FmhaTile resolve_for(int sm, int head_dim_padded, int head_dim_v, int elem_size, bool kv_fp8) {
+    if (kv_fp8) {
+        switch (sm) {
+            case 80:
+                return oasr::attention::fmhaResolveTileKv8(80, head_dim_padded, head_dim_v,
+                                                           elem_size);
+            case 86:
+                return oasr::attention::fmhaResolveTileKv8(86, head_dim_padded, head_dim_v,
+                                                           elem_size);
+            case 89:
+                return oasr::attention::fmhaResolveTileKv8(89, head_dim_padded, head_dim_v,
+                                                           elem_size);
+            case 120:
+                return oasr::attention::fmhaResolveTileKv8(120, head_dim_padded, head_dim_v,
+                                                           elem_size);
+            default:
+                return FmhaTile{false, 0, 0, 0, 0, false, 0};
+        }
+    }
     switch (sm) {
         case 80:
             return oasr::attention::fmhaResolveTile(80, head_dim_padded, head_dim_v, elem_size);
@@ -45,11 +63,31 @@ FmhaTile resolve_for(int sm, int head_dim_padded, int head_dim_v, int elem_size)
         case 89:
             return oasr::attention::fmhaResolveTile(89, head_dim_padded, head_dim_v, elem_size);
         case 120:
-            return oasr::attention::fmhaResolveTile(120, head_dim_padded, head_dim_v,
-                                                    elem_size);
+            return oasr::attention::fmhaResolveTile(120, head_dim_padded, head_dim_v, elem_size);
         default:
             return FmhaTile{false, 0, 0, 0, 0, false, 0};
     }
+}
+
+void write_resolved(TensorView out, int64_t sm, int64_t elem_bits, int64_t head_dim, bool kv_fp8) {
+    CHECK_DIM(1, out);
+    TVM_FFI_ICHECK_GE(out.size(0), 7) << "fmha_resolved_config writes 7 int32 fields";
+    TVM_FFI_ICHECK(out.dtype() == oasr::dl_int32) << "fmha_resolved_config wants int32";
+    TVM_FFI_ICHECK(out.device().device_type == kDLCPU)
+        << "fmha_resolved_config answers on the host; it launches nothing";
+
+    int const elem_size = int(elem_bits) / 8;
+    int const d = oasr::attention::fmhaPaddedHeadDim(int(head_dim));
+    FmhaTile const t = resolve_for(int(sm), d, d, elem_size, kv_fp8);
+
+    int32_t* p = static_cast<int32_t*>(out.data_ptr());
+    p[0] = t.valid ? 1 : 0;
+    p[1] = t.block_m;
+    p[2] = t.block_n;
+    p[3] = t.num_warps;
+    p[4] = t.num_stages;
+    p[5] = t.q_in_regs ? 1 : 0;
+    p[6] = t.smem_bytes;
 }
 
 }  // namespace
@@ -63,24 +101,12 @@ FmhaTile resolve_for(int sm, int head_dim_padded, int head_dim_v, int elem_size)
  * pads it, so a caller cannot get the padding wrong either.
  */
 void fmha_resolved_config(TensorView out, int64_t sm, int64_t elem_bits, int64_t head_dim) {
-    CHECK_DIM(1, out);
-    TVM_FFI_ICHECK_GE(out.size(0), 7) << "fmha_resolved_config writes 7 int32 fields";
-    TVM_FFI_ICHECK(out.dtype() == oasr::dl_int32) << "fmha_resolved_config wants int32";
-    TVM_FFI_ICHECK(out.device().device_type == kDLCPU)
-        << "fmha_resolved_config answers on the host; it launches nothing";
+    write_resolved(out, sm, elem_bits, head_dim, /*kv_fp8=*/false);
+}
 
-    int const elem_size = int(elem_bits) / 8;
-    int const d = oasr::attention::fmhaPaddedHeadDim(int(head_dim));
-    FmhaTile const t = resolve_for(int(sm), d, d, elem_size);
-
-    int32_t* p = static_cast<int32_t*>(out.data_ptr());
-    p[0] = t.valid ? 1 : 0;
-    p[1] = t.block_m;
-    p[2] = t.block_n;
-    p[3] = t.num_warps;
-    p[4] = t.num_stages;
-    p[5] = t.q_in_regs ? 1 : 0;
-    p[6] = t.smem_bytes;
+/*! \brief `fmha_resolved_config` for the fp8-KV variants (`fmhaResolveTileKv8`). */
+void fmha_kv8_resolved_config(TensorView out, int64_t sm, int64_t elem_bits, int64_t head_dim) {
+    write_resolved(out, sm, elem_bits, head_dim, /*kv_fp8=*/true);
 }
 
 /*! \brief Shared memory this architecture budgets a block, in bytes. */
@@ -99,10 +125,10 @@ int64_t fmha_smem_budget(int64_t sm) {
  * arguments, which is what `AGENTS.md` rule 11 requires of it.
  */
 int64_t fmha_num_splits(int64_t cta_count, int64_t n_blocks, int64_t num_sms) {
-    return int64_t(
-        oasr::attention::fmhaNumSplits(int(cta_count), int(n_blocks), int(num_sms)));
+    return int64_t(oasr::attention::fmhaNumSplits(int(cta_count), int(n_blocks), int(num_sms)));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fmha_resolved_config, fmha_resolved_config);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fmha_kv8_resolved_config, fmha_kv8_resolved_config);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fmha_smem_budget, fmha_smem_budget);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fmha_num_splits, fmha_num_splits);

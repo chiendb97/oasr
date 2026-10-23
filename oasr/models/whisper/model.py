@@ -40,6 +40,7 @@ from oasr.layers import (
     LinearActivation,
     RowParallelLinear,
 )
+from oasr.quantization.layout import GemmChain, QuantLayout, SmoothGroup
 
 from ..base import BaseAsrModel, BaseEncoder, LoadReport
 from ..decoders.base import BaseDecoder, DecoderState
@@ -301,6 +302,11 @@ class WhisperDecoder(BaseDecoder):
     #: True for the paged state only — a dense one still carries per-group
     #: cross K/V, and the graph cache refuses such a state (``capturable``).
     supports_step_graphs = True
+    #: fp8 KV: both halves — the self-attention cache and the cross-attention
+    #: K/V, which on a large checkpoint is most of a row's footprint — dense or
+    #: paged.  The alignment pass (:meth:`cross_attention`) keeps the served
+    #: dtype: it is one forward that stores nothing.
+    kv_cache_dtypes = ("fp8_e4m3",)
 
     def __init__(self, cfg: WhisperModelConfig) -> None:
         super().__init__()
@@ -430,6 +436,7 @@ class WhisperDecoder(BaseDecoder):
         capacity: Optional[int] = None,
         kv_manager: Optional["DecoderKVCacheManager"] = None,
         all_positions: bool = False,
+        kv_cache_dtype: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation: cross-KV once + prompt forward.
 
@@ -454,12 +461,26 @@ class WhisperDecoder(BaseDecoder):
         written here once per layer and only read after.  The prompt's own
         forward already reads the cross K/V back through the pages, so prefill
         and steps take one attention path.
+
+        ``kv_cache_dtype`` (``"fp8_e4m3"``): store both caches as fp8 with
+        per-(token, head) scales.  Paged, the pool must have been built fp8 (it
+        decides); dense, the self-attention buffer and the cross K/V are
+        quantized here.  The prompt attends its own fresh self-attention K/V in
+        the served dtype and the cross K/V through the fp8 read, like every step.
         """
         n = len(self.layers)
         layers = [cast(_DecoderLayer, layer) for layer in self.layers]
         B, P = prompt_ids.shape
         cap = None if capacity is None else max(int(capacity), P)
-        kv = build_kv(n, B, prompt_ids.device, prefill_len=P, cap=cap, manager=kv_manager)
+        kv = build_kv(
+            n,
+            B,
+            prompt_ids.device,
+            prefill_len=P,
+            cap=cap,
+            manager=kv_manager,
+            kv_cache=kv_cache_dtype,
+        )
         state: Dict[str, Any] = {"kv": kv}
         # Cross K/V project the *raw* encoder output (the decoder layer's
         # encoder_attn_layer_norm applies to the query side only).
@@ -479,8 +500,14 @@ class WhisperDecoder(BaseDecoder):
         else:
             state["cross_k"] = [None] * n
             state["cross_v"] = [None] * n
+            quantized = kv_cache_dtype not in (None, "auto")
             for i, layer in enumerate(layers):
-                state["cross_k"][i], state["cross_v"][i] = layer.encoder_attn.kv(enc_out)
+                k, v = layer.encoder_attn.kv(enc_out)
+                if quantized:
+                    from oasr.functionals.kv_quant import quantize_kv
+
+                    k, v = quantize_kv(k), quantize_kv(v)
+                state["cross_k"][i], state["cross_v"][i] = k, v
         logits = self._forward_tokens(prompt_ids, state, is_prefill=True)
         return (logits if all_positions else logits[:, -1]), state
 
@@ -620,3 +647,114 @@ class WhisperModel(BaseAsrModel):
         if missing:
             logger.warning("Whisper model keys not filled: %s", missing[:8])
         return LoadReport.build(sd, missing, unexpected, dropped)
+
+    # -- quantization ----------------------------------------------------------
+    def quantization_layout(self) -> QuantLayout:
+        """Encoder and decoder: which norm feeds which GEMM, and where V goes.
+
+        Per layer, read off :class:`_EncoderLayer` / :class:`_DecoderLayer` and the
+        loops in :meth:`WhisperEncoder.forward` / :meth:`WhisperDecoder._forward_tokens`:
+
+        * ``self_attn_layer_norm``'s output feeds ``q_proj`` (the query) and
+          ``k_proj`` / ``v_proj`` (``_WhisperAttention.kv``) and nothing else --
+          the residual travels separately -- so one ``norm_affine`` group with
+          three consumers, fusable;
+        * V reaches ``out_proj`` only through attention (``v_to_o``, ``v_proj``
+          the whole producer); in the decoder the self-attention cache then holds
+          V in the smoothed domain, read back only by the same attention, and the
+          cross-attention K/V are projections of the encoder output, cached once;
+        * ``encoder_attn_layer_norm`` feeds only ``encoder_attn.q_proj`` (the
+          word-timing collector projects the same query again);
+        * ``final_layer_norm`` feeds only ``fc1``; exact-erf GELU sits between
+          ``fc1`` and ``fc2``, so ``fc2`` is smoothed at run time, and nothing but
+          ``fc2`` reads ``fc1``'s activated output (a chain);
+        * the encoder's final ``layer_norm`` output is read by every decoder
+          layer's ``encoder_attn.k_proj`` / ``v_proj`` (prefill, the alignment
+          pass) and by nothing else -- no CTC head, no other consumer -- so it is
+          one ``norm_affine`` group spanning the encoder/decoder boundary.  Not
+          fusable: the encoder output is handed to the engine as a tensor.
+
+        Nothing is kept full precision by declaration: the conv front-end is not
+        a quantizable GEMM and the output head is a raw matmul against the tied
+        embedding.  No full-precision ``Linear`` sits ahead of a quantized one,
+        so nothing needs a batch-invariance pin (the conv front-end cannot take
+        one).
+        """
+        groups: List[SmoothGroup] = []
+        chains: List[GemmChain] = []
+
+        def attention(p: str, norm: str, attn: str, qkv: Tuple[str, ...], heads: int) -> None:
+            module = cast(_WhisperAttention, self.get_submodule(f"{p}.{attn}"))
+            groups.append(
+                SmoothGroup(
+                    f"{p}.{norm}",
+                    tuple(f"{p}.{attn}.{name}" for name in qkv),
+                    "norm_affine",
+                    fuse_output_quant=True,
+                )
+            )
+            groups.append(
+                SmoothGroup(
+                    f"{p}.{attn}.v_proj",
+                    (f"{p}.{attn}.out_proj",),
+                    "v_to_o",
+                    v_rows=(0, module.v_proj.out_features),
+                    heads=(heads, heads, module.d_k),
+                )
+            )
+
+        def ffn(p: str) -> None:
+            groups.append(SmoothGroup(f"{p}.final_layer_norm", (f"{p}.fc1",), "norm_affine", True))
+            groups.append(SmoothGroup(None, (f"{p}.fc2",), "runtime"))
+            chains.append(GemmChain(f"{p}.fc1", f"{p}.fc2"))
+
+        cfg = self.config
+        for i in range(cfg.encoder_layers):
+            p = f"encoder.layers.{i}"
+            attention(
+                p,
+                "self_attn_layer_norm",
+                "self_attn",
+                ("q_proj", "k_proj", "v_proj"),
+                cfg.encoder_attention_heads,
+            )
+            ffn(p)
+        cross: List[str] = []
+        for i in range(cfg.decoder_layers):
+            p = f"decoder.layers.{i}"
+            heads = cfg.decoder_attention_heads
+            attention(p, "self_attn_layer_norm", "self_attn", ("q_proj", "k_proj", "v_proj"), heads)
+            attention(p, "encoder_attn_layer_norm", "encoder_attn", ("q_proj",), heads)
+            ffn(p)
+            cross += [f"{p}.encoder_attn.k_proj", f"{p}.encoder_attn.v_proj"]
+        if cross:
+            groups.append(SmoothGroup("encoder.layer_norm", tuple(cross), "norm_affine"))
+        return QuantLayout(groups=tuple(groups), chains=tuple(chains))
+
+    def calibration_forward(
+        self, features: torch.Tensor, lengths: torch.Tensor, *, tokenizer: Any = None
+    ) -> None:
+        """Encoder, then a greedy decode of up to :data:`_CALIBRATION_TOKENS` tokens.
+
+        The decoder is calibrated on its own greedy output from the checkpoint's
+        start-of-transcript prompt -- what serving feeds it -- through the same
+        ``prefill`` / ``step`` surface the ``aed`` strategy drives.
+        """
+        del tokenizer
+        enc_out, _ = self.encode_offline(features, lengths)
+        cfg = self.config
+        prompt = torch.tensor([cfg.sot_sequence()], dtype=torch.long, device=enc_out.device)
+        prompt = prompt.expand(enc_out.size(0), -1).contiguous()
+        budget = min(_CALIBRATION_TOKENS, int(cfg.max_target_positions) - prompt.size(1) - 1)
+        decoder = cast(WhisperDecoder, self.decoder)
+        logits, state = decoder.prefill(enc_out, prompt)
+        for _ in range(max(budget, 0)):
+            token = logits.argmax(dim=-1)
+            if bool((token == int(cfg.eos_token_id)).all()):
+                break
+            logits, state = decoder.step(token, state)
+
+
+#: Greedy tokens a calibration utterance decodes (a LibriSpeech utterance is
+#: shorter; the cap only bounds a runaway repetition).
+_CALIBRATION_TOKENS = 96

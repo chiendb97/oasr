@@ -1,30 +1,35 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""``oasr tune build`` for the int8 scaled GEMM: a census in, ``scaled_mm.json`` out.
+"""``oasr tune build`` for the 8-bit scaled GEMM: a census in, ``scaled_mm.json`` out.
 
-The ``scaled_mm`` family (``oasr.jit.scaled_mm``) has a fixed, small production
-set -- six data-parallel tiles and two Stream-K tiles, all compiled into one
-module -- and a shape heuristic that is within a few percent of the best tile on
-the shapes it was written against.  So, unlike the fp GEMM build, there is no
+Two families, one build: ``scaled_mm`` (int8) and ``scaled_mm_fp8`` (fp8 e4m3),
+each with its own file (``scaled_mm.json`` / ``scaled_mm_fp8.json``) measured on
+its own lane; :func:`build_scaled_mm` takes the format.  Each has a fixed, small
+production set (``oasr.jit.scaled_mm``: int8 six data-parallel tiles and two
+Stream-K tiles, fp8 eight data-parallel tiles; one module per format) and a
+shape heuristic that is within a few percent of the best tile on the shapes it
+was written against.  So, unlike the fp GEMM build, there is no
 candidate space to prune and no cost model to ship: every eligible variant is
 measured at every point, and the question each point answers is *does anything
 beat the heuristic by more than the gate and the noise?*
 
-Per signature ``(op, N, K)`` of the census -- ``op`` is ``scaled_mm`` (fp16/bf16
-output) or ``scaled_mm_quant`` (the int8-output producer, data-parallel only):
+Per signature ``(op, N, K)`` of the census -- ``op`` is the format's fp16/bf16-output
+GEMM (``scaled_mm`` / ``scaled_mm_fp8``) or its 8-bit-output producer
+(``scaled_mm_quant`` / ``scaled_mm_fp8_quant``, data-parallel only):
 
 1. measure every eligible variant at the census Ms plus ladder fill points
    (``BuildOptions.fill`` / ``thin`` / ``max_points_per_sig``, as the GEMM build)
    with the shared protocol (:func:`oasr.tune.bench.measure`: graph-captured
    loops, rotated weight copies when the served model would not keep them in L2,
    interleaved rounds, successive halving with the heuristic's variant forced to
-   the end, the single-replay gate) on realistic operands -- random int8, a scale
-   per token and per channel, a bias, the swish epilogue, and for the quantizing
-   op an output multiplier per channel;
+   the end, the single-replay gate) on realistic operands -- random 8-bit values,
+   a scale per token and per channel, a bias, the swish epilogue, and for the
+   quantizing op an output multiplier per channel;
 2. gate numerics: the heuristic's variant against the torch reference (within an
-   output ulp), every other variant **bitwise** against it -- the family's
-   invariant (an exact int32 accumulator, int32 Stream-K partials), so a variant
-   that differs is broken, not slower;
+   output ulp, plus fp8's fp32 accumulation error), every other variant
+   **bitwise** against it -- each format's invariant (int8: an exact int32
+   accumulator, int32 Stream-K partials; fp8: one summation order for every
+   tile), so a variant that differs is broken, not slower;
 3. add a ``"heuristic"`` pseudo-arm per point whose measurement is that of the
    variant the heuristic picks there, and partition the M axis against it
    (:func:`oasr.tune.partition.regions_for_signature`): a region whose best is the
@@ -77,8 +82,11 @@ __all__ = [
     "measure_signature",
 ]
 
-#: The census ops this build measures (``oasr.jit.scaled_mm.SCALED_MM_OPS``).
-SCALED_MM_TUNED_OPS = ("scaled_mm", "scaled_mm_quant")
+#: The census ops this build measures, both formats (``oasr.jit.scaled_mm.SCALED_MM_OPS``).
+SCALED_MM_TUNED_OPS = ("scaled_mm", "scaled_mm_quant", "scaled_mm_fp8", "scaled_mm_fp8_quant")
+
+#: The census dtype of each format's operands.
+_DTYPE_STR = {"int8": "int8", "fp8": "float8_e4m3fn"}
 
 #: The epilogue the arms run: its cost does not depend on which activation.
 _ACTIVATION = "swish"
@@ -94,30 +102,38 @@ _REFERENCE_ROWS = 512
 def candidates(op: str, sm: int) -> Dict[str, Any]:
     """``{config id: config}`` of the variants *op* may run on *sm*.
 
-    Every production variant for ``scaled_mm``; the data-parallel ones only for
-    ``scaled_mm_quant`` (Stream-K has no quantizing launcher).
+    Every production variant of *op*'s format for the fp-output op; the
+    data-parallel ones only for a quantizing op (Stream-K has no quantizing
+    launcher).
     """
     import oasr.jit.scaled_mm as jsm
 
-    cfgs = jsm.get_production_configs(sm)
-    if op == "scaled_mm_quant":
+    cfgs = jsm.get_production_configs(sm, jsm.op_format(op))
+    if jsm.is_quant_op(op):
         cfgs = {k: c for k, c in cfgs.items() if not c.stream_k}
     return {jsm.config_id(c): c for c in cfgs.values()}
 
 
+def _random_8bit(shape, fmt: str, g: torch.Generator) -> torch.Tensor:
+    if fmt == "int8":
+        return torch.randint(-127, 128, shape, generator=g, dtype=torch.int8, device="cuda")
+    x = torch.randn(shape, generator=g, device="cuda") * 64.0
+    return x.clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+
 def _operands(op: str, M: int, N: int, K: int, copies: int):
+    import oasr.jit.scaled_mm as jsm
+
+    fmt = jsm.op_format(op)
     g = torch.Generator(device="cuda").manual_seed(0)
-    a = torch.randint(-127, 128, (M, K), generator=g, dtype=torch.int8, device="cuda")
-    bs = [
-        torch.randint(-127, 128, (N, K), generator=g, dtype=torch.int8, device="cuda")
-        for _ in range(copies)
-    ]
+    a = _random_8bit((M, K), fmt, g)
+    bs = [_random_8bit((N, K), fmt, g) for _ in range(copies)]
     a_scale = torch.rand(M, generator=g, device="cuda") * 0.01 + 1e-3
     b_scale = torch.rand(N, generator=g, device="cuda") * 0.01 + 1e-3
     bias = torch.randn(N, generator=g, device="cuda").to(_OUT_DTYPE)
-    if op == "scaled_mm_quant":
+    if jsm.is_quant_op(op):
         out_mul = torch.rand(N, generator=g, device="cuda") * 32.0 + 16.0
-        out = torch.empty(M, N, dtype=torch.int8, device="cuda")
+        out = torch.empty(M, N, dtype=a.dtype, device="cuda")
     else:
         out_mul = None
         out = torch.empty(M, N, dtype=_OUT_DTYPE, device="cuda")
@@ -126,22 +142,32 @@ def _operands(op: str, M: int, N: int, K: int, copies: int):
 
 def _check_reference(op: str, out, a, b, a_scale, b_scale, bias, out_mul, name: str) -> float:
     """Max error of the heuristic's variant against the torch reference; raise if off."""
+    import oasr.jit.scaled_mm as jsm
     from oasr.functionals.scaled_mm import reference_scaled_mm, reference_scaled_mm_quant
 
+    fp8 = jsm.op_format(op) == "fp8"
     r = min(int(a.shape[0]), _REFERENCE_ROWS)
-    if op == "scaled_mm_quant":
+    # fp8 sums in fp32 (not exact): a little more than an output ulp of slack.
+    rel = 2.0**-8 if fp8 else 2.0**-9
+    if jsm.is_quant_op(op):
         ref = reference_scaled_mm_quant(
             a[:r], b, a_scale[:r], b_scale, bias, _ACTIVATION, out_mul, _OUT_DTYPE
         )
-        err = float((out[:r].int() - ref.int()).abs().max()) if r else 0.0
-        ok = err <= 1.0  # one int8 step at a rounding tie
+        if fp8:
+            got_f, ref_f = out[:r].float(), ref.float()
+            diff = (got_f - ref_f).abs()
+            err = float(diff.max()) if r else 0.0
+            ok = bool((diff <= ref_f.abs() * 2.0**-3 + 2.0**-9).all())  # one e4m3 step
+        else:
+            err = float((out[:r].int() - ref.int()).abs().max()) if r else 0.0
+            ok = err <= 1.0  # one int8 step at a rounding tie
     else:
         ref = reference_scaled_mm(a[:r], b, a_scale[:r], b_scale, bias, _ACTIVATION, _OUT_DTYPE)
         got = out[:r].float()
         diff = (got - ref.float()).abs()
         err = float(diff.max()) if r else 0.0
         ok = bool(torch.isfinite(got).all()) and bool(
-            (diff <= ref.float().abs() * 2.0**-9 + 1e-3).all()
+            (diff <= ref.float().abs() * rel + 1e-3).all()
         )
     if not ok:
         raise RuntimeError(
@@ -172,17 +198,18 @@ def measure_case(
     import oasr.jit.scaled_mm as jsm
     from oasr.functionals.scaled_mm import _ROUND_DTYPE_CODE, _get_scaled_mm_module, activation_id
 
-    case = gemm_tune.GemmCase(op, M, N, K, "int8", 1)
+    fmt = jsm.op_format(op)
+    case = gemm_tune.GemmCase(op, M, N, K, _DTYPE_STR[fmt], 1)
     cfgs = candidates(op, sm)
-    heur_id = jsm.config_id(jsm.heuristic_config(M, N, sm))
+    heur_id = jsm.config_id(jsm.heuristic_config(M, N, sm, fmt=fmt))
     copies = bench.l2_copies(
         case.weight_bytes, working_set_bytes=working_set_bytes, max_copies=policy.max_rotation_calls
     )
     a, bs, a_scale, b_scale, bias, out_mul, out = _operands(op, M, N, K, copies)
     act = activation_id(_ACTIVATION)
-    mod = _get_scaled_mm_module()
+    mod = _get_scaled_mm_module(fmt)
 
-    if op == "scaled_mm_quant":
+    if jsm.is_quant_op(op):
         code = _ROUND_DTYPE_CODE[_OUT_DTYPE]
 
         def call_args(i: int) -> tuple:
@@ -271,7 +298,8 @@ def measure_signature(
         )
         alpha = _alpha_for(M, points)
         choice, sp, note = decide_point(res, jsm.HEURISTIC_ID, alpha, opts)
-        note += f" [heuristic: {jsm.config_id(jsm.heuristic_config(M, N, sm))}]"
+        heur = jsm.heuristic_config(M, N, sm, fmt=jsm.op_format(op))
+        note += f" [heuristic: {jsm.config_id(heur)}]"
         w = census_ms[M].weight if M in census_ms and census_ms[M].weight > 0 else fill_w
         out.append(
             PointResult(M, M in census_ms and census_ms[M].must, alpha, res, choice, sp, note, w)
@@ -291,7 +319,7 @@ def _log_rows(pr: PointResult, sig, sm: int, sku, impl_hash: str) -> List[Dict[s
             continue
         rows.append(
             {
-                "family": "scaled_mm",
+                "family": jsm.op_family(op),
                 "sm": sm,
                 "sku": sku,
                 "impl_hash": impl_hash,
@@ -303,7 +331,9 @@ def _log_rows(pr: PointResult, sig, sm: int, sku, impl_hash: str) -> List[Dict[s
                 "dtype": dtype,
                 "config": name,
                 "params": jsm.choice_to_params(m.payload),
-                "heuristic": jsm.config_id(jsm.heuristic_config(pr.M, N, sm)),
+                "heuristic": jsm.config_id(
+                    jsm.heuristic_config(pr.M, N, sm, fmt=jsm.op_format(op))
+                ),
                 "median_ms": round(m.median_ms, 7),
                 "sigma_ms": round(m.sigma_ms, 7),
                 "n": m.n,
@@ -317,16 +347,16 @@ def _log_rows(pr: PointResult, sig, sm: int, sku, impl_hash: str) -> List[Dict[s
     return rows
 
 
-def _log_path(opts: BuildOptions, sm: int) -> Optional[str]:
+def _log_path(opts: BuildOptions, sm: int, family: str = "scaled_mm") -> Optional[str]:
     """Where the arms' timings go: beside the GEMM log, never inside it.
 
-    The GEMM log calibrates the GEMM cost model; int8 rows have no business in it.
+    The GEMM log calibrates the GEMM cost model; 8-bit rows have no business in it.
     """
     if opts.log_path:
         p = Path(opts.log_path)
-        return str(p.with_name(f"{p.stem}.scaled_mm{p.suffix or '.jsonl'}"))
+        return str(p.with_name(f"{p.stem}.{family}{p.suffix or '.jsonl'}"))
     root = database.user_root()
-    return str(root / "measurements" / f"sm{sm}_scaled_mm.jsonl") if root is not None else None
+    return str(root / "measurements" / f"sm{sm}_{family}.jsonl") if root is not None else None
 
 
 def build_scaled_mm(
@@ -335,11 +365,13 @@ def build_scaled_mm(
     sm: Optional[int] = None,
     opts: Optional[BuildOptions] = None,
     base: Optional[database.TuningFile] = None,
+    fmt: str = "int8",
 ) -> database.TuningFile:
-    """Tune every ``scaled_mm`` / ``scaled_mm_quant`` signature of *shapes*.
+    """Tune every *fmt* scaled-GEMM signature of *shapes* (both of its ops).
 
-    Returns the ``scaled_mm`` tuning file (on top of *base* when given: its
-    entries for signatures this census does not name are kept).  Respects
+    Returns the format's tuning file -- ``scaled_mm`` (int8) or ``scaled_mm_fp8``
+    -- on top of *base* when given (its entries for signatures this census does
+    not name are kept).  Respects
     ``budget_s`` (heaviest signature first), ``progress``, ``min_speedup``,
     ``tie``, ``cover_eps``, ``partition``, ``fill``/``thin``/``max_points_per_sig``,
     ``policy``, ``log_path`` and ``checkpoint_path``; the GEMM-only knobs
@@ -349,23 +381,24 @@ def build_scaled_mm(
 
     opts = opts or BuildOptions()
     sm = int(sm if sm is not None else jsm._process_sm())
-    if not jsm.lane_available(sm):
-        raise ValueError(f"no int8 scaled_mm lane is built for sm{sm}")
-    tf = base if base is not None else database.new_file("scaled_mm", sm, jsm.SCALED_MM_LANE)
-    tf.validators["soft"] = database.current_soft_validators("scaled_mm")
+    family = jsm.TUNING_FAMILY[fmt]
+    if not jsm.lane_available(sm, fmt):
+        raise ValueError(f"no {fmt} scaled_mm lane is built for sm{sm}")
+    tf = base if base is not None else database.new_file(family, sm, jsm.LANE_ID[fmt])
+    tf.validators["soft"] = database.current_soft_validators(family)
     t0 = time.time()
     contended = False
     sigs = {
         sig: pts
         for sig, pts in shapes.signatures().items()
-        if sig[0] in SCALED_MM_TUNED_OPS
+        if sig[0] in jsm.FORMAT_OPS[fmt]
         and sig[1] % jsm.N_ALIGNMENT == 0
         and sig[2] % jsm.K_ALIGNMENT == 0
     }
     sigs = dict(sorted(sigs.items(), key=lambda kv: -sum(p.weight for p in kv[1])))
     impl_hash = jsm.scaled_mm_impl_hash()
-    sku = database.current_soft_validators("scaled_mm").get("sku")
-    log_path = _log_path(opts, sm)
+    sku = database.current_soft_validators(family).get("sku")
+    log_path = _log_path(opts, sm, family)
     log_f = None
     if log_path:
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -382,7 +415,7 @@ def build_scaled_mm(
             if opts.budget_s is not None and time.time() - t0 > opts.budget_s:
                 if opts.progress:
                     opts.progress(
-                        f"budget {opts.budget_s:.0f}s spent; {len(sigs) - i + 1} scaled_mm "
+                        f"budget {opts.budget_s:.0f}s spent; {len(sigs) - i + 1} {family} "
                         "signature(s) left unmeasured"
                     )
                 break
@@ -433,7 +466,7 @@ def build_scaled_mm(
                 _append_checkpoint(
                     ckpt_f,
                     {
-                        "family": "scaled_mm",
+                        "family": family,
                         "sig": sid,
                         "digest": digest,
                         "sm": sm,
@@ -453,7 +486,7 @@ def build_scaled_mm(
         if ckpt_f is not None:
             ckpt_f.close()
     if resumed and opts.progress:
-        opts.progress(f"resumed {resumed} scaled_mm signature(s) from {opts.checkpoint_path}")
+        opts.progress(f"resumed {resumed} {family} signature(s) from {opts.checkpoint_path}")
     referenced = set(tf.referenced_configs())
     tf.configs = {k: v for k, v in tf.configs.items() if k in referenced}
     tf.provenance.update(
@@ -465,8 +498,8 @@ def build_scaled_mm(
             "elapsed_s": round(time.time() - t0, 1),
             "fallback": "heuristic: oasr.jit.scaled_mm.heuristic_config (largest data-parallel "
             "tile launching >= half a wave of CTAs)",
-            "operands": f"random int8, per-token/per-channel fp32 scales, {_OUT_DTYPE} bias, "
-            f"{_ACTIVATION} epilogue",
+            "operands": f"random {_DTYPE_STR[fmt]}, per-token/per-channel fp32 scales, "
+            f"{_OUT_DTYPE} bias, {_ACTIVATION} epilogue",
         }
     )
     return tf

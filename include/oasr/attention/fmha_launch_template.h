@@ -49,12 +49,16 @@ namespace attention {
  * non-obviously equal).
  */
 template <int Arch, int kHeadDim, int kHeadDimV, class Element, bool Is_causal, bool Is_local,
-          bool Has_bias, bool PagedKV, bool Split = false>
+          bool Has_bias, bool PagedKV, bool Split = false, bool KvFp8 = false>
 cudaError_t run_fmha(FmhaParams<Element> const& params, cudaStream_t stream) {
     using ArchTraits = FmhaArch<Arch>;
 
+    // fp8 KV resolves against its own shared-memory model (an fp8 ring plus one
+    // dequantized tile, `fmhaSmemBytesKv8`), but along the same ladder, so it
+    // lands on the same K tile as the served-dtype kernel where both fit.
     static constexpr FmhaTile kTile =
-        fmhaResolveTile(Arch, kHeadDim, kHeadDimV, int(sizeof(Element)));
+        KvFp8 ? fmhaResolveTileKv8(Arch, kHeadDim, kHeadDimV, int(sizeof(Element)))
+              : fmhaResolveTile(Arch, kHeadDim, kHeadDimV, int(sizeof(Element)));
     static_assert(kTile.valid,
                   "no (K tile, ring depth) fits this architecture's shared memory at this "
                   "head dim -- the Python side must refuse the config before it gets here");
@@ -80,7 +84,7 @@ cudaError_t run_fmha(FmhaParams<Element> const& params, cudaStream_t stream) {
     using CollectiveMainloop =
         CollectiveFmhaMainloopSm80<kTile.num_warps, kTile.num_stages, kTile.q_in_regs,
                                    TileShape_MNK, kHeadDimV, Element, float, Arch, Is_causal,
-                                   Is_local, Has_bias, PagedKV, Split>;
+                                   Is_local, Has_bias, PagedKV, Split, KvFp8>;
 
     using CollectiveEpilogue = CollectiveFmhaEpilogue<
         cute::Shape<cute::Int<kTile.block_m>, cute::Int<kHeadDimV>, cute::Int<kTile.block_n>>,

@@ -16,12 +16,13 @@ engine's per-tick :class:`~oasr.engine.generation.StepBudget`.
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping, Tuple
+from typing import Any, List, Mapping, Tuple
 
 import torch
 from torch import nn
 
 from oasr.layers import Linear
+from oasr.quantization.layout import GemmChain, QuantLayout, SmoothGroup
 
 from ..base import BaseAsrModel, LoadReport
 from .audio_tower import Qwen2AudioTower
@@ -138,3 +139,148 @@ class SpeechLlmModel(BaseAsrModel):
         hidden, masks = self.audio_tower(features, lengths)
         audio_embeds = self.multi_modal_projector(hidden)
         return audio_embeds, self._lengths_from_mask(masks)
+
+    # -- quantization ---------------------------------------------------------
+    def quantization_layout(self) -> QuantLayout:
+        """Audio tower and LM; the projector and the LM head stay full precision.
+
+        Audio tower (:class:`~oasr.models.speech_llm.audio_tower._TowerLayer`), as
+        Whisper's encoder: ``self_attn_layer_norm`` feeds only ``q_proj`` /
+        ``k_proj`` / ``v_proj``; V reaches ``out_proj`` only through attention;
+        ``final_layer_norm`` feeds only ``fc1``; exact-erf GELU puts ``fc2`` on a
+        run-time smoother; ``fc1`` -> ``fc2`` is a chain.
+
+        LM (:class:`~oasr.models.speech_llm.llm._Qwen2Layer`):
+
+        * ``input_layernorm`` (RMSNorm, no bias) feeds only ``q_proj`` / ``k_proj``
+          / ``v_proj``; RoPE rotates q and k only;
+        * V reaches ``o_proj`` only through attention -- grouped under GQA, so
+          ``s`` is tied across the query heads sharing a KV head -- and the KV
+          cache holds V in the smoothed domain, read back only by this attention;
+        * ``post_attention_layernorm`` feeds only the MLP's ``gate_proj`` and
+          ``up_proj`` (the quantized :class:`~oasr.layers.GatedMLP` runs them as
+          separate GEMMs);
+        * ``act(gate) * up`` is linear in ``up``, so ``down_proj``'s smoothing
+          folds into ``up_proj``'s rows (``producer_rows``) -- no run-time
+          smoother.  Not a chain: the multiply sits between the GEMMs.
+
+        RMSNorm has no int8-emitting kernel, so the norms' ``fuse_output_quant``
+        is a structural fact that does not arm today.
+
+        Kept full precision: ``lm_head`` (tied to the input embedding when
+        ``text_tie_word_embeddings``, and a vocabulary head either way) and the
+        audio projector, whose output *is* the LM's input embedding for every
+        audio position.  The projector is pinned batch-invariant when the model
+        is quantized: an fp GEMM at ``M = B x 750`` ahead of every quantized LM
+        layer.
+        """
+        groups: List[SmoothGroup] = []
+        chains: List[GemmChain] = []
+        cfg = self.config
+        for i in range(cfg.audio_encoder_layers):
+            p = f"audio_tower.layers.{i}"
+            d = cfg.audio_d_model
+            heads = cfg.audio_encoder_attention_heads
+            groups += [
+                SmoothGroup(
+                    f"{p}.self_attn_layer_norm",
+                    tuple(f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")),
+                    "norm_affine",
+                    fuse_output_quant=True,
+                ),
+                SmoothGroup(
+                    f"{p}.self_attn.v_proj",
+                    (f"{p}.self_attn.out_proj",),
+                    "v_to_o",
+                    v_rows=(0, d),
+                    heads=(heads, heads, d // heads),
+                ),
+                SmoothGroup(f"{p}.final_layer_norm", (f"{p}.fc1",), "norm_affine", True),
+                SmoothGroup(None, (f"{p}.fc2",), "runtime"),
+            ]
+            chains.append(GemmChain(f"{p}.fc1", f"{p}.fc2"))
+        h, h_kv, d_k = (
+            cfg.text_num_attention_heads,
+            cfg.text_num_key_value_heads,
+            cfg.text_head_dim,
+        )
+        for i in range(cfg.text_num_hidden_layers):
+            p = f"language_model.layers.{i}"
+            groups += [
+                SmoothGroup(
+                    f"{p}.input_layernorm",
+                    tuple(f"{p}.self_attn.{n}" for n in ("q_proj", "k_proj", "v_proj")),
+                    "norm_affine",
+                    fuse_output_quant=True,
+                ),
+                SmoothGroup(
+                    f"{p}.self_attn.v_proj",
+                    (f"{p}.self_attn.o_proj",),
+                    "v_to_o",
+                    v_rows=(0, h_kv * d_k),
+                    heads=(h, h_kv, d_k),
+                ),
+                SmoothGroup(
+                    f"{p}.post_attention_layernorm",
+                    (f"{p}.mlp.gate_proj", f"{p}.mlp.up_proj"),
+                    "norm_affine",
+                    fuse_output_quant=True,
+                ),
+                SmoothGroup(f"{p}.mlp.up_proj", (f"{p}.mlp.down_proj",), "producer_rows"),
+            ]
+        return QuantLayout(
+            groups=tuple(groups),
+            keep_full_precision=("language_model.lm_head", "multi_modal_projector.*"),
+            chains=tuple(chains),
+            batch_invariant=("multi_modal_projector.linear",),
+        )
+
+    def calibration_forward(
+        self, features: torch.Tensor, lengths: torch.Tensor, *, tokenizer: Any = None
+    ) -> None:
+        """Tower, projector, then the LM over the serving prompt and a greedy answer.
+
+        The prompt is what the ``llm`` strategy builds -- the checkpoint's ChatML
+        prefix, the audio embeddings, the suffix around the default user prompt --
+        so the LM's text positions (whose activation outliers are what
+        SmoothQuant is for) are calibrated too.  That needs the checkpoint's
+        tokenizer; without one only the audio positions reach the LM.
+        """
+        audio, audio_lens = self.encode_offline(features, lengths)
+        lm, cfg = self.language_model, self.config
+        prefix_ids: List[int] = []
+        suffix_ids: List[int] = []
+        if tokenizer is not None and getattr(tokenizer, "supports_encode", False):
+            prefix_ids = list(tokenizer.encode(cfg.prompt_prefix))
+            suffix_ids = list(
+                tokenizer.encode(cfg.prompt_suffix.format(prompt=cfg.default_user_prompt))
+            )
+        else:
+            logger.warning(
+                "speech-LLM calibration without an encoding tokenizer: the LM sees the "
+                "audio positions only"
+            )
+        device, dtype = audio.device, audio.dtype
+
+        def embed(ids: List[int]) -> torch.Tensor:
+            t = torch.tensor(ids, dtype=torch.long, device=device)
+            out: torch.Tensor = lm.embed_tokens(t)
+            return out.to(dtype)
+
+        eos = {int(t) for t in cfg.eos_token_ids}
+        for b in range(audio.size(0)):
+            row = torch.cat(
+                [embed(prefix_ids), audio[b, : int(audio_lens[b])], embed(suffix_ids)], dim=0
+            )
+            valid = torch.ones(1, row.size(0), dtype=torch.bool, device=device)
+            logits, state = lm.prefill(row.unsqueeze(0), valid)
+            for _ in range(_CALIBRATION_TOKENS):
+                token = logits.argmax(dim=-1)
+                if int(token[0]) in eos:
+                    break
+                logits, state = lm.step(token, state)
+
+
+#: Greedy tokens a calibration utterance decodes (a transcript is shorter; the
+#: cap bounds a model that keeps talking).
+_CALIBRATION_TOKENS = 96

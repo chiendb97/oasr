@@ -137,7 +137,7 @@ FP8_W8A8 = QuantScheme(
     QuantArgs(8, "float", "channel"), QuantArgs(8, "float", "token", dynamic=True), "fp8_w8a8"
 )
 FP8_W8A8_STATIC = QuantScheme(
-    QuantArgs(8, "float", "tensor"), QuantArgs(8, "float", "tensor"), "fp8_w8a8_static"
+    QuantArgs(8, "float", "channel"), QuantArgs(8, "float", "tensor"), "fp8_w8a8_static"
 )
 _NVFP4_ARGS = QuantArgs(
     4, "float", "group", group_size=16, scale_dtype="float8_e4m3fn", global_scale=True
@@ -246,8 +246,8 @@ class QuantizationSpec:
         * a target glob that matches no quantizable layer (a typo, or a spec
           written for another architecture);
         * a target that selects a layer whose weight something else reads raw
-          (``quantizable = False``: the fused gated-MLP, the transducer decode
-          kernels) — quantizing it would hand that reader int8;
+          (``quantizable = False``: the transducer decode kernels) — quantizing
+          it would hand that reader 8-bit storage;
         * a runtime-smoothed path that is not a quantized layer.
         """
         from oasr.layers._quantizable import QuantizableGemm

@@ -75,20 +75,38 @@ class QuantizationConfig:
       checkpoint.  Naming a different scheme than a quantized checkpoint's raises.
     * ``ignore`` — extra module-path globs kept at full precision, beyond what the
       model's ``quantization_layout()`` already keeps.
+    * ``kv_cache`` — storage of an autoregressive decoder's attention KV cache:
+      ``None`` / ``"auto"`` keeps the model dtype; ``"fp8_e4m3"`` stores it as
+      e4m3 with one fp32 scale per (token, kv-head), computed when the token is
+      written, which roughly halves the KV bytes a row costs (and the VRAM-derived
+      admission budget counts it that way).  Independent of ``scheme``:
+      ``scheme=None`` with ``kv_cache`` set is fp weights over an fp8 cache.
+      A decode family with no AR KV cache, or a decoder / device / attention
+      lane that cannot store or read one, refuses it at engine construction.
 
-    The Rust front-end passes ``{"scheme": ..., "ignore": "a,b"}`` with string
-    values (``oasr-server --quantization int8_w8a8 --quantization-option
-    ignore=...``); ``coerce`` types them.
+    The Rust front-end passes ``{"scheme": ..., "ignore": "a,b", "kv_cache":
+    "fp8_e4m3"}`` with string values (``oasr-server --quantization int8_w8a8
+    --quantization-option ignore=... --quantization-option kv_cache=fp8_e4m3``);
+    ``coerce`` types them.
     """
 
     scheme: Optional[str] = None
     ignore: Tuple[str, ...] = ()
+    kv_cache: Optional[str] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.ignore, str):
             self.ignore = tuple(g.strip() for g in self.ignore.split(",") if g.strip())
         else:
             self.ignore = tuple(self.ignore)
+        if isinstance(self.kv_cache, str):
+            self.kv_cache = self.kv_cache.strip() or None
+        if self.kv_cache == "auto":
+            self.kv_cache = None
+        if self.kv_cache is not None:
+            from oasr.functionals.kv_quant import kv_cache_dtype
+
+            kv_cache_dtype(self.kv_cache)  # raise now, naming the formats
         if self.scheme is not None:
             from oasr.quantization.spec import get_scheme
 
@@ -103,10 +121,11 @@ class QuantizationConfig:
         if isinstance(value, str):
             return cls(scheme=value)
         if isinstance(value, dict):
-            unknown = set(value) - {"scheme", "ignore"}
+            unknown = set(value) - {"scheme", "ignore", "kv_cache"}
             if unknown:
                 raise ValueError(
-                    f"unknown quantization option(s) {sorted(unknown)}; expected scheme, ignore"
+                    f"unknown quantization option(s) {sorted(unknown)}; expected scheme, "
+                    "ignore, kv_cache"
                 )
             return cls(**value)
         raise TypeError(

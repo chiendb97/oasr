@@ -23,6 +23,7 @@ from helpers import make_engine, tiny_conformer
 from oasr.engine.config import EngineConfig, QuantizationConfig
 from oasr.layers import QuantizedActivation
 from oasr.quantization import (
+    FP8_W8A8,
     INT8_W8A8,
     QuantizationSpec,
     apply_quantization,
@@ -42,6 +43,23 @@ def _dense(x) -> torch.Tensor:
         scale = x.scale.unsqueeze(-1) if x.per_token else x.scale
         return x.data.float() * scale
     return x.detach()
+
+
+def _layout_count(ckpt: str, scheme=INT8_W8A8) -> int:
+    """How many layers *ckpt*'s own ``quantization_layout()`` lets *scheme* quantize.
+
+    Derived, not hard-coded: the count moves whenever a layout does (the U2++
+    attention decoder joining the Conformer's took it from 96 to 156).  Built on
+    the meta device -- only the module tree is needed.
+    """
+    from pathlib import Path
+
+    from oasr.models.registry import get_model_entry, load_checkpoint_bundle
+
+    arch, bundle = load_checkpoint_bundle(Path(ckpt))
+    with torch.device("meta"):
+        model = get_model_entry(arch).model_cls.from_config(bundle.model_config, **bundle.aux)
+    return len(QuantizationSpec.for_model(model, scheme).groups[0].targets)
 
 
 def _waves(n: int):
@@ -107,12 +125,16 @@ class TestBatchInvariance:
     int8 rounding can amplify it into a flipped borderline word.  What int8 owns
     is the per-layer property tested here: given bitwise-equal input rows, a
     quantized layer returns bitwise-equal output rows, however the batch is made
-    up.  (Per-token scales are row-local; the int32 accumulator is exact.)
+    up.  (Per-token scales are row-local; the int32 accumulator is exact, and the
+    fp8 lane sums every output in one order whatever the tile.)
     """
 
-    def test_equal_input_rows_give_equal_output_rows(self):
+    @pytest.mark.parametrize("scheme", [INT8_W8A8, FP8_W8A8], ids=lambda s: s.name)
+    def test_equal_input_rows_give_equal_output_rows(self, scheme):
+        if scheme is FP8_W8A8 and torch.cuda.get_device_capability() < (8, 9):
+            pytest.skip("fp8 tensor cores need sm89+")
         model = tiny_conformer(output_size=256, attention_heads=4, linear_units=256)
-        apply_quantization(model, QuantizationSpec.for_model(model, INT8_W8A8), quantize=True)
+        apply_quantization(model, QuantizationSpec.for_model(model, scheme), quantize=True)
         model = model.to(device="cuda", dtype=torch.float16)
         bind_quantization(model)
         seen = {}
@@ -162,6 +184,7 @@ class TestRealCheckpoint:
             calib_utterances=8,
         )
         waves = _waves(4)
+        expected = _layout_count(ckpt)
         for mode in ("offline", "streaming"):
             engine = make_engine(str(dst), service_mode=mode)
             try:
@@ -172,7 +195,7 @@ class TestRealCheckpoint:
             finally:
                 del engine
                 torch.cuda.empty_cache()
-            assert info["schemes"] == ["int8_w8a8"] and info["layers"] == 96
+            assert info["schemes"] == ["int8_w8a8"] and info["layers"] == expected
             assert all(texts), mode
 
     def test_the_tuning_report_counts_the_quantized_layers_by_tier(self):
@@ -186,10 +209,29 @@ class TestRealCheckpoint:
             finally:
                 del engine
                 torch.cuda.empty_cache()
+        expected = _layout_count(ckpt)
         line = next(
             row
             for row in reports["int8_w8a8"].splitlines()
-            if row.startswith("scaled_mm: 96 quantized layer(s)")
+            if row.startswith(f"scaled_mm: {expected} quantized layer(s)")
         )
         assert "with a tuning entry" in line and "on the shape heuristic" in line
         assert "scaled_mm" not in reports[None]
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+        reason="fp8 tensor cores need sm89+",
+    )
+    def test_online_fp8_serves_offline_and_streaming(self):
+        ckpt = assets.require("CKPT_DIR")
+        waves = _waves(4)
+        for mode in ("offline", "streaming"):
+            engine = make_engine(ckpt, service_mode=mode, quantization="fp8_w8a8")
+            try:
+                info = engine.quantization_info()
+                texts = engine.transcribe(waves, streaming=mode == "streaming")
+            finally:
+                del engine
+                torch.cuda.empty_cache()
+            assert info["schemes"] == ["fp8_w8a8"] and info["lanes"] == ["cutlass_sm89_fp8"]
+            assert all(texts), mode
