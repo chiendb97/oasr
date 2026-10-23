@@ -168,8 +168,18 @@ int8, `scaled_mm_fp8` (its own `scaled_mm_fp8.json`, measured on its own lane)
 for fp8 -- a
 measured entry per `(op, N, K)`, M rounded up to a region, user tier over the
 shipped `oasr/tune/db/sm<family>/scaled_mm.json` — and falls back to the shape
-heuristic: the largest data-parallel tile that still launches half a wave of
-CTAs.  A region may name the heuristic itself (`"heuristic"`: measured, nothing
+heuristic.  For int8 that is a ladder over seven data-parallel tiles
+(`_INT8_LADDER`): the largest tile no taller than twice M that launches enough
+CTAs for the GPU, with a K-dependent rung.  Short-K tiles keep two CTAs resident
+per SM: at K = 256 (every Conformer width) a CTA runs four K tiles, so its
+prologue and its dequant epilogue are most of its life, and only a second CTA
+hides them.  A deep K, or a launch with fewer CTAs than SMs, takes a deeper
+pipeline instead.  Fitted to a 25-tile sweep over five architectures' shapes, it
+is within 1 % of the best of the 25 (geomean; worst 1.23x).  The first int8 set
+was sized for one CTA per SM: 1.13x slower (geomean, up to 1.39x) on the Conformer
+widths above M = 256.  For
+fp8 the heuristic is the largest data-parallel tile that still launches half a
+wave of CTAs.  A region may name the heuristic itself (`"heuristic"`: measured, nothing
 beat it), and only a measured entry picks a Stream-K tile.  Every variant computes
 the same bits, so tuning changes speed only.  The tuning census records the int8
 GEMMs (`oasr tune census --quantization int8_w8a8`, or `fp8_w8a8`), `oasr tune

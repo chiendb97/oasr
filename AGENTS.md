@@ -473,6 +473,12 @@ extension cookbook for each axis.
   NDEBUG removes; the config space excludes it. Stream-K is the supported split, and exact
   (int32 partials) — but it loses on every Conformer shape, so only a measured tuning entry
   picks it.
+- **An 8-bit tile set sized for one CTA per SM.** At K = 256 a CTA runs four K tiles, so its
+  prologue and its dequant epilogue are most of its life, and only a second resident CTA
+  overlaps them with MMA work. The first int8 set (3-5 stages, all 1 CTA/SM) was 1.13x
+  slower (geomean, up to 1.39x) on the Conformer widths above M = 256. Neither the tuner
+  nor the heuristic could see it, because both only rank the production set. Before
+  changing that set, sweep candidates outside it with the tuner's own `measure_case`.
 - **Expecting a quantized model to be batch-invariant because its layers are.** Per-token
   scales and the int32 accumulator make each quantized layer row-local, but an fp16 GEMM
   ahead of it picks an M-dependent config (cuBLAS, split-K, Stream-K), and int8 rounding

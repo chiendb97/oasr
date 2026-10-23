@@ -116,16 +116,68 @@ class ScaledMmConfig:
         )
 
 
-#: The data-parallel production set, ordered by M bucket.  Small-M tiles favour a
-#: deep K tile (few rows, so the mainloop is the cost); large-M tiles the 128x128
-#: square.  Each one also exports the int8-output (quantizing) launcher.
+#: The int8 data-parallel tiles.  A Conformer-width GEMM has K = 256: two to four
+#: K tiles, so a CTA's pipeline prologue and its dequant/activation epilogue are
+#: most of its life, and only a second CTA resident on the same SM overlaps them
+#: with tensor-core work.  The shallow-K tiles are therefore sized for two or more
+#: CTAs per SM (4 warps, <= 48 KiB of shared memory); the deep-K and the sparse
+#: launch -- fewer CTAs than SMs, where a second CTA is never there -- take a
+#: deeper pipeline instead.
+_T16 = ScaledMmConfig(16, 64, 128, 16, 64, 64, 5)
+_T64 = ScaledMmConfig(64, 64, 64, 32, 32, 64, 4)
+_T64_DEEP_K = ScaledMmConfig(64, 64, 128, 32, 32, 128, 4)
+_T64X128 = ScaledMmConfig(64, 128, 64, 32, 64, 64, 4)
+_T128 = ScaledMmConfig(128, 128, 64, 64, 64, 64, 3)
+_T128_SPARSE = ScaledMmConfig(128, 128, 64, 64, 64, 64, 4)
+_T128X256 = ScaledMmConfig(128, 256, 64, 64, 64, 64, 3)
+
+#: The data-parallel production set.  Each one also exports the int8-output
+#: (quantizing) launcher.  Chosen from a sweep of 25 tiles over 23 shapes of five
+#: architectures (U2++, Nemotron, whisper-tiny, whisper-large, Qwen2-7B; M = 1 to
+#: 16384; the tuner's protocol, ``oasr.tune.build_scaled_mm.measure_case``) on an
+#: RTX 5090, 2026-10-23: the best of these seven is within 0.6 % (geomean) of the
+#: best of all 25.  The set it replaced was sized for one CTA per SM (3-5 stages):
+#: on the Conformer widths above M = 256 its best tile was 1.13x slower than this
+#: set's (geomean; up to 1.39x).
 _PRODUCTION: Tuple[ScaledMmConfig, ...] = (
-    ScaledMmConfig(16, 64, 128, 16, 64, 64, 5),
-    ScaledMmConfig(32, 64, 128, 32, 64, 64, 5),
-    ScaledMmConfig(64, 64, 128, 64, 64, 64, 5),
-    ScaledMmConfig(64, 128, 128, 64, 64, 64, 3),
-    ScaledMmConfig(128, 128, 64, 64, 64, 64, 5),
-    ScaledMmConfig(128, 256, 64, 64, 64, 64, 3),
+    _T16,
+    _T64,
+    _T64_DEEP_K,
+    _T64X128,
+    _T128,
+    _T128_SPARSE,
+    _T128X256,
+)
+
+
+@dataclass(frozen=True)
+class _Rung:
+    """One step of the int8 shape heuristic (:data:`_INT8_LADDER`)."""
+
+    tile: ScaledMmConfig
+    #: The rung serves when its tile launches at least this many CTAs per SM.
+    min_ctas_per_sm: float
+    #: The K range the rung serves, ``[min_k, max_k)``.
+    min_k: int = 0
+    max_k: Optional[int] = None
+    #: Served instead when the tile's CTAs do not cover every SM once: with one
+    #: CTA per SM, a deeper pipeline beats the second CTA that is never there.
+    sparse: Optional[ScaledMmConfig] = None
+
+
+#: The int8 shape heuristic, largest tile first: the first rung whose tile is less
+#: than twice as tall as M (a taller one computes mostly padding rows) and launches
+#: at least ``min_ctas_per_sm x num_sms`` CTAs serves, else :data:`_T16`.  The
+#: thresholds are fitted to the sweep above; every leave-one-architecture-out fold
+#: refits the same values.  Regret against the best of all 25 tiles: 0.9 % geomean,
+#: worst 1.23x (the previous half-wave rule over the previous set: 5.4 %, worst
+#: 1.47x; on the Conformer widths 0.5 % vs 7.4 %).
+_INT8_LADDER: Tuple[_Rung, ...] = (
+    _Rung(_T128X256, 0.5, min_k=2048),
+    _Rung(_T128, 0.5, sparse=_T128_SPARSE),
+    _Rung(_T64X128, 0.5),
+    _Rung(_T64_DEEP_K, 0.2, min_k=1024),
+    _Rung(_T64, 0.25, max_k=1024),
 )
 
 #: The Stream-K variants.  Exact (the partials are int32), so a Stream-K choice
@@ -210,16 +262,40 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _ctas(m: int, n: int, cfg: ScaledMmConfig) -> int:
+    return -(-m // cfg.block_m) * -(-n // cfg.block_n)
+
+
+def _select_int8(
+    m: int, n: int, k: int, num_sms: int, built: Dict[str, ScaledMmConfig]
+) -> ScaledMmConfig:
+    for rung in _INT8_LADDER:
+        if k < rung.min_k or (rung.max_k is not None and k >= rung.max_k):
+            continue
+        if 2 * m <= rung.tile.block_m:
+            continue
+        ctas = _ctas(m, n, rung.tile)
+        if ctas < rung.min_ctas_per_sm * num_sms:
+            continue
+        pick = rung.sparse if rung.sparse is not None and ctas < num_sms else rung.tile
+        if pick.compile_name in built:
+            return pick
+    return _T16
+
+
 @functools.lru_cache(maxsize=4096)
-def _select(m: int, n: int, sm: int, num_sms: int, fmt: str = "int8") -> ScaledMmConfig:
+def _select(m: int, n: int, k: int, sm: int, num_sms: int, fmt: str = "int8") -> ScaledMmConfig:
+    built = get_production_configs(sm, fmt)
+    if fmt == "int8":
+        return _select_int8(m, n, k, num_sms, built)
+    # fp8: the largest data-parallel tile that still launches half a wave of CTAs.
     by_area = sorted(
-        (c for c in get_production_configs(sm, fmt).values() if not c.stream_k),
+        (c for c in built.values() if not c.stream_k),
         key=lambda c: c.block_m * c.block_n,
         reverse=True,
     )
     for cfg in by_area:
-        ctas = -(-m // cfg.block_m) * -(-n // cfg.block_n)
-        if 2 * ctas >= num_sms:
+        if 2 * _ctas(m, n, cfg) >= num_sms:
             return cfg
     return by_area[-1]
 
@@ -243,12 +319,17 @@ def _process_num_sms() -> int:
 
 
 def heuristic_config(
-    m: int, n: int, sm: int | None = None, num_sms: int | None = None, fmt: str = "int8"
+    m: int,
+    n: int,
+    k: int,
+    sm: int | None = None,
+    num_sms: int | None = None,
+    fmt: str = "int8",
 ) -> ScaledMmConfig:
     """The shape heuristic's pick, ignoring the tuning DB (what a build measures against)."""
     sm = _process_sm() if sm is None else int(sm)
     num_sms = _process_num_sms() if num_sms is None else int(num_sms)
-    return _select(int(m), int(n), sm, num_sms, _check_fmt(fmt))
+    return _select(int(m), int(n), int(k), sm, num_sms, _check_fmt(fmt))
 
 
 def select_config(
@@ -263,13 +344,11 @@ def select_config(
 
     A measured tuning entry first (``scaled_mm|op=scaled_mm|N=..|K=..``, user tier
     then system tier, M rounded *up* to a region; see :func:`covering_tier`), else
-    the shape heuristic: the largest data-parallel tile that still launches at
-    least half a wave of CTAs, else the smallest tile -- never Stream-K (see
-    ``_STREAMK_PRODUCTION``), which only a measured entry can name.  Measured on
-    the Conformer shapes on an RTX 5090 (170 SMs; N, K in {(768, 256), (256,
-    256), (2048, 256), (256, 2048), (512, 256)}, M from 16 to 16384) the
-    heuristic picks the fastest variant, or one within 3 % of it, at every
-    point; the per-M bucket rule it replaced was up to 3x off at mid M.
+    the shape heuristic -- never Stream-K (see ``_STREAMK_PRODUCTION``), which only
+    a measured entry can name.  For int8 that is :data:`_INT8_LADDER` (the largest
+    tile that fills enough of the GPU for its K, within 1 % of the best of 25
+    tiles on five architectures' shapes); for fp8 the largest data-parallel tile
+    that still launches at least half a wave of CTAs, else the smallest.
 
     A function of shape, device and the tuning-DB snapshot alone — never of
     capture state (AGENTS.md rule 11) — so an eager call and a graph replay of a
@@ -608,9 +687,9 @@ def _resolve(op: str, m: int, n: int, k: int, sm: int, num_sms: int) -> ScaledMm
         record_tier(family, op, tier)
         if isinstance(choice, ScaledMmConfig):
             return choice
-        return _select(m, n, sm, num_sms, fmt)  # the heuristic sentinel
+        return _select(m, n, k, sm, num_sms, fmt)  # the heuristic sentinel
     record_tier(family, op, "heuristic")
-    return _select(m, n, sm, num_sms, fmt)
+    return _select(m, n, k, sm, num_sms, fmt)
 
 
 def _memoise(key: tuple, op: str, m, n, k, sm, num_sms) -> ScaledMmConfig:

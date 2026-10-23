@@ -106,11 +106,12 @@ default, and a coverage basis (`jit.gemm.get_production_configs`);
 ### The int8 scaled GEMM (`scaled_mm`)
 
 The W8A8 GEMM of a quantized layer (`oasr.scaled_mm`, [`quantization.md`](quantization.md))
-is its own kernel family with its own file, keyed by op and width:
+is its own kernel family with its own file, keyed by op and width. A region
+names a tile, or the heuristic (an illustrative entry):
 
 ```json
 "scaled_mm|op=scaled_mm|N=768|K=256": {
-  "regions": [[7136, "heuristic"], [null, "b128x128x64_w64x64x64_s5"]], ...
+  "regions": [[7136, "heuristic"], [null, "b128x128x64_w64x64x64_s3"]], ...
 }
 ```
 
@@ -119,8 +120,10 @@ is its own kernel family with its own file, keyed by op and width:
   separately; `select_quant_config` never serves a Stream-K tile (there is no
   quantizing Stream-K launcher), so such an entry is warned about once and skipped.
 - **The `"heuristic"` sentinel.** The family's untuned selector is a shape
-  heuristic (the largest data-parallel tile still launching half a wave of CTAs),
-  within a few percent of the best tile on Conformer shapes. A region names
+  heuristic. For int8 it is the ladder `_INT8_LADDER`: the largest tile that fills
+  enough of the GPU for its K, within 1 % (geomean) of the best of 25 tiles
+  measured over five architectures' shapes. For fp8 it is the largest
+  data-parallel tile still launching half a wave of CTAs. A region names
   `"heuristic"` where nothing beat it by the gate; the build keeps an entry even
   when every region does — `[[null, "heuristic"]]` says *measured*, which
   `tuning.strict` and the coverage report need, where an absent entry would say
@@ -140,7 +143,8 @@ is its own kernel family with its own file, keyed by op and width:
   int8_w8a8` probes a full-precision checkpoint quantized online; a quantized
   checkpoint needs no flag. `oasr tune build` then writes `scaled_mm.json` beside
   `gemm.json` (`--family scaled_mm` builds only it): every eligible variant is
-  measured at every point (the set is eight tiles — no pruning, no cost model),
+  measured at every point (the set is nine tiles: seven data-parallel, two
+  Stream-K — no pruning, no cost model),
   numerics-gated **bitwise** against the heuristic's variant, and partitioned
   against a `heuristic` pseudo-arm (`oasr/tune/build_scaled_mm.py`).
 - **fp8: a family of its own.** The fp8 e4m3 GEMM (`fp8_w8a8`) keeps its entries
