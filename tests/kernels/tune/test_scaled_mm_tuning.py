@@ -54,7 +54,7 @@ def _entry_file(root, op, n, k, regions, sm=SM):
     return _user_file(root, {key: db.Entry(regions=regions)}, configs, sm)
 
 
-BIG = "b128x128x64_w64x64x64_s5"
+BIG = "b128x128x64_w64x64x64_s3"
 SMALL = "b16x64x128_w16x64x64_s5"
 STREAM_K = "b64x64x128_w64x64x64_s5_sk"
 
@@ -95,9 +95,9 @@ class TestTiers:
     def test_an_entry_is_served_and_rounds_up(self, user_db):
         _entry_file(user_db, "scaled_mm", N, K, [(64, BIG), (1024, jsm.HEURISTIC_ID)])
         assert jsm.config_id(_select(64)) == BIG
-        assert _select(65) == jsm.heuristic_config(65, N, SM, NUM_SMS)
+        assert _select(65) == jsm.heuristic_config(65, N, K, SM, NUM_SMS)
         # No catch-all: above the measured range is the heuristic, and uncovered.
-        assert _select(4096) == jsm.heuristic_config(4096, N, SM, NUM_SMS)
+        assert _select(4096) == jsm.heuristic_config(4096, N, K, SM, NUM_SMS)
         assert jsm.covering_tier("scaled_mm", 64, N, K, SM) == "user"
         assert jsm.covering_tier("scaled_mm", 1024, N, K, SM) == "user"
         assert jsm.covering_tier("scaled_mm", 1025, N, K, SM) is None
@@ -109,7 +109,7 @@ class TestTiers:
 
     def test_without_an_entry_the_heuristic_serves(self, user_db):
         for m in (1, 17, 300, 5000):
-            assert _select(m) == jsm.heuristic_config(m, N, SM, NUM_SMS)
+            assert _select(m) == jsm.heuristic_config(m, N, K, SM, NUM_SMS)
             assert not _select(m).stream_k
         assert jsm.covering_tier("scaled_mm", 17, N, K, SM) is None
         assert db.tier_counts() == {("scaled_mm", "scaled_mm", "heuristic"): 4}
@@ -122,11 +122,11 @@ class TestTiers:
         _entry_file(user_db, "scaled_mm_quant", N, K, [(None, STREAM_K)])
         with caplog.at_level(logging.WARNING, logger="oasr.jit.scaled_mm"):
             cfg = _select_quant(512)
-        assert not cfg.stream_k and cfg == jsm.heuristic_config(512, N, SM, NUM_SMS)
+        assert not cfg.stream_k and cfg == jsm.heuristic_config(512, N, K, SM, NUM_SMS)
         assert "Stream-K" in caplog.text
         assert jsm.covering_tier("scaled_mm_quant", 512, N, K, SM) is None
         # The fp-output op has its own key: the quantizing entry does not leak into it.
-        assert _select(512) == jsm.heuristic_config(512, N, SM, NUM_SMS)
+        assert _select(512) == jsm.heuristic_config(512, N, K, SM, NUM_SMS)
 
     def test_an_uncompiled_config_falls_through_with_one_warning(self, user_db, caplog):
         bogus = {
@@ -141,7 +141,7 @@ class TestTiers:
         _user_file(user_db, {key: db.Entry(regions=[(None, "bogus")])}, {"bogus": bogus})
         with caplog.at_level(logging.WARNING, logger="oasr.jit.scaled_mm"):
             for m in (8, 900, 3000):
-                assert _select(m) == jsm.heuristic_config(m, N, SM, NUM_SMS)
+                assert _select(m) == jsm.heuristic_config(m, N, K, SM, NUM_SMS)
         warned = [r for r in caplog.records if "production set" in r.getMessage()]
         assert len(warned) == 1, caplog.text
         assert jsm.covering_tier("scaled_mm", 8, N, K, SM) is None
@@ -150,7 +150,7 @@ class TestTiers:
     def test_an_unreadable_config_falls_through(self, user_db):
         key = jsm.scaled_mm_sig_key("scaled_mm", N, K)
         _user_file(user_db, {key: db.Entry(regions=[(None, "x")])}, {"x": {"kind": "torch"}})
-        assert _select(64) == jsm.heuristic_config(64, N, SM, NUM_SMS)
+        assert _select(64) == jsm.heuristic_config(64, N, K, SM, NUM_SMS)
 
     def test_the_user_tier_wins_over_the_shipped_one(self, user_db):
         shipped = db.tiers("scaled_mm", SM).system
@@ -197,6 +197,56 @@ class TestTiers:
         _select(64)
         assert "scaled_mm" in db.tuning_report()
         assert "scaled_mm" not in db.tuning_report(families=["gemm", "conv1d"])
+
+
+#: Every SM family the int8 lane serves, with its SM count for a full-size part.
+_LANE_SMS = {80: 108, 86: 84, 89: 128, 90: 132, 100: 148, 120: 170}
+
+
+class TestInt8Heuristic:
+    """The int8 shape heuristic (``_INT8_LADDER``) over the production set."""
+
+    @pytest.mark.parametrize("sm", sorted(jsm.SCALED_MM_LANE_BY_SM))
+    def test_every_rung_is_built_wherever_the_lane_runs(self, sm):
+        built = jsm.get_production_configs(sm)
+        for rung in jsm._INT8_LADDER:
+            for cfg in (rung.tile, rung.sparse):
+                if cfg is not None:
+                    assert built.get(cfg.compile_name) == cfg, (sm, cfg)
+        assert built.get(jsm._T16.compile_name) == jsm._T16
+
+    @pytest.mark.parametrize("sm", sorted(_LANE_SMS))
+    def test_picks_a_data_parallel_production_tile(self, sm):
+        built = jsm.get_production_configs(sm)
+        for m in (1, 2, 16, 17, 33, 64, 65, 128, 129, 300, 1000, 4096, 16384, 100000):
+            for n, k in ((256, 256), (768, 256), (2048, 256), (256, 2048), (18944, 3584)):
+                cfg = jsm.heuristic_config(m, n, k, sm, _LANE_SMS[sm])
+                assert built[cfg.compile_name] == cfg and not cfg.stream_k
+
+    @pytest.mark.parametrize("n,k", [(768, 256), (256, 256), (2048, 256), (512, 256)])
+    def test_a_short_k_launch_that_fills_the_gpu_keeps_two_ctas_per_sm(self, n, k):
+        """K = 256 is four K tiles: a CTA's prologue and epilogue are most of its life,
+        and a second resident CTA is what overlaps them with tensor-core work.  The
+        first int8 set was sized for one CTA per SM and was 1.05-1.36x slower here."""
+        cfg = jsm.heuristic_config(16384, n, k, SM, NUM_SMS)
+        smem = jsm._smem_bytes(cfg.block_m, cfg.block_n, cfg.block_k, cfg.stages, dtype_bytes=1)
+        assert 2 * smem <= jsm._SM_MAX_SMEM_BYTES[SM], (n, k, cfg)
+
+    def test_a_launch_short_of_one_cta_per_sm_takes_the_deeper_pipeline(self):
+        # 128x128 tiles: 10 x 16 = 160 CTAs on 170 SMs -- the second CTA never comes.
+        sparse = jsm.heuristic_config(1280, 2048, 1024, SM, NUM_SMS)
+        dense = jsm.heuristic_config(4096, 2048, 1024, SM, NUM_SMS)
+        assert (sparse.block_m, sparse.block_n) == (dense.block_m, dense.block_n) == (128, 128)
+        assert sparse.stages > dense.stages
+
+    def test_a_tile_twice_as_tall_as_m_is_never_picked(self):
+        for m in (1, 8, 16, 32, 64):
+            cfg = jsm.heuristic_config(m, 18944, 3584, SM, NUM_SMS)
+            assert 2 * m > cfg.block_m or cfg == jsm._T16, (m, cfg)
+
+    def test_deep_k_takes_the_deep_k_tile(self):
+        assert jsm.heuristic_config(1024, 256, 2048, SM, NUM_SMS).block_k == 128
+        assert jsm.heuristic_config(1024, 256, 256, SM, NUM_SMS).block_k == 64
 
 
 class TestShippedFiles:
@@ -415,7 +465,7 @@ class TestBuild:
         assert not res.rejected
         assert set(res.results) == set(candidates("scaled_mm", sm)) | {jsm.HEURISTIC_ID}
         heur = res.results[jsm.HEURISTIC_ID]
-        twin = res.results[jsm.config_id(jsm.heuristic_config(200, 256, sm))]
+        twin = res.results[jsm.config_id(jsm.heuristic_config(200, 256, 256, sm))]
         assert heur.median_ms == twin.median_ms and heur.eliminated_at is None
         q = measure_case("scaled_mm_quant", 200, 256, 256, sm=sm)
         assert not any(
@@ -482,7 +532,7 @@ class TestFp8Family:
         cfg = jsm.select_config(64, N, K, SM, NUM_SMS, fmt="fp8")
         assert jsm.config_id(cfg) == FP8_BIG
         assert jsm.select_config(65, N, K, SM, NUM_SMS, fmt="fp8") == jsm.heuristic_config(
-            65, N, SM, NUM_SMS, fmt="fp8"
+            65, N, K, SM, NUM_SMS, fmt="fp8"
         )
         assert jsm.covering_tier("scaled_mm_fp8", 64, N, K, SM) == "user"
         # The int8 op of the same shape has no entry.
@@ -493,7 +543,7 @@ class TestFp8Family:
 
     def test_the_heuristic_picks_fp8_tiles(self):
         for m in (1, 300, 16384):
-            cfg = jsm.heuristic_config(m, N, SM, NUM_SMS, fmt="fp8")
+            cfg = jsm.heuristic_config(m, N, K, SM, NUM_SMS, fmt="fp8")
             assert cfg.fp8 and cfg.block_k == cfg.warp_k
 
     def test_an_int8_config_in_an_fp8_entry_falls_through(self, user_db, caplog):

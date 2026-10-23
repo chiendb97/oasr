@@ -201,7 +201,7 @@ def measure_case(
     fmt = jsm.op_format(op)
     case = gemm_tune.GemmCase(op, M, N, K, _DTYPE_STR[fmt], 1)
     cfgs = candidates(op, sm)
-    heur_id = jsm.config_id(jsm.heuristic_config(M, N, sm, fmt=fmt))
+    heur_id = jsm.config_id(jsm.heuristic_config(M, N, K, sm, fmt=fmt))
     copies = bench.l2_copies(
         case.weight_bytes, working_set_bytes=working_set_bytes, max_copies=policy.max_rotation_calls
     )
@@ -298,7 +298,7 @@ def measure_signature(
         )
         alpha = _alpha_for(M, points)
         choice, sp, note = decide_point(res, jsm.HEURISTIC_ID, alpha, opts)
-        heur = jsm.heuristic_config(M, N, sm, fmt=jsm.op_format(op))
+        heur = jsm.heuristic_config(M, N, K, sm, fmt=jsm.op_format(op))
         note += f" [heuristic: {jsm.config_id(heur)}]"
         w = census_ms[M].weight if M in census_ms and census_ms[M].weight > 0 else fill_w
         out.append(
@@ -332,7 +332,7 @@ def _log_rows(pr: PointResult, sig, sm: int, sku, impl_hash: str) -> List[Dict[s
                 "config": name,
                 "params": jsm.choice_to_params(m.payload),
                 "heuristic": jsm.config_id(
-                    jsm.heuristic_config(pr.M, N, sm, fmt=jsm.op_format(op))
+                    jsm.heuristic_config(pr.M, N, K, sm, fmt=jsm.op_format(op))
                 ),
                 "median_ms": round(m.median_ms, 7),
                 "sigma_ms": round(m.sigma_ms, 7),
@@ -496,8 +496,12 @@ def build_scaled_mm(
             "census": shapes.provenance,
             "contended": contended,
             "elapsed_s": round(time.time() - t0, 1),
-            "fallback": "heuristic: oasr.jit.scaled_mm.heuristic_config (largest data-parallel "
-            "tile launching >= half a wave of CTAs)",
+            "fallback": "heuristic: oasr.jit.scaled_mm.heuristic_config ("
+            + (
+                "_INT8_LADDER: the largest tile filling enough of the GPU for its K)"
+                if fmt == "int8"
+                else "largest data-parallel tile launching >= half a wave of CTAs)"
+            ),
             "operands": f"random {_DTYPE_STR[fmt]}, per-token/per-channel fp32 scales, "
             f"{_OUT_DTYPE} bias, {_ACTIVATION} epilogue",
         }

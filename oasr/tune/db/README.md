@@ -28,7 +28,20 @@ two CTAs per SM at fp8's half-rate fp32 accumulation.  Regenerate as below with
 `--quantization fp8_w8a8`, `--recipe smoothquant_fp8_w8a8_fused` and
 `--family scaled_mm_fp8`.
 
-### `sm120/scaled_mm.json` — Conformer int8 widths (2026-10-20; re-measured 2026-10-21)
+### `sm120/scaled_mm.json` — Conformer int8 widths (2026-10-20; re-measured 2026-10-21, 2026-10-23)
+
+Re-measured on 2026-10-23 for the new int8 production set and its ladder
+heuristic (`oasr/jit/scaled_mm.py`, `_INT8_LADDER`).  The new set has seven
+data-parallel tiles; the shallow-K ones keep two CTAs resident per SM.  It
+replaced six tiles sized for one CTA per SM.  It was measured as below, from the
+same four census configurations, with the SmoothQuant checkpoint recalibrated
+by the current `oasr quantize` (156 layers).  Every region of all six signatures
+now keeps the heuristic: no variant beats it by 1.05x over a region.  The one
+override of the old file is gone: `(768, 256)` above M = 7136, where the old
+heuristic's 128×256 tile spilled into a second wave.  At census points the
+heuristic's tile is 1.26x faster than the old one at `(768, 256)`, M = 8160
+(11.7 vs 14.7 us), and 1.32x at the quantizing `w_1`, M = 3552 (13.2 vs
+17.4 us).  The paragraphs below describe the 2026-10-20 file and its tile set.
 
 Re-measured on 2026-10-21 after the scaled-mm headers became element-generic
 (the `impl_hash` validator marked the file stale): the same decisions, region
