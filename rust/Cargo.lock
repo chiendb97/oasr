@@ -1162,11 +1162,13 @@ dependencies = [
 name = "oasr-asr"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "bytes",
  "hound",
  "rubato",
  "symphonia",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

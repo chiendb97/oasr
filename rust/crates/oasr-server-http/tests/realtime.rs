@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
+use oasr_asr::DecodePool;
 use oasr_engine_client::EnginePool;
 use oasr_server_http::{build_router, RouterLimits, ServerState, ServiceMode};
 use serde_json::Value;
@@ -35,6 +36,7 @@ async fn serve(mode: ServiceMode, limits: RouterLimits) -> SocketAddr {
         sample_rate: 16_000,
         max_body_bytes: 1024 * 1024,
         max_audio_samples: Some(16_000 * 60),
+        decode_pool: DecodePool::new(2),
         served_model_names: Vec::new(),
         model_id: "/ckpt/test".into(),
     });

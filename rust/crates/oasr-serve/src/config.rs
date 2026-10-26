@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use oasr_asr::DecodePool;
 use serde_json::{Map, Number, Value};
 
 #[derive(Debug, Parser)]
@@ -360,6 +361,17 @@ pub struct Cli {
     /// limit.
     #[arg(long, default_value_t = 4 * 3600)]
     pub max_audio_seconds: u64,
+    /// Most unary requests (HTTP `speech:recognize`, the OpenAI upload routes,
+    /// gRPC `Recognize`) decoding and resampling their audio at once; the rest
+    /// wait for a slot.  Defaults to the number of CPUs this process may use.
+    ///
+    /// Decoding runs on tokio's blocking pool, not on the async workers: an
+    /// hour of MP3 is seconds of CPU, and inline it held a worker -- and the
+    /// health checks, metrics scrapes and stream forwards queued behind it --
+    /// for all of them.  The bound is on CPU and on memory, since each decode
+    /// holds its waveform at both the source and the model rate until done.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_concurrent_decodes: Option<u32>,
     /// Names this server answers to on the OpenAI surface's `model` field.
     /// Repeatable.
     ///
@@ -440,6 +452,14 @@ impl Cli {
     pub fn max_audio_samples(&self, model_sample_rate: u32) -> Option<usize> {
         (self.max_audio_seconds > 0)
             .then(|| (self.max_audio_seconds as usize).saturating_mul(model_sample_rate as usize))
+    }
+
+    /// The shared decode pool both front-ends run unary audio decodes in.
+    pub fn decode_pool(&self) -> DecodePool {
+        match self.max_concurrent_decodes {
+            Some(n) => DecodePool::new(n as usize),
+            None => DecodePool::per_cpu(),
+        }
     }
 
     /// Concurrency limit for each listener, defaulted from the admission cap.
@@ -940,6 +960,24 @@ mod tests {
         let c = cli(&["--max-concurrent-requests", "256"]);
         assert_eq!(c.inflight_limit(), Some(1024));
         assert!(c.inflight_limit().unwrap() > c.max_concurrent_requests as usize);
+    }
+
+    /// Decodes are bounded by the CPUs unless told otherwise, and never by
+    /// zero, which would queue every unary request forever.
+    #[test]
+    fn the_decode_bound_defaults_to_the_cpu_count() {
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(cli(&[]).decode_pool().max_concurrent(), cpus);
+        let c = cli(&["--max-concurrent-decodes", "3"]);
+        assert_eq!(c.decode_pool().max_concurrent(), 3);
+        let argv = [
+            "oasr-server",
+            "--ckpt-dir",
+            "/ckpt",
+            "--max-concurrent-decodes",
+            "0",
+        ];
+        assert!(Cli::try_parse_from(argv).is_err());
     }
 
     /// The pinned-audio cap must be **absent** from the JSON when the flag is

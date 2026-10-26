@@ -184,11 +184,15 @@ async fn serve(cli: Cli) -> Result<()> {
     // The command channel buffers whole audio payloads, so its depth has to
     // follow the admission cap rather than sit at an unrelated constant.
     client_cfg.sync_cmd_channel_cap();
+    // One decode bound for both listeners: it limits CPU and resident waveforms
+    // in the process, and neither surface can see the other's share of those.
+    let decode_pool = cli.decode_pool();
     info!(
         label = %cli.engine_label,
         max_concurrent_requests = cli.max_concurrent_requests,
         cmd_channel_cap = client_cfg.cmd_channel_cap,
         max_audio_mib = cli.max_audio_mib,
+        max_concurrent_decodes = decode_pool.max_concurrent(),
         request_timeout_secs = cli.request_timeout_secs,
         stream_idle_timeout_secs = cli.stream_idle_timeout_secs,
         max_inflight_connections = ?cli.inflight_limit(),
@@ -254,6 +258,7 @@ async fn serve(cli: Cli) -> Result<()> {
         sample_rate: engine_sample_rate,
         max_body_bytes: cli.max_audio_bytes(),
         max_audio_samples,
+        decode_pool: decode_pool.clone(),
         served_model_names: cli.served_model_name.clone(),
         model_id,
     });
@@ -295,6 +300,7 @@ async fn serve(cli: Cli) -> Result<()> {
     let grpc_max_message = cli.max_audio_bytes();
     let grpc_conn_limit = cli.inflight_limit();
     let grpc_max_audio_samples = max_audio_samples;
+    let grpc_decode_pool = decode_pool;
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     // Start NOT_SERVING and let the watcher below promote us: the reporter has
@@ -348,7 +354,8 @@ async fn serve(cli: Cli) -> Result<()> {
     let grpc_handle = tokio::spawn(async move {
         let svc = SpeechService::new(grpc_pool, grpc_mode, engine_sample_rate)
             .with_stream_idle_timeout(grpc_idle)
-            .with_max_audio_samples(grpc_max_audio_samples);
+            .with_max_audio_samples(grpc_max_audio_samples)
+            .with_decode_pool(grpc_decode_pool);
         info!("gRPC listening on {grpc_bind}");
         // Both message-size limits are set explicitly.  tonic's default
         // decoding cap is 4 MiB, which silently rejected any unary `Recognize`

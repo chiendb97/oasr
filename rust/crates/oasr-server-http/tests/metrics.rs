@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use oasr_asr::DecodePool;
 use oasr_engine_client::EnginePool;
 use oasr_server_http::{build_router, RouterLimits, ServerState, ServiceMode};
 use tower::ServiceExt; // `oneshot`
@@ -57,6 +58,7 @@ async fn metrics_endpoint_renders_histograms_and_labels() {
         sample_rate: 16_000,
         max_body_bytes: 1024 * 1024,
         max_audio_samples: Some(16_000 * 60),
+        decode_pool: DecodePool::new(2),
         served_model_names: Vec::new(),
         model_id: "/ckpt/u2pp-conformer".into(),
     });

@@ -31,7 +31,7 @@ use axum::http::{header, StatusCode};
 use axum::response::sse::Event as SseEvent;
 use axum::response::{IntoResponse, Json, Response, Sse};
 use bytes::Bytes;
-use oasr_asr::{decode_audio, AudioError, DecodeOptions, SourceEncoding};
+use oasr_asr::{AudioError, DecodeOptions, SourceEncoding};
 use oasr_wire::{DecodingParams, Event};
 use serde::Serialize;
 use serde_json::json;
@@ -548,7 +548,7 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
             );
         }
 
-        let form = match read_form(form).await {
+        let mut form = match read_form(form).await {
             Ok(f) => f,
             Err(resp) => return resp,
         };
@@ -616,28 +616,41 @@ async fn handle_audio(State(s): State<AppState>, form: Multipart, endpoint: Endp
             );
         }
 
-        let decoded = match decode_audio(
-            &form.file,
-            &DecodeOptions {
-                hint: form.hint(),
-                encoding: SourceEncoding::Container,
-                source_sample_rate: None,
-                target_sample_rate: Some(s.sample_rate),
-                max_samples: s.max_audio_samples,
-            },
-        ) {
+        // The upload moves into the decode, which frees it once the waveform
+        // exists rather than holding it for the rest of the request.
+        let file = std::mem::take(&mut form.file);
+        let decoded = match s
+            .decode_pool
+            .decode(
+                file,
+                &DecodeOptions {
+                    hint: form.hint(),
+                    encoding: SourceEncoding::Container,
+                    source_sample_rate: None,
+                    target_sample_rate: Some(s.sample_rate),
+                    max_samples: s.max_audio_samples,
+                },
+            )
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
-                let status = match e {
-                    AudioError::TooLong(..) => StatusCode::PAYLOAD_TOO_LARGE,
-                    AudioError::UnsupportedCodec(_) | AudioError::CodecsDisabled(_) => {
-                        StatusCode::NOT_IMPLEMENTED
+                let (status, kind) = match e {
+                    AudioError::TooLong(..) => {
+                        (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error")
                     }
-                    _ => StatusCode::BAD_REQUEST,
+                    AudioError::UnsupportedCodec(_) | AudioError::CodecsDisabled(_) => {
+                        (StatusCode::NOT_IMPLEMENTED, "invalid_request_error")
+                    }
+                    // The decoder crashed: ours to fix, whatever the input was.
+                    AudioError::DecodeTask(_) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+                    }
+                    _ => (StatusCode::BAD_REQUEST, "invalid_request_error"),
                 };
                 return api_error(
                     status,
-                    "invalid_request_error",
+                    kind,
                     Some("file"),
                     format!("could not decode the uploaded audio: {e}"),
                 );

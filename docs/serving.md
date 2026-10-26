@@ -360,6 +360,21 @@ accepted the two stop being related, since a few MiB of MP3 is hours of audio
 and the allocation happens before anything could notice. Exceeding it is `413`,
 never a truncated transcript.
 
+**Decoding runs off the async workers.** Decoding and resampling a whole clip
+is CPU work for as long as the clip is -- seconds for an hour of compressed
+audio -- so the unary routes (`speech:recognize`, the OpenAI uploads, gRPC
+`Recognize`) run it on tokio's blocking pool, at most
+`--max-concurrent-decodes` at once (default: the CPU count); the rest wait for
+a slot. Inline, one long upload held a worker and every health check, metrics
+scrape and stream forward queued behind it. The exception is raw PCM already at
+the model's rate and at most 2^18 samples (16 s at 16 kHz): that decode is one
+pass over the body, cheaper than the hop to another thread, so it runs in place
+and the throughput path pays nothing for the pool. The waveform stays one `Vec<f32>`
+from the decoder to the engine hand-off: the decoder fills it, the resampler
+reads it, and it becomes the request's bytes without a copy, so a decode's peak
+is the waveform at the source rate plus the waveform at the model's rate. The
+streaming surfaces decode each chunk inline, which is a chunk's worth of work.
+
 ## HTTP — the Google-shaped surface
 
 ### `POST /v1/speech:recognize`
@@ -1093,6 +1108,7 @@ the defaults that bit hardest were the ones nobody had written down.
 |---|---|---|
 | `--max-audio-mib` | `256` | Largest audio payload per request. Drives **both** the HTTP body cap (including the multipart routes) and gRPC's `max_decoding_message_size`. One number, because tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same ~2-minute clip was accepted on REST and rejected on the surface this doc recommends for offline throughput — and axum's own 2 MiB multipart default would have reintroduced exactly that asymmetry on the upload routes. |
 | `--max-audio-seconds` | `14400` (4 h) | Longest **decoded** waveform. A separate bound because a compressed container breaks the relationship between body bytes and audio seconds: a few MiB of MP3 is hours of waveform, allocated before anything could notice. Exceeding it is `413`, never a truncated transcript. `0` disables. |
+| `--max-concurrent-decodes` | the CPU count | Unary requests decoding and resampling their audio at once, shared by both listeners; the rest wait for a slot. Decodes run on tokio's blocking pool rather than the async workers, so the bound is on CPU and on resident waveforms -- each decode holds its audio at the source and the model rate until it finishes. Short raw PCM at the model's rate bypasses the pool (see above). A decoder that panics on some input fails that request with `500` / `INTERNAL`. Minimum `1`. |
 | `--served-model-name` | *(unset)* | Names the OpenAI surface's `model` field must match. Unset accepts any name — what makes a client hardcoded to `whisper-1` work after a base-URL change. Set, an unknown name is `404`. Repeatable. |
 | `--cors-allow-origin` | *(unset)* | Origins allowed to call the HTTP API from a browser; `*` allows any. No CORS layer is installed when unset. Repeatable. |
 | `--request-timeout-secs` | `300` | Deadline for one **unary** request (HTTP `speech:recognize`, gRPC `Recognize`), covering time queued behind the concurrency limit. `0` disables. |

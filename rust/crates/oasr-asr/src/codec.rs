@@ -37,7 +37,7 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
 #[cfg(feature = "codecs")]
-use crate::audio::{f32_to_bytes, AudioError, DecodedAudio};
+use crate::audio::{AudioError, DecodedAudio, Waveform};
 
 /// Container families this crate recognises by magic bytes.
 ///
@@ -187,6 +187,17 @@ pub fn decode_container(
     container: Container,
     max_samples: Option<usize>,
 ) -> Result<DecodedAudio, AudioError> {
+    container_waveform(body, container, max_samples).map(Waveform::into_decoded)
+}
+
+/// [`decode_container`] up to the samples, which stay a `Vec<f32>` for the
+/// resampler to read.
+#[cfg(feature = "codecs")]
+pub(crate) fn container_waveform(
+    body: &[u8],
+    container: Container,
+    max_samples: Option<usize>,
+) -> Result<Waveform, AudioError> {
     let mut hint = Hint::new();
     if let Some(ext) = container.hint() {
         hint.with_extension(ext);
@@ -212,6 +223,14 @@ pub fn decode_container(
         .first_track_known_codec(TrackType::Audio)
         .ok_or_else(|| AudioError::Container(format!("{container:?}: no decodable audio track")))?;
     let track_id = track.id;
+    // Reserve what the track says it holds, so the waveform is not regrown --
+    // and copied -- a doubling at a time.  The header is only a hint, and an
+    // untrusted one: the reservation never exceeds the cap the decode is held
+    // to anyway, and without a cap nothing is reserved.
+    let reserve = match (track.num_frames, max_samples) {
+        (Some(n), Some(cap)) => usize::try_from(n).unwrap_or(usize::MAX).min(cap),
+        _ => 0,
+    };
     let params = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p.clone(),
         _ => {
@@ -234,6 +253,8 @@ pub fn decode_container(
         })?;
 
     let mut out: Vec<f32> = Vec::new();
+    // A failed reservation is not an error: the decode grows `out` as before.
+    let _ = out.try_reserve_exact(reserve);
     let mut scratch: Vec<f32> = Vec::new();
     loop {
         let packet = match format.next_packet() {
@@ -275,9 +296,9 @@ pub fn decode_container(
             "{container:?}: stream declares no sample rate"
         )));
     }
-    Ok(DecodedAudio {
+    Ok(Waveform {
         sample_rate,
-        samples: f32_to_bytes(&out),
+        samples: out,
     })
 }
 
