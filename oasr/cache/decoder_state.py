@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from oasr.functionals.kv_quant import QuantizedKv, kv_cache_dtype, quantize_kv_store
+
 from .paged_kv import flat_write_index
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -169,8 +171,6 @@ class DecoderKv(_RowIndexed):
 
     def __post_init__(self) -> None:
         if self.kv_cache is not None:
-            from oasr.functionals.kv_quant import kv_cache_dtype
-
             kv_cache_dtype(self.kv_cache)  # raise now on an unknown format
             if self.cap is None:
                 raise ValueError(
@@ -325,8 +325,6 @@ class DecoderKv(_RowIndexed):
         whole buffers as :class:`~oasr.functionals.kv_quant.QuantizedKv`, plus the
         logical extent, exactly as the fp16 path hands over its capacity buffer.
         """
-        from oasr.functionals.kv_quant import QuantizedKv, quantize_kv_store
-
         if trim and self.max_len:
             raise RuntimeError("trim is for a prefill: every row must still be empty")
         t_new = k_new.size(2)
@@ -344,8 +342,6 @@ class DecoderKv(_RowIndexed):
         self, layer: int, like: torch.Tensor, needed: int, value: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """This layer's fp8 capacity buffer and its scales, allocated or grown."""
-        from oasr.functionals.kv_quant import kv_cache_dtype
-
         store = self.v if value else self.k
         scales = self.v_scale if value else self.k_scale
         buf, sc = store[layer], scales[layer]
@@ -683,8 +679,6 @@ class PagedDecoderKv(_RowIndexed):
         self._grow_to([n + t_new for n in self.lens_host])
         index = self._write_index(t_new)
         if self.quantized:
-            from oasr.functionals.kv_quant import quantize_kv_store
-
             # One launch quantizes and scatters both halves; the prompt of a
             # prefill attends its own fresh K/V (see the module docstring).
             fresh = trim or self.max_len == 0
@@ -936,8 +930,6 @@ def consume_cat_rows(a: List[torch.Tensor], b: List[torch.Tensor]) -> List[torch
     (an AED's cross-attention K/V), which merge by plain concatenation because
     their token axis does not grow.
     """
-    from oasr.functionals.kv_quant import QuantizedKv
-
     out: List[Any] = []
     for i in range(len(a)):
         left, right = a[i], b[i]

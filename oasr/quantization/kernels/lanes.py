@@ -9,12 +9,17 @@ layer at bind time.  A scheme no lane serves on this device is either a declared
 kernel gap (``oasr.layers._backend.KERNEL_GAPS``, counted, then the torch
 reference) or a refusal — never a silent reroute (AGENTS.md rule 3).
 
-``OASR_SCALED_MM_BACKEND`` (``auto`` | ``cutlass`` | ``torch``), read once at
-import, is the A/B switch: naming a lane requires it.
+``OASR_SCALED_MM_BACKEND`` (``auto`` | ``cutlass`` | ``torch``), read once on
+first use, is the A/B switch: naming a lane requires it.  ``auto`` considers
+only the lanes that are a default (:attr:`ScaledMMLane.in_auto`): the torch lanes
+are baselines and A/B arms, reachable by naming ``torch`` and never as a
+fallback, so a layer the CUTLASS lanes cannot serve is a declared gap or a
+refusal at bind -- which is what the report then says.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple, Type
@@ -29,10 +34,21 @@ import oasr.functionals.scaled_mm as _smm
 if TYPE_CHECKING:  # pragma: no cover
     from ..spec import QuantScheme
 
-_BACKEND = os.environ.get("OASR_SCALED_MM_BACKEND", "auto").strip().lower()
 _BACKENDS = ("auto", "cutlass", "torch")
-if _BACKEND not in _BACKENDS:
-    raise ValueError(f"OASR_SCALED_MM_BACKEND={_BACKEND!r}; expected one of {_BACKENDS}")
+
+
+@functools.lru_cache(maxsize=1)
+def _backend() -> str:
+    """``OASR_SCALED_MM_BACKEND``, read once -- on first use, not at import.
+
+    Every model file imports this package (``oasr.quantization.layout``), so a
+    value refused at import would stop a full-precision model from loading; it
+    is refused where it would take effect, the first quantized layer's bind.
+    """
+    value = os.environ.get("OASR_SCALED_MM_BACKEND", "auto").strip().lower()
+    if value not in _BACKENDS:
+        raise ValueError(f"OASR_SCALED_MM_BACKEND={value!r}; expected one of {_BACKENDS}")
+    return value
 
 
 def w8a8_format(scheme: "QuantScheme") -> Optional[str]:
@@ -73,6 +89,9 @@ class ScaledMMLane(ABC):
 
     name: ClassVar[str]
     backend: ClassVar[str]
+    #: Whether ``OASR_SCALED_MM_BACKEND=auto`` may pick this lane.  ``False`` for a
+    #: baseline / A/B arm, reachable only by naming its backend.
+    in_auto: ClassVar[bool] = True
 
     @classmethod
     @abstractmethod
@@ -188,13 +207,14 @@ _TORCH_ACTIVATION = {
 class TorchIntMMLane(ScaledMMLane):
     """``torch._int_mm`` (cuBLASLt int8) plus a torch dequant epilogue.
 
-    A baseline and A/B arm, not the default: the epilogue is four extra
+    A baseline and A/B arm, never picked by ``auto``: the epilogue is four extra
     elementwise launches and an int32 round trip through global memory.
     ``_int_mm`` refuses M <= 16, so small M is padded with zero rows.
     """
 
     name = "torch_int_mm"
     backend = "torch"
+    in_auto = False
 
     @classmethod
     def is_supported(cls, sm: int) -> Tuple[bool, str]:
@@ -273,7 +293,7 @@ class CutlassSm89Fp8Lane(ScaledMMLane):
 class TorchScaledMMLane(ScaledMMLane):
     """``torch._scaled_mm`` (cuBLASLt fp8) plus a torch dequant epilogue.
 
-    A baseline and A/B arm, not the default.  The GEMM runs with unit per-tensor
+    A baseline and A/B arm, never picked by ``auto``.  The GEMM runs with unit per-tensor
     scales and an fp32 output -- the plain fp32 sum of the e4m3 products -- and
     the per-token x per-channel dequant, bias and activation follow in torch.
     cuBLASLt's *rowwise* scaling is not used: on this torch build
@@ -284,6 +304,7 @@ class TorchScaledMMLane(ScaledMMLane):
 
     name = "torch_scaled_mm"
     backend = "torch"
+    in_auto = False
 
     @classmethod
     def is_supported(cls, sm: int) -> Tuple[bool, str]:
@@ -346,11 +367,15 @@ def choose_lane(
     """``(lane, note)``: the first lane that serves this layer, else ``(None, why)``.
 
     With ``OASR_SCALED_MM_BACKEND`` naming a backend, only that backend's lanes
-    are candidates, and the caller must refuse rather than fall back.
+    are candidates, and the caller must refuse rather than fall back; with
+    ``auto``, only the default lanes (``in_auto``) -- never a torch A/B arm.
     """
+    backend = _backend()
     reasons = []
     for cls in _LANES:
-        if _BACKEND != "auto" and cls.backend != _BACKEND:
+        if backend == "auto" and not cls.in_auto:
+            continue
+        if backend != "auto" and cls.backend != backend:
             continue
         ok, why = cls.is_supported(sm)
         if ok:
@@ -359,12 +384,13 @@ def choose_lane(
             note = "native" if cls.is_native(sm) else f"non-native lane on sm{sm}"
             return cls(), note
         reasons.append(f"{cls.name}: {why}")
-    return None, "; ".join(reasons) or f"no lane for backend {_BACKEND!r}"
+    return None, "; ".join(reasons) or f"no lane for backend {backend!r}"
 
 
 def forced_backend() -> Optional[str]:
     """The backend ``OASR_SCALED_MM_BACKEND`` names, or ``None`` for ``auto``."""
-    return None if _BACKEND == "auto" else _BACKEND
+    backend = _backend()
+    return None if backend == "auto" else backend
 
 
 class CutlassSm80Int8ConvLane:
@@ -410,7 +436,7 @@ class CutlassSm80Int8ConvLane:
 
 def choose_conv_lane(sm: int) -> Tuple[Optional[CutlassSm80Int8ConvLane], str]:
     """``(lane, note)`` for a quantized convolution on *sm*, else ``(None, why)``."""
-    if _BACKEND == "torch":
+    if _backend() == "torch":
         return None, "reference (OASR_SCALED_MM_BACKEND=torch: torch has no int8 convolution)"
     ok, why = CutlassSm80Int8ConvLane.is_supported(sm)
     if not ok:

@@ -63,12 +63,16 @@ fp8 trio `fp8_w8a8_rtn`, `smoothquant_fp8_w8a8`, `smoothquant_fp8_w8a8_fused`.
 `--recipe smoothquant_w8a8_fused` adds a calibrated static input scale to every
 GEMM-chain consumer (the FFN's `w_2`), so `w_1` quantizes for it and the pair
 exchanges int8 ([Fewer quantize launches](#fewer-quantize-launches)): faster, and
-on the U2++ gate 4.11 % offline / 3.64 % streaming against 4.03 / 3.70 for
+on the U2++ gate 3.97 % offline / 3.64 % streaming against 4.03 / 3.73 for
 `smoothquant_w8a8` and 4.08 / 3.70 for fp16.
 
 A checkpoint written by `oasr quantize` is served quantized with **no flag**: its
-`oasr_config.json` carries the spec, and the spec is authoritative — an online
-request for a different scheme raises, the same scheme is a no-op.
+`oasr_config.json` carries the spec, and the spec is authoritative.  Naming one of
+the schemes it was written with is a no-op (a `smoothquant_w8a8_fused` checkpoint
+answers to both `int8_w8a8` and `int8_w8a8_static`), naming another raises, and so
+do `ignore` / `module_types` — they choose the layers *online* quantization
+quantizes, and a quantized checkpoint's layers are already chosen.  For the same
+reason neither is accepted without a `scheme`.
 
 `--calib-manifest` takes any `{id, audio, ...}` jsonl (paths relative to
 `--audio-root`, default the manifest's directory), so production recipes
@@ -150,15 +154,22 @@ full-precision export stays version 1.  Readers accept both.
 |---|---|---|
 | `cutlass_sm80_int8` | 80, 86, 89, 120 (native); 90, 100 (the Sm80 `mma.sync` kernel, as fp16 GEMM runs there) | int8.  Default.  Needs `K % 16 == 0`, `N % 8 == 0`.  Per-token or per-tensor activation scale (a runtime switch in the epilogue).  No serial/parallel split-K (the Sm80 EVT rejects it only by an `assert` NDEBUG removes); Stream-K instead, below |
 | `cutlass_sm89_fp8` | 89, 120 (native); 90, 100 (the same `mma.sync` kernel) | fp8.  Default.  Same template, epilogue and alignment; no split of any kind ([FP8](#fp8)) |
-| `torch_int_mm` | ≥ 75 | int8: `torch._int_mm` + a torch epilogue; A/B and baseline only |
-| `torch_scaled_mm` | ≥ 89 | fp8: `torch._scaled_mm` at unit tensorwise scales into fp32, then a torch epilogue; A/B and baseline only, and not batch-invariant (cuBLASLt picks its algorithm per M) |
+| `torch_int_mm` | ≥ 75 | int8: `torch._int_mm` + a torch epilogue; A/B and baseline only — reached by naming `torch`, never by `auto` |
+| `torch_scaled_mm` | ≥ 89 | fp8: `torch._scaled_mm` at unit tensorwise scales into fp32, then a torch epilogue; A/B and baseline only — reached by naming `torch`, never by `auto` — and not batch-invariant (cuBLASLt picks its algorithm per M) |
 
 Below sm89 an fp8 scheme is refused at bind with a pointer to `int8_w8a8`: the
 GPU has no fp8 tensor cores, which is not a missing kernel.
 
 Turing (sm75) is the declared kernel gap `scaled-mm-int8-sm75`: a quantized layer
-there runs the torch reference.  `OASR_SCALED_MM_BACKEND=auto|cutlass|torch`
-(read at import) is the A/B switch; naming a lane requires it.
+there runs the torch reference, counted in the gap report.  `auto` considers only
+the CUTLASS lanes, so what they cannot serve is that gap or a refusal at bind,
+never a torch lane reported as served.  A GEMM outside their operand contract
+(`K % 16`, `N % 8`; `QuantizableGemm.quant_unsupported`) is not selected at all —
+it stays full precision, recorded in the spec's `producer["skipped"]`, and naming
+it explicitly is refused; no shipped architecture has one.  Lane tables are keyed
+by the device's kernel family (`oasr.jit.core.sm_family`: sm_121 runs the sm_120
+kernels, sm_87 the sm_86 ones).  `OASR_SCALED_MM_BACKEND=auto|cutlass|torch`
+(read once, at the first bind) is the A/B switch; naming a lane requires it.
 
 **Stream-K.**  Two Stream-K variants are built.  Their partials are the int32
 accumulator, so the reduction is an exact integer sum and a Stream-K launch
@@ -280,8 +291,8 @@ Accuracy on the LJSpeech-200 gate is unchanged:
 
 | Model | Without the conv | With it | fp16 |
 |---|---|---|---|
-| U2++ `smoothquant_w8a8_fused` + `conv2d` | 4.11 / 3.64 | 4.09 / 3.70 | 4.08 / 3.70 |
-| whisper-tiny `smoothquant_w8a8` + `conv1d` | 3.76 | 3.67 | 3.67 |
+| U2++ `smoothquant_w8a8_fused` + `conv2d` | 3.97 / 3.64 | 4.00 / 3.76 | 4.08 / 3.70 |
+| whisper-tiny `smoothquant_w8a8` + `conv1d` | 3.61 | 3.70 | 3.67 |
 
 U2++ figures are offline / streaming.  A convolution neither consumes a
 producer's 8-bit output nor emits one.
@@ -329,7 +340,9 @@ frame spans 22 % of that range -- which cost 0.44 WER in streaming; the 99.999th
 percentile 24.9 dB.  `observer=mse` (the default) picks the clip minimising the
 expected quantization error of a histogram of the calibration values (rounding
 below the clip, saturation above it); it measured 4.11 / 3.64 % against 4.20 /
-3.73 % for the percentile and 4.08 / 4.14 % for the maximum (offline / streaming).
+3.73 % for the percentile and 4.08 / 4.14 % for the maximum (offline / streaming,
+all three calibrated before the `runtime` fold stopped changing the master the
+clip is measured on; `mse` measures 3.97 / 3.64 % since).
 
 ## FP8
 
@@ -386,8 +399,9 @@ Qwen2-Audio LM -- as e4m3, independently of the weight `scheme`:
   (`fmha_kv8_*` cells; dense and paged, unsplit and split-KV), which stage fp8 in
   the cp.async ring and dequantize each tile in shared memory.  The arbiter
   routes fp8 KV there as a declared rule; a causal, windowed or biased read, a
-  head dim the gather cannot tile, `OASR_ATTN_BACKEND=cute|sdpa` or a device
-  outside the lane (sm80/86/89/120) is refused by name.  Prefill attends its own
+  head dim the gather cannot tile, `OASR_ATTN_BACKEND=cute|sdpa`,
+  `OASR_LAYERS_BACKEND=torch` (the dequantizing reference) or a device outside
+  the lane (sm80/86/89/120) is refused by name.  Prefill attends its own
   prompt in the served dtype; it is quantized into the cache as it is written.
 * **Capacity.**  The VRAM-derived decoder-KV budget and paged pool count fp8 plus
   scales (Qwen2-7B 524,288 -> 270,336 bytes per token, Whisper-large-v3 163,840 ->
@@ -459,11 +473,19 @@ parameters stay inside fp16.  The model declares where `X / s` is absorbed:
 | `norm_affine` | LayerNorm / RMSNorm `γ /= s`, `β /= s` | only commuting ops (zero mask, zero pad, a same-domain cache `cat`) sit between norm and GEMM |
 | `v_to_o` | V rows of the fused QKV projection `/= s` | attention is linear in V per channel; tied per KV head under GQA |
 | `producer_rows` | the previous GEMM's rows and bias `/= s` | the activation between is positively homogeneous (ReLU) |
-| `runtime` | none: `smooth_inv = 1/s` on the consumer, applied inside `quantize_per_token` | always |
+| `runtime` | none: `smooth_inv = 1/s` on the consumer, applied inside `quantize_per_token`; the weight takes `W · s` when it is quantized | always |
 
 Every scale is computed from the original weights before any fold is applied,
 so a layer that is a consumer in one group (its input columns) and a producer in
 another (its output rows) folds consistently.
+
+After every fold the full-precision master still computes the original model,
+because the algorithms that follow SmoothQuant (`static_inputs`,
+`static_conv_inputs`) calibrate on it.  That is why a `runtime` fold only installs
+`smooth_inv`: the fp forward never applies it, so scaling the consumer's columns
+at fold time would scale that layer's output — and every later layer's input —
+by `s`.  `W8A8Method.quantize_weight` applies `W · s = W / smooth_inv` when the
+weight is quantized, next to the kernel that applies `smooth_inv` to the input.
 
 The Conformer's layout (`ConformerModel.quantization_layout`): per block,
 `norm_ff_macaron → feed_forward_macaron.w_1`, `norm_mha → self_attn.linear_qkv`,
@@ -504,7 +526,10 @@ greedy CTC path in both directions, Whisper and Qwen2 greedily from their prompt
 Paraformer through CIF and its NAR pass), so decoder groups are observed.
 `oasr quantize --calib-dtype bfloat16` keeps the fp32 master on the host and
 calibrates a reduced-precision twin on the device, for a model whose fp32 master
-does not fit (a 7B LM is 33.6 GB fp32).
+does not fit (a 7B LM is 33.6 GB fp32).  Observers are forward hooks on the
+consumer GEMMs, so a block whose fused kernel never calls its projections (the
+gated MLP's dual-B GEMM) runs them separately while a hook watches them, and the
+twin observes every row.
 
 Calibration runs one unpadded utterance at a time through the checkpoint's own
 frontend (`audio_scale` and the `FeatureSpec`, exactly as `InputProcessor`), in

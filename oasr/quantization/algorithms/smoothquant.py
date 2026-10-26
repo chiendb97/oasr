@@ -14,13 +14,22 @@ model's declared :class:`~oasr.quantization.layout.SmoothGroup` says where it is
 absorbed (the producer norm's affine, V through attention, a ReLU producer's
 rows, or a runtime ``smooth_inv`` the quantize kernel applies).
 
-Two rules keep it exact on a real model:
+Three rules keep it exact on a real model:
 
 * every scale is computed from the *original* weights and statistics before any
   fold is applied — a layer can be a consumer (its input columns) in one group
   and a producer (its output rows) in another, and the folds commute;
 * ``s_lo`` keeps every folded parameter inside the served dtype: ``γ / s`` of a
-  norm overflows fp16 when ``s`` is tiny, and the accuracy gate serves fp16.
+  norm overflows fp16 when ``s`` is tiny, and the accuracy gate serves fp16;
+* the full-precision master still computes the original model afterwards,
+  because the calibration passes that follow (``static_inputs``,
+  ``static_conv_inputs``) run it.  A ``runtime`` fold therefore leaves the
+  consumer's weight alone and only installs ``smooth_inv``: the fp forward never
+  applies it, so scaling the columns here would scale that layer's output, and
+  every later layer's activations, by ``s``.  The column scaling ``W · s`` is
+  applied when the layer's weight is quantized
+  (:meth:`~oasr.quantization.methods.w8a8.W8A8Method.quantize_weight`), next to
+  the kernel that applies ``smooth_inv`` to the input.
 """
 
 from __future__ import annotations
@@ -383,13 +392,14 @@ def _fold(
         for layer in consumers:
             _scale_columns(layer, s)
     elif group.fold == "runtime":
+        # Only the smoother: ``W · s`` waits for quantize_weight (module docstring),
+        # so the master's forward -- which ignores smooth_inv -- is unchanged.
         inv = s.reciprocal().float()
         for layer in consumers:
             module = cast(nn.Module, layer)
             if "smooth_inv" in module._buffers:
                 raise RuntimeError(f"{group.consumers} is smoothed twice")
             module.register_buffer("smooth_inv", inv.clone())
-            _scale_columns(layer, s)
     else:  # pragma: no cover - validated in SmoothGroup
         raise ValueError(group.fold)
 

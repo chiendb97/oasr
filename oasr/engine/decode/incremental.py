@@ -383,7 +383,8 @@ class IncrementalArStrategy(DecodeStrategy):
           which is what sizes the pool and is checked against the kernel;
         * on CUDA, the decoder must run fp16/bf16 and the fp8 attention lane must
           serve its head dim on this device, in this process's attention mode
-          (``OASR_ATTN_BACKEND=sdpa`` / ``cute`` name lanes that cannot read fp8).
+          (``OASR_ATTN_BACKEND=sdpa`` / ``cute`` name lanes that cannot read fp8,
+          and ``OASR_LAYERS_BACKEND=torch`` forces the dequantizing reference).
           Off CUDA the cache runs on the dequantizing reference -- the parity
           oracle, which OASR does not target for serving.
         """
@@ -414,6 +415,7 @@ class IncrementalArStrategy(DecodeStrategy):
                 "bfloat16"
             )
         from oasr.jit.attention import fmha_kv8_backend, fmha_kv8_refusal
+        from oasr.layers._backend import use_fmha_kernel
 
         try:
             lane = fmha_kv8_backend()
@@ -424,6 +426,12 @@ class IncrementalArStrategy(DecodeStrategy):
                 f"quantization.kv_cache={kv_cache!r}: OASR_ATTN_BACKEND=sdpa forces the "
                 "reference attention, which would dequantize the whole cache on every step; "
                 "the fp8 cache is read by the C++ lane (OASR_ATTN_BACKEND=auto or cxx)"
+            )
+        if not use_fmha_kernel():
+            raise ValueError(
+                f"quantization.kv_cache={kv_cache!r}: OASR_LAYERS_BACKEND=torch forces the "
+                "reference attention, which would dequantize the whole cache on every step; "
+                "the fp8 cache is read by the C++ lane (OASR_LAYERS_BACKEND=oasr)"
             )
         dtype_str = "float16" if param.dtype is torch.float16 else "bfloat16"
         for paged in (False, True):

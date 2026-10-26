@@ -78,11 +78,21 @@ def checkpoint_fingerprint(path: str) -> Dict[str, Any]:
 
 
 def _quantization_config(cfg: Any) -> Optional[Dict[str, Any]]:
-    """``EngineConfig.quantization`` as JSON: ``{scheme, ignore}`` or ``None``."""
+    """``EngineConfig.quantization`` as JSON -- every field -- or ``None``.
+
+    Each field changes what is served (``module_types`` which layers,
+    ``kv_cache`` the decoder's cache), so a recorded run that drops one cannot
+    be told apart from a run without it.
+    """
     q = getattr(cfg, "quantization", None)
     if q is None:
         return None
-    return {"scheme": q.scheme, "ignore": list(q.ignore)}
+    return {
+        "scheme": q.scheme,
+        "ignore": list(q.ignore),
+        "module_types": None if q.module_types is None else list(q.module_types),
+        "kv_cache": q.kv_cache,
+    }
 
 
 class _Pump:
@@ -226,9 +236,10 @@ class OasrEngineBackend(Backend):
         "use_cuda_graphs": "true | false (engine default)",
         "long_form": "window over-length audio for fixed-window frontends (false)",
         "vad": "VadConfig mapping, e.g. {mode: segment, backend: silero}",
-        "quantization": "online GEMM quantization: a scheme (int8_w8a8) or "
-        "{scheme: int8_w8a8, ignore: 'glob,glob'} (none; a quantized checkpoint "
-        "is served quantized regardless)",
+        "quantization": "online quantization: a scheme (int8_w8a8) or "
+        "{scheme: int8_w8a8, ignore: 'glob,glob', module_types: 'linear,...', "
+        "kv_cache: fp8_e4m3} (none; a quantized checkpoint is served quantized "
+        "regardless)",
         "word_timestamps": "request word timings on offline requests (false)",
         "pinned_audio": "hand the engine page-locked waveforms, as the server does (true)",
         "engine": "any other EngineConfig fields, YAML mapping",

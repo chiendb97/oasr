@@ -186,8 +186,11 @@ pub struct Cli {
     /// Extra quantization setting, `key=value`, repeatable (e.g.
     /// `ignore=ctc.*`, `module_types=linear,pointwise_conv`,
     /// `kv_cache=fp8_e4m3`). Values are passed as strings and typed by the
-    /// engine. Convolutions (`conv1d` / `conv2d`) need a calibrated checkpoint
-    /// from `oasr quantize --module-types`.
+    /// engine. `ignore` and `module_types` choose the layers online
+    /// quantization quantizes, so they need `--quantization` and a
+    /// full-precision checkpoint; `kv_cache` stands alone. Convolutions
+    /// (`conv1d` / `conv2d`) need a calibrated checkpoint from
+    /// `oasr quantize --module-types`.
     #[arg(long = "quantization-option", value_name = "KEY=VALUE")]
     pub quantization_option: Vec<String>,
     /// Maximum incremental decoder steps per tick; bounds dispatcher starvation.
@@ -830,8 +833,8 @@ mod tests {
 
     /// Quantization flags land in one `quantization` object, mirroring the
     /// engine's single `EngineConfig.quantization` field, and `scheme` is only
-    /// there when `--quantization` was given: options alone tune whatever the
-    /// checkpoint declares rather than inventing a scheme.
+    /// there when `--quantization` was given: an option alone (an fp8 KV cache)
+    /// leaves the weights to the checkpoint rather than inventing a scheme.
     #[test]
     fn quantization_flags_become_one_object() {
         let json = cli(&[
@@ -850,7 +853,7 @@ mod tests {
         assert_eq!(quant.as_object().map(Map::len), Some(2));
 
         let options_only: Value = serde_json::from_str(
-            &cli(&["--quantization-option", "ignore=ctc.*"])
+            &cli(&["--quantization-option", "kv_cache=fp8_e4m3"])
                 .build_engine_config_json()
                 .expect("build"),
         )
@@ -859,7 +862,7 @@ mod tests {
             .get("quantization")
             .expect("quantization object");
         assert!(quant.get("scheme").is_none(), "{quant}");
-        assert_eq!(quant["ignore"], "ctc.*");
+        assert_eq!(quant["kv_cache"], "fp8_e4m3");
     }
 
     /// No quantization flags must serialize no `quantization` key at all — not

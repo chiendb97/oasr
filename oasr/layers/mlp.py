@@ -33,6 +33,11 @@ _UNFUSED_ACTIVATION: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
 }
 
 
+def _observed(module: nn.Module) -> bool:
+    """Whether a forward hook watches *module* (a calibration observer does)."""
+    return bool(module._forward_pre_hooks or module._forward_hooks)
+
+
 class FeedForward(nn.Module):
     """``w_2(activation(w_1(x)))``, optionally with a norm between them.
 
@@ -202,9 +207,13 @@ class GatedMLP(nn.Module):
         if (
             getattr(gate_proj, "quant_method", None) is not None
             or getattr(up_proj, "quant_method", None) is not None
+            or _observed(gate_proj)
+            or _observed(up_proj)
         ):
-            # ``oasr.gated_mlp`` reads both weights raw: a quantized projection
-            # must run its own forward, so the block takes the two-GEMM path.
+            # ``oasr.gated_mlp`` reads both weights raw and never calls the
+            # projections: a quantized one must run its own forward, and one a
+            # hook watches (calibration's observers) must be called to be seen,
+            # so the block takes the two-GEMM path.
             return self._forward_unfused(x)
         # ``_proj`` resolves through ``_modules``, so the parameter types are
         # only known to be ``Tensor | Module``; the projections are always

@@ -1554,20 +1554,30 @@ class ASREngine:
         logger.info("%s", format_quant_report(validate_runtime(model)))
 
     def quantization_info(self) -> Optional[Dict[str, Any]]:
-        """A JSON-safe summary of the model's quantization, or ``None``."""
+        """A JSON-safe summary of the served quantization, or ``None`` (none at all).
+
+        The model's quantized layers (``schemes``, ``layers``, ``lanes``) and, when
+        the decoder's KV cache is stored 8-bit, its format (``kv_cache``) -- an
+        fp8 cache over full-precision weights is still a different configuration.
+        """
         from oasr.quantization.apply import describe_quantization
 
-        return describe_quantization(self._model)
+        info = describe_quantization(self._model)
+        kv_cache = getattr(self._config.quantization, "kv_cache", None)
+        if kv_cache is not None:
+            info = dict(info or {"schemes": [], "layers": 0, "lanes": []})
+            info["kv_cache"] = kv_cache
+        return info
 
     @property
     def quantization(self) -> Optional[str]:
-        """The served quantization scheme(s), comma-joined, or ``None`` (full precision).
+        """The served weight quantization scheme(s), comma-joined, or ``None``.
 
         What ``/v1/models`` reports; read off the model, because a checkpoint
         written by ``oasr quantize`` is quantized without any engine flag.
         """
         info = self.quantization_info()
-        return None if info is None else ",".join(info["schemes"])
+        return ",".join(info["schemes"]) if info and info["schemes"] else None
 
     def tuning_report(self) -> str:
         """Which tuning tier served this process's kernel selections, and what missed.

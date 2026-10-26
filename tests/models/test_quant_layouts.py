@@ -13,11 +13,12 @@ transcript -- so the checks here are structural and numerical, per architecture:
 * **SmoothQuant invariance**: smoothing with random scales in ``[0.1, 10]`` and
   random norm affines, *without* quantizing, leaves every forward path's output
   unchanged in fp32 -- offline, streaming, teacher-forced and incremental
-  decode, preallocated and grown KV caches.  Runtime smoothers are emulated by
-  multiplying each layer's input by its ``smooth_inv``, as the quantize kernel
-  does, so all four fold kinds are checked together and must commute.  The
-  calibration loop is each model's own ``calibration_forward``, so this also
-  proves the loop reaches every declared group (an unobserved group raises);
+  decode, preallocated and grown KV caches.  All four fold kinds are checked
+  together and must commute; a ``runtime`` fold must leave the master alone (its
+  ``W · s`` waits for quantization), which is what lets the calibration passes
+  after SmoothQuant run the master.  The calibration loop is each model's own
+  ``calibration_forward``, so this also proves the loop reaches every declared
+  group (an unobserved group raises);
 * **the oracle is seen to fail**: a deliberately wrong group (a consumer
   missing, V rows that are K, a fold through a non-homogeneous activation) must
   move the output;
@@ -395,16 +396,6 @@ def random_scales(monkeypatch):
     monkeypatch.setattr(sq, "_smoothing_vector", fake)
 
 
-def _emulate_runtime_smoothers(model: torch.nn.Module) -> None:
-    """An unquantized layer ignores ``smooth_inv``; the quantize kernel applies it.
-    Apply it to the input here, so a runtime fold is checked like the others."""
-    for module in model.modules():
-        if "smooth_inv" in module._buffers:
-            module.register_forward_pre_hook(
-                lambda m, args: (args[0] * m.smooth_inv.to(args[0].dtype),) + tuple(args[1:])
-            )
-
-
 def _smoothed(
     arch: str, model, layout=None, folds: str = "norm_affine,v_to_o,producer_rows,runtime"
 ):
@@ -412,7 +403,6 @@ def _smoothed(
     spec = QuantizationSpec.for_model(out, INT8_W8A8)
     algo = build_algorithm("smoothquant", {"folds": folds})
     algo.apply(out, layout or out.quantization_layout(), spec, _calibrate(arch))
-    _emulate_runtime_smoothers(out)
     return out
 
 

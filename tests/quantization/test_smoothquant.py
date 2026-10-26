@@ -25,11 +25,20 @@ import torch.nn.functional as F
 from helpers import tiny_conformer
 
 import oasr.quantization.algorithms.smoothquant as sq
-from oasr.quantization import INT8_W8A8, QuantizationSpec, QuantLayout, SmoothGroup
+from oasr.quantization import (
+    FOLD_KINDS,
+    INT8_W8A8,
+    QuantizationSpec,
+    QuantLayout,
+    SmoothGroup,
+    apply_quantization,
+)
 from oasr.quantization.algorithms import SmoothQuantOptions, build_algorithm
 from oasr.quantization.calibration import AbsMaxPerChannel
 
-_EXACT_FOLDS = "norm_affine,v_to_o,producer_rows"
+#: Every fold kind: each must leave the full-precision master computing the
+#: original model, ``runtime`` included (its ``W · s`` waits for quantization).
+_ALL_FOLDS = ",".join(FOLD_KINDS)
 
 
 def _feed(model: torch.nn.Module) -> None:
@@ -54,7 +63,7 @@ def random_scales(monkeypatch):
     monkeypatch.setattr(sq, "_smoothing_vector", fake)
 
 
-def _smoothed(model: torch.nn.Module, folds: str = _EXACT_FOLDS, layout=None):
+def _smoothed(model: torch.nn.Module, folds: str = _ALL_FOLDS, layout=None):
     out = copy.deepcopy(model)
     spec = QuantizationSpec.for_model(out, INT8_W8A8)
     algo = build_algorithm("smoothquant", {"folds": folds})
@@ -121,18 +130,48 @@ class TestInvariance:
             got, _ = broken.forward_offline(feats, lens)
         assert (got - want).abs().max() > 1e-2
 
-    def test_runtime_fold_is_the_smoother(self, random_scales):
-        """A runtime group stores 1/s; applying it to the input undoes W·s exactly."""
+    def test_runtime_fold_leaves_the_master_alone(self, random_scales):
+        """A runtime group stores ``1/s`` and nothing else: the master's fp forward
+        ignores ``smooth_inv``, so folding ``W · s`` here would change what the
+        calibration passes after SmoothQuant measure (every later layer's input).
+        """
         model = tiny_conformer()
         smoothed = _smoothed(model, folds="runtime")
         w2 = smoothed.encoder.encoders[0].feed_forward.w_2
         ref = model.encoder.encoders[0].feed_forward.w_2
-        x = torch.randn(9, w2.in_features)
+        assert "smooth_inv" in w2._buffers
+        assert torch.equal(w2.weight, ref.weight)
+        feats, lens = _inputs()
+        with torch.no_grad():
+            want, _ = model.forward_offline(feats, lens)
+            got, _ = smoothed.forward_offline(feats, lens)
+        assert torch.equal(got, want)
+
+    def test_quantizing_a_runtime_smoothed_layer_applies_w_times_s(self, random_scales):
+        """The quantized weight is ``W · s = W / smooth_inv`` (to half a step per
+        row), and that is the direction that cancels the kernel's
+        ``x * smooth_inv``: ``(x * smooth_inv) @ (W / smooth_inv)ᵀ == x @ Wᵀ``."""
+        model = tiny_conformer()
+        smoothed = copy.deepcopy(model)
+        spec = build_algorithm("smoothquant", {"folds": "runtime"}).apply(
+            smoothed,
+            smoothed.quantization_layout(),
+            QuantizationSpec.for_model(smoothed, INT8_W8A8),
+            _feed,
+        )
+        apply_quantization(smoothed, spec, quantize=True)
+        w2 = smoothed.encoder.encoders[0].feed_forward.w_2
+        ref = model.encoder.encoders[0].feed_forward.w_2
+        inv = w2.smooth_inv
+        dequant = w2.weight.float() * w2.weight_scale.reshape(-1, 1)
+        want = ref.weight.float() / inv.reshape(1, -1)
+        # Per output row, round-to-nearest is within half a quantization step.
+        step = w2.weight_scale.reshape(-1, 1)
+        assert bool(((dequant - want).abs() <= step * 0.5 + 1e-6).all())
+        x = torch.randn(9, w2.in_features, dtype=torch.float64)
         torch.testing.assert_close(
-            F.linear(x * w2.smooth_inv, w2.weight, w2.bias),
-            F.linear(x, ref.weight, ref.bias),
-            rtol=1e-4,
-            atol=1e-4,
+            F.linear(x * inv.double(), want.double()),
+            F.linear(x, ref.weight.double()),
         )
 
     @pytest.mark.cuda

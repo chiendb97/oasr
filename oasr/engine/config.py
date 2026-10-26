@@ -72,9 +72,11 @@ class QuantizationConfig:
     weights with dynamic per-token activation scales, so no calibration data:
 
     * ``scheme`` — a preset name (``"int8_w8a8"``), or ``None`` to follow the
-      checkpoint.  Naming a different scheme than a quantized checkpoint's raises.
+      checkpoint.  On a quantized checkpoint, naming one of its schemes is a
+      no-op and naming another raises.
     * ``ignore`` — extra module-path globs kept at full precision, beyond what the
-      model's ``quantization_layout()`` already keeps.
+      model's ``quantization_layout()`` already keeps.  Online only: it needs a
+      ``scheme``, and a quantized checkpoint refuses it (as ``module_types``).
     * ``module_types`` — which kinds of layer to quantize: ``"linear"``
       (``Linear`` / ``LinearActivation``), ``"pointwise_conv"`` (1x1 convolutions,
       GEMMs over channels), ``"conv1d"``, ``"conv2d"``, or the aliases ``"conv"``
@@ -138,6 +140,12 @@ class QuantizationConfig:
                     "quantizes; it needs a scheme (a quantized checkpoint's own spec "
                     "already names its layers)"
                 )
+        if self.ignore and self.scheme is None:
+            raise ValueError(
+                "quantization.ignore keeps layers of online quantization at full "
+                "precision; it needs a scheme (a quantized checkpoint's own spec already "
+                "names its layers)"
+            )
 
     @classmethod
     def coerce(cls, value) -> Optional["QuantizationConfig"]:

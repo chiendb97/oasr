@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 
+from oasr.functionals.kv_quant import QuantizedKv
 from oasr.utils.staging import to_device
 
 from .block_pool import BlockPool
@@ -249,8 +250,6 @@ class DecoderKVCacheManager:
         if view is None:
             k, v = self._pool.get_kv_view(layer)
             if self.quantized:
-                from oasr.functionals.kv_quant import QuantizedKv
-
                 ks, vs = self._pool.get_kv_scale_view(layer)
                 view = (QuantizedKv(k, ks), QuantizedKv(v, vs))
             else:

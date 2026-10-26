@@ -132,6 +132,47 @@ class TestRefusals:
         with pytest.raises(ValueError, match="already quantized"):
             materialize_model(arch, bundle, quantization=SimpleNamespace(scheme="fp8_w8a8"))
 
+    @pytest.mark.parametrize("named", ["int8_w8a8", "int8_w8a8_static"])
+    def test_any_scheme_a_mixed_checkpoint_uses_is_a_no_op(self, fp_model, tmp_path, named):
+        """A ``smoothquant_w8a8_fused`` checkpoint holds per-token and static layers;
+        naming either scheme is the checkpoint's own, not a re-quantization (the
+        static one used to be refused as 'needs calibration' before the
+        checkpoint was even consulted)."""
+
+        def loop(model):
+            with torch.no_grad():
+                model.encode_offline(*_feats())
+
+        spec = quantize_model(fp_model, get_recipe("smoothquant_w8a8_fused"), loop)
+        dst = _save(fp_model, tmp_path / "q", quantization=spec)
+        arch, bundle = load_checkpoint_bundle(dst)
+        loaded, _, _ = materialize_model(
+            arch, bundle, quantization=SimpleNamespace(scheme=named, ignore=())
+        )
+        assert loaded.quantization_spec == spec
+
+    @pytest.mark.parametrize(
+        "request_",
+        [
+            {"ignore": ("encoder.encoders.0.*",)},
+            {"module_types": ("linear",)},
+        ],
+    )
+    def test_a_layer_selection_against_a_quantized_checkpoint_is_refused(
+        self, fp_model, tmp_path, request_
+    ):
+        """``ignore`` / ``module_types`` pick what online quantization quantizes; a
+        quantized checkpoint's layers are chosen, so the request is refused rather
+        than silently dropped."""
+        spec = quantize_model(fp_model, get_recipe("int8_w8a8_rtn"))
+        dst = _save(fp_model, tmp_path / "q", quantization=spec)
+        arch, bundle = load_checkpoint_bundle(dst)
+        quantization = SimpleNamespace(scheme="int8_w8a8", ignore=(), module_types=None)
+        for key, value in request_.items():
+            setattr(quantization, key, value)
+        with pytest.raises(ValueError, match="already quantized"):
+            materialize_model(arch, bundle, quantization=quantization)
+
     def test_online_static_activation_schemes_need_calibration(self, fp_model, tmp_path):
         dst = _save(fp_model, tmp_path / "fp")
         arch, bundle = load_checkpoint_bundle(dst)
