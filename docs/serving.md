@@ -770,9 +770,12 @@ type. The option keys are `ignore` (comma-separated module-path globs kept in
 full precision: `--quantization-option ignore=ctc.*,decoder.*`), `module_types`
 (the layer kinds to quantize, default `linear,pointwise_conv`; a `conv1d` /
 `conv2d` needs a calibrated checkpoint from `oasr quantize --module-types`, so it
-is refused here) and `kv_cache` (`fp8_e4m3`). A checkpoint written by `oasr quantize` needs **no**
-flag — it is served quantized as-is — so leave `--quantization` unset to follow
-the checkpoint; with neither flag the key is not sent at all. A `quantization`
+is refused here) and `kv_cache` (`fp8_e4m3`). `ignore` and `module_types` select
+the layers online quantization quantizes, so they need `--quantization` and a
+full-precision checkpoint; `kv_cache` stands alone. A checkpoint written by
+`oasr quantize` needs **no** flag — it is served quantized as-is — so leave
+`--quantization` unset to follow the checkpoint; with neither flag the key is not
+sent at all. A `quantization`
 object in `--engine-config` JSON wins over both flags.
 
 > **Known limitation.** The front-end configures `tracing`, not Python's

@@ -102,6 +102,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from oasr.functionals.attention import fmha, gather_paged_kv
 from oasr.functionals.kv_quant import QuantizedKv
 
 from .._backend import (
@@ -297,8 +298,6 @@ class Attention(nn.Module):
                     "no materialized key axis to broadcast a mask against. Pass the "
                     "full (B, H, T_q, T_k) grid as attn_bias instead."
                 )
-            from oasr.functionals.attention import fmha, gather_paged_kv
-
             if self._delegate_paged(q, k):
                 paged: torch.Tensor = fmha(
                     q,
@@ -328,8 +327,6 @@ class Attention(nn.Module):
                 attn_bias = attn_bias[..., :t_kv]
 
         if self._kernel_eligible(q, k, kv_lens, kv_starts, attn_bias, attn_mask, is_causal):
-            from oasr.functionals.attention import fmha
-
             fused: torch.Tensor = fmha(
                 q,
                 k,
@@ -389,8 +386,6 @@ class Attention(nn.Module):
         The whole capacity buffer or pool is handed over with ``kv_lens``, never
         a slice, so ``kv_extent`` has nothing to add here.
         """
-        from oasr.functionals.attention import fmha
-
         if not isinstance(k, QuantizedKv) or not isinstance(v, QuantizedKv):
             raise TypeError("an fp8 KV cache quantizes K and V together")
         if attn_mask is not None:

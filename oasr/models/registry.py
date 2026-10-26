@@ -451,6 +451,42 @@ def _online_quantization_spec(model: BaseAsrModel, quantization: Any) -> Any:
     )
 
 
+def _check_request_against_checkpoint(spec: Any, quantization: Any) -> None:
+    """Reconcile an engine request with a quantized checkpoint's own spec.
+
+    The checkpoint is authoritative.  Naming one of the schemes it was written
+    with is a no-op -- a ``smoothquant_w8a8_fused`` checkpoint serves both
+    ``int8_w8a8`` and ``int8_w8a8_static`` layers, and either name is accepted --
+    and any other scheme raises.  ``ignore`` / ``module_types`` choose which
+    layers *online* quantization quantizes; the checkpoint's layers are already
+    chosen, so asking to change them raises rather than being dropped.
+    """
+    scheme_name = getattr(quantization, "scheme", None)
+    if scheme_name is None:
+        return  # QuantizationConfig refuses ignore / module_types without a scheme
+    from oasr.quantization.spec import get_scheme
+
+    have = sorted({g.scheme.name for g in spec.groups})
+    wanted = get_scheme(scheme_name).name
+    if wanted not in have:
+        raise ValueError(
+            f"the checkpoint is already quantized as {have}; it cannot be re-quantized "
+            f"online as {wanted!r}"
+        )
+    selection = [
+        f"{key}={value!r}"
+        for key in ("ignore", "module_types")
+        if (value := getattr(quantization, key, None))
+    ]
+    if selection:
+        raise ValueError(
+            f"quantization {', '.join(selection)} select the layers online quantization "
+            "quantizes, and this checkpoint is already quantized (its spec names its "
+            "layers); drop them, or quantize the full-precision checkpoint with "
+            "`oasr quantize`"
+        )
+
+
 def materialize_model(
     arch: str,
     bundle: "ConvertedCheckpoint",
@@ -476,23 +512,20 @@ def materialize_model(
       scales alone (``QuantizableLayer._apply``), the model moves to *device*,
       and only then does each layer choose its kernel lane.
 
-    A checkpoint spec is authoritative: an online request for a different
-    scheme raises, the same scheme is a no-op.
+    A checkpoint spec is authoritative: naming one of its schemes is a no-op,
+    naming another scheme -- or asking it to quantize other layers -- raises
+    (:func:`_check_request_against_checkpoint`).  Only an unquantized checkpoint
+    is quantized online.
     """
     entry = get_model_entry(arch)
     model = entry.model_cls.from_config(bundle.model_config, **bundle.aux)
 
     spec = getattr(bundle, "quantization", None)
-    online = _online_quantization_spec(model, quantization)
-    if spec is not None and online is not None:
-        wanted = {g.scheme.name for g in online.groups}
-        have = {g.scheme.name for g in spec.groups}
-        if wanted != have:
-            raise ValueError(
-                f"the checkpoint is already quantized as {sorted(have)}; it cannot be "
-                f"re-quantized online as {sorted(wanted)}"
-            )
+    if spec is not None:
+        _check_request_against_checkpoint(spec, quantization)
         online = None
+    else:
+        online = _online_quantization_spec(model, quantization)
 
     if bundle.source_format == "native":
         from oasr.checkpoints.native import load_native_weights

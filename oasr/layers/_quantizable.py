@@ -178,6 +178,16 @@ class QuantizableGemm(QuantizableLayer):
     def quant_weight(self) -> torch.Tensor:
         return self.gemm_weight()
 
+    def quant_unsupported(self) -> Optional[str]:
+        # The 8-bit GEMMs' operand contract (``oasr.jit.scaled_mm`` K_ALIGNMENT /
+        # N_ALIGNMENT), the same for int8 and fp8: a layer outside it is kept at
+        # full precision, not handed to a torch lane behind the report's back.
+        if self.in_features % 16:
+            return f"in_features={self.in_features} is not a multiple of 16 (8-bit operand loads)"
+        if self.out_features % 8:
+            return f"out_features={self.out_features} is not a multiple of 8 (output stores)"
+        return None
+
 
 class QuantizableConv(QuantizableLayer):
     """Mixin for a dense channels-last convolution, ``act(conv(x, W) + bias)``.

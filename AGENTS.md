@@ -478,18 +478,26 @@ extension cookbook for each axis.
   picks it.
 - **An 8-bit tile set sized for one CTA per SM.** At K = 256 a CTA runs four K tiles, so its
   prologue and its dequant epilogue are most of its life, and only a second resident CTA
-  overlaps them with MMA work. The first int8 set (3-5 stages, all 1 CTA/SM) was 1.13x
-  slower (geomean, up to 1.39x) on the Conformer widths above M = 256. Neither the tuner
-  nor the heuristic could see it, because both only rank the production set. Before
-  changing that set, sweep candidates outside it with the tuner's own `measure_case`.
+  overlaps them with MMA work. A set of 1-CTA/SM tiles lost on the Conformer widths above
+  M = 256, and neither the tuner nor the heuristic could see it, because both only rank
+  the production set. Before changing that set, sweep candidates outside it with the
+  tuner's own `measure_case`.
 - **Expecting a quantized model to be batch-invariant because its layers are.** Per-token
   scales and the int32 accumulator make each quantized layer row-local, but an fp16 GEMM
   ahead of it picks an M-dependent config (cuBLAS, split-K, Stream-K), and int8 rounding
   amplifies its ulps. Name such GEMMs in `QuantLayout.batch_invariant` (the Conformer pins
   `embed.out.0` and `linear_pos`). Attention still differs at batch 1 (split-KV).
 - **A static activation scale at the calibration maximum.** The median frame then spans a
-  fifth of the range: 17 dB SQNR against 30 dB per-token, +0.44 WER streaming on U2++.
-  `static_inputs` searches the clip (`observer=mse`).
+  small part of the range, so most of the int8 levels go unused and streaming WER pays for
+  it. `static_inputs` searches the clip (`observer=mse`).
+- **A smoothing fold the full-precision master does not compute.** The calibration passes
+  run in sequence on the master (`smoothquant`, then `static_inputs` / `static_conv_inputs`),
+  so every fold must leave its function unchanged. A `runtime` smoother is applied by the
+  quantize kernel, which the fp forward never runs, so its `W · s` waits for
+  `quantize_weight`; folded at calibration time, it scaled every later layer's input and the
+  static scales were calibrated on activations serving never sees. A twin-vs-direct oracle
+  is blind to it (both sides are distorted alike); the oracle is the unsmoothed model,
+  with all four folds (`tests/models/test_quant_layouts.py::TestSmoothQuantInvariance`).
 - **Declaring `fuse_output_quant` or a `GemmChain` on an output something else reads.** The
   producer then returns a `QuantizedActivation`, which only its declared consumers accept;
   a residual, a mask or a cache `cat` in between needs the tensor (hence no fused `norm_conv`).
@@ -501,19 +509,26 @@ extension cookbook for each axis.
   The fp8 config uses `OpMultiplyAddFastAccum` and forbids sliced K (`BK == WK`) and any
   split, so every tile sums in K order; `tests/kernels/test_scaled_mm.py::TestFp8` fails
   with the staged operator.
-- **`torch._scaled_mm` row-wise scales with an fp16 output.** torch 2.12 / CUDA 13.2
-  accepts it on an RTX 5090 and returns values ~64 off on unit scales, silently. The fp8
-  torch lane runs tensor-wise into fp32 and dequantizes in torch.
+- **`torch._scaled_mm` row-wise scales with an fp16 output.** A torch / CUDA build can
+  accept it and return wrong values on unit scales, silently. The fp8 torch lane runs
+  tensor-wise into fp32 and dequantizes in torch.
+- **A torch lane as the fallback for a shape or SM the CUTLASS lanes refuse.** It is a real
+  kernel, so nothing fails, and the report calls it served: the sm75 gap became unreachable
+  that way. `auto` considers only lanes with `in_auto`; a GEMM outside the 8-bit operand
+  contract (`K % 16`, `N % 8`) is skipped at selection, and the torch lanes are reached only
+  by naming them (`OASR_SCALED_MM_BACKEND=torch`). Key a lane table by `sm_family`, never by
+  the raw capability, or an sm_121 device misses every sm_120 entry.
 - **A per-token scale on a convolution's input.** An output pixel sums over a receptive
   field spanning several input pixels, so their scales do not factor out of the sum:
   a quantized `Conv1d` / `Conv2d` takes a calibrated static per-tensor scale
   (`int8_w8a8_static`), which is why `module_types` refuses `conv1d` / `conv2d` online
   and `oasr quantize` calibrates them with any recipe.  `QuantizableGemm` is the GEMM
-  seam (8-aligned, smoothable); a convolution is `QuantizableConv` -- a code path that
+  seam (`K % 16`, `N % 8`, smoothable); a convolution is `QuantizableConv` -- a code path that
   needs GEMM semantics must not widen its `isinstance` to `QuantizableLayer`.
 - **A target glob that selects a raw-read weight.** The transducer joiner's fused-decode
   weights are `quantizable = False`; mark any new one. (The gated MLP's gate/up are
-  quantizable: a quantized block leaves its fused dual-B kernel for two scaled GEMMs.)
+  quantizable: a quantized block leaves its fused dual-B kernel for two scaled GEMMs, and so
+  does one a calibration hook watches -- the fused kernel never calls its projections.)
 - **SmoothQuant scales for a channel the calibration never saw active.** At `s`'s floor
   such a channel is divided by ~1e-5 and owns its token's scale on out-of-domain audio:
   Paraformer calibrated on English turned every encoder FFN to noise on Chinese. The
@@ -734,7 +749,7 @@ Environment variables:
 | `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the fused recurrent step — whether to fuse at all |
 | `OASR_RECURRENT_BACKEND` | Which fused recurrent-step lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
-| `OASR_SCALED_MM_BACKEND` | Quantized-GEMM lane: `auto` (default) / `cutlass` (the int8 and fp8 CUTLASS kernels) / `torch` (`torch._int_mm` / `torch._scaled_mm` + a torch epilogue). Naming one **requires** it |
+| `OASR_SCALED_MM_BACKEND` | Quantized-GEMM lane: `auto` (default: the CUTLASS lanes only -- what they cannot serve is a declared gap or a refusal, never the torch lane) / `cutlass` (the int8 and fp8 CUTLASS kernels) / `torch` (`torch._int_mm` / `torch._scaled_mm` + a torch epilogue). Naming one **requires** it; an unknown value is refused at the first quantized layer's bind |
 | `OASR_QUANT_FUSION` | `0` disarms the fused quantize producers (a norm emitting int8, a GEMM quantizing for its chained consumer): every quantized layer quantizes its own input again. Bit-identical either way (A/B, rollback) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
 | `OASR_METRICS` | `0` binds the engine-side metric collector to a no-op (front-end metrics are unaffected) |

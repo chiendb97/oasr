@@ -38,7 +38,9 @@ from typing import Optional, Tuple
 #:   through a per-channel positively homogeneous map: a ReLU, or the gated MLP's
 #:   ``act(gate) * up`` (linear in ``up``).  Its output rows and bias absorb ``1/s``.
 #: * ``runtime``       — nothing can absorb it: the consumer stores
-#:   ``smooth_inv = 1/s`` and the activation-quantize kernel applies it.
+#:   ``smooth_inv = 1/s`` and the activation-quantize kernel applies it.  Its
+#:   weight takes ``W · s`` when it is quantized, not at the fold, so the
+#:   full-precision master (which never applies ``smooth_inv``) is unchanged.
 FOLD_KINDS = ("norm_affine", "v_to_o", "producer_rows", "runtime")
 
 

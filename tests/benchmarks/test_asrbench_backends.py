@@ -412,7 +412,12 @@ def test_engine_backend_forwards_and_records_quantization(tmp_path):
         quantization=QuantizationConfig.coerce({"scheme": "int8_w8a8", "ignore": "a.*,b.*"}),
     )
     config = b.info().to_json()["config"]
-    assert config["quantization"] == {"scheme": "int8_w8a8", "ignore": ["a.*", "b.*"]}
+    assert config["quantization"] == {
+        "scheme": "int8_w8a8",
+        "ignore": ["a.*", "b.*"],
+        "module_types": None,
+        "kv_cache": None,
+    }
     assert config["quantization_info"] == served
     json.dumps(config)  # what the runner writes into run.json
 

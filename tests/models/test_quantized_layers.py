@@ -67,11 +67,15 @@ def _layers():
 
 
 def _everything(model):
-    """A spec quantizing every quantizable layer: the GEMMs per token, every
-    convolution an int8 kernel serves with a static input scale (one, uncalibrated).
+    """A spec quantizing every quantizable layer an 8-bit kernel serves: the GEMMs
+    per token, the convolutions with a static input scale (one, uncalibrated).
     """
     layers = quantizable_layers(model)
-    gemms = tuple(p for p, m in layers.items() if isinstance(m, QuantizableGemm))
+    gemms = tuple(
+        p
+        for p, m in layers.items()
+        if isinstance(m, QuantizableGemm) and m.quant_unsupported() is None
+    )
     convs = tuple(
         p
         for p, m in layers.items()

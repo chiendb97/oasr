@@ -161,6 +161,18 @@ class TestRefusedByName:
         with pytest.raises(ValueError, match=needle):
             _aed(cuda=True)
 
+    @pytest.mark.cuda
+    def test_the_torch_layers_backend_cannot_read_fp8(self):
+        """``OASR_LAYERS_BACKEND=torch`` reaches the dequantizing reference as surely
+        as ``OASR_ATTN_BACKEND=sdpa`` (``use_fmha_kernel``): refused at construction,
+        not served by dequantizing the whole pool every step."""
+        _requires_lane()
+        from oasr.layers._backend import layers_backend_override
+
+        with layers_backend_override("torch"):
+            with pytest.raises(ValueError, match="OASR_LAYERS_BACKEND=torch"):
+                _aed(cuda=True)
+
     def test_off_cuda_the_reference_serves_it(self):
         """CPU is out of scope for serving, not an error: the parity oracle runs."""
         assert _aed().kv_cache_format == "fp8_e4m3"

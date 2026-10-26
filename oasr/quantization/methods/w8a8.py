@@ -54,6 +54,7 @@ from oasr.functionals.quant import (
 )
 from oasr.functionals.scaled_conv import reference_scaled_conv1d, reference_scaled_conv2d
 from oasr.functionals.scaled_mm import reference_scaled_mm, reference_scaled_mm_quant
+from oasr.jit.core import sm_family
 from oasr.layers._backend import layers_backend, take_gap
 from oasr.layers._quantizable import QuantizableConv, QuantizableGemm, QuantizedActivation
 
@@ -166,6 +167,12 @@ class W8A8Method(QuantMethod):
 
     def quantize_weight(self, layer: "QuantizableLayer", weight_fp32: torch.Tensor) -> None:
         module: nn.Module = layer  # type: ignore[assignment]
+        smooth = _optional(module, "smooth_inv")
+        if smooth is not None:
+            # A runtime-smoothed layer: SmoothQuant left the master's weight alone
+            # (its fp forward ignores smooth_inv), and the kernel quantizes
+            # ``x * smooth_inv``, so the stored weight is ``W · s = W / smooth_inv``.
+            weight_fp32 = weight_fp32 / smooth.to(weight_fp32.device).reshape(1, -1)
         q, scale = quantize_weight_per_channel(weight_fp32, dtype=self.storage_dtype)
         weight = _tensor(module, "weight")
         weight.data.copy_(q.reshape(weight.shape))
@@ -189,8 +196,7 @@ class W8A8Method(QuantMethod):
         if out_dtype not in _SERVED:
             self.lane, self.lane_note = None, f"reference ({out_dtype})"
             return
-        major, minor = torch.cuda.get_device_capability(device)
-        sm = major * 10 + minor
+        sm = sm_family(*torch.cuda.get_device_capability(device))
         lane, note = choose_lane(self.scheme, layer.out_features, layer.in_features, out_dtype, sm)
         if lane is not None:
             self.lane, self.lane_note = lane, note
@@ -382,8 +388,7 @@ class W8A8ConvMethod(W8A8Method):
         if out_dtype not in _SERVED:
             self.lane, self.lane_note = None, f"reference ({out_dtype})"
             return
-        major, minor = torch.cuda.get_device_capability(device)
-        sm = major * 10 + minor
+        sm = sm_family(*torch.cuda.get_device_capability(device))
         lane, note = choose_conv_lane(sm)
         if lane is not None or forced_backend() == "torch":
             self.lane, self.lane_note = lane, note  # type: ignore[assignment]

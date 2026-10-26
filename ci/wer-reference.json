@@ -109,13 +109,13 @@
           }
         }
       },
-      "error_rate_pct": 3.7,
+      "error_rate_pct": 3.73,
       "ref_units": 3403,
       "substitutions": 98,
       "deletions": 16,
-      "insertions": 12,
+      "insertions": 13,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
-      "_comment": "fp16 streaming on the same checkpoint measures 3.70 %."
+      "_comment": "fp16 streaming on the same checkpoint measures 3.70 %. Re-recorded 2026-10-26 (was 3.70, S98 D16 I12) in the tree that quantizes a runtime-smoothed weight as W / smooth_inv at quantize time rather than folding W * s at calibration."
     },
     {
       "key": "conformer_w8a8_sq_fused",
@@ -139,13 +139,13 @@
           }
         }
       },
-      "error_rate_pct": 4.11,
+      "error_rate_pct": 3.97,
       "ref_units": 3403,
-      "substitutions": 107,
-      "deletions": 22,
+      "substitutions": 106,
+      "deletions": 18,
       "insertions": 11,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
-      "_comment": "The FFN's w_2 takes a calibrated static per-tensor input scale so w_1's epilogue quantizes for it; the clip is the MSE-optimal one over the calibration audio. At the calibration maximum (observer absmax) the same recipe measured 4.08 offline and 4.14 streaming (before the pins), at the 99.999th percentile 4.20 / 3.73. Measured 4.14 / 4.11 / 4.11 / 4.11 % at max_batch_size 1 / 8 / 16 / 32. Acceptance: <= fp16 + 0.3 and <= RTN."
+      "_comment": "The FFN's w_2 takes a calibrated static per-tensor input scale so w_1's epilogue quantizes for it; the clip is the MSE-optimal one over the calibration audio. At the calibration maximum (observer absmax) the same recipe measured 4.08 offline and 4.14 streaming (before the pins), at the 99.999th percentile 4.20 / 3.73. Measured 4.14 / 4.11 / 4.11 / 4.11 % at max_batch_size 1 / 8 / 16 / 32. Acceptance: <= fp16 + 0.3 and <= RTN. Re-recorded 2026-10-26 (was 4.11, S107 D22 I11): SmoothQuant's runtime fold no longer scales the full-precision master's weight at calibration time (W * s now waits for quantize_weight), so static_inputs calibrates on the activations serving sees."
     },
     {
       "key": "conformer_w8a8_sq_fused_conv",
@@ -174,13 +174,13 @@
           "conv2d"
         ]
       },
-      "error_rate_pct": 4.09,
+      "error_rate_pct": 4.0,
       "ref_units": 3403,
-      "substitutions": 107,
-      "deletions": 22,
-      "insertions": 10,
+      "substitutions": 105,
+      "deletions": 19,
+      "insertions": 12,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --module-types linear,pointwise_conv,conv2d --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
-      "_comment": "Recorded 2026-10-23 (RTX 5090). module_types adds the dense subsampling conv (encoder.embed.convs.1, 256->256 3x3/2) on the int8 implicit-GEMM convolution; the one-channel stem has no int8 kernel and stays fp16 (skipped, recorded in the spec's producer). The same recipe without the conv measured 4.11 in the same tree, fp16 4.08."
+      "_comment": "Recorded 2026-10-23 (RTX 5090). module_types adds the dense subsampling conv (encoder.embed.convs.1, 256->256 3x3/2) on the int8 implicit-GEMM convolution; the one-channel stem has no int8 kernel and stays fp16 (skipped, recorded in the spec's producer). The same recipe without the conv measured 4.11 in the same tree, fp16 4.08. Re-recorded 2026-10-26 (was 4.09, S107 D22 I10): SmoothQuant's runtime fold no longer scales the full-precision master's weight at calibration time (W * s now waits for quantize_weight), so static_inputs calibrates on the activations serving sees."
     },
     {
       "key": "conformer_w8a8_sq_fused_streaming",
@@ -241,13 +241,13 @@
           "conv2d"
         ]
       },
-      "error_rate_pct": 3.7,
+      "error_rate_pct": 3.76,
       "ref_units": 3403,
-      "substitutions": 99,
-      "deletions": 15,
-      "insertions": 12,
+      "substitutions": 101,
+      "deletions": 14,
+      "insertions": 13,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fused --recipe smoothquant_w8a8_fused --module-types linear,pointwise_conv,conv2d --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
-      "_comment": "Recorded 2026-10-23 (RTX 5090). Without the conv 3.64, fp16 streaming 3.70."
+      "_comment": "Recorded 2026-10-23 (RTX 5090). Without the conv 3.64, fp16 streaming 3.70. Re-recorded 2026-10-26 (was 3.70, S99 D15 I12): SmoothQuant's runtime fold no longer scales the full-precision master's weight at calibration time (W * s now waits for quantize_weight), so static_inputs calibrates on the activations serving sees."
     },
     {
       "key": "conformer_fp8_rtn",
@@ -291,13 +291,13 @@
           }
         }
       },
-      "error_rate_pct": 4.03,
+      "error_rate_pct": 4.06,
       "ref_units": 3403,
       "substitutions": 107,
-      "deletions": 20,
+      "deletions": 21,
       "insertions": 10,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fp8_fused --recipe smoothquant_fp8_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fp8_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
-      "_comment": "Needs fp8 tensor cores (sm89+). The fp8 twin of conformer_w8a8_sq_fused (4.11): every pre-norm emits e4m3, w_1's epilogue quantizes for w_2 at its static scale. smoothquant_fp8_w8a8 (no static scales) measured 4.06 / 3.73."
+      "_comment": "Needs fp8 tensor cores (sm89+). The fp8 twin of conformer_w8a8_sq_fused (4.11): every pre-norm emits e4m3, w_1's epilogue quantizes for w_2 at its static scale. smoothquant_fp8_w8a8 (no static scales) measured 4.06 / 3.73. Re-recorded 2026-10-26 (was 4.03, S107 D20 I10): SmoothQuant's runtime fold no longer scales the full-precision master's weight at calibration time (W * s now waits for quantize_weight), so static_inputs calibrates on the activations serving sees."
     },
     {
       "key": "conformer_fp8_sq_fused_streaming",
@@ -322,13 +322,13 @@
           }
         }
       },
-      "error_rate_pct": 3.7,
+      "error_rate_pct": 3.67,
       "ref_units": 3403,
-      "substitutions": 97,
+      "substitutions": 98,
       "deletions": 15,
-      "insertions": 14,
+      "insertions": 12,
       "recorded_with": "oasr quantize $ASSET /tmp/u2pp_fp8_fused --recipe smoothquant_fp8_w8a8_fused --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/u2pp_fp8_fused --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming",
-      "_comment": "Needs fp8 tensor cores (sm89+)."
+      "_comment": "Needs fp8 tensor cores (sm89+). Re-recorded 2026-10-26 (was 3.70, S97 D15 I14): SmoothQuant's runtime fold no longer scales the full-precision master's weight at calibration time (W * s now waits for quantize_weight), so static_inputs calibrates on the activations serving sees."
     },
     {
       "_comment": [
@@ -434,13 +434,13 @@
           }
         }
       },
-      "error_rate_pct": 3.76,
+      "error_rate_pct": 3.61,
       "ref_units": 3403,
-      "substitutions": 103,
-      "deletions": 11,
-      "insertions": 14,
+      "substitutions": 101,
+      "deletions": 10,
+      "insertions": 12,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/whisper_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/whisper_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
-      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Within fp16 + 0.3 but 0.12 above RTN (3.64): an alpha sweep (0.3-0.75: 3.73-3.94) and dropping each fold kind (3.73 each) found no group to blame; RTN already sits at fp16 and both change 19-24 of 200 transcripts against it."
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Within fp16 + 0.3 but 0.12 above RTN (3.64): an alpha sweep (0.3-0.75: 3.73-3.94) and dropping each fold kind (3.73 each) found no group to blame; RTN already sits at fp16 and both change 19-24 of 200 transcripts against it. Re-recorded 2026-10-26 (was 3.76, S103 D11 I14) in the tree that quantizes a runtime-smoothed weight as W / smooth_inv at quantize time rather than folding W * s at calibration."
     },
     {
       "key": "whisper_w8a8_sq_conv",
@@ -466,13 +466,13 @@
           "conv1d"
         ]
       },
-      "error_rate_pct": 3.67,
+      "error_rate_pct": 3.7,
       "ref_units": 3403,
-      "substitutions": 102,
+      "substitutions": 103,
       "deletions": 10,
       "insertions": 13,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/whisper_sq --recipe smoothquant_w8a8 --module-types linear,pointwise_conv,conv1d --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/whisper_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
-      "_comment": "Recorded 2026-10-23 (RTX 5090). module_types adds encoder.conv1 (80->384, k3) and encoder.conv2 (384->384, k3/2). The same recipe without them 3.76, fp16 3.67."
+      "_comment": "Recorded 2026-10-23 (RTX 5090). module_types adds encoder.conv1 (80->384, k3) and encoder.conv2 (384->384, k3/2). The same recipe without them 3.76, fp16 3.67. Re-recorded 2026-10-26 (was 3.67, S102 D10 I13) in the tree that quantizes a runtime-smoothed weight as W / smooth_inv at quantize time rather than folding W * s at calibration."
     },
     {
       "_comment": [
@@ -758,13 +758,13 @@
           }
         }
       },
-      "error_rate_pct": 2.38,
+      "error_rate_pct": 2.44,
       "ref_units": 3403,
-      "substitutions": 65,
+      "substitutions": 66,
       "deletions": 7,
-      "insertions": 9,
+      "insertions": 10,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/nemotron_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/nemotron_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16",
-      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Below fp16 (2.59) with every encoder GEMM quantized, FFN1 included."
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Below fp16 (2.59) with every encoder GEMM quantized, FFN1 included. Re-recorded 2026-10-26 (was 2.38, S65 D7 I9) in the tree that quantizes a runtime-smoothed weight as W / smooth_inv at quantize time rather than folding W * s at calibration."
     },
     {
       "key": "nemotron_w8a8_sq_streaming",
@@ -789,11 +789,11 @@
       },
       "error_rate_pct": 2.38,
       "ref_units": 3403,
-      "substitutions": 66,
+      "substitutions": 65,
       "deletions": 5,
-      "insertions": 10,
+      "insertions": 11,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/nemotron_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/nemotron_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --max-batch-size 16 --service-mode streaming --chunk-size 16",
-      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout)."
+      "_comment": "Recorded 2026-10-21 (RTX 5090) with the layouts of P3 (oasr/models/*/model.py quantization_layout). Re-recorded 2026-10-26 (was 2.38, S66 D5 I10) in the tree that quantizes a runtime-smoothed weight as W / smooth_inv at quantize time rather than folding W * s at calibration."
     },
     {
       "_comment": [
@@ -917,13 +917,13 @@
           }
         }
       },
-      "error_rate_pct": 5.14,
+      "error_rate_pct": 5.52,
       "ref_units": 3403,
-      "substitutions": 57,
-      "deletions": 47,
-      "insertions": 71,
+      "substitutions": 58,
+      "deletions": 61,
+      "insertions": 69,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/qwen_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl --calib-dtype bfloat16 && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/qwen_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --dtype bfloat16 --max-batch-size 16 --decode-option 'prompt=Transcribe the audio into text. Output only the transcription, with no extra words.'",
-      "_comment": "Recorded 2026-10-21 (RTX 5090), bf16 activations; the bf16 arm measured 5.67 (65S 51D 77I) in the same tree. The fp32 master (33.6 GB) does not fit the GPU: calibration runs a bf16 twin on the device, the folds the fp32 master on the host (5 min, 141 GB host RAM free)."
+      "_comment": "Recorded 2026-10-21 (RTX 5090), bf16 activations; the bf16 arm measured 5.67 (65S 51D 77I) in the same tree. The fp32 master (33.6 GB) does not fit the GPU: calibration runs a bf16 twin on the device, the folds the fp32 master on the host (5 min, 141 GB host RAM free). Re-recorded 2026-10-26 (was 5.14, S57 D47 I71): the bf16 twin's gated MLP used to take its fused kernel for the rows it serves fused (the decode steps), which never calls gate_proj / up_proj, so their SmoothQuant observers missed those rows while down_proj saw them. A hooked projection is now called, so the post_attention_layernorm groups see every row, as an fp32 calibration would. A/B in the same tree: 5.11 (S57 D49 I68) with the old behaviour, 5.52 with it; still <= the bf16 row + 0.3 and below RTN."
     }
   ]
 }

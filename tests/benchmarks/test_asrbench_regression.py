@@ -160,6 +160,9 @@ def test_a_quantized_checkpoint_is_not_the_same_configuration_as_a_full_precisio
     assert compare(_in_process(s, int8), _in_process(s, torch_lane), RULES)[1] == (
         EXIT_INCOMPARABLE
     )
+    # An fp8 KV cache over full-precision weights is not the full-precision run.
+    kv8 = {"schemes": [], "layers": 0, "lanes": [], "kv_cache": "fp8_e4m3"}
+    assert compare(full, _in_process(s, kv8), RULES)[1] == EXIT_INCOMPARABLE
     # A run recorded before the field existed still compares with a full-precision one.
     assert compare(_in_process(s, None, recorded=False), full, RULES)[1] == EXIT_OK
 

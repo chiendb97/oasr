@@ -15,11 +15,14 @@ What the engine promises an fp model it must promise a quantized one:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import assets
 import pytest
 import torch
 from helpers import make_engine, tiny_conformer
 
+from oasr.engine import ASREngine
 from oasr.engine.config import EngineConfig, QuantizationConfig
 from oasr.layers import QuantizedActivation
 from oasr.quantization import (
@@ -84,6 +87,33 @@ class TestConfig:
             EngineConfig(ckpt_dir="/x", quantization={"scheme": "int3"})
         with pytest.raises(ValueError, match="unknown quantization option"):
             EngineConfig(ckpt_dir="/x", quantization={"scheme": "int8_w8a8", "alpha": "0.5"})
+
+    @pytest.mark.parametrize("key, value", [("ignore", "ctc.*"), ("module_types", "linear")])
+    def test_a_layer_selection_needs_a_scheme(self, key, value):
+        """``ignore`` / ``module_types`` only mean something to online quantization:
+        without a scheme there is nothing for them to select, and dropping them
+        silently is what ``ignore`` used to do."""
+        with pytest.raises(ValueError, match="needs a scheme"):
+            EngineConfig(ckpt_dir="/x", quantization={key: value})
+        # The KV cache format stands alone (fp weights over an fp8 cache).
+        assert EngineConfig(
+            ckpt_dir="/x", quantization={"kv_cache": "fp8_e4m3"}
+        ).quantization == QuantizationConfig(kv_cache="fp8_e4m3")
+
+    def test_the_served_identity_includes_the_kv_cache(self):
+        """An fp8 KV cache over full-precision weights is a configuration of its
+        own: ``quantization_info`` names it, ``quantization`` (the weight schemes
+        ``/v1/models`` reports) stays ``None``."""
+        engine = SimpleNamespace(
+            _model=torch.nn.Linear(4, 4),
+            _config=SimpleNamespace(quantization=QuantizationConfig(kv_cache="fp8_e4m3")),
+        )
+        info = ASREngine.quantization_info(engine)
+        assert info == {"schemes": [], "layers": 0, "lanes": [], "kv_cache": "fp8_e4m3"}
+        engine.quantization_info = lambda: info
+        assert ASREngine.quantization.fget(engine) is None
+        engine._config.quantization = None
+        assert ASREngine.quantization_info(engine) is None
 
 
 @pytest.mark.cuda

@@ -207,8 +207,8 @@ def test_wer_has_not_regressed(spec, device, tmp_path_factory):
     quant = dict(spec.get("quantization") or {})
     if quant.get("scheme") or spec.get("quantize_recipe"):
         assert engine.quantization_info() is not None, f"{spec['key']} measured an fp model"
-    # A KV-cache format is not a weight scheme, so ``quantization_info`` cannot
-    # see it; ask the strategy that stores the cache instead.
+    # ``quantization_info`` names a requested KV-cache format; the strategy that
+    # stores the cache is what proves it is served, so ask it.
     if quant.get("kv_cache"):
         served = getattr(engine._output_processor.strategy, "kv_cache_format", None)
         assert served == quant["kv_cache"], f"{spec['key']} measured a {served!r} KV cache"

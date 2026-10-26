@@ -178,6 +178,18 @@ _SM_FAMILY = {
 _TARGET_SMS = tuple(sorted(set(_SM_FAMILY.values())))
 
 
+def sm_family(major: int, minor: int) -> int:
+    """The kernel family a ``major.minor`` device runs (:data:`_SM_FAMILY`).
+
+    What every per-SM lane table is keyed by: an sm_121 device runs the sm_120
+    kernels, an sm_87 one the sm_86 kernels.  A capability OASR builds nothing
+    for comes back as its own ``major * 10 + minor``, so a lookup refuses it by
+    name rather than reading another architecture's entry.
+    """
+    sm = major * 10 + minor
+    return _SM_FAMILY.get(sm, sm)
+
+
 #: Capabilities whose kernels must be built for a CUDA **family** target rather
 #: than their own arch-conditional one, and which target that is.
 #:

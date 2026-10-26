@@ -107,6 +107,35 @@ class TestUnquantizedIsUnchanged:
             assert torch.equal(mlp(x), _legacy_forward(mlp, x))
 
 
+class TestObserved:
+    @cuda
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_a_hooked_projection_is_called(self, fused_calls, dtype):
+        """Calibration observes a projection's input with a forward hook, and the
+        fused kernel never calls the projection: while a hook watches gate or up,
+        the block runs the two GEMMs, so every row it serves is seen -- a reduced-
+        precision calibration twin on CUDA used to skip the fused kernel's rows."""
+        mlp = _mlp().cuda().to(dtype)
+        x = torch.randn(4, D, device="cuda", dtype=dtype)  # inside the fused band
+        seen: List[int] = []
+        with torch.no_grad():
+            mlp(x)
+            assert fused_calls, "4 rows should take the fused kernel when unobserved"
+            fused_calls.clear()
+            handle = mlp.up_proj.register_forward_pre_hook(
+                lambda m, args: seen.append(args[0].shape[0])
+            )
+            try:
+                got = mlp(x)
+            finally:
+                handle.remove()
+            assert seen == [4] and not fused_calls
+            # Same function either way: two GEMMs instead of the dual-B kernel.
+            torch.testing.assert_close(got, _legacy_forward(mlp, x), rtol=2e-2, atol=2e-2)
+            mlp(x)
+        assert fused_calls, "the hook's removal returns the block to the fused kernel"
+
+
 class TestQuantized:
     def test_all_three_projections_are_quantizable(self):
         holder = torch.nn.Module()
