@@ -11,21 +11,42 @@ throughout (instruction shape ``16x8x16``, float accumulator, half-only
 dispatch, ``dt=half`` rule tables), and 8-bit variants there would grow every
 user's cold build.  The config-space helpers are shared, at 1-byte operands.
 
-Two operand formats, one template, one JIT module each (so an int8 user never
-compiles the fp8 variants, nor the reverse):
+Two operand formats, one JIT module per format and lane (so an int8 user never
+compiles the fp8 variants, nor the reverse).  A *lane* is a kernel generation
+with its own config space, module and tuning entries:
 
-* ``int8`` -- the Sm80 ``mma.sync`` int8 kernel with an exact int32 accumulator,
-  serving every SM >= 80: natively on sm80/86/89/120 and as the mixed lane on
-  sm90/sm100, the way the fp16 GEMM already runs there.  Turing (sm75) is a
-  declared kernel gap (``scaled-mm-int8-sm75`` in
-  :data:`oasr.layers._backend.KERNEL_GAPS`).
-* ``fp8`` -- the Sm89 ``mma.sync`` e4m3 kernel (Ada's instruction, which sm_120
-  executes too) with an fp32 accumulator and fast accumulation, natively on
-  sm89/sm120 and as the mixed lane on sm90/sm100.  Below sm89 there are no fp8
-  tensor cores: not a gap, a scheme the GPU cannot run.  Its accumulator is not
-  exact, so batch invariance rests on the config space instead: no tile slices K
-  across warps and none splits K, so every tile sums each output in the same
-  order and computes the same bits (``cutlass_scaled_mm_configs.h``).
+* The CUTLASS 2.x ``mma.sync`` lanes (:data:`LANE_ID`), one template:
+
+  * ``int8`` -- the Sm80 int8 kernel with an exact int32 accumulator, serving
+    every SM >= 80: natively on sm80/86/89/120, and on sm90/sm100 as the A/B
+    arm of the native lanes below (``OASR_SCALED_MM_BACKEND=mma_sync``).
+    Turing (sm75) is a declared kernel gap (``scaled-mm-int8-sm75`` in
+    :data:`oasr.layers._backend.KERNEL_GAPS`).
+  * ``fp8`` -- the Sm89 e4m3 kernel (Ada's instruction, which sm_120 executes
+    too) with an fp32 accumulator and fast accumulation, natively on sm89/sm120.
+    Below sm89 there are no fp8 tensor cores: not a gap, a scheme the GPU cannot
+    run.  Its accumulator is not exact, so batch invariance rests on the config
+    space instead: no tile slices K across warps and none splits K, so every
+    tile sums each output in the same order and computes the same bits
+    (``cutlass_scaled_mm_configs.h``).
+
+* The native CUTLASS 3.x lanes (:data:`NATIVE_LANE_ID`), the default on Hopper
+  and Blackwell data-center parts: TMA, a warp-specialized persistent kernel,
+  and the architecture's own MMA -- wgmma with ping-pong or cooperative
+  warpgroups on sm90, tcgen05 accumulating in (double-buffered) tensor memory on
+  sm100 -- so the epilogue of one tile overlaps the mainloop of the next
+  (``cutlass_scaled_mm_configs_sm90.h``).  The same epilogue arithmetic and the
+  same launcher signatures as the 2.x lane; the same per-lane invariant (int8:
+  exact; fp8: one summation order for every tile).  int8 on sm100 is
+  narrower than its family: CUTLASS enables tcgen05 ``kind::i8`` for the
+  arch-specific ``sm_100a`` target only, not ``sm_100f``, so that lane is built
+  for ``sm_100a`` and serves compute capability 10.0 (B200) alone; B300 keeps
+  the 2.x lane.
+
+**Unmeasured:** the native production sets and their shape heuristic below are
+starting points chosen without Hopper or Blackwell hardware.  They are
+compile-checked, not tuned; a measured tuning entry (``oasr tune build``)
+overrides the heuristic per shape.
 """
 
 from __future__ import annotations
@@ -33,7 +54,7 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from . import env
 from .core import JitSpec, _get_target_sm, gen_jit_spec
@@ -65,6 +86,36 @@ SCALED_MM_FP8_LANE_BY_SM: Dict[int, bool] = {
 }
 
 _LANE_BY_SM = {"int8": SCALED_MM_LANE_BY_SM, "fp8": SCALED_MM_FP8_LANE_BY_SM}
+
+#: The native CUTLASS 3.x lane of each ``(SM family, format)``.
+NATIVE_LANE_ID: Dict[Tuple[int, str], str] = {
+    (90, "int8"): "sm90_int8_wgmma",
+    (90, "fp8"): "sm90_fp8_wgmma",
+    (100, "int8"): "sm100_int8_umma",
+    (100, "fp8"): "sm100_fp8_umma",
+}
+
+_NATIVE_LANE_KEY = {lane: key for key, lane in NATIVE_LANE_ID.items()}
+
+#: The compute capabilities a native lane runs on, where narrower than its SM
+#: family.  tcgen05 ``kind::i8`` is enabled by CUTLASS for ``sm_100a`` /
+#: ``sm_101a`` / ``sm_110a`` only -- not for the ``sm_100f`` family target the
+#: rest of the sm100 family builds with (``oasr.jit.core._GENCODE_TARGET``) --
+#: so an int8 kernel built for the family has no int8 MMA at all, and B300
+#: (10.3), which the family also covers, has none to build for.  Checked on the
+#: generated PTX: ``kind::i8`` under ``sm_100a``, nothing under ``sm_100f``.
+_NATIVE_CAPABILITIES: Dict[Tuple[int, str], Tuple[Tuple[int, int], ...]] = {
+    (100, "int8"): ((10, 0),),
+}
+
+#: The gencode target of a native module, where it is not its family's default.
+_NATIVE_GENCODE: Dict[Tuple[int, str], str] = {
+    (100, "int8"): "100a",
+}
+
+#: N alignment of the quantizing (8-bit-output) launch: the native lanes store D
+#: through TMA, whose rows are 16-byte aligned -- 16 one-byte elements.
+NATIVE_QUANT_N_ALIGNMENT = 16
 
 #: The epilogue's thread map partitions fp32 compute fragments, four per
 #: access (``CutlassScaledMmKernel::kEpilogueElementsPerAccess``), so the
@@ -114,6 +165,76 @@ class ScaledMmConfig:
         return TileShape(
             self.block_m, self.block_n, self.block_k, self.warp_m, self.warp_n, self.warp_k
         )
+
+    @property
+    def lane(self) -> str:
+        """The lane this config belongs to (its format's ``mma.sync`` lane)."""
+        return LANE_ID[self.fmt]
+
+    #: SMs one output tile occupies (the shape heuristic's wave arithmetic).
+    sms_per_tile = 1
+
+
+#: Native schedules and their C++ (``oasr::scaled_mm::NativeSchedule``) names.
+_NATIVE_SCHEDULES = {
+    90: {"pingpong": "kPingpong", "cooperative": "kCooperative"},
+    100: {"1sm": "k1Sm", "2sm": "k2Sm"},
+}
+
+_SCHEDULE_TAG = {"pingpong": "pp", "cooperative": "coop", "1sm": "1sm", "2sm": "2sm"}
+
+
+@dataclass(frozen=True)
+class NativeScaledMmConfig:
+    """One native (CUTLASS 3.x) 8-bit tile configuration on sm90 or sm100.
+
+    ``block_m`` is the MMA tile's M -- for the 2-SM sm100 schedule the CTA pair's
+    combined extent.  ``schedule``: ``pingpong`` / ``cooperative`` (sm90),
+    ``1sm`` / ``2sm`` (sm100).  Data-parallel only: no Stream-K, no split-K.
+    """
+
+    sm: int
+    block_m: int
+    block_n: int
+    cluster_m: int = 1
+    cluster_n: int = 1
+    schedule: str = "pingpong"
+    block_k: int = 128
+    #: fp8 e4m3 operands instead of int8.
+    fp8: bool = False
+
+    #: No Stream-K variant exists (the 2.x config's field, for one interface).
+    stream_k = False
+
+    @property
+    def fmt(self) -> str:
+        """The operand format, ``"int8"`` or ``"fp8"``."""
+        return "fp8" if self.fp8 else "int8"
+
+    @property
+    def lane(self) -> str:
+        return NATIVE_LANE_ID[(self.sm, self.fmt)]
+
+    @property
+    def compile_name(self) -> str:
+        return (
+            f"sm{self.sm}_b{self.block_m}x{self.block_n}x{self.block_k}_"
+            f"c{self.cluster_m}x{self.cluster_n}_{_SCHEDULE_TAG[self.schedule]}"
+            + ("_e4m3" if self.fp8 else "")
+        )
+
+    @property
+    def cpp_schedule(self) -> str:
+        """The ``NativeSchedule`` enumerator the rendered translation unit names."""
+        return _NATIVE_SCHEDULES[self.sm][self.schedule]
+
+    @property
+    def sms_per_tile(self) -> int:
+        return 2 if self.schedule == "2sm" else 1
+
+
+#: Either generation's config.
+AnyScaledMmConfig = Union[ScaledMmConfig, NativeScaledMmConfig]
 
 
 #: The int8 data-parallel tiles.  A Conformer-width GEMM has K = 256: two to four
@@ -227,6 +348,64 @@ def _buildable(cfg: ScaledMmConfig, sm: int) -> bool:
     return _epilogue_covers_warp(cfg.tile, element_bits=_EPILOGUE_ELEMENT_BITS)
 
 
+#: The native production tiles, ``(block_m, block_n, cluster_m, cluster_n,
+#: schedule)``, shared by both formats (``block_k`` is 128 throughout: one
+#: 128-byte swizzle row of 8-bit operands, and on sm90 fp8 a divisor of the
+#: 128-element promotion interval, so every tile sums in the same order).
+#:
+#: sm90: ping-pong at 64 rows, where most ASR GEMMs live (a decode step, a
+#: streaming chunk, a short utterance) and the epilogue is a large share of a
+#: shallow-K tile's life -- the other warpgroup's mainloop hides it; ping-pong at
+#: 128 rows with a 2x1 cluster (TMA multicasts B to both CTAs) for mid M; and two
+#: cooperative tiles for large M and N.  sm100: 1-SM tcgen05 tiles up to 128
+#: rows, and 2-SM (CTA-pair) tiles of 256 rows for large M, each SM then loading
+#: half of B.  **Not measured on either architecture** (see the module docstring).
+_NATIVE_TILES: Dict[int, Tuple[Tuple[int, int, int, int, str], ...]] = {
+    90: (
+        (64, 64, 1, 1, "pingpong"),
+        (64, 128, 1, 1, "pingpong"),
+        (64, 256, 1, 1, "pingpong"),
+        (128, 128, 2, 1, "pingpong"),
+        (128, 256, 2, 1, "cooperative"),
+        (256, 128, 2, 1, "cooperative"),
+    ),
+    100: (
+        (64, 64, 1, 1, "1sm"),
+        (64, 128, 1, 1, "1sm"),
+        (128, 128, 1, 1, "1sm"),
+        (128, 256, 1, 1, "1sm"),
+        (256, 128, 2, 1, "2sm"),
+        (256, 256, 2, 1, "2sm"),
+    ),
+}
+
+
+def _native_buildable(cfg: NativeScaledMmConfig) -> bool:
+    """Whether CUTLASS builds *cfg* -- ``CutlassScaledMmConfigNative``'s asserts, mirrored.
+
+    One unbuildable variant fails its whole JIT module, so nothing that would
+    trip an assert is ever rendered.
+    """
+    if cfg.schedule not in _NATIVE_SCHEDULES.get(cfg.sm, {}):
+        return False
+    if cfg.block_k != 128 or cfg.block_n % 16 or cfg.block_n > 256:
+        return False
+    if cfg.schedule == "pingpong":
+        return cfg.block_m in (64, 128)
+    if cfg.schedule == "cooperative":
+        return cfg.block_m % 128 == 0
+    if cfg.schedule == "1sm":
+        return cfg.block_m in (64, 128)
+    # 2sm: a CTA pair over an even cluster M.  The 16-bit 2-SM TMA epilogue also
+    # needs N <= 128 or N % 64 == 0 (sm100_builder.inl); this space's 2-SM tiles
+    # (N = 128, 256) meet it, and the check keeps a new one honest.
+    return (
+        cfg.block_m in (128, 256)
+        and cfg.cluster_m % 2 == 0
+        and (cfg.block_n <= 128 or cfg.block_n % 64 == 0)
+    )
+
+
 def _check_fmt(fmt: str) -> str:
     if fmt not in FORMATS:
         raise ValueError(f"scaled_mm operand format must be one of {FORMATS}, got {fmt!r}")
@@ -234,25 +413,111 @@ def _check_fmt(fmt: str) -> str:
 
 
 def lane_available(sm: int, fmt: str = "int8") -> bool:
-    """Whether the *fmt* lane serves *sm* at all."""
+    """Whether the *fmt* ``mma.sync`` lane serves *sm* at all."""
     return sm in _LANE_BY_SM[_check_fmt(fmt)]
 
 
 def is_native_lane(sm: int, fmt: str = "int8") -> bool:
-    """Whether the *fmt* lane is *sm*'s native tensor-core path."""
+    """Whether the *fmt* ``mma.sync`` lane is *sm*'s native tensor-core path."""
     return _LANE_BY_SM[_check_fmt(fmt)].get(sm, False)
 
 
+def _device_capability() -> Tuple[int, int]:
+    """This process's compute capability (``OASR_CUDA_ARCH_LIST`` wins, as for the build)."""
+    from .core import _get_cuda_arch
+
+    major, minor = _get_cuda_arch()
+    return int(major), int(minor)
+
+
+def native_lane_available(sm: int, fmt: str = "int8") -> bool:
+    """Whether *sm*'s native *fmt* lane exists and runs on this device.
+
+    A family without one (everything but 90 and 100) says no, and so does any
+    family this device is not (nothing native runs here, so the default stays
+    ``mma.sync``); so does int8 on an sm100-family device other than compute
+    capability 10.0 (:data:`_NATIVE_CAPABILITIES`).
+    """
+    from .core import sm_family
+
+    key = (int(sm), _check_fmt(fmt))
+    if key not in NATIVE_LANE_ID:
+        return False
+    cap = _device_capability()
+    if sm_family(*cap) != key[0]:
+        return False
+    caps = _NATIVE_CAPABILITIES.get(key)
+    return caps is None or cap in caps
+
+
+def default_lane(sm: int | None = None, fmt: str = "int8") -> str:
+    """The lane an unqualified call runs on *sm*: the native one where it runs, else ``mma.sync``."""
+    sm = _get_target_sm() if sm is None else int(sm)
+    if native_lane_available(sm, fmt):
+        return NATIVE_LANE_ID[(sm, fmt)]
+    return LANE_ID[_check_fmt(fmt)]
+
+
+def is_native_lane_id(lane: str) -> bool:
+    """Whether *lane* names a native (CUTLASS 3.x) lane."""
+    return lane in _NATIVE_LANE_KEY
+
+
+def lane_format(lane: str) -> str:
+    """The operand format a lane id serves."""
+    if lane in _NATIVE_LANE_KEY:
+        return _NATIVE_LANE_KEY[lane][1]
+    for fmt, mma_lane in LANE_ID.items():
+        if lane == mma_lane:
+            return fmt
+    raise ValueError(f"unknown scaled_mm lane {lane!r}")
+
+
+def _resolve_lane(sm: int, fmt: str, lane: Optional[str]) -> str:
+    """*lane*, or *sm*'s default, after checking it serves *fmt* on *sm*'s family.
+
+    Naming a lane does not consult the device (a config space is a function of
+    the family alone -- what rendering and the tests need); only the *default*
+    asks whether the native lane runs here.
+    """
+    if lane is None:
+        return default_lane(sm, fmt)
+    if lane_format(lane) != fmt:
+        raise ValueError(f"lane {lane!r} serves {lane_format(lane)}, not {fmt}")
+    if lane in _NATIVE_LANE_KEY and _NATIVE_LANE_KEY[lane][0] != sm:
+        raise ValueError(f"lane {lane!r} is sm{_NATIVE_LANE_KEY[lane][0]}'s, not sm{sm}'s")
+    return lane
+
+
+def quant_n_alignment(lane: str) -> int:
+    """N alignment the fused quantizing launch of *lane* needs (the functional unfuses below it)."""
+    return NATIVE_QUANT_N_ALIGNMENT if is_native_lane_id(lane) else N_ALIGNMENT
+
+
 @functools.lru_cache(maxsize=None)
-def _production_configs(sm: int, fmt: str) -> Tuple[ScaledMmConfig, ...]:
+def _production_configs(sm: int, fmt: str, lane: str) -> Tuple[AnyScaledMmConfig, ...]:
+    if is_native_lane_id(lane):
+        native = tuple(
+            NativeScaledMmConfig(sm, bm, bn, cm, cn, schedule, fp8=fmt == "fp8")
+            for bm, bn, cm, cn, schedule in _NATIVE_TILES[sm]
+        )
+        return tuple(cfg for cfg in native if _native_buildable(cfg))
     space = _FP8_PRODUCTION if fmt == "fp8" else _PRODUCTION + _STREAMK_PRODUCTION
     return tuple(cfg for cfg in space if _buildable(cfg, sm))
 
 
-def get_production_configs(sm: int | None = None, fmt: str = "int8") -> Dict[str, ScaledMmConfig]:
-    """``{compile_name: config}`` for every *fmt* production variant buildable on *sm*."""
-    sm = _get_target_sm() if sm is None else sm
-    return {cfg.compile_name: cfg for cfg in _production_configs(sm, _check_fmt(fmt))}
+def get_production_configs(
+    sm: int | None = None, fmt: str = "int8", lane: Optional[str] = None
+) -> Dict[str, AnyScaledMmConfig]:
+    """``{compile_name: config}`` for every *fmt* production variant of *lane* on *sm*.
+
+    *lane* defaults to :func:`default_lane` -- the native lane on a Hopper or
+    Blackwell data-center device, the ``mma.sync`` lane elsewhere.
+    """
+    sm = _get_target_sm() if sm is None else int(sm)
+    fmt = _check_fmt(fmt)
+    lane = _resolve_lane(sm, fmt, lane)
+    return {cfg.compile_name: cfg for cfg in _production_configs(sm, fmt, lane)}
 
 
 @functools.lru_cache(maxsize=None)
@@ -262,12 +527,12 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _ctas(m: int, n: int, cfg: ScaledMmConfig) -> int:
+def _ctas(m: int, n: int, cfg: AnyScaledMmConfig) -> int:
     return -(-m // cfg.block_m) * -(-n // cfg.block_n)
 
 
 def _select_int8(
-    m: int, n: int, k: int, num_sms: int, built: Dict[str, ScaledMmConfig]
+    m: int, n: int, k: int, num_sms: int, built: Dict[str, AnyScaledMmConfig]
 ) -> ScaledMmConfig:
     for rung in _INT8_LADDER:
         if k < rung.min_k or (rung.max_k is not None and k >= rung.max_k):
@@ -283,9 +548,34 @@ def _select_int8(
     return _T16
 
 
+def _select_native(
+    m: int, n: int, num_sms: int, built: Dict[str, AnyScaledMmConfig]
+) -> AnyScaledMmConfig:
+    """The native lanes' shape heuristic -- a starting point, **not fitted** to measurements.
+
+    The largest tile (by area, then height) that is not mostly padding rows -- a
+    tile above 64 rows at least twice as tall as M is skipped -- and that still
+    launches half a wave (the fp8 ``mma.sync`` rule; a 2-SM tile occupies two
+    SMs); else the smallest.  A measured tuning entry overrides it per shape; the
+    int8 ``mma.sync`` ladder above is the model of what a fitted rule looks like.
+    """
+    by_size = sorted(built.values(), key=lambda c: (c.block_m * c.block_n, c.block_m), reverse=True)
+    for cfg in by_size:
+        if cfg.block_m > 64 and 2 * m <= cfg.block_m:
+            continue
+        if 2 * _ctas(m, n, cfg) * cfg.sms_per_tile >= num_sms:
+            return cfg
+    return by_size[-1]
+
+
 @functools.lru_cache(maxsize=4096)
-def _select(m: int, n: int, k: int, sm: int, num_sms: int, fmt: str = "int8") -> ScaledMmConfig:
-    built = get_production_configs(sm, fmt)
+def _select(
+    m: int, n: int, k: int, sm: int, num_sms: int, fmt: str = "int8", lane: Optional[str] = None
+) -> AnyScaledMmConfig:
+    lane = _resolve_lane(sm, fmt, lane)
+    built = get_production_configs(sm, fmt, lane)
+    if is_native_lane_id(lane):
+        return _select_native(m, n, num_sms, built)
     if fmt == "int8":
         return _select_int8(m, n, k, num_sms, built)
     # fp8: the largest data-parallel tile that still launches half a wave of CTAs.
@@ -325,11 +615,13 @@ def heuristic_config(
     sm: int | None = None,
     num_sms: int | None = None,
     fmt: str = "int8",
-) -> ScaledMmConfig:
+    lane: Optional[str] = None,
+) -> AnyScaledMmConfig:
     """The shape heuristic's pick, ignoring the tuning DB (what a build measures against)."""
     sm = _process_sm() if sm is None else int(sm)
     num_sms = _process_num_sms() if num_sms is None else int(num_sms)
-    return _select(int(m), int(n), int(k), sm, num_sms, _check_fmt(fmt))
+    fmt = _check_fmt(fmt)
+    return _select(int(m), int(n), int(k), sm, num_sms, fmt, _resolve_lane(sm, fmt, lane))
 
 
 def select_config(
@@ -339,8 +631,9 @@ def select_config(
     sm: int | None = None,
     num_sms: int | None = None,
     fmt: str = "int8",
-) -> ScaledMmConfig:
-    """The *fmt* production variant for a ``[m, k] @ [n, k]ᵀ`` problem.
+    lane: Optional[str] = None,
+) -> AnyScaledMmConfig:
+    """The *fmt* production variant of *lane* for a ``[m, k] @ [n, k]ᵀ`` problem.
 
     A measured tuning entry first (``scaled_mm|op=scaled_mm|N=..|K=..``, user tier
     then system tier, M rounded *up* to a region; see :func:`covering_tier`), else
@@ -348,7 +641,9 @@ def select_config(
     a measured entry can name.  For int8 that is :data:`_INT8_LADDER` (the largest
     tile that fills enough of the GPU for its K, within 1 % of the best of 25
     tiles on five architectures' shapes); for fp8 the largest data-parallel tile
-    that still launches at least half a wave of CTAs, else the smallest.
+    that still launches at least half a wave of CTAs, else the smallest; for a
+    native lane :func:`_select_native`.  *lane* defaults to :func:`default_lane`;
+    an entry naming another lane's config is warned about once and skipped.
 
     A function of shape, device and the tuning-DB snapshot alone — never of
     capture state (AGENTS.md rule 11) — so an eager call and a graph replay of a
@@ -356,10 +651,10 @@ def select_config(
     one dict lookup.
     """
     op = FORMAT_OPS[fmt][0]
-    key = (_epoch(), op, m, n, k, sm, num_sms)
+    key = (_epoch(), op, m, n, k, sm, num_sms, lane)
     cfg = _MEMO.get(key)
     if cfg is None:
-        cfg = _memoise(key, op, m, n, k, sm, num_sms)
+        cfg = _memoise(key, op, m, n, k, sm, num_sms, lane)
     return cfg
 
 
@@ -370,7 +665,8 @@ def select_quant_config(
     sm: int | None = None,
     num_sms: int | None = None,
     fmt: str = "int8",
-) -> ScaledMmConfig:
+    lane: Optional[str] = None,
+) -> AnyScaledMmConfig:
     """The variant for a quantizing (8-bit-output) launch: data-parallel only.
 
     The producer of a GEMM chain (the FFN's ``w_1``) has a short K and a wide N,
@@ -380,29 +676,31 @@ def select_quant_config(
     signature key (the quantizing epilogue is measured separately).
     """
     op = FORMAT_OPS[fmt][1]
-    key = (_epoch(), op, m, n, k, sm, num_sms)
+    key = (_epoch(), op, m, n, k, sm, num_sms, lane)
     cfg = _MEMO.get(key)
     if cfg is None:
-        cfg = _memoise(key, op, m, n, k, sm, num_sms)
+        cfg = _memoise(key, op, m, n, k, sm, num_sms, lane)
     return cfg
 
 
-def scaled_mm_func_name(cfg: ScaledMmConfig) -> str:
+def scaled_mm_func_name(cfg: AnyScaledMmConfig) -> str:
     """The TVM-FFI export name of a variant's fp16/bf16-output launcher."""
     return f"scaled_mm_{cfg.compile_name}"
 
 
-def scaled_mm_quant_func_name(cfg: ScaledMmConfig) -> str:
+def scaled_mm_quant_func_name(cfg: AnyScaledMmConfig) -> str:
     """The TVM-FFI export name of a data-parallel variant's 8-bit-output launcher."""
     if cfg.stream_k:
         raise ValueError(f"{cfg.compile_name}: Stream-K variants have no quantizing launcher")
     return f"scaled_mm_q8_{cfg.compile_name}"
 
 
-#: The MMA lane a tuning file of each format is measured on.
+#: The CUTLASS 2.x ``mma.sync`` lane of each format.  A tuning file records the
+#: lane it was measured on (:func:`default_lane` when built); its entries name
+#: configs of that lane, which another lane skips.
 LANE_ID = {"int8": "sm80_int8_mma", "fp8": "sm89_fp8_mma"}
 
-#: The int8 lane's id (the ``scaled_mm`` family's files).
+#: The int8 ``mma.sync`` lane's id.
 SCALED_MM_LANE = LANE_ID["int8"]
 
 #: The tuning-DB family a format's measured selections live in: one file per
@@ -437,13 +735,21 @@ def is_quant_op(op: str) -> bool:
     return FORMAT_OPS[op_format(op)][1] == op
 
 
-def config_id(cfg: ScaledMmConfig) -> str:
+def config_id(cfg: AnyScaledMmConfig) -> str:
     """The id a tuning file stores a config under (its compile name)."""
     return cfg.compile_name
 
 
-def config_to_params(cfg: ScaledMmConfig) -> Dict[str, object]:
+def config_to_params(cfg: AnyScaledMmConfig) -> Dict[str, object]:
     """A config as the explicit parameter dict a tuning file stores."""
+    if isinstance(cfg, NativeScaledMmConfig):
+        return {
+            "kind": "cutlass",
+            "lane": cfg.lane,
+            "tile": [cfg.block_m, cfg.block_n, cfg.block_k],
+            "cluster": [cfg.cluster_m, cfg.cluster_n],
+            "schedule": cfg.schedule,
+        }
     return {
         "kind": "cutlass",
         "lane": LANE_ID[cfg.fmt],
@@ -454,11 +760,27 @@ def config_to_params(cfg: ScaledMmConfig) -> Dict[str, object]:
     }
 
 
-def config_from_params(params: Dict[str, object]) -> ScaledMmConfig:
+def config_from_params(params: Dict[str, object]) -> AnyScaledMmConfig:
     """Inverse of :func:`config_to_params`."""
     lanes = {lane: fmt for fmt, lane in LANE_ID.items()}
-    if params.get("kind") != "cutlass" or params.get("lane") not in lanes:
-        raise ValueError(f"not a scaled_mm config ({sorted(lanes)}): {params}")
+    lane = params.get("lane")
+    if params.get("kind") == "cutlass" and lane in _NATIVE_LANE_KEY:
+        sm, fmt = _NATIVE_LANE_KEY[str(lane)]
+        tile = [int(v) for v in params["tile"]]  # type: ignore[attr-defined]
+        cluster = [int(v) for v in params["cluster"]]  # type: ignore[attr-defined]
+        return NativeScaledMmConfig(
+            sm=sm,
+            block_m=tile[0],
+            block_n=tile[1],
+            block_k=tile[2],
+            cluster_m=cluster[0],
+            cluster_n=cluster[1],
+            schedule=str(params["schedule"]),
+            fp8=fmt == "fp8",
+        )
+    if params.get("kind") != "cutlass" or lane not in lanes:
+        known = sorted(lanes) + sorted(_NATIVE_LANE_KEY)
+        raise ValueError(f"not a scaled_mm config ({known}): {params}")
     tile = [int(v) for v in params["tile"]]  # type: ignore[attr-defined]
     warp = [int(v) for v in params["warp"]]  # type: ignore[attr-defined]
     return ScaledMmConfig(
@@ -530,7 +852,10 @@ def scaled_mm_impl_hash() -> str:
     """
     from oasr.tune.database import hash_paths
 
-    paths = [env.OASR_TEMPLATE_DIR / "scaled_mm_cutlass_template.cu.jinja"]
+    paths = [
+        env.OASR_TEMPLATE_DIR / "scaled_mm_cutlass_template.cu.jinja",
+        env.OASR_TEMPLATE_DIR / "scaled_mm_cutlass_template_sm90.cu.jinja",
+    ]
     paths += sorted((env.OASR_INCLUDE_DIR / "oasr" / "scaled_mm").glob("*.h"))
     return hash_paths(paths)
 
@@ -547,8 +872,8 @@ _TIER_VIEWS: Dict[
     Tuple[int, int, str], List[Tuple[str, Dict[Tuple[str, int, int], List[_Rule]]]]
 ] = {}
 
-#: ``(epoch, op, m, n, k, sm arg, num_sms arg) -> config``: the per-call path.
-_MEMO: Dict[tuple, ScaledMmConfig] = {}
+#: ``(epoch, op, m, n, k, sm arg, num_sms arg, lane arg) -> config``: the per-call path.
+_MEMO: Dict[tuple, AnyScaledMmConfig] = {}
 
 #: A long-form or varlen workload has many distinct M; rebuilding one entry is
 #: microseconds, so dropping the whole table on overflow beats tracking recency.
@@ -622,17 +947,20 @@ def _region(rules: List[_Rule], m: int) -> Optional[_Rule]:
     return None
 
 
-def _unusable_reason(op: str, choice, sm: int) -> Optional[str]:
-    """Why *choice* cannot be dispatched for *op* on *sm* (``None``: it can)."""
+def _unusable_reason(op: str, choice, sm: int, lane: Optional[str] = None) -> Optional[str]:
+    """Why *choice* cannot be dispatched for *op* on *sm*'s *lane* (``None``: it can)."""
     if choice == HEURISTIC_ID:
         return None
-    if not isinstance(choice, ScaledMmConfig):
+    if not isinstance(choice, (ScaledMmConfig, NativeScaledMmConfig)):
         return "cannot be decoded as a scaled_mm config"
     fmt = op_format(op)
     if choice.fmt != fmt:
         return f"is a {choice.fmt} config, not {fmt}"
-    if get_production_configs(sm, fmt).get(choice.compile_name) != choice:
-        return f"is not in sm{sm}'s {fmt} production set"
+    lane = _resolve_lane(sm, fmt, lane)
+    if choice.lane != lane:
+        return f"belongs to lane {choice.lane}, not {lane}"
+    if get_production_configs(sm, fmt, lane).get(choice.compile_name) != choice:
+        return f"is not in sm{sm}'s {lane} production set"
     if is_quant_op(op) and choice.stream_k:
         return "is Stream-K, which the quantizing launcher does not build"
     return None
@@ -660,8 +988,8 @@ def _note_unusable(tier: str, op: str, n: int, k: int, cid: str, reason: str, sm
     )
 
 
-def _lookup(op: str, m: int, n: int, k: int, sm: int):
-    """``(tier, choice)`` of the first tier whose entry serves this shape, or ``None``."""
+def _lookup(op: str, m: int, n: int, k: int, sm: int, lane: Optional[str] = None):
+    """``(tier, choice)`` of the first tier whose entry serves this shape on *lane*, or ``None``."""
     for tier, table in _tier_views(sm, op_family(op)):
         rules = table.get((op, n, k))
         if not rules:
@@ -670,39 +998,44 @@ def _lookup(op: str, m: int, n: int, k: int, sm: int):
         if rule is None:  # above every bounded region: never measured there
             continue
         _, cid, choice = rule
-        reason = _unusable_reason(op, choice, sm)
+        reason = _unusable_reason(op, choice, sm, lane)
         if reason is None:
             return tier, choice
         _note_unusable(tier, op, n, k, cid, reason, sm)
     return None
 
 
-def _resolve(op: str, m: int, n: int, k: int, sm: int, num_sms: int) -> ScaledMmConfig:
+def _resolve(
+    op: str, m: int, n: int, k: int, sm: int, num_sms: int, lane: str
+) -> AnyScaledMmConfig:
     from oasr.tune.database import record_tier
 
     fmt, family = op_format(op), op_family(op)
-    hit = _lookup(op, m, n, k, sm)
+    hit = _lookup(op, m, n, k, sm, lane)
     if hit is not None:
         tier, choice = hit
         record_tier(family, op, tier)
-        if isinstance(choice, ScaledMmConfig):
+        if isinstance(choice, (ScaledMmConfig, NativeScaledMmConfig)):
             return choice
-        return _select(m, n, k, sm, num_sms, fmt)  # the heuristic sentinel
+        return _select(m, n, k, sm, num_sms, fmt, lane)  # the heuristic sentinel
     record_tier(family, op, "heuristic")
-    return _select(m, n, k, sm, num_sms, fmt)
+    return _select(m, n, k, sm, num_sms, fmt, lane)
 
 
-def _memoise(key: tuple, op: str, m, n, k, sm, num_sms) -> ScaledMmConfig:
+def _memoise(key: tuple, op: str, m, n, k, sm, num_sms, lane) -> AnyScaledMmConfig:
     sm_ = _process_sm() if sm is None else int(sm)
     num_sms_ = _process_num_sms() if num_sms is None else int(num_sms)
-    cfg = _resolve(op, int(m), int(n), int(k), sm_, num_sms_)
+    lane_ = _resolve_lane(sm_, op_format(op), lane)
+    cfg = _resolve(op, int(m), int(n), int(k), sm_, num_sms_, lane_)
     if len(_MEMO) >= _MEMO_MAX:
         _MEMO.clear()
     _MEMO[key] = cfg  # keyed by the epoch read *before* resolving: a racing reload strands it
     return cfg
 
 
-def covering_tier(op: str, M: int, N: int, K: int, sm: int | None = None) -> Optional[str]:
+def covering_tier(
+    op: str, M: int, N: int, K: int, sm: int | None = None, lane: Optional[str] = None
+) -> Optional[str]:
     """The tuning tier (``"user"`` / ``"system"``) that serves this shape, or ``None``.
 
     Covered means an entry exists for ``(op, N, K)``, one of its regions contains
@@ -713,11 +1046,13 @@ def covering_tier(op: str, M: int, N: int, K: int, sm: int | None = None) -> Opt
     if op not in SCALED_MM_OPS:
         return None
     sm = _process_sm() if sm is None else int(sm)
-    hit = _lookup(op, int(M), int(N), int(K), sm)
+    hit = _lookup(op, int(M), int(N), int(K), sm, lane)
     return None if hit is None else hit[0]
 
 
-def signature_tier(op: str, N: int, K: int, sm: int | None = None) -> Optional[str]:
+def signature_tier(
+    op: str, N: int, K: int, sm: int | None = None, lane: Optional[str] = None
+) -> Optional[str]:
     """The highest tier with a servable entry for ``(op, N, K)`` at *some* M, or ``None``.
 
     What a per-layer report asks: a layer has a signature but no single M.
@@ -727,7 +1062,7 @@ def signature_tier(op: str, N: int, K: int, sm: int | None = None) -> Optional[s
     sm = _process_sm() if sm is None else int(sm)
     for tier, table in _tier_views(sm, op_family(op)):
         rules = table.get((op, int(N), int(K)))
-        if rules and any(_unusable_reason(op, choice, sm) is None for _, _, choice in rules):
+        if rules and any(_unusable_reason(op, choice, sm, lane) is None for _, _, choice in rules):
             return tier
     return None
 
@@ -750,13 +1085,16 @@ def _register_with_tuning_db() -> Callable[[], int]:
 _epoch: Callable[[], int] = _register_with_tuning_db()
 
 
-def _render_variants(configs: Dict[str, ScaledMmConfig]) -> List:
+def _render_variants(configs: Dict[str, AnyScaledMmConfig]) -> List:
     from .cubin_loader import write_if_different
     from .templates import render_template
 
     sm = _get_target_sm()
     paths = []
     for name, cfg in configs.items():
+        if isinstance(cfg, NativeScaledMmConfig):
+            paths.append(_render_native_variant(cfg))
+            continue
         variant = f"scaled_mm_sm{sm}_{name}"
         rendered = render_template(
             "scaled_mm_cutlass_template.cu.jinja",
@@ -781,15 +1119,63 @@ def _render_variants(configs: Dict[str, ScaledMmConfig]) -> List:
     return paths
 
 
-#: The JIT module of each format.
+def _render_native_variant(cfg: NativeScaledMmConfig):
+    from .cubin_loader import write_if_different
+    from .templates import render_template
+
+    variant = f"scaled_mm_{cfg.compile_name}"
+    rendered = render_template(
+        "scaled_mm_cutlass_template_sm90.cu.jinja",
+        op_name=variant,
+        fp8=cfg.fp8,
+        func_name=scaled_mm_func_name(cfg),
+        quant_func_name=scaled_mm_quant_func_name(cfg),
+        tile_m=cfg.block_m,
+        tile_n=cfg.block_n,
+        tile_k=cfg.block_k,
+        cluster_m=cfg.cluster_m,
+        cluster_n=cfg.cluster_n,
+        schedule=cfg.cpp_schedule,
+        sm_version=cfg.sm,
+    )
+    path = env.OASR_GEN_SRC_DIR / "scaled_mm_native" / f"{variant}.cu"
+    write_if_different(path, rendered)
+    return path
+
+
+#: The JIT module of each format's ``mma.sync`` lane.
 MODULE_NAME = {"int8": "scaled_mm", "fp8": "scaled_mm_fp8"}
 
+#: The JIT module of each native lane.
+NATIVE_MODULE_NAME = {
+    "sm90_int8_wgmma": "scaled_mm_sm90",
+    "sm90_fp8_wgmma": "scaled_mm_fp8_sm90",
+    "sm100_int8_umma": "scaled_mm_sm100",
+    "sm100_fp8_umma": "scaled_mm_fp8_sm100",
+}
 
-def gen_scaled_mm_module(fmt: str = "int8") -> JitSpec:
-    """JIT spec for every production *fmt* scaled-GEMM variant, one TU each."""
-    return gen_jit_spec(
-        MODULE_NAME[_check_fmt(fmt)], _render_variants(get_production_configs(fmt=fmt))
-    )
+
+def module_name(fmt: str = "int8", lane: Optional[str] = None) -> str:
+    """The JIT module that holds *lane*'s *fmt* variants (default: this device's lane)."""
+    lane = _resolve_lane(_get_target_sm(), _check_fmt(fmt), lane)
+    return NATIVE_MODULE_NAME[lane] if is_native_lane_id(lane) else MODULE_NAME[fmt]
+
+
+def gen_scaled_mm_module(fmt: str = "int8", lane: Optional[str] = None) -> JitSpec:
+    """JIT spec for every production *fmt* scaled-GEMM variant of *lane*, one TU each.
+
+    *lane* defaults to :func:`default_lane`.  A native module is its own JIT
+    module, so its variants and the ``mma.sync`` ones never share a library
+    (CUTLASS's one-time statics are GNU-unique across ``.so`` files).  int8 on
+    sm100 is built for ``sm_100a`` rather than the family target
+    (:data:`_NATIVE_GENCODE`).
+    """
+    sm = _get_target_sm()
+    fmt = _check_fmt(fmt)
+    lane = _resolve_lane(sm, fmt, lane)
+    sources = _render_variants(get_production_configs(sm, fmt, lane))
+    gencode = _NATIVE_GENCODE.get(_NATIVE_LANE_KEY[lane]) if is_native_lane_id(lane) else None
+    return gen_jit_spec(module_name(fmt, lane), sources, gencode_target=gencode)
 
 
 def gen_scaled_mm_fp8_modules() -> List[JitSpec]:

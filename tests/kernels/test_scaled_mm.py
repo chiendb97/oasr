@@ -39,6 +39,7 @@ from oasr.functionals.scaled_mm import (
 from oasr.jit.gemm import _epilogue_covers_warp
 from oasr.jit.scaled_mm import (
     _EPILOGUE_ELEMENT_BITS,
+    LANE_ID,
     get_production_configs,
     lane_available,
     scaled_mm_func_name,
@@ -88,8 +89,11 @@ class TestEveryCompiledVariantIsCorrect:
             )
 
     def test_every_variant_covers_a_warp(self):
-        """The thin-N epilogue trap is a config-space property, checked statically."""
-        for cfg in get_production_configs().values():
+        """The thin-N epilogue trap is a config-space property, checked statically.
+
+        A property of the ``mma.sync`` lane's warp tiles (a native lane has none).
+        """
+        for cfg in get_production_configs(lane=LANE_ID["int8"]).values():
             assert _epilogue_covers_warp(cfg.tile, element_bits=_EPILOGUE_ELEMENT_BITS), cfg
 
 
@@ -234,8 +238,11 @@ class TestFp8:
             _assert_fp8_close(out, reference_scaled_mm(a, b, a_scale, b_scale, bias, act, dtype))
 
     def test_config_space_never_splits_k(self):
-        """The summation order is a property of the config space: no sliced K, no split."""
-        cfgs = get_production_configs(fmt="fp8").values()
+        """The summation order is a property of the config space: no sliced K, no split.
+
+        The ``mma.sync`` lane's rule (the native lanes': ``test_scaled_mm_native.py``).
+        """
+        cfgs = get_production_configs(fmt="fp8", lane=LANE_ID["fp8"]).values()
         assert cfgs
         for cfg in cfgs:
             assert cfg.fp8 and cfg.block_k == cfg.warp_k and not cfg.stream_k, cfg

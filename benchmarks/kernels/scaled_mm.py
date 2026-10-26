@@ -26,7 +26,13 @@ int8 ones first:
 Arms:
 
 ``cutlass``
-    ``oasr.scaled_mm`` (the CUTLASS int8 lane, dequant fused in the epilogue).
+    ``oasr.scaled_mm`` on the device's default lane, dequant fused in the
+    epilogue: the native CUTLASS 3.x kernel on Hopper / Blackwell data-center
+    parts, the CUTLASS 2.x ``mma.sync`` one elsewhere.
+``mma_sync``
+    The same call on the CUTLASS 2.x ``mma.sync`` lane, present only where the
+    default lane is native: what the native kernel buys, interleaved in one run
+    (``OASR_SCALED_MM_BACKEND=mma_sync`` is the end-to-end form).
 ``torch``
     ``TorchIntMMLane`` -- ``torch._int_mm`` plus a torch epilogue, the A/B lane
     ``OASR_SCALED_MM_BACKEND=torch`` serves.  In ``quant_scaled_mm`` it is fed
@@ -105,6 +111,23 @@ TOLERANCES = {
 _SERVED = (torch.float16, torch.bfloat16)
 
 ACTIVATIONS = ("none", "relu", "swish", "gelu", "gelu_tanh")
+
+
+def _mma_sync_lane(fmt: str) -> Optional[str]:
+    """The ``mma.sync`` lane id when this device's default *fmt* lane is another one, else ``None``."""
+    from oasr.jit.scaled_mm import LANE_ID, default_lane
+
+    return LANE_ID[fmt] if default_lane(fmt=fmt) != LANE_ID[fmt] else None
+
+
+def _with_mma_sync(
+    fns: Dict[str, Callable[[], Any]], fmt: str, arm: Callable[[str], Callable[[], Any]]
+) -> Dict[str, Callable[[], Any]]:
+    """*fns* plus the ``mma_sync`` arm (``arm(lane)``) where the default lane is native."""
+    lane = _mma_sync_lane(fmt)
+    if lane is not None:
+        fns["mma_sync"] = arm(lane)
+    return fns
 
 
 def _cfg(M: int, N: int, K: int, activation: str = "none", bias: bool = True) -> Dict[str, Any]:
@@ -208,16 +231,22 @@ def build_fns(
 
     if subroutine == "scaled_mm":
         a_q, a_scale = oasr.quantize_per_token(x)
-        return {
-            "cutlass": lambda: oasr.scaled_mm(
-                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out
+        return _with_mma_sync(
+            {
+                "cutlass": lambda: oasr.scaled_mm(
+                    a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out
+                ),
+                "torch": lambda: lane.run(a_q, w_q, a_scale, w_scale, bias, act, dtype),
+                "fp16": fp16,
+                "reference": lambda: reference_scaled_mm(
+                    a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype
+                ),
+            },
+            "int8",
+            lambda mma: lambda: oasr.scaled_mm(
+                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out, lane=mma
             ),
-            "torch": lambda: lane.run(a_q, w_q, a_scale, w_scale, bias, act, dtype),
-            "fp16": fp16,
-            "reference": lambda: reference_scaled_mm(
-                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype
-            ),
-        }
+        )
 
     q_buf = torch.empty(M, K, device="cuda", dtype=torch.int8)
     s_buf = torch.empty(M, device="cuda", dtype=torch.float32)
@@ -234,7 +263,18 @@ def build_fns(
         q, s = reference_quantize_per_token(x)
         return reference_scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype)
 
-    return {"cutlass": cutlass, "torch": torch_lane, "fp16": fp16, "reference": reference}
+    def mma_sync(mma: str) -> Callable[[], Any]:
+        def run() -> torch.Tensor:
+            q, s = oasr.quantize_per_token(x, out=q_buf, scale=s_buf)
+            return oasr.scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype, out=out, lane=mma)
+
+        return run
+
+    return _with_mma_sync(
+        {"cutlass": cutlass, "torch": torch_lane, "fp16": fp16, "reference": reference},
+        "int8",
+        mma_sync,
+    )
 
 
 def _fp8_fns(
@@ -257,16 +297,22 @@ def _fp8_fns(
     lane = TorchScaledMMLane()
     if subroutine == "scaled_mm_fp8":
         a_q, a_scale = oasr.quantize_per_token(x, dtype=fp8)
-        return {
-            "cutlass": lambda: oasr.scaled_mm(
-                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out
+        return _with_mma_sync(
+            {
+                "cutlass": lambda: oasr.scaled_mm(
+                    a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out
+                ),
+                "torch": lambda: lane.run(a_q, w_q, a_scale, w_scale, bias, act, dtype),
+                "fp16": fp16,
+                "reference": lambda: reference_scaled_mm(
+                    a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype
+                ),
+            },
+            "fp8",
+            lambda mma: lambda: oasr.scaled_mm(
+                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype, out=out, lane=mma
             ),
-            "torch": lambda: lane.run(a_q, w_q, a_scale, w_scale, bias, act, dtype),
-            "fp16": fp16,
-            "reference": lambda: reference_scaled_mm(
-                a_q, w_q, a_scale, w_scale, bias, act, out_dtype=dtype
-            ),
-        }
+        )
 
     M, K = x.shape
     q_buf = torch.empty(M, K, device="cuda", dtype=fp8)
@@ -284,7 +330,18 @@ def _fp8_fns(
         q, s = reference_quantize_per_token(x, dtype=fp8)
         return reference_scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype)
 
-    return {"cutlass": cutlass, "torch": torch_lane, "fp16": fp16, "reference": reference}
+    def mma_sync(mma: str) -> Callable[[], Any]:
+        def run() -> torch.Tensor:
+            q, s = oasr.quantize_per_token(x, out=q_buf, scale=s_buf)
+            return oasr.scaled_mm(q, w_q, s, w_scale, bias, act, out_dtype=dtype, out=out, lane=mma)
+
+        return run
+
+    return _with_mma_sync(
+        {"cutlass": cutlass, "torch": torch_lane, "fp16": fp16, "reference": reference},
+        "fp8",
+        mma_sync,
+    )
 
 
 def _ffn_chain_fns(cfg: Dict[str, Any], dtype: torch.dtype) -> Dict[str, Callable[[], Any]]:
@@ -335,7 +392,21 @@ def _ffn_chain_fns(cfg: Dict[str, Any], dtype: torch.dtype) -> Dict[str, Callabl
         yq = reference_scaled_mm_quant(q0, w1_q, s0, w1_s, b1, act, mul, dtype)
         return reference_scaled_mm(yq, w2_q, in_scale, w2_s, b2, None, out_dtype=dtype)
 
-    return {"cutlass": fused, "dynamic": dynamic, "fp16": fp16, "reference": reference}
+    def mma_sync(mma: str) -> Callable[[], Any]:
+        def run() -> torch.Tensor:
+            q, sc = oasr.quantize_per_token(x, out=q_buf, scale=s_buf)
+            oasr.scaled_mm_quant(q, w1_q, sc, w1_s, b1, act, mul, dtype, out=y_q, lane=mma)
+            return oasr.scaled_mm(
+                y_q, w2_q, in_scale, w2_s, b2, None, out_dtype=dtype, out=out, lane=mma
+            )
+
+        return run
+
+    return _with_mma_sync(
+        {"cutlass": fused, "dynamic": dynamic, "fp16": fp16, "reference": reference},
+        "int8",
+        mma_sync,
+    )
 
 
 def describe(subroutine: str, cfg: Dict[str, Any], dtype: torch.dtype) -> Work:

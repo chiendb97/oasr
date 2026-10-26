@@ -208,7 +208,8 @@ class TestInt8Heuristic:
 
     @pytest.mark.parametrize("sm", sorted(jsm.SCALED_MM_LANE_BY_SM))
     def test_every_rung_is_built_wherever_the_lane_runs(self, sm):
-        built = jsm.get_production_configs(sm)
+        # The mma.sync lane's ladder, named: on sm90 / sm100 the default is native.
+        built = jsm.get_production_configs(sm, lane=jsm.LANE_ID["int8"])
         for rung in jsm._INT8_LADDER:
             for cfg in (rung.tile, rung.sparse):
                 if cfg is not None:
@@ -490,7 +491,7 @@ def _fp8_file(root, op, n, k, regions, sm=SM):
         )
         for _, cid in regions
     }
-    tf = db.new_file("scaled_mm_fp8", sm, jsm.LANE_ID["fp8"])
+    tf = db.new_file("scaled_mm_fp8", sm, jsm.default_lane(sm, "fp8"))
     tf.configs.update(configs)
     tf.entries[jsm.scaled_mm_sig_key(op, n, k)] = db.Entry(regions=regions)
     db.save_file(tf, root / f"sm{sm}" / "scaled_mm_fp8.json")
@@ -509,7 +510,7 @@ def _fp8_capable() -> bool:
 class TestFp8Family:
     @pytest.mark.parametrize("sm", sorted(jsm.SCALED_MM_FP8_LANE_BY_SM))
     def test_every_fp8_config_round_trips(self, sm):
-        cfgs = jsm.get_production_configs(sm, "fp8")
+        cfgs = jsm.get_production_configs(sm, "fp8", jsm.LANE_ID["fp8"])
         assert cfgs
         for cid, cfg in cfgs.items():
             params = json.loads(json.dumps(jsm.config_to_params(cfg)))

@@ -69,7 +69,7 @@ def _cover(root, op="scaled_mm", n=N, k=K, cid=jsm.HEURISTIC_ID):
     ops = [(op, n, k)] if isinstance(op, str) else op
     fmt = jsm.op_format(ops[0][0])
     family = jsm.TUNING_FAMILY[fmt]
-    tf = db.new_file(family, sm, jsm.LANE_ID[fmt])
+    tf = db.new_file(family, sm, jsm.default_lane(sm, fmt))
     for o, nn, kk in ops:
         tf.entries[jsm.scaled_mm_sig_key(o, nn, kk)] = db.Entry(regions=[(None, cid)])
     tf.configs[cid] = (

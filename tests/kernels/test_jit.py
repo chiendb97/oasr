@@ -97,6 +97,7 @@ class TestJitInfrastructure:
     def test_gen_all_modules(self):
         """Verify AOT gen_all_modules returns all expected specs."""
         from oasr.aot import gen_all_modules
+        from oasr.jit.scaled_mm import module_name
 
         specs = gen_all_modules()
         names = [s.name for s in specs]
@@ -120,7 +121,9 @@ class TestJitInfrastructure:
             "features",
             "transducer",
             "quant",
-            "scaled_mm",
+            # The int8 scaled GEMM on this device's lane: ``scaled_mm`` (mma.sync),
+            # or the native module on sm90 / sm100 (``scaled_mm_sm90``, ...).
+            module_name("int8"),
             "kv_quant",
         }
         assert expected.issubset(set(names)), f"missing modules: {expected - set(names)}"
@@ -133,7 +136,7 @@ class TestJitInfrastructure:
         per_cell = ("fmha_", "gated_mlp_", "recurrent_step_")
         # The fp8 scaled GEMM exists only where its lane does (sm89+), the int8
         # convolution only where the int8 lane does (sm80+).
-        per_arch = {"scaled_mm_fp8", "scaled_conv"}
+        per_arch = {module_name("fp8"), "scaled_conv"}
         extras = [n for n in names if n not in expected]
         unknown = [n for n in extras if not n.startswith(per_cell) and n not in per_arch]
         assert not unknown, f"unexpected AOT modules: {unknown}"
@@ -142,10 +145,10 @@ class TestJitInfrastructure:
     def test_the_fp8_scaled_gemm_is_registered_where_its_lane_serves_the_arch(self):
         from oasr.aot import gen_all_modules
         from oasr.jit.core import _get_target_sm
-        from oasr.jit.scaled_mm import lane_available
+        from oasr.jit.scaled_mm import lane_available, module_name
 
         names = {s.name for s in gen_all_modules()}
-        assert ("scaled_mm_fp8" in names) == lane_available(_get_target_sm(), "fp8")
+        assert (module_name("fp8") in names) == lane_available(_get_target_sm(), "fp8")
 
     def test_the_int8_convolution_is_registered_where_its_lane_serves_the_arch(self):
         from oasr.aot import gen_all_modules

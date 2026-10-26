@@ -157,6 +157,17 @@ names a tile, or the heuristic (an illustrative entry):
   [quantization.md](quantization.md#fp8)), so the bitwise numerics gate holds.
   The shipped `sm120/scaled_mm_fp8.json` covers the Conformer widths: at large
   M the 64x64 tile beats the heuristic's 128-wide ones on every signature.
+- **Lanes.** A *lane* is a kernel generation with its own config space and JIT
+  module: the CUTLASS 2.x `mma.sync` lanes (`sm80_int8_mma`, `sm89_fp8_mma`) and, on
+  sm90 / sm100, the native CUTLASS 3.x ones (`sm90_int8_wgmma`, `sm90_fp8_wgmma`,
+  `sm100_int8_umma`, `sm100_fp8_umma`; six tiles each, ping-pong / cooperative or
+  1-SM / 2-SM). A file records the lane it was measured on -- the device's default
+  lane, so a Hopper or Blackwell build measures the native kernels -- and its entries
+  name that lane's configs (`"lane"`, `"cluster"`, `"schedule"` for a native one).
+  Resolution is per lane: an entry naming another lane's config (the `mma.sync` A/B arm
+  reading a native file) is warned about once and skipped, and the shape heuristic
+  answers. The native lanes' heuristic is an unfitted half-wave rule until such a
+  file exists.
 - **The engine.** `TuningConfig(strict=True)` raises on an uncovered int8
   must-tune point as on a GEMM one, `mode="prewarm"` measures it into the user
   tier before capture (one `budget_s` for both families), and the tuning report

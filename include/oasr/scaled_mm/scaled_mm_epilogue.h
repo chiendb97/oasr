@@ -30,73 +30,15 @@
 
 #pragma once
 
-#include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/epilogue/threadblock/fusion/visitors.hpp>
-#include <cutlass/float8.h>
 #include <cutlass/functional.h>
 
 #include <oasr/common/types.h>
+#include <oasr/scaled_mm/scaled_mm_functors.h>
 #include <oasr/scaled_mm/scaled_mm_visitors.h>
 
 namespace oasr {
 namespace scaled_mm {
-
-// OASR ActivationType -> the CUTLASS functor the epilogue applies.  The two GELU
-// spellings stay distinct: ``GELU`` is the tanh approximation, ``GELU_ERF``
-// exact erf (AGENTS.md: a fused epilogue must not change checkpoint semantics).
-template <ActivationType act>
-struct ScaledMmActivation;
-
-template <>
-struct ScaledMmActivation<ActivationType::IDENTITY> {
-    template <class T>
-    using Fn = cutlass::epilogue::thread::Identity<T>;
-};
-
-template <>
-struct ScaledMmActivation<ActivationType::RELU> {
-    template <class T>
-    using Fn = cutlass::epilogue::thread::ReLu<T>;
-};
-
-template <>
-struct ScaledMmActivation<ActivationType::SWISH> {
-    template <class T>
-    using Fn = cutlass::epilogue::thread::SiLu<T>;
-};
-
-template <>
-struct ScaledMmActivation<ActivationType::GELU> {
-    template <class T>
-    using Fn = cutlass::epilogue::thread::GELU_taylor<T>;
-};
-
-template <>
-struct ScaledMmActivation<ActivationType::GELU_ERF> {
-    template <class T>
-    using Fn = cutlass::epilogue::thread::GELU<T>;
-};
-
-// ``clamp(rint(y * m), -127, 127)`` per element, in fp32 with an IEEE multiply
-// (``__fmul_rn``: never contracted into an FMA under --use_fast_math).  The result
-// is integral and in range, so the store's float->int8 conversion is exact.
-template <class T>
-struct MulRintClampInt8;
-
-template <int N>
-struct MulRintClampInt8<cutlass::Array<float, N>> {
-    CUTLASS_DEVICE
-    cutlass::Array<float, N> operator()(cutlass::Array<float, N> const& y,
-                                        cutlass::Array<float, N> const& mul) const {
-        cutlass::Array<float, N> q;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < N; ++i) {
-            const float r = rintf(__fmul_rn(y[i], mul[i]));
-            q[i] = fminf(fmaxf(r, -127.0f), 127.0f);
-        }
-        return q;
-    }
-};
 
 // The dequantized pre-activation shared by both trees: fma(a_scale, b_scale*acc, bias).
 template <typename OutputTileThreadMap, typename ElementBias>
@@ -155,43 +97,6 @@ struct ScaledMmEpilogue {
         typename D::Arguments d_args{out, cute::Stride<int64_t, cute::_1, cute::_0>{ldd, {}, {}}};
         return typename EVTD::Arguments{compute_args, d_args};
     }
-};
-
-// ``clamp(y * m, -448, 448)`` per element, an IEEE multiply; the e4m3 store's
-// round-to-nearest-even conversion (``cvt.rn.satfinite.e4m3x2.f32``, as
-// ``quantize.cuh`` uses) then rounds it, so the clamp only makes the saturation
-// explicit.
-template <class T>
-struct MulSatFp8;
-
-template <int N>
-struct MulSatFp8<cutlass::Array<float, N>> {
-    CUTLASS_DEVICE
-    cutlass::Array<float, N> operator()(cutlass::Array<float, N> const& y,
-                                        cutlass::Array<float, N> const& mul) const {
-        cutlass::Array<float, N> q;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < N; ++i) {
-            q[i] = fminf(fmaxf(__fmul_rn(y[i], mul[i]), -448.0f), 448.0f);
-        }
-        return q;
-    }
-};
-
-// The per-element quantize of each 8-bit output format.
-template <typename ElementQ>
-struct ScaledMmQuantize;
-
-template <>
-struct ScaledMmQuantize<int8_t> {
-    template <class T>
-    using Fn = MulRintClampInt8<T>;
-};
-
-template <>
-struct ScaledMmQuantize<cutlass::float_e4m3_t> {
-    template <class T>
-    using Fn = MulSatFp8<T>;
 };
 
 template <typename ElementT, typename OutputTileThreadMap, ActivationType act,

@@ -26,12 +26,18 @@ import sys
 import pytest
 import torch
 
+import oasr.jit.scaled_mm as jsm
 import oasr.quantization.kernels.lanes as lanes
 from oasr.jit.core import sm_family
 from oasr.layers import Conv2d, Linear
 from oasr.layers._backend import gap_hits
 from oasr.quantization import QuantizationSpec, apply_quantization, bind_quantization
-from oasr.quantization.kernels import CutlassSm80Int8Lane, TorchIntMMLane, TorchScaledMMLane
+from oasr.quantization.kernels import (
+    CutlassSm80Int8Lane,
+    CutlassSm89Fp8Lane,
+    TorchIntMMLane,
+    TorchScaledMMLane,
+)
 from oasr.quantization.kernels.lanes import CutlassSm80Int8ConvLane
 from oasr.quantization.spec import FP8_W8A8, INT8_W8A8, QuantGroup
 
@@ -138,6 +144,74 @@ class TestAutoNeverFallsBackToTorch:
         assert layer.quant_method.lane is None
         assert layer.quant_method.lane_note == "reference (declared gap scaled-mm-int8-sm75)"
         assert gap_hits()["scaled-mm-int8-sm75"] == before + 1
+
+
+class TestNativeLanes:
+    """The native CUTLASS 3.x lanes come first where they run, and only there."""
+
+    @pytest.fixture(autouse=True)
+    def _auto(self, monkeypatch):
+        monkeypatch.setattr(lanes, "_backend", lambda: "auto")
+
+    @pytest.mark.parametrize(
+        "cap, fmt, lane_cls",
+        [
+            ((9, 0), "int8", lanes.CutlassSm90Int8Lane),
+            ((9, 0), "fp8", lanes.CutlassSm90Fp8Lane),
+            ((10, 0), "int8", lanes.CutlassSm100Int8Lane),
+            ((10, 0), "fp8", lanes.CutlassSm100Fp8Lane),
+            # B300: no tcgen05 int8 (sm_100a only), so the mma.sync lane, reported as such.
+            ((10, 3), "int8", CutlassSm80Int8Lane),
+            ((10, 3), "fp8", lanes.CutlassSm100Fp8Lane),
+            ((12, 0), "int8", CutlassSm80Int8Lane),
+        ],
+    )
+    def test_auto_takes_the_native_lane_where_it_runs(self, monkeypatch, cap, fmt, lane_cls):
+        monkeypatch.setattr(jsm, "_device_capability", lambda: cap)
+        scheme = INT8_W8A8 if fmt == "int8" else FP8_W8A8
+        lane, note = lanes.choose_lane(scheme, 768, 256, torch.float16, sm_family(*cap))
+        assert type(lane) is lane_cls
+        native = lane_cls.kernel == "native" or sm_family(*cap) == 120
+        assert note == ("native" if native else f"non-native lane on sm{sm_family(*cap)}")
+
+    def test_mma_sync_names_the_2x_lanes(self, monkeypatch):
+        """The A/B arm for what a native lane buys: the mma.sync lane on Hopper."""
+        monkeypatch.setattr(lanes, "_backend", lambda: "mma_sync")
+        monkeypatch.setattr(jsm, "_device_capability", lambda: (9, 0))
+        lane, note = lanes.choose_lane(INT8_W8A8, 768, 256, torch.float16, 90)
+        assert type(lane) is CutlassSm80Int8Lane and note == "non-native lane on sm90"
+        lane, _ = lanes.choose_lane(FP8_W8A8, 768, 256, torch.float16, 90)
+        assert type(lane) is CutlassSm89Fp8Lane
+        # No torch lane, and on sm75 nothing: naming a backend requires it.
+        assert lanes.choose_lane(INT8_W8A8, 768, 256, torch.float16, 75)[0] is None
+
+    def test_cutlass_prefers_native(self, monkeypatch):
+        monkeypatch.setattr(lanes, "_backend", lambda: "cutlass")
+        monkeypatch.setattr(jsm, "_device_capability", lambda: (9, 0))
+        lane, _ = lanes.choose_lane(INT8_W8A8, 768, 256, torch.float16, 90)
+        assert type(lane) is lanes.CutlassSm90Int8Lane
+
+    def test_the_lane_ids_match_the_jit(self):
+        """The lane classes spell their ids out (no import per call); pinned here."""
+        for cls in (
+            lanes.CutlassSm90Int8Lane,
+            lanes.CutlassSm90Fp8Lane,
+            lanes.CutlassSm100Int8Lane,
+            lanes.CutlassSm100Fp8Lane,
+        ):
+            assert cls.lane == jsm.NATIVE_LANE_ID[(cls.sm, cls.fmt)]
+        assert lanes._MMA_LANE == jsm.LANE_ID
+
+
+def test_mma_sync_is_a_backend_value(monkeypatch):
+    monkeypatch.setenv("OASR_SCALED_MM_BACKEND", "mma_sync")
+    lanes._backend.cache_clear()
+    try:
+        assert lanes._backend() == "mma_sync"
+        assert lanes.forced_backend() == "mma_sync"
+    finally:
+        monkeypatch.delenv("OASR_SCALED_MM_BACKEND")
+        lanes._backend.cache_clear()
 
 
 class TestGemmOperandContract:

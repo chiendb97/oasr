@@ -37,11 +37,10 @@
 #include <oasr/common/workspace_cache.h>
 #include <oasr/scaled_mm/cutlass_scaled_mm_configs.h>
 #include <oasr/scaled_mm/scaled_mm_epilogue.h>
+#include <oasr/scaled_mm/scaled_mm_status.h>
 
 namespace oasr {
 namespace scaled_mm {
-
-enum class ScaledMmStatus { SUCCESS = 0, CANNOT_IMPLEMENT, INITIALIZE_FAILED, RUN_FAILED };
 
 // Fp32 compute fragments, four per access: the thread map every epilogue
 // visitor partitions the tile with (vLLM's sm80 W8A8 choice).

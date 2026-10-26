@@ -384,7 +384,7 @@ def build_scaled_mm(
     family = jsm.TUNING_FAMILY[fmt]
     if not jsm.lane_available(sm, fmt):
         raise ValueError(f"no {fmt} scaled_mm lane is built for sm{sm}")
-    tf = base if base is not None else database.new_file(family, sm, jsm.LANE_ID[fmt])
+    tf = base if base is not None else database.new_file(family, sm, jsm.default_lane(sm, fmt))
     tf.validators["soft"] = database.current_soft_validators(family)
     t0 = time.time()
     contended = False

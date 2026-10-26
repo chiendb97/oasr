@@ -438,12 +438,16 @@ class JinjaJitSpec(JitSpec):
 # ---------------------------------------------------------------------------
 
 
-def _default_cuda_cflags() -> List[str]:
-    """Standard OASR NVCC flags used by all kernel modules."""
+def _default_cuda_cflags(gencode_target: Optional[str] = None) -> List[str]:
+    """Standard OASR NVCC flags used by all kernel modules.
+
+    *gencode_target* replaces the capability's default target (``"100a"`` for a
+    module whose instructions the ``sm_100f`` family target does not enable).
+    """
     target_sm = _get_target_sm()
     major, minor = _get_cuda_arch()
     sm = major * 10 + minor
-    arch = _gencode_target(sm, major)
+    arch = gencode_target or _gencode_target(sm, major)
     return [
         "-std=c++17",
         "-O3",
@@ -467,12 +471,17 @@ def gen_jit_spec(
     sources: List[Path],
     extra_cuda_cflags: Optional[List[str]] = None,
     extra_ldflags: Optional[List[str]] = None,
+    gencode_target: Optional[str] = None,
 ) -> JitSpec:
-    """Create a JitSpec with standard OASR compilation flags."""
+    """Create a JitSpec with standard OASR compilation flags.
+
+    *gencode_target* overrides the device's default ``compute_X``/``sm_X`` suffix
+    (see :func:`_default_cuda_cflags`); it is part of the flags, so of the cache key.
+    """
     return JitSpec(
         name=name,
         sources=sources,
-        extra_cuda_cflags=_default_cuda_cflags() + (extra_cuda_cflags or []),
+        extra_cuda_cflags=_default_cuda_cflags(gencode_target) + (extra_cuda_cflags or []),
         extra_ldflags=extra_ldflags,
     )
 
