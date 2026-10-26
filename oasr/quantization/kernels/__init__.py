@@ -5,6 +5,10 @@
 from .lanes import (
     CutlassSm80Int8Lane,
     CutlassSm89Fp8Lane,
+    CutlassSm90Fp8Lane,
+    CutlassSm90Int8Lane,
+    CutlassSm100Fp8Lane,
+    CutlassSm100Int8Lane,
     ScaledMMLane,
     TorchIntMMLane,
     TorchScaledMMLane,
@@ -17,6 +21,10 @@ from .lanes import (
 __all__ = [
     "CutlassSm80Int8Lane",
     "CutlassSm89Fp8Lane",
+    "CutlassSm90Fp8Lane",
+    "CutlassSm90Int8Lane",
+    "CutlassSm100Fp8Lane",
+    "CutlassSm100Int8Lane",
     "ScaledMMLane",
     "TorchIntMMLane",
     "TorchScaledMMLane",

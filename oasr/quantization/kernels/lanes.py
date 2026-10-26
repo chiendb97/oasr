@@ -9,12 +9,16 @@ layer at bind time.  A scheme no lane serves on this device is either a declared
 kernel gap (``oasr.layers._backend.KERNEL_GAPS``, counted, then the torch
 reference) or a refusal — never a silent reroute (AGENTS.md rule 3).
 
-``OASR_SCALED_MM_BACKEND`` (``auto`` | ``cutlass`` | ``torch``), read once on
-first use, is the A/B switch: naming a lane requires it.  ``auto`` considers
-only the lanes that are a default (:attr:`ScaledMMLane.in_auto`): the torch lanes
-are baselines and A/B arms, reachable by naming ``torch`` and never as a
-fallback, so a layer the CUTLASS lanes cannot serve is a declared gap or a
-refusal at bind -- which is what the report then says.
+``OASR_SCALED_MM_BACKEND`` (``auto`` | ``cutlass`` | ``mma_sync`` | ``torch``),
+read once on first use, is the A/B switch: naming a backend requires it.
+``auto`` considers only the lanes that are a default
+(:attr:`ScaledMMLane.in_auto`): the torch lanes are baselines and A/B arms,
+reachable by naming ``torch`` and never as a fallback, so a layer the CUTLASS
+lanes cannot serve is a declared gap or a refusal at bind -- which is what the
+report then says.  ``cutlass`` is every CUTLASS lane, the native CUTLASS 3.x one
+first where it runs (sm90, sm100); ``mma_sync`` only the CUTLASS 2.x ``mma.sync``
+lanes -- the A/B arm that measures what a native lane buys on Hopper and
+Blackwell.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ import oasr.functionals.scaled_mm as _smm
 if TYPE_CHECKING:  # pragma: no cover
     from ..spec import QuantScheme
 
-_BACKENDS = ("auto", "cutlass", "torch")
+_BACKENDS = ("auto", "cutlass", "mma_sync", "torch")
 
 
 @functools.lru_cache(maxsize=1)
@@ -92,6 +96,9 @@ class ScaledMMLane(ABC):
     #: Whether ``OASR_SCALED_MM_BACKEND=auto`` may pick this lane.  ``False`` for a
     #: baseline / A/B arm, reachable only by naming its backend.
     in_auto: ClassVar[bool] = True
+    #: The kernel generation of a CUTLASS lane: ``"native"`` (3.x) or
+    #: ``"mma_sync"`` (2.x), which ``OASR_SCALED_MM_BACKEND=mma_sync`` selects.
+    kernel: ClassVar[str] = ""
 
     @classmethod
     @abstractmethod
@@ -157,6 +164,7 @@ class CutlassSm80Int8Lane(ScaledMMLane):
 
     name = "cutlass_sm80_int8"
     backend = "cutlass"
+    kernel = "mma_sync"
 
     @classmethod
     def is_supported(cls, sm: int) -> Tuple[bool, str]:
@@ -186,12 +194,18 @@ class CutlassSm80Int8Lane(ScaledMMLane):
             return False, f"N={n} K={k}: needs K % {K_ALIGNMENT} == 0 and N % {N_ALIGNMENT} == 0"
         return True, ""
 
+    # The lane is named, not left to the device default, which on sm90 / sm100 is
+    # the native lane.
     def run(self, a, b, a_scale, b_scale, bias, activation, out_dtype):
-        return _smm.scaled_mm(a, b, a_scale, b_scale, bias, activation, out_dtype=out_dtype)
+        return _smm.scaled_mm(
+            a, b, a_scale, b_scale, bias, activation, out_dtype=out_dtype, lane=_MMA_LANE["int8"]
+        )
 
     def run_quant(self, a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype):
         # One launch: the epilogue quantizes for the consumer.
-        return _smm.scaled_mm_quant(a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype)
+        return _smm.scaled_mm_quant(
+            a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype, lane=_MMA_LANE["int8"]
+        )
 
 
 _TORCH_ACTIVATION = {
@@ -254,6 +268,7 @@ class CutlassSm89Fp8Lane(ScaledMMLane):
 
     name = "cutlass_sm89_fp8"
     backend = "cutlass"
+    kernel = "mma_sync"
 
     @classmethod
     def is_supported(cls, sm: int) -> Tuple[bool, str]:
@@ -284,10 +299,109 @@ class CutlassSm89Fp8Lane(ScaledMMLane):
         return True, ""
 
     def run(self, a, b, a_scale, b_scale, bias, activation, out_dtype):
-        return _smm.scaled_mm(a, b, a_scale, b_scale, bias, activation, out_dtype=out_dtype)
+        return _smm.scaled_mm(
+            a, b, a_scale, b_scale, bias, activation, out_dtype=out_dtype, lane=_MMA_LANE["fp8"]
+        )
 
     def run_quant(self, a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype):
-        return _smm.scaled_mm_quant(a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype)
+        return _smm.scaled_mm_quant(
+            a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype, lane=_MMA_LANE["fp8"]
+        )
+
+
+class _CutlassNativeLane(ScaledMMLane):
+    """A native CUTLASS 3.x lane (``oasr.jit.scaled_mm``, ``NATIVE_LANE_ID``).
+
+    TMA, a warp-specialized persistent kernel and the architecture's own MMA:
+    wgmma with ping-pong / cooperative warpgroups on sm90, tcgen05 with a
+    double-buffered tensor-memory accumulator on sm100 -- one tile's epilogue
+    overlaps the next tile's mainloop.  The epilogue arithmetic, the launcher
+    signatures and the per-format invariant (int8 exact; fp8 one summation order
+    for every tile) are the ``mma.sync`` lane's.
+    """
+
+    backend = "cutlass"
+    kernel = "native"
+    sm: ClassVar[int]
+    fmt: ClassVar[str]
+    #: ``oasr.jit.scaled_mm.NATIVE_LANE_ID[(sm, fmt)]``, spelled out so the
+    #: per-call path runs no import (a test pins the two together).
+    lane: ClassVar[str]
+
+    @classmethod
+    def is_supported(cls, sm: int) -> Tuple[bool, str]:
+        from oasr.jit.scaled_mm import native_lane_available
+
+        if sm != cls.sm:
+            return False, f"the native lane of sm{cls.sm}, not sm{sm}"
+        if native_lane_available(sm, cls.fmt):
+            return True, ""
+        return False, (
+            f"no native {cls.fmt} kernel runs on this sm{sm}-family device "
+            "(tcgen05 int8 needs compute capability 10.0: CUTLASS enables it for sm_100a only)"
+        )
+
+    @classmethod
+    def can_implement(
+        cls, scheme: "QuantScheme", n: int, k: int, out_dtype: torch.dtype
+    ) -> Tuple[bool, str]:
+        from oasr.jit.scaled_mm import K_ALIGNMENT, N_ALIGNMENT
+
+        if w8a8_format(scheme) != cls.fmt:
+            return False, f"serves {cls.fmt} per-channel W x {cls.fmt} A (per-token or static) only"
+        if out_dtype not in (torch.float16, torch.bfloat16):
+            return False, f"output dtype {out_dtype} (fp16/bf16 only)"
+        if k % K_ALIGNMENT or n % N_ALIGNMENT:
+            return False, f"N={n} K={k}: needs K % {K_ALIGNMENT} == 0 and N % {N_ALIGNMENT} == 0"
+        return True, ""
+
+    def run(self, a, b, a_scale, b_scale, bias, activation, out_dtype):
+        return _smm.scaled_mm(
+            a, b, a_scale, b_scale, bias, activation, out_dtype=out_dtype, lane=self.lane
+        )
+
+    def run_quant(self, a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype):
+        # One launch where N % 16 == 0 (the 8-bit TMA store); the functional
+        # computes the bit-identical unfused pair otherwise.
+        return _smm.scaled_mm_quant(
+            a, b, a_scale, b_scale, bias, activation, out_mul, round_dtype, lane=self.lane
+        )
+
+
+class CutlassSm90Int8Lane(_CutlassNativeLane):
+    """Hopper int8: wgmma s8 -> int32 (exact)."""
+
+    name = "cutlass_sm90_int8"
+    sm = 90
+    fmt = "int8"
+    lane = "sm90_int8_wgmma"
+
+
+class CutlassSm90Fp8Lane(_CutlassNativeLane):
+    """Hopper fp8 e4m3: wgmma with the accumulator promoted to fp32 every 128 K."""
+
+    name = "cutlass_sm90_fp8"
+    sm = 90
+    fmt = "fp8"
+    lane = "sm90_fp8_wgmma"
+
+
+class CutlassSm100Int8Lane(_CutlassNativeLane):
+    """Blackwell data-center int8: tcgen05 ``kind::i8`` -> int32 (exact); B200 (10.0) only."""
+
+    name = "cutlass_sm100_int8"
+    sm = 100
+    fmt = "int8"
+    lane = "sm100_int8_umma"
+
+
+class CutlassSm100Fp8Lane(_CutlassNativeLane):
+    """Blackwell data-center fp8 e4m3: tcgen05 ``kind::f8f6f4`` -> fp32 tensor memory."""
+
+    name = "cutlass_sm100_fp8"
+    sm = 100
+    fmt = "fp8"
+    lane = "sm100_fp8_umma"
 
 
 class TorchScaledMMLane(ScaledMMLane):
@@ -343,8 +457,16 @@ def _unit_scale(device: torch.device) -> torch.Tensor:
     return one
 
 
-#: Priority order for ``auto``.
+#: The ``mma.sync`` lane ids the 2.x lane classes name: ``oasr.jit.scaled_mm.LANE_ID``,
+#: spelled out so the per-call path runs no import (a test pins the two together).
+_MMA_LANE = {"int8": "sm80_int8_mma", "fp8": "sm89_fp8_mma"}
+
+#: Priority order: a native lane before the ``mma.sync`` lane it replaces.
 _LANES: List[Type[ScaledMMLane]] = [
+    CutlassSm90Int8Lane,
+    CutlassSm90Fp8Lane,
+    CutlassSm100Int8Lane,
+    CutlassSm100Fp8Lane,
     CutlassSm80Int8Lane,
     CutlassSm89Fp8Lane,
     TorchIntMMLane,
@@ -367,15 +489,14 @@ def choose_lane(
     """``(lane, note)``: the first lane that serves this layer, else ``(None, why)``.
 
     With ``OASR_SCALED_MM_BACKEND`` naming a backend, only that backend's lanes
-    are candidates, and the caller must refuse rather than fall back; with
-    ``auto``, only the default lanes (``in_auto``) -- never a torch A/B arm.
+    are candidates (``mma_sync``: the CUTLASS 2.x lanes), and the caller must
+    refuse rather than fall back; with ``auto``, only the default lanes
+    (``in_auto``) -- never a torch A/B arm.
     """
     backend = _backend()
     reasons = []
     for cls in _LANES:
-        if backend == "auto" and not cls.in_auto:
-            continue
-        if backend != "auto" and cls.backend != backend:
+        if not _selected_by(cls, backend):
             continue
         ok, why = cls.is_supported(sm)
         if ok:
@@ -385,6 +506,15 @@ def choose_lane(
             return cls(), note
         reasons.append(f"{cls.name}: {why}")
     return None, "; ".join(reasons) or f"no lane for backend {backend!r}"
+
+
+def _selected_by(cls: Type[ScaledMMLane], backend: str) -> bool:
+    """Whether ``OASR_SCALED_MM_BACKEND=backend`` makes *cls* a candidate."""
+    if backend == "auto":
+        return cls.in_auto
+    if backend == "mma_sync":
+        return cls.backend == "cutlass" and cls.kernel == "mma_sync"
+    return cls.backend == backend
 
 
 def forced_backend() -> Optional[str]:

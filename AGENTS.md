@@ -278,7 +278,7 @@ extension cookbook for each axis.
 | `oasr/engine/vad_stage.py` | The two engine entry points: offline splitter, per-tick streaming stage |
 | `oasr/layers/` | The narrow waist; `_backend.py` holds the routing rules and `KERNEL_GAPS`; `_quantizable.py` the quantization seam |
 | `oasr/quantization/` | The ninth axis: `spec` (formats, `QuantizationSpec`), `layout` (what a model declares), `methods/` + `kernels/lanes.py` (runtime), `calibration/` + `algorithms/` (offline), `export.py` / `cli.py` (`oasr quantize`) |
-| `oasr/functionals/{quant,scaled_mm}.py`, `include/oasr/{quant,scaled_mm}/`, `oasr/jit/scaled_mm.py` | Per-token / static 8-bit quantize (int8, fp8 e4m3) and the CUTLASS 2.x 8-bit GEMM (int8 Sm80, e4m3 Sm89) with its EVT dequant epilogue |
+| `oasr/functionals/{quant,scaled_mm}.py`, `include/oasr/{quant,scaled_mm}/`, `oasr/jit/scaled_mm.py` | Per-token / static 8-bit quantize (int8, fp8 e4m3) and the 8-bit GEMM with its EVT dequant epilogue: CUTLASS 2.x `mma.sync` (int8 Sm80, e4m3 Sm89) everywhere, and the native CUTLASS 3.x lanes on sm90 (wgmma, ping-pong / cooperative) and sm100 (tcgen05) -- a *lane* is a kernel generation with its own config space, JIT module and tuning entries |
 | `oasr/functionals/scaled_conv.py`, `include/oasr/scaled_conv/`, `oasr/jit/scaled_conv.py` | The int8 implicit-GEMM convolution of a quantized `Conv1d` / `Conv2d` (broadcast epilogue: per-channel scale vector, zero-stride bias) |
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
@@ -518,6 +518,12 @@ extension cookbook for each axis.
   contract (`K % 16`, `N % 8`) is skipped at selection, and the torch lanes are reached only
   by naming them (`OASR_SCALED_MM_BACKEND=torch`). Key a lane table by `sm_family`, never by
   the raw capability, or an sm_121 device misses every sm_120 entry.
+- **Building a tcgen05 int8 kernel for `sm_100f`.** CUTLASS enables `kind::i8` for the
+  arch-specific `sm_100a` / `sm_101a` / `sm_110a` targets only, so the family target every other
+  sm100 module uses compiles an int8 kernel with no MMA instruction in it -- it builds, and fails
+  at run time. The native int8 sm100 lane is built for `sm_100a` and serves compute capability
+  10.0 alone (`oasr/jit/scaled_mm.py::_NATIVE_CAPABILITIES`); B300 keeps the `mma.sync` lane.
+  Check a new 3.x kernel's PTX for its MMA instruction, not only that it compiles.
 - **A per-token scale on a convolution's input.** An output pixel sums over a receptive
   field spanning several input pixels, so their scales do not factor out of the sum:
   a quantized `Conv1d` / `Conv2d` takes a calibrated static per-tensor scale
@@ -749,7 +755,7 @@ Environment variables:
 | `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the fused recurrent step — whether to fuse at all |
 | `OASR_RECURRENT_BACKEND` | Which fused recurrent-step lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
-| `OASR_SCALED_MM_BACKEND` | Quantized-GEMM lane: `auto` (default: the CUTLASS lanes only -- what they cannot serve is a declared gap or a refusal, never the torch lane) / `cutlass` (the int8 and fp8 CUTLASS kernels) / `torch` (`torch._int_mm` / `torch._scaled_mm` + a torch epilogue). Naming one **requires** it; an unknown value is refused at the first quantized layer's bind |
+| `OASR_SCALED_MM_BACKEND` | Quantized-GEMM lane: `auto` (default: the CUTLASS lanes only, native 3.x first on sm90/sm100 -- what they cannot serve is a declared gap or a refusal, never the torch lane) / `cutlass` (the int8 and fp8 CUTLASS kernels) / `mma_sync` (the CUTLASS 2.x kernels only: the A/B arm for the native lanes) / `torch` (`torch._int_mm` / `torch._scaled_mm` + a torch epilogue). Naming one **requires** it; an unknown value is refused at the first quantized layer's bind |
 | `OASR_QUANT_FUSION` | `0` disarms the fused quantize producers (a norm emitting int8, a GEMM quantizing for its chained consumer): every quantized layer quantizes its own input again. Bit-identical either way (A/B, rollback) |
 | `OASR_USE_K2` | `1` builds the k2-backed WFST decoder (needs `pip install k2` + `K2_SOURCE_DIR`) |
 | `OASR_METRICS` | `0` binds the engine-side metric collector to a no-op (front-end metrics are unaffected) |
@@ -789,7 +795,7 @@ before process start.
 | [`docs/kernels.md`](docs/kernels.md) | CUDA/CUTLASS layer, the JIT pipeline, the functional API |
 | [`docs/features.md`](docs/features.md) | Feature frontends, `FeatureSpec`, streaming framing |
 | [`docs/vad.md`](docs/vad.md) | Speech detectors, segmentation, endpointing, and the API surfaces |
-| [`docs/quantization.md`](docs/quantization.md) | W8A8 int8 / fp8 at the layer waist, SmoothQuant and `oasr quantize`, native v2, kernel lanes, the fp8 KV cache, pinned numerics |
+| [`docs/quantization.md`](docs/quantization.md) | W8A8 int8 / fp8 at the layer waist, SmoothQuant and `oasr quantize`, native v2, GPU support, the fp8 KV cache, numerics |
 | [`docs/tokenizers.md`](docs/tokenizers.md) | Tokenizer axis and `TokenizerSpec` |
 | [`docs/checkpoints.md`](docs/checkpoints.md) | Resolution precedence, converter contract, native format |
 | [`docs/cache_manager.md`](docs/cache_manager.md) | Paged and slot streaming caches |

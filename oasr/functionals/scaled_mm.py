@@ -11,6 +11,11 @@ summation order for every tile).  :func:`scaled_mm_quant` is the same GEMM
 quantizing its output straight to the operands' format for a consumer with a
 static input scale.  :func:`reference_scaled_mm` and
 :func:`reference_scaled_mm_quant` are the torch twins.
+
+``lane`` picks the kernel generation (``oasr.jit.scaled_mm``): ``None`` is the
+device's default -- the native CUTLASS 3.x lane on Hopper and Blackwell
+data-center parts, the CUTLASS 2.x ``mma.sync`` lane elsewhere -- and a lane id
+names one (the quantized layers' lanes pass theirs).
 """
 
 import functools
@@ -54,11 +59,18 @@ def activation_id(name: Optional[str]) -> int:
         ) from None
 
 
+def _get_scaled_mm_module(fmt: str = "int8", lane: Optional[str] = None):
+    """The loaded JIT module of *lane*'s *fmt* variants (default: this device's lane)."""
+    from oasr.jit.scaled_mm import _process_sm, _resolve_lane
+
+    return _load_scaled_mm_module(fmt, _resolve_lane(_process_sm(), fmt, lane))
+
+
 @functools.cache
-def _get_scaled_mm_module(fmt: str = "int8"):
+def _load_scaled_mm_module(fmt: str, lane: str):
     from oasr.jit.scaled_mm import gen_scaled_mm_module
 
-    return gen_scaled_mm_module(fmt).build_and_load()
+    return gen_scaled_mm_module(fmt, lane).build_and_load()
 
 
 #: Operand dtype -> the kernel family's format name.
@@ -83,6 +95,7 @@ def scaled_mm(
     activation: Optional[str] = None,
     out_dtype: torch.dtype = torch.float16,
     out: Optional[torch.Tensor] = None,
+    lane: Optional[str] = None,
 ) -> torch.Tensor:
     """8-bit GEMM with per-token × per-channel dequantization fused in the epilogue.
 
@@ -97,6 +110,7 @@ def scaled_mm(
         activation: Layer-level activation name, or ``None``.
         out_dtype: fp16 or bf16, when *out* is not given.
         out: Optional pre-allocated ``[..., N]`` output.
+        lane: The kernel lane (``oasr.jit.scaled_mm``); ``None`` for the device's.
 
     Returns:
         ``[..., N]`` tensor in the output dtype.
@@ -109,8 +123,8 @@ def scaled_mm(
     n = b.shape[0]
     if out is None:
         out = torch.empty((*a.shape[:-1], n), dtype=out_dtype, device=a.device)
-    cfg = select_config(m, n, k, fmt=fmt)
-    fn = getattr(_get_scaled_mm_module(fmt), scaled_mm_func_name(cfg))
+    cfg = select_config(m, n, k, fmt=fmt, lane=lane)
+    fn = getattr(_load_scaled_mm_module(fmt, cfg.lane), scaled_mm_func_name(cfg))
     fn(out, a, b, a_scale, b_scale, bias, activation_id(activation))
     return out
 
@@ -126,6 +140,7 @@ def scaled_mm_quant(
     out_mul: torch.Tensor,
     round_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
+    lane: Optional[str] = None,
 ) -> torch.Tensor:
     """:func:`scaled_mm`, quantized straight to 8 bits for the consuming GEMM.
 
@@ -142,11 +157,18 @@ def scaled_mm_quant(
         out_mul: fp32 ``[N]``, the consumer's per-channel quantize multiplier.
         round_dtype: fp16 or bf16 -- the layer's floating dtype.
         out: Optional pre-allocated ``[..., N]`` of the operands' dtype.
+        lane: The kernel lane; ``None`` for the device's.  A native lane stores the
+            8-bit output through TMA, which needs ``N % 16 == 0``; for another N
+            this computes the unfused pair, which is bit-identical, in two launches.
 
     Returns:
         ``[..., N]`` in the operands' dtype.
     """
-    from oasr.jit.scaled_mm import scaled_mm_quant_func_name, select_quant_config
+    from oasr.jit.scaled_mm import (
+        quant_n_alignment,
+        scaled_mm_quant_func_name,
+        select_quant_config,
+    )
 
     fmt = operand_format(a.dtype)
     k = a.shape[-1]
@@ -157,8 +179,14 @@ def scaled_mm_quant(
     code = _ROUND_DTYPE_CODE.get(round_dtype)
     if code is None:
         raise ValueError(f"scaled_mm_quant rounds to fp16 or bf16, not {round_dtype}")
-    cfg = select_quant_config(m, n, k, fmt=fmt)
-    fn = getattr(_get_scaled_mm_module(fmt), scaled_mm_quant_func_name(cfg))
+    cfg = select_quant_config(m, n, k, fmt=fmt, lane=lane)
+    if n % quant_n_alignment(cfg.lane):
+        from oasr.functionals.quant import quantize_static
+
+        y = scaled_mm(a, b, a_scale, b_scale, bias, activation, round_dtype, lane=cfg.lane)
+        q: torch.Tensor = quantize_static(y, out_mul, out=out, dtype=a.dtype)
+        return q
+    fn = getattr(_load_scaled_mm_module(fmt, cfg.lane), scaled_mm_quant_func_name(cfg))
     fn(out, a, b, a_scale, b_scale, bias, out_mul, activation_id(activation), code)
     return out
 

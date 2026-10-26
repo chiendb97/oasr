@@ -28,7 +28,7 @@ interfaces and operation.
 | [models.md](models.md) | The model layer: base contracts, capabilities, registry, and the seven built-in architectures |
 | [decoding.md](decoding.md) | Decode families: selection, the incremental AR protocol, beam search, per-family and per-request options |
 | [kernels.md](kernels.md) | The CUDA/CUTLASS layer, the TVM-FFI JIT pipeline, and the Python functional API |
-| [quantization.md](quantization.md) | Quantization: W8A8 int8 at the layer waist, SmoothQuant and `oasr quantize`, the native v2 checkpoint, kernel lanes, pinned numerics, extending to new formats |
+| [quantization.md](quantization.md) | Quantization: W8A8 int8 and fp8 at the layer waist, SmoothQuant and `oasr quantize`, the native v2 checkpoint, GPU support, the fp8 KV cache, numerics, extending to new formats |
 
 ## Components
 
