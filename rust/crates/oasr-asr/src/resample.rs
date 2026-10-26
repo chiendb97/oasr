@@ -67,18 +67,26 @@ fn expected_out(n_in: u64, from_hz: u32, to_hz: u32) -> u64 {
 /// to one-shot input. [`flush`](Self::flush) compensates filter delay and returns
 /// exactly `round(n_in * to/from)` frames overall.
 pub struct Resampler {
-    inner: SincFixedIn<f32>,
+    filter: Filter,
     from_hz: u32,
     to_hz: u32,
-    /// Input frames received but not yet handed to `inner`.
+    /// The partial chunk a previous [`push`](Self::push) left behind, never
+    /// more than one `CHUNK`.  Whole chunks are read from the caller's slice
+    /// directly: staging the input here first was one more full copy of the
+    /// waveform, and for a one-shot resample the largest allocation it made.
     pending: Vec<f32>,
-    /// Chunk-sized staging so the steady-state path never allocates.
-    stage_in: Vec<f32>,
+    /// Input frames accepted so far (across the whole stream).
+    consumed: u64,
+}
+
+/// The sinc filter and what it has emitted, split from the input side so a
+/// chunk can be read from [`Resampler::pending`] while the filter runs.
+struct Filter {
+    inner: SincFixedIn<f32>,
+    /// Chunk-sized output staging so the steady-state path never allocates.
     stage_out: Vec<Vec<f32>>,
     /// Output frames of filter group delay still to be discarded.
     delay_left: usize,
-    /// Input frames accepted so far (across the whole stream).
-    consumed: u64,
     /// Output frames emitted so far, after the group-delay trim.
     emitted: u64,
 }
@@ -102,15 +110,16 @@ impl Resampler {
         let out_cap = inner.output_frames_max();
         let delay_left = inner.output_delay();
         Ok(Self {
-            inner,
+            filter: Filter {
+                inner,
+                stage_out: vec![vec![0.0; out_cap]],
+                delay_left,
+                emitted: 0,
+            },
             from_hz,
             to_hz,
-            pending: Vec::with_capacity(CHUNK * 2),
-            stage_in: vec![0.0; CHUNK],
-            stage_out: vec![vec![0.0; out_cap]],
-            delay_left,
+            pending: Vec::with_capacity(CHUNK),
             consumed: 0,
-            emitted: 0,
         })
     }
 
@@ -128,17 +137,25 @@ impl Resampler {
     ///
     /// Output lags input by up to one [`CHUNK`]; the remainder comes out of
     /// [`flush`](Self::flush).
-    pub fn push(&mut self, input: &[f32], out: &mut Vec<f32>) -> Result<(), AudioError> {
+    pub fn push(&mut self, mut input: &[f32], out: &mut Vec<f32>) -> Result<(), AudioError> {
         self.consumed += input.len() as u64;
-        self.pending.extend_from_slice(input);
-        let mut read = 0usize;
-        while self.pending.len() - read >= CHUNK {
-            self.stage_in
-                .copy_from_slice(&self.pending[read..read + CHUNK]);
-            read += CHUNK;
-            self.run_chunk(out)?;
+        // Complete the chunk a previous call left partial before anything else,
+        // so the filter sees the same chunk sequence however the input is cut.
+        if !self.pending.is_empty() {
+            let take = (CHUNK - self.pending.len()).min(input.len());
+            self.pending.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.pending.len() < CHUNK {
+                return Ok(());
+            }
+            self.filter.run(&self.pending, out)?;
+            self.pending.clear();
         }
-        self.pending.drain(..read);
+        let mut chunks = input.chunks_exact(CHUNK);
+        for chunk in &mut chunks {
+            self.filter.run(chunk, out)?;
+        }
+        self.pending.extend_from_slice(chunks.remainder());
         Ok(())
     }
 
@@ -150,44 +167,41 @@ impl Resampler {
 
         // Remaining partial chunk, zero-padded to CHUNK.
         if !self.pending.is_empty() {
-            let n = self.pending.len();
-            self.stage_in[..n].copy_from_slice(&self.pending);
-            self.stage_in[n..].fill(0.0);
-            self.pending.clear();
-            self.run_chunk(out)?;
+            self.pending.resize(CHUNK, 0.0);
+            self.filter.run(&self.pending, out)?;
         }
 
         // Silence chunks until the delayed tail has come out.  Bounded so a
         // ratio the arithmetic did not anticipate cannot spin here; the
         // truncate/pad below still makes the length exact.
+        self.pending.clear();
+        self.pending.resize(CHUNK, 0.0);
         let mut guard = 0;
-        while self.emitted < target && guard < 64 {
-            self.stage_in.fill(0.0);
-            self.run_chunk(out)?;
+        while self.filter.emitted < target && guard < 64 {
+            self.filter.run(&self.pending, out)?;
             guard += 1;
         }
+        self.pending.clear();
 
         // Snap to the expected length.  Downstream frame arithmetic (and every
         // test) is much easier to reason about when a resample is a pure
         // function of the input length.
-        let extra = self.emitted.saturating_sub(target) as usize;
+        let extra = self.filter.emitted.saturating_sub(target) as usize;
         out.truncate(out.len() - extra.min(out.len()));
-        let short = target.saturating_sub(self.emitted) as usize;
+        let short = target.saturating_sub(self.filter.emitted) as usize;
         out.resize(out.len() + short, 0.0);
-        self.emitted = target;
+        self.filter.emitted = target;
         Ok(())
     }
+}
 
-    /// Run one `CHUNK`-sized input from `stage_in`, appending post-delay-trim
-    /// output frames to `out`.
-    fn run_chunk(&mut self, out: &mut Vec<f32>) -> Result<(), AudioError> {
+impl Filter {
+    /// Run one `CHUNK`-sized input, appending post-delay-trim output frames to
+    /// `out`.
+    fn run(&mut self, chunk: &[f32], out: &mut Vec<f32>) -> Result<(), AudioError> {
         let (_, n_out) = self
             .inner
-            .process_into_buffer(
-                std::slice::from_ref(&self.stage_in),
-                &mut self.stage_out,
-                None,
-            )
+            .process_into_buffer(std::slice::from_ref(&chunk), &mut self.stage_out, None)
             .map_err(|e| AudioError::Resample(e.to_string()))?;
         let produced = &self.stage_out[0][..n_out];
         let skip = self.delay_left.min(produced.len());

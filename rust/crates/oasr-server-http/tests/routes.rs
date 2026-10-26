@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
+use oasr_asr::DecodePool;
 use oasr_engine_client::EnginePool;
 use oasr_server_http::{build_router, RouterLimits, ServerState, ServiceMode};
 use serde_json::Value;
@@ -33,6 +34,7 @@ fn state(mode: ServiceMode, served: &[&str]) -> Arc<ServerState> {
         sample_rate: 16_000,
         max_body_bytes: 1024 * 1024,
         max_audio_samples: Some(16_000 * 60),
+        decode_pool: DecodePool::new(2),
         served_model_names: served.iter().map(|s| (*s).to_owned()).collect(),
         model_id: "/ckpt/u2pp-conformer".into(),
     })
@@ -154,6 +156,47 @@ async fn health_answers_while_the_engine_is_down() {
     )
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A long upload's decode must not hold the worker the probes run on.  A
+/// current-thread runtime has exactly one: decoded inline, the upload kept
+/// `/healthz` waiting until it was done, which is how a few long uploads
+/// stalled a server's own health checks.
+#[tokio::test(flavor = "current_thread")]
+async fn health_answers_while_an_upload_decodes() {
+    let app = router(ServiceMode::Offline, &[]);
+    // Half a MiB of 8 kHz LINEAR16, resampled to the model's 16 kHz.
+    let audio: Vec<u8> = (0..256 * 1024)
+        .flat_map(|i| (((i % 200) as i16) * 100).to_le_bytes())
+        .collect();
+    let upload = tokio::spawn(send(
+        app.clone(),
+        Request::builder()
+            .method("POST")
+            .uri("/v1/speech:recognize?encoding=LINEAR16&sample_rate=8000")
+            .body(Body::from(audio))
+            .unwrap(),
+    ));
+    // Let the upload run until it waits on something.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let (status, body) = send(
+        app,
+        Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, "ok"));
+    assert!(
+        !upload.is_finished(),
+        "the probe was answered only after the upload's decode had finished"
+    );
+    // Decoded, then refused by the engine pool, which has no workers here.
+    let (status, body) = upload.await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
 }
 
 #[tokio::test]

@@ -33,6 +33,7 @@ pub use router::{build_router, AppState, RouterLimits, ServiceMode, READY_STALE_
 use std::sync::Arc;
 
 use metrics_exporter_prometheus::PrometheusHandle;
+use oasr_asr::DecodePool;
 use oasr_engine_client::EnginePool;
 
 /// Shared state injected into every handler.
@@ -52,6 +53,11 @@ pub struct ServerState {
     /// container breaks the relationship between the two: a few MiB of MP3 is
     /// hours of audio, and the allocation happens before anything could notice.
     pub max_audio_samples: Option<usize>,
+    /// Where the unary routes decode and resample request audio: on the
+    /// blocking pool, a bounded number at a time.  Inline, an hour of MP3 held
+    /// a tokio worker -- and every probe and stream forward queued behind it --
+    /// for seconds.
+    pub decode_pool: DecodePool,
     /// Names this process answers to on the OpenAI surface's `model` field.
     /// Empty means "accept anything" — the single-model default, which keeps a
     /// client pointed at `whisper-1` working after nothing but a base-URL

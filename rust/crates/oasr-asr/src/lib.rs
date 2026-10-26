@@ -16,7 +16,9 @@
 //!
 //! and converts the result to a target rate ([`decode_audio`] for whole clips,
 //! [`PcmStream`] for chunk-by-chunk streaming, which carries the resampler's
-//! filter state across chunks).
+//! filter state across chunks).  A whole clip is seconds of CPU for long audio,
+//! so the serving front-ends run it through [`DecodePool`], off their async
+//! workers.
 //!
 //! **Opus is the one gap**, and a declared one: there is no pure-Rust decoder,
 //! and pulling in libopus would add a C dependency to every build.  An Opus
@@ -25,6 +27,7 @@
 pub mod audio;
 pub mod codec;
 pub mod encoding;
+pub mod pool;
 pub mod resample;
 
 pub use audio::{
@@ -33,6 +36,7 @@ pub use audio::{
 };
 pub use codec::{container_from_hint, sniff, Container};
 pub use encoding::{parse_encoding, EncodingError};
+pub use pool::DecodePool;
 pub use resample::{
     resample_mono, validate_sample_rate, Resampler, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE,
 };

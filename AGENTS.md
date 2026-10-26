@@ -552,6 +552,14 @@ extension cookbook for each axis.
   only event-track the in-flight copy through the tensor whose storage it allocated, and an
   anonymous re-wrap can be recycled under a live DMA. The offer is bounded
   (`max_pinned_audio_seconds`); page-locked memory is process-global.
+- **Decoding or resampling a whole clip on a tokio worker.** It is seconds of CPU for
+  long compressed audio, and inline it parks the worker together with every probe,
+  scrape and stream forward queued behind it. Unary decodes go through
+  `oasr_asr::DecodePool` (`spawn_blocking` behind `--max-concurrent-decodes`), and the
+  waveform stays a `Vec<f32>` until one zero-copy hand-off to `Bytes`: passing f32-LE
+  bytes between the codec, the resampler and the hand-off was about six copies of it.
+  The converse holds too: short raw PCM at the model rate stays inline, because the hop
+  costs more than that pass (`INLINE_MAX_SAMPLES`).
 - **Sniffing a container out of a declared `LINEAR16` body.** MP3 and AAC are identified by an
   11-bit frame sync that real PCM hits by chance; only unambiguous magic may override a
   caller's declared encoding (`oasr-asr::codec::Container::is_unambiguous`).

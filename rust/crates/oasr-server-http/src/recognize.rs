@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use bytes::Bytes;
-use oasr_asr::{decode_audio, parse_encoding, DecodeOptions, EncodingError, SourceEncoding};
+use oasr_asr::{parse_encoding, AudioError, DecodeOptions, EncodingError, SourceEncoding};
 use oasr_wire::{normalize_language, score_posteriors, DecodingParams, WordTiming};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, field, info, info_span, Instrument, Span};
@@ -353,18 +353,30 @@ pub async fn handle_recognize(
         // derives every frame count from its own `FeatureConfig.sample_rate` and
         // ignores the request's, so 8 kHz telephony or 44.1 kHz media reaching it
         // unconverted produced a confident, wrong transcript.  A WAV body carries
-        // its own rate in the header, which is what `decode_audio` converts from.
-        let decoded = match decode_audio(
-            &bytes,
-            &DecodeOptions {
-                hint: ct_hint,
-                encoding: source_enc,
-                source_sample_rate: Some(sr),
-                target_sample_rate: Some(s.sample_rate),
-                max_samples: s.max_audio_samples,
-            },
-        ) {
+        // its own rate in the header, which is what the decode converts from.
+        let decoded = match s
+            .decode_pool
+            .decode(
+                bytes,
+                &DecodeOptions {
+                    hint: ct_hint,
+                    encoding: source_enc,
+                    source_sample_rate: Some(sr),
+                    target_sample_rate: Some(s.sample_rate),
+                    max_samples: s.max_audio_samples,
+                },
+            )
+            .await
+        {
             Ok(d) => d,
+            // The decoder crashed: ours to fix, whatever the input was.
+            Err(e @ AudioError::DecodeTask(_)) => {
+                return reject(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    format!("audio decode: {e}"),
+                );
+            }
             Err(e) => {
                 return reject(
                     StatusCode::BAD_REQUEST,

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Audio decoding to raw f32 mono PCM (little-endian bytes).
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use hound::{SampleFormat, WavReader};
 use thiserror::Error;
 
@@ -47,6 +47,10 @@ pub enum AudioError {
     /// A compressed container reached a build with the `codecs` feature off.
     #[error("{0} decoding requires the `codecs` feature, which this build has disabled")]
     CodecsDisabled(String),
+    /// The [`DecodePool`](crate::DecodePool) task running the decode did not
+    /// return -- a decoder that panicked on this input, in practice.
+    #[error("the audio decoder failed on this input: {0}")]
+    DecodeTask(String),
 }
 
 /// Decoded audio ready to hand to the engine.
@@ -58,23 +62,42 @@ pub struct DecodedAudio {
     pub samples: Bytes,
 }
 
-impl DecodedAudio {
+/// Mono f32 samples on their way through a decode: what every decoder fills,
+/// what the resampler reads and writes, and what becomes
+/// [`DecodedAudio::samples`] once, at the end, without a copy.
+///
+/// The waveform used to travel as f32-LE `Bytes` between the stages, so each
+/// one widened it back to `Vec<f32>` and narrowed its result again -- about six
+/// copies of the waveform per request, three of them alive at the peak.
+#[derive(Debug)]
+pub(crate) struct Waveform {
+    pub(crate) sample_rate: u32,
+    pub(crate) samples: Vec<f32>,
+}
+
+impl Waveform {
     /// Convert to `target` Hz, returning `self` untouched when already there.
     ///
     /// Both the source and target rates are validated, so a client that
     /// declares a nonsense `sampleRateHertz` is rejected here rather than
     /// producing a nonsense conversion.
-    pub fn resampled_to(self, target: u32) -> Result<Self, AudioError> {
+    fn resampled_to(self, target: u32) -> Result<Self, AudioError> {
         if self.sample_rate == target {
             crate::resample::validate_sample_rate(target)?;
             return Ok(self);
         }
-        let src = bytes_to_f32(&self.samples);
-        let out = resample_mono(&src, self.sample_rate, target)?;
+        let samples = resample_mono(&self.samples, self.sample_rate, target)?;
         Ok(Self {
             sample_rate: target,
-            samples: f32_to_bytes(&out),
+            samples,
         })
+    }
+
+    pub(crate) fn into_decoded(self) -> DecodedAudio {
+        DecodedAudio {
+            sample_rate: self.sample_rate,
+            samples: samples_into_bytes(self.samples),
+        }
     }
 }
 
@@ -88,12 +111,25 @@ fn bytes_to_f32(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-pub(crate) fn f32_to_bytes(v: &[f32]) -> Bytes {
-    let mut out = BytesMut::with_capacity(v.len() * 4);
-    for &s in v {
-        out.put_f32_le(s);
+/// Hand `samples` over as f32-LE bytes, keeping the allocation: the `Bytes`
+/// owns the `Vec` and reads its memory in place.
+fn samples_into_bytes(mut samples: Vec<f32>) -> Bytes {
+    if cfg!(target_endian = "big") {
+        // The wire is little-endian; swap in place so the bytes read as LE.
+        for s in &mut samples {
+            *s = f32::from_bits(s.to_bits().swap_bytes());
+        }
     }
-    out.freeze()
+    Bytes::from_owner(LeSamples(samples))
+}
+
+/// A `Vec<f32>` whose memory is already f32-LE, viewed as bytes.
+struct LeSamples(Vec<f32>);
+
+impl AsRef<[u8]> for LeSamples {
+    fn as_ref(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.0)
+    }
 }
 
 /// Chunk-by-chunk PCM decode + resample for the streaming RPCs.
@@ -162,7 +198,7 @@ impl PcmStream {
         let src = pcm_to_f32(body, self.encoding)?;
         let mut out = Vec::with_capacity(src.len() + 64);
         r.push(&src, &mut out)?;
-        Ok(f32_to_bytes(&out))
+        Ok(samples_into_bytes(out))
     }
 
     /// Emit the frames still inside the resampler.  Empty for a passthrough
@@ -173,7 +209,7 @@ impl PcmStream {
         };
         let mut out = Vec::new();
         r.flush(&mut out)?;
-        Ok(f32_to_bytes(&out))
+        Ok(samples_into_bytes(out))
     }
 }
 
@@ -303,53 +339,83 @@ pub struct DecodeOptions<'a> {
 
 /// Decode an audio blob into f32 mono PCM, optionally converted to
 /// `opts.target_sample_rate`.
+///
+/// CPU-bound for as long as the clip is -- seconds for an hour of compressed
+/// audio -- so an async caller runs it through [`crate::DecodePool`].
 pub fn decode_audio(body: &[u8], opts: &DecodeOptions<'_>) -> Result<DecodedAudio, AudioError> {
     let decoded = decode_to_source_rate(body, opts)?;
     if let Some(cap) = opts.max_samples {
-        let n = decoded.samples.len() / 4;
+        let n = decoded.samples.len();
         if n > cap {
             return Err(AudioError::TooLong(n, cap));
         }
     }
-    match opts.target_sample_rate {
-        Some(target) => decoded.resampled_to(target),
-        None => Ok(decoded),
-    }
+    let converted = match opts.target_sample_rate {
+        Some(target) => decoded.resampled_to(target)?,
+        None => decoded,
+    };
+    Ok(converted.into_decoded())
 }
 
-/// Decode without rate conversion: pick the container (or raw PCM) and run it.
-fn decode_to_source_rate(
-    body: &[u8],
-    opts: &DecodeOptions<'_>,
-) -> Result<DecodedAudio, AudioError> {
+/// What a body is decoded as.
+enum Route {
+    Pcm(PcmEncoding),
+    Container(crate::codec::Container),
+}
+
+/// Pick the container, or raw PCM, a body is decoded as.
+fn route(body: &[u8], opts: &DecodeOptions<'_>) -> Result<Route, AudioError> {
     let hinted = opts.hint.and_then(crate::codec::container_from_hint);
-    let container = match opts.encoding {
+    match opts.encoding {
         // A declared container: the hint wins, the magic is the fallback, and
         // an ambiguous frame sync is allowed because there is no PCM reading
         // of this body to protect.
         SourceEncoding::Container => hinted
             .or_else(|| crate::codec::sniff(body))
-            .ok_or(AudioError::UnknownContainer)?,
+            .map(Route::Container)
+            .ok_or(AudioError::UnknownContainer),
         // Declared PCM: only a header we are sure about may override it.
-        SourceEncoding::Pcm(_) => match hinted.or_else(|| crate::codec::sniff_unambiguous(body)) {
-            Some(c) => c,
-            None => {
-                let sr = opts
-                    .source_sample_rate
-                    .ok_or(AudioError::MissingSampleRate)?;
-                let SourceEncoding::Pcm(enc) = opts.encoding else {
-                    unreachable!("matched SourceEncoding::Pcm above")
-                };
-                return decode_raw_pcm(body, enc, sr);
-            }
-        },
-    };
-    match container {
+        SourceEncoding::Pcm(enc) => Ok(
+            match hinted.or_else(|| crate::codec::sniff_unambiguous(body)) {
+                Some(c) => Route::Container(c),
+                None => Route::Pcm(enc),
+            },
+        ),
+    }
+}
+
+/// The sample count, when [`decode_audio`] reads `body` as raw PCM and
+/// converts no rate: one linear pass, whose cost follows from that count alone.
+/// `None` for every other decode, which can cost far more than its body
+/// suggests -- a container can hold hours, and a resample is a filter over
+/// every sample.
+pub(crate) fn linear_pass_samples(body: &[u8], opts: &DecodeOptions<'_>) -> Option<usize> {
+    let converts = opts
+        .target_sample_rate
+        .is_some_and(|target| opts.source_sample_rate.is_some_and(|src| src != target));
+    match route(body, opts) {
+        Ok(Route::Pcm(enc)) if !converts => Some(body.len() / enc.sample_width()),
+        _ => None,
+    }
+}
+
+/// Decode without rate conversion: pick the container (or raw PCM) and run it.
+fn decode_to_source_rate(body: &[u8], opts: &DecodeOptions<'_>) -> Result<Waveform, AudioError> {
+    match route(body, opts)? {
+        Route::Pcm(enc) => {
+            let sr = opts
+                .source_sample_rate
+                .ok_or(AudioError::MissingSampleRate)?;
+            Ok(Waveform {
+                sample_rate: sr,
+                samples: pcm_to_f32(body, enc)?,
+            })
+        }
         // WAV stays on `hound`: it is the hot path for the raw-PCM surfaces,
         // it handles 24-bit containers symphonia's reader treats differently,
         // and it keeps WAV working with the `codecs` feature off.
-        crate::codec::Container::Wav => decode_wav(body),
-        other => decode_compressed(body, other, opts.max_samples),
+        Route::Container(crate::codec::Container::Wav) => wav_waveform(body),
+        Route::Container(other) => decode_compressed(body, other, opts.max_samples),
     }
 }
 
@@ -358,8 +424,8 @@ fn decode_compressed(
     body: &[u8],
     container: crate::codec::Container,
     max_samples: Option<usize>,
-) -> Result<DecodedAudio, AudioError> {
-    crate::codec::decode_container(body, container, max_samples)
+) -> Result<Waveform, AudioError> {
+    crate::codec::container_waveform(body, container, max_samples)
 }
 
 #[cfg(not(feature = "codecs"))]
@@ -367,61 +433,88 @@ fn decode_compressed(
     _body: &[u8],
     container: crate::codec::Container,
     _max_samples: Option<usize>,
-) -> Result<DecodedAudio, AudioError> {
+) -> Result<Waveform, AudioError> {
     Err(AudioError::CodecsDisabled(format!("{container:?}")))
 }
 
 /// Decode a WAV container.
 pub fn decode_wav(body: &[u8]) -> Result<DecodedAudio, AudioError> {
+    wav_waveform(body).map(Waveform::into_decoded)
+}
+
+/// Decode a WAV container to mono f32 at its own rate.
+///
+/// Samples are averaged a block at a time straight off `hound`'s reader rather
+/// than collected whole first: that intermediate vector was a full copy of the
+/// waveform at its source width.  `hound` refuses a data chunk that is not a
+/// whole number of frames, so every frame here is complete.
+fn wav_waveform(body: &[u8]) -> Result<Waveform, AudioError> {
     let mut reader = WavReader::new(std::io::Cursor::new(body))?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
     let bps = spec.bits_per_sample;
-    let mut out = BytesMut::with_capacity(body.len()); // upper bound
+    // What the header promises, bounded by what the body could hold, so a
+    // header that lies about its length cannot reserve more than that.
+    let frame_bytes = channels * usize::from(bps.div_ceil(8)).max(1);
+    let frames = (reader.duration() as usize).min(body.len() / frame_bytes);
+    let mut out = Vec::with_capacity(frames);
 
     match (spec.sample_format, bps) {
         (SampleFormat::Float, 32) => {
-            // Interleaved float32; average channels.
-            let samples: Vec<f32> = reader.samples::<f32>().collect::<Result<_, _>>()?;
-            for frame in samples.chunks_exact(channels) {
-                let mean: f32 = frame.iter().sum::<f32>() / channels as f32;
-                out.put_f32_le(mean);
-            }
-            let rem = samples.len() % channels;
-            if rem != 0 {
-                let frame = &samples[samples.len() - rem..];
-                let mean: f32 = frame.iter().sum::<f32>() / rem as f32;
-                out.put_f32_le(mean);
-            }
+            let n = channels as f32;
+            mix_down(reader.samples::<f32>(), channels, &mut out, |frame| {
+                frame.iter().sum::<f32>() / n
+            })?;
         }
         (SampleFormat::Int, 16) => {
-            let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<_, _>>()?;
             const SCALE: f32 = 32768.0;
-            for frame in samples.chunks_exact(channels) {
+            let scale = channels as f32 * SCALE;
+            mix_down(reader.samples::<i16>(), channels, &mut out, |frame| {
                 let acc: i32 = frame.iter().map(|&s| s as i32).sum();
-                let mean = (acc as f32) / (channels as f32 * SCALE);
-                out.put_f32_le(mean);
-            }
+                (acc as f32) / scale
+            })?;
         }
         (SampleFormat::Int, 24) | (SampleFormat::Int, 32) => {
-            let samples: Vec<i32> = reader.samples::<i32>().collect::<Result<_, _>>()?;
             // hound returns each sample in its own bit depth's range, sign
             // extended — a 24-bit full scale is 2^23, not 2^31.  Dividing every
             // depth by 2^31 delivered 24-bit audio 256x (48 dB) too quiet.
             let scale = f64::from(1u32 << (bps - 1));
-            for frame in samples.chunks_exact(channels) {
-                let mean =
-                    (frame.iter().map(|&s| s as f64).sum::<f64>() / channels as f64 / scale) as f32;
-                out.put_f32_le(mean);
-            }
+            mix_down(reader.samples::<i32>(), channels, &mut out, |frame| {
+                (frame.iter().map(|&s| s as f64).sum::<f64>() / channels as f64 / scale) as f32
+            })?;
         }
         _ => return Err(AudioError::Unsupported),
     }
 
-    Ok(DecodedAudio {
+    Ok(Waveform {
         sample_rate: spec.sample_rate,
-        samples: out.freeze(),
+        samples: out,
     })
+}
+
+/// Average each `channels`-sample frame of `samples` to one value with `mean`.
+///
+/// Reads a block of samples, then converts it: two tight loops measured faster
+/// than one fused per-sample loop, and a block keeps the read side bounded.
+fn mix_down<T: Copy>(
+    mut samples: impl Iterator<Item = Result<T, hound::Error>>,
+    channels: usize,
+    out: &mut Vec<f32>,
+    mean: impl Fn(&[T]) -> f32,
+) -> Result<(), AudioError> {
+    const BLOCK_FRAMES: usize = 4096;
+    let block_len = BLOCK_FRAMES * channels;
+    let mut block = Vec::with_capacity(block_len);
+    loop {
+        block.clear();
+        for sample in samples.by_ref().take(block_len) {
+            block.push(sample?);
+        }
+        out.extend(block.chunks_exact(channels).map(&mean));
+        if block.len() < block_len {
+            return Ok(());
+        }
+    }
 }
 
 /// Decode raw PCM bytes.  No header parsing.
@@ -443,7 +536,7 @@ pub fn decode_raw_pcm(
     }
     Ok(DecodedAudio {
         sample_rate,
-        samples: f32_to_bytes(&pcm_to_f32(body, encoding)?),
+        samples: samples_into_bytes(pcm_to_f32(body, encoding)?),
     })
 }
 
@@ -454,6 +547,7 @@ pub fn decode_raw_pcm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
     fn write_wav_i16(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
         let spec = hound::WavSpec {

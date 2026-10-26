@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::Stream;
 use oasr_asr::{
-    decode_audio, parse_encoding, DecodeOptions, EncodingError, PcmStream, SourceEncoding,
+    parse_encoding, AudioError, DecodeOptions, DecodePool, EncodingError, PcmStream, SourceEncoding,
 };
 use oasr_engine_client::EnginePool;
 use oasr_wire::{
@@ -62,6 +62,9 @@ pub struct SpeechService {
     max_audio_samples: Option<usize>,
     /// Abort a streaming RPC idle this long.  `None` disables.
     stream_idle_timeout: Option<Duration>,
+    /// Where `Recognize` decodes its audio: off the async workers, a bounded
+    /// number at a time.
+    decode_pool: DecodePool,
 }
 
 impl SpeechService {
@@ -72,7 +75,15 @@ impl SpeechService {
             sample_rate,
             max_audio_samples: None,
             stream_idle_timeout: None,
+            decode_pool: DecodePool::default(),
         }
+    }
+
+    /// Decode `Recognize` audio in `pool` -- the one the HTTP surface uses, so
+    /// a single bound covers the process.
+    pub fn with_decode_pool(mut self, pool: DecodePool) -> Self {
+        self.decode_pool = pool;
+        self
     }
 
     /// Bound the decoded waveform at `n` samples (at the source rate).
@@ -740,18 +751,29 @@ impl pb::speech_server::Speech for SpeechService {
             // Convert to the engine's rate before submitting: the engine derives
             // every frame count from its own feature config and ignores the
             // request's rate, so unconverted 8 kHz / 44.1 kHz audio decoded to a
-            // confident, wrong transcript.
-            let decoded = decode_audio(
-                &audio_bytes,
-                &DecodeOptions {
-                    hint: ct_hint,
-                    encoding: source_enc,
-                    source_sample_rate: Some(sr),
-                    target_sample_rate: Some(self.sample_rate),
-                    max_samples: self.max_audio_samples,
-                },
-            )
-            .map_err(|e| log_reject(Status::invalid_argument(format!("audio decode: {e}"))))?;
+            // confident, wrong transcript.  Seconds of CPU for long audio, so
+            // the pool runs it off this worker.
+            let decoded = self
+                .decode_pool
+                .decode(
+                    Bytes::from(audio_bytes),
+                    &DecodeOptions {
+                        hint: ct_hint,
+                        encoding: source_enc,
+                        source_sample_rate: Some(sr),
+                        target_sample_rate: Some(self.sample_rate),
+                        max_samples: self.max_audio_samples,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    let message = format!("audio decode: {e}");
+                    log_reject(match e {
+                        // The decoder crashed: ours to fix, whatever the input was.
+                        AudioError::DecodeTask(_) => Status::internal(message),
+                        _ => Status::invalid_argument(message),
+                    })
+                })?;
             if decoded.sample_rate != sr {
                 debug!(
                     from_hz = sr,

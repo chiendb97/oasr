@@ -13,9 +13,12 @@ default = ["codecs"]
 codecs = ["dep:symphonia"]
 
 [dependencies]
+bytemuck = { workspace = true }
 bytes = { workspace = true }
 hound = { workspace = true }
 rubato = { workspace = true }
 symphonia = { workspace = true, optional = true }
 thiserror = { workspace = true }
+# `DecodePool`: whole-clip decodes run on the blocking pool behind a semaphore.
+tokio = { workspace = true }
 tracing = { workspace = true }
