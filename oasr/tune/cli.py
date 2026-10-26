@@ -184,12 +184,14 @@ def _cmd_build(args) -> int:
             uniq[key] = p
     merged.points = list(uniq.values())
     families = {kernel_family(p.op) for p in merged.points}
-    want = {
+    # Typed: mypy 2.x infers this literal's values as `object` without the annotation.
+    wanted: Dict[str, List[str]] = {
         "auto": [f for f in ("gemm", "scaled_mm", "scaled_mm_fp8") if f in families] or ["gemm"],
         "gemm": ["gemm"],
         "scaled_mm": ["scaled_mm"],
         "scaled_mm_fp8": ["scaled_mm_fp8"],
-    }[args.family]
+    }
+    want = wanted[args.family]
     for family, what in (("scaled_mm", "int8"), ("scaled_mm_fp8", "fp8")):
         if family in want and family not in families:
             print(f"[build] the census has no {what} {family} points (census a quantized model)")
