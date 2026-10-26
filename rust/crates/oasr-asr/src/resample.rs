@@ -151,11 +151,11 @@ impl Resampler {
             self.filter.run(&self.pending, out)?;
             self.pending.clear();
         }
-        let mut chunks = input.chunks_exact(CHUNK);
-        for chunk in &mut chunks {
+        let (chunks, rest) = input.as_chunks::<CHUNK>();
+        for chunk in chunks {
             self.filter.run(chunk, out)?;
         }
-        self.pending.extend_from_slice(chunks.remainder());
+        self.pending.extend_from_slice(rest);
         Ok(())
     }
 
