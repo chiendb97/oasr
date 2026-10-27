@@ -314,8 +314,13 @@ def run_one(
         # After construction: the peak is what serving the manifest needs on top
         # of what the engine holds, not a one-time load or quantization transient.
         reset_peak_memory()
+        # An untimed pass over the whole manifest, then the timed one.  JIT
+        # compilation and graph capture happen on the first use of each batch
+        # shape, and only the same batches reach every shape the timed pass
+        # will; anything less leaves captures inside wall time and RTFx.
+        warm_hyps, _ = transcribe(engine, waves, max_batch_size, streaming=streaming)
         t0 = time.perf_counter()
-        hyps, per_utt_ms = transcribe(engine, waves, max_batch_size, streaming=streaming)
+        hyps, per_request_ms = transcribe(engine, waves, max_batch_size, streaming=streaming)
         wall = time.perf_counter() - t0
         peak_mib = peak_alloc_mib()
     finally:
@@ -327,6 +332,15 @@ def run_one(
 
         if _t.cuda.is_available():
             _t.cuda.empty_cache()
+
+    # The two passes decode the same audio, and only whether a shape had been
+    # captured yet differs between them -- the output must not depend on that.
+    changed = sum(a != b for a, b in zip(warm_hyps, hyps))
+    if changed:
+        print(
+            f"[WARN] {changed} of {len(hyps)} transcript(s) differ between the warm-up "
+            "and the timed pass; the error rate is the timed pass's"
+        )
 
     result = compute(
         [e.text for e in entries],
@@ -345,7 +359,7 @@ def run_one(
                 )
         print(f"[INFO] transcripts written to {save_transcripts}")
 
-    ordered = sorted(per_utt_ms)
+    ordered = sorted(per_request_ms)
     return Row(
         manifest=manifest_name,
         ckpt=Path(ckpt_dir).name,

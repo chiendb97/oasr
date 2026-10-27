@@ -14,9 +14,11 @@ import argparse
 import dataclasses
 import importlib
 import shlex
+import time
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -513,3 +515,199 @@ def test_accuracy_row_names_a_quantized_cell_and_leaves_a_full_precision_one_alo
     )
     assert "quantization=int8_w8a8" in int8.params and int8.shape.endswith("/int8_w8a8")
     assert int8.peak_alloc_mib == 250.0
+
+
+# ---------------------------------------------------------------------------
+# Timing windows: what the clock of a workload row covers
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A ``time.perf_counter`` that moves only when the fake engine says so."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+class _ShapeEngine:
+    """Costs ``cold_s`` the first time it sees a batch shape and ``warm_s`` after:
+    the first-use JIT and graph capture a warm-up exists to keep out of the clock.
+
+    A cold shape decodes to ``cold_text`` (``None``: the same as warm), so a
+    caller can check which pass its transcripts came from.
+    """
+
+    sample_rate = 16000
+
+    def __init__(self, clock, cold_s, warm_s, cold_text=None):
+        self.clock, self.cold_s, self.warm_s, self.cold_text = clock, cold_s, warm_s, cold_text
+        self.seen = set()
+
+    def transcribe_offline(self, waves):
+        shape = (len(waves), max(int(w.numel()) for w in waves))
+        cold = shape not in self.seen
+        self.seen.add(shape)
+        self.clock.t += self.cold_s if cold else self.warm_s
+        if cold and self.cold_text is not None:
+            return [self.cold_text for _ in waves]
+        return [f"w{int(w.numel())}" for w in waves]
+
+    def shutdown(self):
+        pass
+
+
+def _waves(n):
+    return [torch.zeros(1600 * (i + 1)) for i in range(n)]
+
+
+def test_a_batched_request_waits_for_its_whole_batch(monkeypatch):
+    """The batched API returns a batch's rows together, so each one's latency is
+    the batch's wall time -- not that time over the batch size."""
+    from oasr.testing.accuracy import transcribe
+
+    clock = _Clock()
+    monkeypatch.setattr(time, "perf_counter", clock)
+    waves = _waves(6)
+    hyps, latency_ms = transcribe(_ShapeEngine(clock, cold_s=0.1, warm_s=0.1), waves, 4)
+    assert hyps == [f"w{int(w.numel())}" for w in waves]
+    assert latency_ms == pytest.approx([100.0] * 6)  # a batch of 4, then of 2
+
+
+def _accuracy_row(accuracy, monkeypatch, engine, waves):
+    import oasr.engine
+
+    class _Config:
+        def __init__(self, **kw):
+            self.chunk_size = kw.get("chunk_size", 0)
+
+    monkeypatch.setattr(oasr.engine, "ASREngine", lambda cfg: engine)
+    monkeypatch.setattr(oasr.engine, "EngineConfig", _Config)
+    monkeypatch.setattr(accuracy, "load_audio", lambda entries, rate: (waves, 36.0))
+    entries = [
+        accuracy.Entry(uid=f"u{i}", audio=Path(f"u{i}.wav"), text=f"w{int(w.numel())}")
+        for i, w in enumerate(waves)
+    ]
+    return accuracy.run_one(
+        entries,
+        ckpt_dir="ckpt",
+        architecture=None,
+        decode_method=None,
+        decode_options={},
+        service_mode="offline",
+        chunk_size=None,
+        vad_mode="off",
+        vad_backend=None,
+        vad_model_dir=None,
+        vad_options={},
+        dtype="float16",
+        max_batch_size=4,
+        metric="wer",
+        normalizer_kind="none",
+        manifest_name="m.jsonl",
+        save_transcripts=None,
+    )
+
+
+def test_the_accuracy_row_times_a_warm_pass(monkeypatch):
+    """Every capture happens in the untimed pass, so the timed one is two warm
+    batches.  Timing the first pass instead counted 1 s per new shape."""
+    accuracy = registry.get_family("accuracy")
+    clock = _Clock()
+    monkeypatch.setattr(time, "perf_counter", clock)
+    engine = _ShapeEngine(clock, cold_s=1.0, warm_s=0.01)
+    row = _accuracy_row(accuracy, monkeypatch, engine, _waves(8))
+    assert row.wall_seconds == pytest.approx(0.02)
+    assert row.rtfx == pytest.approx(36.0 / 0.02)
+    assert row.latency_p50_ms == pytest.approx(10.0)
+    assert row.latency_p99_ms == pytest.approx(10.0)
+    assert row.error_rate_pct == 0.0
+
+
+def test_the_accuracy_row_scores_the_timed_pass_and_says_when_the_passes_differ(
+    monkeypatch, capsys
+):
+    accuracy = registry.get_family("accuracy")
+    clock = _Clock()
+    monkeypatch.setattr(time, "perf_counter", clock)
+    engine = _ShapeEngine(clock, cold_s=1.0, warm_s=0.01, cold_text="")
+    row = _accuracy_row(accuracy, monkeypatch, engine, _waves(8))
+    assert row.error_rate_pct == 0.0
+    assert "8 of 8 transcript(s) differ between the warm-up and the timed pass" in (
+        capsys.readouterr().out
+    )
+
+
+def _service_samples(n):
+    service = registry.get_family("service")
+    return [
+        service.Sample(
+            path=Path(f"{i}.wav"),
+            samples=np.zeros(1600 * (i + 1), dtype=np.float32),
+            sample_rate=16000,
+            duration_s=0.1 * (i + 1),
+            wav_bytes=b"",
+        )
+        for i in range(n)
+    ]
+
+
+def _drive_service(monkeypatch, samples, *flags):
+    """``service._drive`` against a fake offline subroutine; returns the calls
+    it made, as ``(durations, concurrency)``, and its stats."""
+    service = registry.get_family("service")
+    monkeypatch.setattr(service, "_load_dataset", lambda audio_dir, n: samples)
+    calls = []
+
+    async def fake_offline(http_url, batch, concurrency, wire_encoding):
+        calls.append(([s.duration_s for s in batch], concurrency))
+        return service.RunStats(name=f"call {len(calls)}", n_ok=len(batch), wall_s=1.0)
+
+    monkeypatch.setattr(service, "_bench_offline", fake_offline)
+    parser = argparse.ArgumentParser(add_help=False)
+    service.parse_args(parser)
+    args = parser.parse_args(
+        ["--audio-dir", "unused", "--server-url", "http://127.0.0.1:1", "-c", "4", *flags]
+    )
+    return calls, service._drive(args)
+
+
+def test_the_service_bench_replays_the_set_untimed_before_the_timed_run(monkeypatch):
+    samples = _service_samples(10)
+    calls, [(sub, stats)] = _drive_service(monkeypatch, samples)
+    every = [s.duration_s for s in samples]
+    assert calls == [(every, 4), (every, 4)]  # the warm-up, then the timed run
+    assert sub == "offline" and stats.name == "call 2" and stats.warmup_requests == 10
+
+
+def test_a_counted_service_warmup_spans_the_durations(monkeypatch):
+    samples = _service_samples(10)
+    calls, [(_, stats)] = _drive_service(monkeypatch, samples, "--warmup-requests", "3")
+    assert calls[0] == ([0.1, 0.5, 1.0], 4)
+    assert stats.warmup_requests == 3
+    calls, [(_, stats)] = _drive_service(monkeypatch, samples, "--warmup-requests", "0")
+    assert len(calls) == 1 and stats.warmup_requests == 0
+
+
+def test_the_service_warmup_flag_takes_all_or_a_count():
+    parser = argparse.ArgumentParser(add_help=False)
+    registry.get_family("service").parse_args(parser)
+
+    def parse(*flag):
+        return parser.parse_args(["--audio-dir", "unused", *flag]).warmup_requests
+
+    assert parse() == "all" and parse("--warmup-requests", "ALL") == "all"
+    assert parse("--warmup-requests", "3") == 3
+    for bad in ("-1", "half"):
+        with pytest.raises(SystemExit):
+            parse("--warmup-requests", bad)
+
+
+def test_run_py_hands_the_warmup_flag_to_the_service_family():
+    """``--warmup`` would have been read as run.py's ``--warmup-iters``."""
+    from benchmarks.run import build_parser
+
+    _, extra = build_parser().parse_known_args(["--family", "service", "--warmup-requests", "0"])
+    assert extra == ["--warmup-requests", "0"]

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import os
 import statistics
 import subprocess
@@ -18,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Coroutine, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -297,6 +298,8 @@ class RunStats:
     partial_counts: List[int] = field(default_factory=list)
     # rejection-cause histogram (engine error code | "transport:<ExcType>")
     error_codes: dict = field(default_factory=dict)
+    # untimed requests sent before this run (--warmup-requests)
+    warmup_requests: int = 0
 
     def pretty(self) -> str:
         if not self.latencies_ms:
@@ -433,11 +436,13 @@ async def _bench_offline(
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def _load_grpc_stubs(proto_path: Path):
     """Compile ``rust/proto/oasr_speech_v1.proto`` to a temp dir and import it.
 
     Keeps the bench self-contained — we don't ship pre-generated stubs in
-    the repo.
+    the repo.  Cached, so the warm-up round and the timed run share one
+    compilation.
     """
     import importlib
     import shutil
@@ -706,6 +711,17 @@ def parse_args(p: argparse.ArgumentParser) -> None:
         help="Concurrent in-flight requests per subroutine "
         "(reads $CONCURRENCY if set; default 16)",
     )
+    p.add_argument(
+        "--warmup-requests",
+        type=_warmup_arg,
+        default="all",
+        metavar="all|N",
+        help="Untimed requests sent before each subroutine's timed run, at the same "
+        "concurrency.  `all` (default) replays the whole set once, so the batch "
+        "shapes the timed run forms are JIT-compiled and graph-captured before the "
+        "clock starts; N sends N requests spread over the durations; 0 measures a "
+        "cold server.",
+    )
 
     # Streaming-specific
     p.add_argument(
@@ -802,6 +818,39 @@ def parse_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _warmup_arg(value: str) -> Union[str, int]:
+    """``--warmup-requests``: ``"all"`` or a request count >= 0."""
+    if value.strip().lower() == "all":
+        return "all"
+    try:
+        n = int(value)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected `all` or a count >= 0, got {value!r}")
+    return n
+
+
+def _warmup_samples(samples: List[Sample], warmup: Union[str, int]) -> List[Sample]:
+    """What the warm-up round sends: the whole set, or *warmup* samples spread
+    evenly over the sorted durations.
+
+    The engine captures a graph per batch shape, and the frame axis of that shape
+    follows the audio, so a count that took the first N files would warm the
+    lengths those files happen to have and leave the rest of the captures in the
+    timed run.
+    """
+    if warmup == "all":
+        return list(samples)
+    n = min(int(warmup), len(samples))
+    if n <= 0:
+        return []
+    ordered = sorted(samples, key=lambda s: s.duration_s)
+    if n == 1:
+        return [ordered[len(ordered) // 2]]
+    return [ordered[round(i * (len(ordered) - 1) / (n - 1))] for i in range(n)]
+
+
 SUBROUTINES = ["offline", "streaming", "grpc_offline", "grpc_streaming", "whisper"]
 
 #: Served precision, matching what bench_service.py defaulted to.
@@ -877,6 +926,7 @@ def run(args: argparse.Namespace, reporter: Reporter, repro_command: str = "") -
                 "first_partial_ms": s_.first_partial_ms,
                 "partial_counts": s_.partial_counts,
                 "error_codes": s_.error_codes,
+                "warmup_requests": s_.warmup_requests,
             },
         )
 
@@ -917,6 +967,7 @@ def _drive(args: argparse.Namespace):
         http_url = args.server_url.rstrip("/")
         grpc_addr = args.grpc_bind
 
+    warm = _warmup_samples(samples, args.warmup_requests)
     all_stats: List[tuple] = []
     try:
         for sub in args.subroutines:
@@ -925,34 +976,18 @@ def _drive(args: argparse.Namespace):
                 f"n={len(samples)}, mode={args.service_mode})",
                 flush=True,
             )
-            if sub == "offline":
-                s = asyncio.run(
-                    _bench_offline(http_url, samples, args.concurrency, args.wire_encoding)
+            # Untimed and discarded.  The server captures a graph the first time it
+            # forms each batch shape, and without this round every first capture
+            # landed in the timed run's p99.
+            if warm:
+                w = asyncio.run(_bench(sub, args, http_url, grpc_addr, warm))
+                print(
+                    f"  warm-up    {len(warm)} requests (ok={w.n_ok}) in {w.wall_s:.2f} s, "
+                    "untimed",
+                    flush=True,
                 )
-            elif sub == "grpc_offline":
-                s = asyncio.run(
-                    _bench_grpc_offline(
-                        grpc_addr,
-                        samples,
-                        args.concurrency,
-                        args.proto,
-                        args.language_code,
-                    )
-                )
-            elif sub == "grpc_streaming":
-                s = asyncio.run(
-                    _bench_grpc_streaming(
-                        grpc_addr,
-                        samples,
-                        args.concurrency,
-                        args.chunk_ms,
-                        args.proto,
-                        bool(args.realtime),
-                        args.language_code,
-                    )
-                )
-            else:
-                raise SystemExit(f"unknown subroutine: {sub}")
+            s = asyncio.run(_bench(sub, args, http_url, grpc_addr, samples))
+            s.warmup_requests = len(warm)
             print(s.pretty(), flush=True)
             all_stats.append((sub, s))
     finally:
@@ -960,6 +995,37 @@ def _drive(args: argparse.Namespace):
             handle.stop()
 
     return all_stats
+
+
+def _bench(
+    sub: str,
+    args: argparse.Namespace,
+    http_url: str,
+    grpc_addr: str,
+    samples: List[Sample],
+) -> Coroutine[Any, Any, RunStats]:
+    """The coroutine that drives *sub* over *samples*."""
+    if sub == "offline":
+        return _bench_offline(http_url, samples, args.concurrency, args.wire_encoding)
+    if sub == "grpc_offline":
+        return _bench_grpc_offline(
+            grpc_addr,
+            samples,
+            args.concurrency,
+            args.proto,
+            args.language_code,
+        )
+    if sub == "grpc_streaming":
+        return _bench_grpc_streaming(
+            grpc_addr,
+            samples,
+            args.concurrency,
+            args.chunk_ms,
+            args.proto,
+            bool(args.realtime),
+            args.language_code,
+        )
+    raise SystemExit(f"unknown subroutine: {sub}")
 
 
 if __name__ == "__main__":
