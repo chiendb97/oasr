@@ -3,12 +3,16 @@
 """Functional API for convolution operations."""
 
 import functools
-from typing import List, Optional, cast
+import logging
+from typing import Callable, List, Optional, cast
 
 import torch
 
 import oasr.jit.conv as _jit_conv
 from oasr.api_logging import oasr_api
+from oasr.jit.errors import VariantUnsupportedError
+
+logger = logging.getLogger("oasr.functionals.conv")
 
 
 def _padding_pair(padding: int | tuple[int, int]) -> tuple[int, int]:
@@ -121,6 +125,33 @@ def _conv1d_activation_fn(compile_name: str):
     return getattr(_get_conv2d_module(), f"conv1d_{compile_name}_activation")
 
 
+_CONV1D_WARNED: set = set()
+
+
+def _warn_conv1d_once(op: str, name: str, filter: torch.Tensor, what: str) -> None:
+    key = (op, name, int(filter.shape[0]), int(filter.shape[1]), what)
+    if key not in _CONV1D_WARNED:
+        _CONV1D_WARNED.add(key)
+        logger.warning(
+            "%s: tile %s %s (K=%d, kernel=%d); using the fixed default tile",
+            op,
+            name,
+            what,
+            int(filter.shape[0]),
+            int(filter.shape[1]),
+        )
+
+
+def _conv1d_tile(op: str, name: str, resolve: Callable, filter: torch.Tensor):
+    """The compiled launcher for tile *name*, or ``None`` (warned once) when the
+    module was not built with it -- a rule naming a tile the module lacks."""
+    try:
+        return resolve(name)
+    except AttributeError:
+        _warn_conv1d_once(op, name, filter, "is not compiled")
+        return None
+
+
 def _dispatch_conv1d(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -130,24 +161,32 @@ def _dispatch_conv1d(
     stride: int,
     dilation: int,
 ) -> None:
-    """Run the measured shape-specific tile, retaining a safe fixed fallback."""
-    try:
-        choice = _jit_conv.select_default_conv1d_config(
-            input.shape[0],
-            input.shape[1],
-            input.shape[2],
-            filter.shape[0],
-            filter.shape[1],
-            padding,
-            stride,
-            dilation,
-            input.dtype,
-            _target_sm(),
-        )
-        _conv1d_fn(choice.compile_name)(out, input, filter, bias, padding, stride, dilation)
-        return
-    except Exception:
-        pass
+    """Run the measured shape-specific tile, retaining a safe fixed fallback.
+
+    The fallback is for a tile that cannot serve the shape: one the module was
+    not compiled with, or one whose ``can_implement`` refuses the problem
+    (``VariantUnsupportedError``, raised before anything launches).  Every other
+    failure propagates; catching it relaunched the default over a CUDA error.
+    """
+    choice = _jit_conv.select_default_conv1d_config(
+        input.shape[0],
+        input.shape[1],
+        input.shape[2],
+        filter.shape[0],
+        filter.shape[1],
+        padding,
+        stride,
+        dilation,
+        input.dtype,
+        _target_sm(),
+    )
+    fn = _conv1d_tile("conv1d", choice.compile_name, _conv1d_fn, filter)
+    if fn is not None:
+        try:
+            fn(out, input, filter, bias, padding, stride, dilation)
+            return
+        except VariantUnsupportedError:
+            _warn_conv1d_once("conv1d", choice.compile_name, filter, "refuses this shape")
     _default_conv1d_fn()(out, input, filter, bias, padding, stride, dilation)
 
 
@@ -161,26 +200,28 @@ def _dispatch_conv1d_activation(
     stride: int,
     dilation: int,
 ) -> None:
-    """Run a measured fused-activation tile, retaining a safe fixed fallback."""
-    try:
-        choice = _jit_conv.select_default_conv1d_activation_config(
-            input.shape[0],
-            input.shape[1],
-            input.shape[2],
-            filter.shape[0],
-            filter.shape[1],
-            padding,
-            stride,
-            dilation,
-            input.dtype,
-            _target_sm(),
-        )
-        _conv1d_activation_fn(choice.compile_name)(
-            out, input, filter, bias, activation_type, padding, stride, dilation
-        )
-        return
-    except Exception:
-        pass
+    """Run a measured fused-activation tile, retaining a safe fixed fallback
+    (the same one as :func:`_dispatch_conv1d`)."""
+    choice = _jit_conv.select_default_conv1d_activation_config(
+        input.shape[0],
+        input.shape[1],
+        input.shape[2],
+        filter.shape[0],
+        filter.shape[1],
+        padding,
+        stride,
+        dilation,
+        input.dtype,
+        _target_sm(),
+    )
+    op = "conv1d_activation"
+    fn = _conv1d_tile(op, choice.compile_name, _conv1d_activation_fn, filter)
+    if fn is not None:
+        try:
+            fn(out, input, filter, bias, activation_type, padding, stride, dilation)
+            return
+        except VariantUnsupportedError:
+            _warn_conv1d_once(op, choice.compile_name, filter, "refuses this shape")
     _default_conv1d_activation_fn()(
         out, input, filter, bias, activation_type, padding, stride, dilation
     )

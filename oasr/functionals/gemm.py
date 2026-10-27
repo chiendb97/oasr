@@ -14,6 +14,7 @@ import torch
 # the heuristic at its source, which the dispatch tests rely on.
 import oasr.jit.gemm as _jit_gemm
 from oasr.api_logging import oasr_api
+from oasr.jit.errors import VariantUnsupportedError
 from oasr.tune import is_tuning_enabled
 
 logger = logging.getLogger("oasr.functionals.gemm")
@@ -303,6 +304,30 @@ def _plan(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tuple:
     return plan
 
 
+def _downgrade(key: tuple, plan: tuple, exc: VariantUnsupportedError) -> None:
+    """The planned variant refused its shape: dispatch the default from now on.
+
+    *plan* replaces the memoised entry under *key* (same resolvers, default kind),
+    so the refusal is paid once per shape rather than once per call.  Only a
+    :class:`~oasr.jit.errors.VariantUnsupportedError` gets here -- nothing was
+    launched -- and it is logged once per ``(op, N, K)``: a rule naming a variant
+    that cannot run its own shape is a tuning bug, worth one line, not a silence.
+    """
+    _PLANS[key] = plan
+    op, N, K = key[0], key[3], key[4]
+    wkey = (op, N, K, "unsupported")
+    if wkey not in _PLAN_WARNED:
+        _PLAN_WARNED.add(wkey)
+        logger.warning(
+            "%s (%s M=%d N=%d K=%d); using the fixed default variant for this shape",
+            exc,
+            op,
+            key[2],
+            N,
+            K,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Batch-invariant ("pinned") dispatch
 # ---------------------------------------------------------------------------
@@ -369,24 +394,26 @@ def _plan_pinned(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tu
 def _dispatch_gemm_pinned(out, A, B, C, N, K, M) -> None:
     """``gemm(..., batch_invariant=True)``: a CUTLASS data-parallel variant, always.
 
-    No cuBLAS, no split-K, no Stream-K -- and no ``except: use the default``
-    unless the default is in the class too, since a silent fallback to a
-    kernel whose rows depend on M is the one outcome this call exists to rule
-    out.
+    No cuBLAS, no split-K, no Stream-K -- and no fallback to the default unless
+    the default is in the class too, since a silent fallback to a kernel whose
+    rows depend on M is the one outcome this call exists to rule out.  Only a
+    variant that refuses the shape falls back; a failed launch raises.
     """
     if M == 0:
         # No rows, nothing to pin -- and the CUTLASS launchers refuse an empty
         # grid, which the unpinned path only ever avoided by routing it to
         # cuBLAS.
         return
-    _, _, kind, fn = _plan_pinned("gemm", False, M, N, K, A.dtype)
-    if kind == _PLAN_CUTLASS:
+    plan = _plan_pinned("gemm", False, M, N, K, A.dtype)
+    if plan[2] == _PLAN_CUTLASS:
         try:
-            fn(out, A, B, C, 1)
+            plan[3](out, A, B, C, 1)
             return
-        except Exception:
+        except VariantUnsupportedError as exc:
             if not _jit_gemm.is_batch_invariant(_jit_gemm.GEMM_DEFAULT):
                 raise
+            key = ("gemm", False, M, N, K, A.dtype, True)
+            _downgrade(key, (plan[0], plan[1], _PLAN_DEFAULT, None), exc)
     _default_gemm_fn()(out, A, B, C, 1)
 
 
@@ -394,14 +421,16 @@ def _dispatch_gemm_activation_pinned(out, A, B, C, activation_type, N, K, M) -> 
     """``gemm_activation(..., batch_invariant=True)`` (see ``_dispatch_gemm_pinned``)."""
     if M == 0:
         return
-    _, _, kind, fn = _plan_pinned("gemm_activation", True, M, N, K, A.dtype)
-    if kind == _PLAN_CUTLASS:
+    plan = _plan_pinned("gemm_activation", True, M, N, K, A.dtype)
+    if plan[2] == _PLAN_CUTLASS:
         try:
-            fn(out, A, B, C, activation_type, 1)
+            plan[3](out, A, B, C, activation_type, 1)
             return
-        except Exception:
+        except VariantUnsupportedError as exc:
             if not _jit_gemm.is_batch_invariant(_jit_gemm.GEMM_DEFAULT):
                 raise
+            key = ("gemm_activation", True, M, N, K, A.dtype, True)
+            _downgrade(key, (plan[0], plan[1], _PLAN_DEFAULT, None), exc)
     _default_gemm_activation_fn()(out, A, B, C, activation_type, 1)
 
 
@@ -418,45 +447,53 @@ def _dispatch_gemm(out, A, B, C, N, K, M) -> None:
     """Shape-aware non-tuning dispatch for ``gemm``.
 
     Picks a per-shape config via the heuristic rules (CUTLASS variant or torch/
-    cuBLAS); any failure falls through to the fixed ``GEMM_DEFAULT`` so a bad rule
-    can never break inference.
+    cuBLAS).  A variant that refuses the shape (``VariantUnsupportedError``, raised
+    before anything launches) falls back to the fixed ``GEMM_DEFAULT``, and the plan
+    remembers it.  Every other failure propagates: catching it relaunched the
+    default over a CUDA error -- a sticky one then surfaced calls later, a
+    non-sticky one (a variant that could never launch) only as a slowdown.
 
     ``A``/``out`` arrive N-D — the CUTLASS launchers flatten internally.  Only
     the cuBLAS escape needs 2-D views, and it is the rare branch (5 of 27 rules),
-    so it pays for its own reshapes.
+    so it pays for its own.  ``view``, not ``reshape``: the CUTLASS launchers
+    refuse a non-contiguous ``out``, and ``reshape`` made the cuBLAS route accept
+    one by writing the product into a copy the caller never sees.
 
     The decision itself is memoised per shape by :func:`_plan`; only the launch
     remains per-invocation.
     """
-    _, kind, fn, split_k = _plan("gemm", False, M, N, K, A.dtype)
-    try:
-        if kind == _PLAN_CUTLASS:
+    plan = _plan("gemm", False, M, N, K, A.dtype)
+    _, kind, fn, split_k = plan
+    if kind == _PLAN_CUTLASS:
+        try:
             fn(out, A, B, C, split_k)
             return
-        if kind == _PLAN_TORCH:
-            from oasr.functionals.gemm_torch import torch_gemm
+        except VariantUnsupportedError as exc:
+            _downgrade(("gemm", False, M, N, K, A.dtype), (plan[0], _PLAN_DEFAULT, None, 1), exc)
+    elif kind == _PLAN_TORCH:
+        from oasr.functionals.gemm_torch import torch_gemm
 
-            torch_gemm(out.reshape(M, N), A.reshape(M, K), B, C, 1)
-            return
-    except Exception:
-        pass
+        torch_gemm(out.view(M, N), A.view(M, K), B, C, 1)
+        return
     _default_gemm_fn()(out, A, B, C, 1)
 
 
 def _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M) -> None:
     """Shape-aware non-tuning dispatch for ``gemm_activation`` (see ``_dispatch_gemm``)."""
-    _, kind, fn, split_k = _plan("gemm_activation", True, M, N, K, A.dtype)
-    try:
-        if kind == _PLAN_CUTLASS:
+    plan = _plan("gemm_activation", True, M, N, K, A.dtype)
+    _, kind, fn, split_k = plan
+    if kind == _PLAN_CUTLASS:
+        try:
             fn(out, A, B, C, activation_type, split_k)
             return
-        if kind == _PLAN_TORCH:
-            from oasr.functionals.gemm_torch import torch_gemm_activation
+        except VariantUnsupportedError as exc:
+            key = ("gemm_activation", True, M, N, K, A.dtype)
+            _downgrade(key, (plan[0], _PLAN_DEFAULT, None, 1), exc)
+    elif kind == _PLAN_TORCH:
+        from oasr.functionals.gemm_torch import torch_gemm_activation
 
-            torch_gemm_activation(out.reshape(M, N), A.reshape(M, K), B, C, activation_type, 1)
-            return
-    except Exception:
-        pass
+        torch_gemm_activation(out.view(M, N), A.view(M, K), B, C, activation_type, 1)
+        return
     _default_gemm_activation_fn()(out, A, B, C, activation_type, 1)
 
 
@@ -516,20 +553,23 @@ def _dispatch_bmm(out, A, B, N, K) -> None:
     The rule table is keyed on ``("bmm", N, K)`` with M thresholds (the batch
     dimension is not part of the key).  BMM has no Stream-K / parallel split-K
     variants and no runtime split-K argument, so a rule choice only selects a
-    tile.  Any failure falls through to the fixed default.
+    tile.  A tile that refuses the shape falls through to the fixed default, as
+    in :func:`_dispatch_gemm`; any other failure propagates.
     """
-    _, kind, fn, _sk = _plan("bmm", False, A.shape[1], N, K, A.dtype)
-    try:
-        if kind == _PLAN_CUTLASS:
+    M = A.shape[1]
+    plan = _plan("bmm", False, M, N, K, A.dtype)
+    _, kind, fn, _sk = plan
+    if kind == _PLAN_CUTLASS:
+        try:
             fn(out, A, B)
             return
-        if kind == _PLAN_TORCH:
-            from oasr.functionals.gemm_torch import torch_bmm
+        except VariantUnsupportedError as exc:
+            _downgrade(("bmm", False, M, N, K, A.dtype), (plan[0], _PLAN_DEFAULT, None, 1), exc)
+    elif kind == _PLAN_TORCH:
+        from oasr.functionals.gemm_torch import torch_bmm
 
-            torch_bmm(out, A, B)
-            return
-    except Exception:
-        pass
+        torch_bmm(out, A, B)
+        return
     _default_bmm_fn()(out, A, B)
 
 
@@ -552,7 +592,8 @@ def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
         the fused path, but the GEMM tile is shape-selected).
 
     Falls back to the legacy fused launcher (the historical behaviour) when no
-    rule matches.
+    rule matches, or when the rule's GEMM variant refuses the shape; any other
+    failure propagates (see :func:`_dispatch_gemm`).
 
     An unaligned ``N``/``K`` used to be quietly rerouted to cuBLAS here, which
     made this the one GEMM entry point with a different contract from the rest
@@ -560,21 +601,24 @@ def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
     raise the same actionable error (``CHECK_GEMM_ALIGNMENT``), and the fix is
     to pad the projection at the model layer, which every in-tree caller does.
     """
-    _, kind, fn, split_k = _plan("gemm_log_softmax", False, M, N, K, A.dtype)
-    try:
-        if kind == _PLAN_TORCH:
-            from oasr.functionals.gemm_torch import torch_gemm_log_softmax
+    plan = _plan("gemm_log_softmax", False, M, N, K, A.dtype)
+    _, kind, fn, split_k = plan
+    if kind == _PLAN_TORCH:
+        from oasr.functionals.gemm_torch import torch_gemm_log_softmax
 
-            torch_gemm_log_softmax(out.reshape(M, N), A.reshape(M, K), B, C, 1)
-            return
-        if kind == _PLAN_CUTLASS:
+        torch_gemm_log_softmax(out.view(M, N), A.view(M, K), B, C, 1)
+        return
+    if kind == _PLAN_CUTLASS:
+        try:
             fn(out, A, B, C, split_k)
+        except VariantUnsupportedError as exc:
+            key = ("gemm_log_softmax", False, M, N, K, A.dtype)
+            _downgrade(key, (plan[0], _PLAN_DEFAULT, None, 1), exc)
+        else:
             # The online log_softmax kernel normalises the trailing dim, so it
             # takes the N-D buffer as-is.
             _log_softmax_inplace(out)
             return
-    except Exception:
-        pass
     _get_gemm_log_softmax_module().gemm_log_softmax(out, A, B, C, 1)
 
 
@@ -623,7 +667,7 @@ def gemm(
             shape_sig=(M, N, K),
             dtype=A.dtype,
             device=A.device,
-            runner_args=(out.reshape(-1, N), A.reshape(-1, K), B, C),
+            runner_args=(out.view(-1, N), A.view(-1, K), B, C),
         )
         return out
 
@@ -809,7 +853,7 @@ def gemm_activation(
             shape_sig=(M, N, K),
             dtype=A.dtype,
             device=A.device,
-            runner_args=(out.reshape(-1, N), A.reshape(-1, K), B, C, activation_type),
+            runner_args=(out.view(-1, N), A.view(-1, K), B, C, activation_type),
         )
         return out
 
@@ -851,7 +895,7 @@ def gemm_log_softmax(
             shape_sig=(M, N, K),
             dtype=A.dtype,
             device=A.device,
-            runner_args=(out.reshape(-1, N), A.reshape(-1, K), B, C),
+            runner_args=(out.view(-1, N), A.view(-1, K), B, C),
         )
         return out
 

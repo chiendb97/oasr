@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <oasr/common/arch_dispatch.h>
+#include <oasr/common/utils.h>
 
 #include <tvm/ffi/c_api.h>
 #include <tvm/ffi/container/tensor.h>
@@ -144,6 +145,31 @@ inline T* OptionalDataPtr(Optional const& t) {
                static_cast<int64_t>(oasr::get_element_size((x).dtype()))            \
         << " bytes, more than one launch can address (2 GiB); split the batch -- "  \
            "the oasr.conv* entry points do"
+
+// Raise for a CUTLASS launcher's GemmStatus, keeping the two kinds of failure
+// apart.  NOT_SUPPORTED -- the variant's can_implement refused the problem, or it
+// has no path for these arguments -- raises OasrVariantUnsupported
+// (oasr.jit.errors.VariantUnsupportedError in Python), which the dispatch layer
+// answers by running the default variant.  Anything else is a launch that did not
+// happen (a failed shared-memory opt-in, initialize(), the launch itself) and
+// raises RuntimeError: a fallback there would hide a CUDA error until a later call
+// trips over it, and a variant that can never launch until someone profiles.
+#define CHECK_GEMM_STATUS(status, what)                                                   \
+    do {                                                                                  \
+        const ::oasr::gemm::GemmStatus oasr_status_ = (status);                           \
+        if (oasr_status_ == ::oasr::gemm::GemmStatus::NOT_SUPPORTED) {                    \
+            TVM_FFI_THROW(OasrVariantUnsupported)                                         \
+                << (what) << " cannot implement this problem (NOT_SUPPORTED)";            \
+        }                                                                                 \
+        if (oasr_status_ != ::oasr::gemm::GemmStatus::SUCCESS) {                          \
+            const cudaError_t oasr_cuda_ = cudaPeekAtLastError();                         \
+            TVM_FFI_THROW(RuntimeError)                                                   \
+                << (what) << " failed: "                                                  \
+                << ::oasr::gemm::getGemmStatusString(oasr_status_)                        \
+                << (oasr_cuda_ == cudaSuccess ? "" : " -- ")                              \
+                << (oasr_cuda_ == cudaSuccess ? "" : cudaGetErrorString(oasr_cuda_));     \
+        }                                                                                 \
+    } while (0)
 
 // =============================================================================
 // Dtype dispatch macros

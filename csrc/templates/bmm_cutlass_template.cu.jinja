@@ -67,8 +67,7 @@ void {{ func_name }}(TensorView output, TensorView A, TensorView B) {
                 reinterpret_cast<CutlassType*>(output.data_ptr()),
                 batch_size, M, N, K, lda, ldb, ldd,
                 stride_a, stride_b, stride_d, 1.0f, 0.0f, stream);
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "BMM kernel failed";
+        CHECK_GEMM_STATUS(status, "BMM kernel {{ func_name }}");
         return true;
     });
 }

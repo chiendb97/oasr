@@ -1150,8 +1150,30 @@ def _render_bmm_general_variants() -> List:
 # =============================================================================
 
 
-def _level_configs(level: str, *, native_only: bool = False):
-    """The variants a module of *level* renders.
+def _production_set(family: str, sm: int):
+    """The configs *family*'s production module compiles in this process.
+
+    Frozen the first time either of the family's modules is generated, because
+    the production library a process has loaded cannot change.  Re-deriving it
+    from a reloaded tuning DB, as the tuning level used to, computed a tuning
+    module that overlapped the library already loaded -- every config the old
+    DB named and the new one dropped was in both, which is the clash
+    :func:`_level_configs` exists to rule out.  A config the reloaded DB adds is
+    not lost: it is outside the frozen set, so the tuning module compiles it.
+    """
+    key = (family, int(sm))
+    cfgs = _FROZEN_PRODUCTION.get(key)
+    if cfgs is None:
+        cfgs = _FROZEN_PRODUCTION[key] = get_production_configs(sm)
+        if family == "gemm":  # the GEMM family's dispatch record (``_is_compiled``)
+            _BUILT_PRODUCTION[int(sm)] = frozenset(cfgs)
+            _COMPILED_NAMES.pop(int(sm), None)
+            _PINNED_CANDIDATES.pop(int(sm), None)
+    return cfgs
+
+
+def _level_configs(level: str, *, family: str = "gemm", native_only: bool = False):
+    """The variants a module of *family* at *level* renders.
 
     The tuning module holds the tuning space **minus** the production set --
     never a variant both modules have.  Two libraries instantiating the same
@@ -1162,17 +1184,15 @@ def _level_configs(level: str, *, native_only: bool = False):
     whose 73.7 KB of dynamic shared memory then failed to launch ("GEMM kernel
     failed") -- measured, the moment both modules had run the same variant.
     Lookups resolve production first, then tuning (``oasr.functionals.gemm``).
+    Both levels read one frozen set per family (:func:`_production_set`), so a
+    tuning-DB reload between them cannot make them overlap.
     """
     sm = _get_target_sm()
+    prod = _production_set(family, sm)
     if level == "production":
-        cfgs = get_production_configs(sm)
-        if native_only:  # BMM / grouped GEMM: not the GEMM family's dispatch record
-            return {n: c for n, c in cfgs.items() if is_native_lane(c, sm)}
-        _BUILT_PRODUCTION[sm] = frozenset(cfgs)
-        _COMPILED_NAMES.pop(sm, None)
-        _PINNED_CANDIDATES.pop(sm, None)
-        return cfgs
-    prod = get_production_configs(sm)
+        if native_only:  # BMM / grouped GEMM
+            return {n: c for n, c in prod.items() if is_native_lane(c, sm)}
+        return prod
     return {
         n: c
         for n, c in get_unique_compile_configs(sm).items()
@@ -1227,7 +1247,7 @@ def gen_bmm_module(level: str = "production") -> JitSpec:
         "bmm_cutlass_template.cu.jinja",
         "bmm_cutlass_template_sm90.cu.jinja",
         "bmm",
-        configs=_level_configs(level, native_only=True),
+        configs=_level_configs(level, family="bmm", native_only=True),
     )
     if level == "production":
         # The general lane lives in the production module only: a second copy
@@ -1253,7 +1273,7 @@ def gen_group_gemm_module(level: str = "production") -> JitSpec:
         "group_gemm_cutlass_template.cu.jinja",
         "group_gemm_cutlass_template_sm90.cu.jinja",
         "group_gemm",
-        configs=_level_configs(level, native_only=True),
+        configs=_level_configs(level, family="group_gemm", native_only=True),
     )
     return gen_jit_spec(_module_name("group_gemm", level), source_paths)
 
@@ -1632,10 +1652,17 @@ _register_reload_hook()
 #: ``sm -> compile names`` a production dispatch can reach (see :func:`_is_compiled`).
 _COMPILED_NAMES: Dict[int, frozenset] = {}
 
-#: ``sm -> compile names`` the production GEMM module of this process was built
-#: with.  Frozen at generation: a later tuning-DB reload can name configs the
-#: loaded module does not contain, and those must not reach dispatch.
+#: ``sm -> compile names`` the production GEMM module of this process is built
+#: with.  Frozen with :data:`_FROZEN_PRODUCTION`: a later tuning-DB reload can name
+#: configs the loaded module does not contain, and those must not reach dispatch.
 _BUILT_PRODUCTION: Dict[int, frozenset] = {}
+
+#: ``(family, sm) -> configs`` of each family's production module, frozen at first
+#: use (:func:`_production_set`).  Never cleared by a tuning reload -- the library
+#: it describes stays loaded.
+_FROZEN_PRODUCTION: Dict[
+    Tuple[str, int], Dict[str, Union[CutlassGemmConfig, CutlassGemmConfigSm90]]
+] = {}
 
 #: Families whose tuning module (the whole space) this process has loaded.
 _TUNE_LOADED: set = set()

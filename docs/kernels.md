@@ -446,9 +446,24 @@ shape lookup(s) used GEMM_DEFAULT. Tune this card with scripts/tune_asr_gemm.py.
 **The production module compiles the tuned subset.** `get_production_configs(sm)`
 is what the tuning DB references for the arch (both tiers), the default and a
 small coverage basis — 20 of 35 variants on sm120, 9 of 43 on sm80; the tuning
-modules (`gemm_tune`, `bmm_tune`, `group_gemm_tune`) compile the whole space
-(`get_unique_compile_configs`) and are only built by a process that tunes or
-sweeps. `OASR_GEMM_COMPILE_SET=all` restores the old single-module behaviour.
+modules (`gemm_tune`, `bmm_tune`, `group_gemm_tune`) compile the rest of the
+space (`get_unique_compile_configs` minus production) and are only built by a
+process that tunes or sweeps. Never a variant in both: two libraries
+instantiating one CUTLASS kernel share its one-time initialisation
+(`STB_GNU_UNIQUE` statics), so the second skips its own shared-memory opt-in and
+fails to launch. Each family's production set is therefore frozen at first use
+(`jit.gemm._production_set`) — a tuning-DB reload cannot move it under a loaded
+library, and a config the reload adds is compiled by the tuning module instead.
+`OASR_GEMM_COMPILE_SET=all` restores the old single-module behaviour.
+
+**What a failed launch does.** A variant whose `can_implement` refuses the
+problem raises `oasr.jit.errors.VariantUnsupportedError` before anything
+launches (`CHECK_GEMM_STATUS`, `csrc/tvm_ffi_utils.h`). The GEMM, BMM and Conv1D
+dispatch answer it with the default variant, remember it per shape and log it
+once. Every other failure — a CUDA error, a failed shared-memory opt-in,
+`initialize()` — is a plain `RuntimeError` and reaches the caller: relaunching
+the default over it hid a sticky CUDA error until a later call tripped over it,
+and a variant that could never launch until someone profiled.
 The candidate space itself is one generator per MMA lane: every CUTLASS 2.x
 family (sm_75/80/86/89/120) gets the lane's tiles at every pipeline depth its
 template can take *and* its shared memory fits — which is how sm_86/sm_89, with
