@@ -56,7 +56,10 @@ BLANK = 0
 #: The grouping and the emission tiling are C++ only — there is no Python
 #: implementation to fall back to, so the classes that exercise them need the
 #: built extension.  Everything else in this file (the clock, the CTC oracle,
-#: the DTW, the per-family contract) is pure Python and runs anywhere.
+#: the DTW, the per-family contract) is pure Python and runs anywhere.  Mark
+#: classes, never the module: a ``pytestmark`` covers every test in the file
+#: wherever it is assigned, and one placed above the oracle section once
+#: skipped the whole file on test-cpu.yml.
 requires_cpp = pytest.mark.requires_assets("OASR_C")  # test-cpu.yml builds no extension
 
 
@@ -863,9 +866,6 @@ class TestRealCheckpoint:
 # ---------------------------------------------------------------------------
 
 
-pytestmark = requires_cpp
-
-
 @pytest.fixture(scope="module")
 def cpp():
     from oasr import _C
@@ -1004,6 +1004,7 @@ class _OracleDetok:
         return list(self._pieces)
 
 
+@requires_cpp
 class TestClassification:
     def test_whitespace_is_pythons_own_over_the_whole_plane(self, cpp):
         bad = [cp for cp in range(0x110000) if cpp.is_space(cp) != chr(cp).isspace()]
@@ -1061,6 +1062,7 @@ def _compare(got, want, ctx):
     assert [tuple(w) for w in g_words] == want_words, ctx
 
 
+@requires_cpp
 class TestAgreesWithTheOracle:
     @pytest.mark.parametrize("want_words", [True, False])
     def test_emissions(self, cpp, want_words):
@@ -1116,6 +1118,7 @@ class TestAgreesWithTheOracle:
         assert [w[0] for w in got[0]] == ["a", "b"]
 
 
+@requires_cpp
 class TestBeamReadBack:
     """``extract_beam_tokens`` replaces two tensor ops per (row, beam)."""
 
@@ -1166,6 +1169,7 @@ class TestBeamReadBack:
             cpp.extract_beam_tokens(values, lengths, -1)
 
 
+@requires_cpp
 class TestSymbolTablePieces:
     """The tokenizer half: C++ rendering must equal the oracle.
 
@@ -1256,6 +1260,7 @@ class TestNothingIsAskedOfTheExtensionUntilItIsNeeded:
             emission_fields([0, 1, 2], [0, 1], None, _OracleDetok([]), FrameClock(0.04))
 
 
+@requires_cpp
 class TestEndToEndParity:
     """The public Python entry must agree with the oracle end to end."""
 
