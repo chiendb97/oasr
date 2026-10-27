@@ -51,6 +51,8 @@ __all__ = [
     "ShapeProbe",
     "census",
     "census_engine_config",
+    "model_name",
+    "portable_path",
 ]
 
 #: A recorded GEMM-family call: ``(op, N, K, dtype, batch, M)``.
@@ -70,6 +72,43 @@ class EngineKey:
 
     def label(self) -> str:
         return f"{self.mode}:B{self.batch}" + (f"xT{self.frames}" if self.frames else "")
+
+
+# =============================================================================
+# Provenance
+# =============================================================================
+
+#: The repository root, against which a recorded path is made relative.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def portable_path(path: str) -> str:
+    """*path* as recorded in a provenance: repository-relative, else its basename.
+
+    A census is reviewed and shipped (``oasr/tune/db/``), so it must not carry
+    the measuring machine's directory layout.
+    """
+    p = Path(path).expanduser().resolve()
+    try:
+        return p.relative_to(_REPO_ROOT).as_posix()
+    except ValueError:
+        return p.name
+
+
+def model_name(ckpt_dir: str) -> str:
+    """The checkpoint *ckpt_dir* names, without the machine's path to it.
+
+    A Hub repo id is already portable and is returned as given; a Hub cache
+    snapshot (``models--org--name/snapshots/<rev>``) maps back to ``org/name``;
+    any other local directory is named by its basename.
+    """
+    p = Path(ckpt_dir).expanduser()
+    if not p.exists():
+        return str(ckpt_dir)
+    p = p.resolve()
+    if p.parent.name == "snapshots" and p.parent.parent.name.startswith("models--"):
+        return p.parent.parent.name[len("models--") :].replace("--", "/")
+    return p.name
 
 
 # =============================================================================
@@ -113,7 +152,7 @@ class TrafficModel:
                 d = _audio_seconds(Path(audio) if os.path.isabs(audio) else root / audio)
                 if d is not None:
                     durations.append(d)
-        return cls(durations_s=durations, source=f"manifest:{path}", **kw)
+        return cls(durations_s=durations, source=f"manifest:{portable_path(path)}", **kw)
 
     def offline_durations(self, cfg) -> List[float]:
         if self.durations_s:

@@ -45,7 +45,7 @@
      },
      "coverage": 0.97,
      "points_seen": 55,
-     "ckpt_dir": "/data01/kilm/users/chiendb/models/asr/20210610_u2pp_conformer_exp_librispeech",
+     "model_name": "20210610_u2pp_conformer_exp_librispeech",
      "quantization": "int8_w8a8"
     },
     {
@@ -64,7 +64,7 @@
      },
      "coverage": 0.97,
      "points_seen": 73,
-     "ckpt_dir": "/data01/kilm/users/chiendb/models/asr/20210610_u2pp_conformer_exp_librispeech",
+     "model_name": "20210610_u2pp_conformer_exp_librispeech",
      "quantization": "int8_w8a8"
     },
     {
@@ -83,7 +83,7 @@
      },
      "coverage": 0.97,
      "points_seen": 55,
-     "ckpt_dir": "/tmp/claude-0/-data01-kilm-users-chiendb-projects-oasr/9840fc25-e228-42c3-a5e1-555f0de0af8d/scratchpad/ckpt/u2pp_w8a8_sq_fused"
+     "model_name": "u2pp_w8a8_sq_fused"
     },
     {
      "path": "census_fused_streaming.json",
@@ -101,7 +101,7 @@
      },
      "coverage": 0.97,
      "points_seen": 73,
-     "ckpt_dir": "/tmp/claude-0/-data01-kilm-users-chiendb-projects-oasr/9840fc25-e228-42c3-a5e1-555f0de0af8d/scratchpad/ckpt/u2pp_w8a8_sq_fused"
+     "model_name": "u2pp_w8a8_sq_fused"
     }
    ]
   },

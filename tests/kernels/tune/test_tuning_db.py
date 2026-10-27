@@ -4,6 +4,7 @@ Pure Python -- no kernel runs -- so it covers every arch family from any box.
 """
 
 import json
+import re
 
 import pytest
 import torch
@@ -155,6 +156,56 @@ class TestShippedFiles:
                     continue
                 assert choice.compile_name in compiled, f"{path}: {cid}"
                 assert jg.gemm_config_id(choice) == cid, f"{path}: id of {cid} is not canonical"
+
+    def test_provenance_names_no_local_path(self):
+        def strings(node):
+            if isinstance(node, dict):
+                for v in node.values():
+                    yield from strings(v)
+            elif isinstance(node, list):
+                for v in node:
+                    yield from strings(v)
+            elif isinstance(node, str):
+                yield node
+
+        absolute = re.compile(r"(?:^|[\s:=\"'])(?:/|~/)[\w.-]+/")
+        for _, _, path in self._files():
+            provenance = json.loads(path.read_text())["provenance"]
+            for s in strings(provenance):
+                assert not absolute.search(s), f"{path}: local path in {s!r}"
+
+
+class TestPortableProvenance:
+    """A census records its checkpoint and manifest without the machine's layout."""
+
+    def test_local_checkpoint_is_named_by_its_directory(self, tmp_path):
+        from oasr.tune.census import model_name
+
+        ckpt = tmp_path / "exp" / "u2pp_conformer"
+        ckpt.mkdir(parents=True)
+        assert model_name(str(ckpt)) == "u2pp_conformer"
+        assert model_name(f"{ckpt}/") == "u2pp_conformer"
+
+    def test_hub_snapshot_maps_back_to_its_repo_id(self, tmp_path):
+        from oasr.tune.census import model_name
+
+        snap = tmp_path / "hub" / "models--openai--whisper-tiny" / "snapshots" / "abc123"
+        snap.mkdir(parents=True)
+        assert model_name(str(snap)) == "openai/whisper-tiny"
+
+    def test_hub_repo_id_is_kept(self):
+        from oasr.tune.census import model_name
+
+        assert model_name("openai/whisper-tiny") == "openai/whisper-tiny"
+
+    def test_manifest_is_repo_relative_or_a_basename(self, tmp_path):
+        from helpers import REPO_ROOT
+
+        from oasr.tune.census import portable_path
+
+        inside = REPO_ROOT / "benchmarks" / "manifests" / "ljspeech_200.jsonl"
+        assert portable_path(str(inside)) == "benchmarks/manifests/ljspeech_200.jsonl"
+        assert portable_path(str(tmp_path / "corpus" / "m.jsonl")) == "m.jsonl"
 
 
 class TestGemmTiers:
