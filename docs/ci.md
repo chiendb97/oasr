@@ -8,7 +8,7 @@ the fast half of them locally.
 | `lint.yml` | GitHub-hosted | push to `main`, every PR | black, isort, ruff, the mypy ratchet, `cargo fmt`, `cargo clippy -D warnings`, `cargo test` |
 | `test-cpu.yml` | GitHub-hosted | push to `main`, every PR | `pytest tests/` on Python 3.10 + 3.12 with no GPU, behind a `--min-passed` coverage floor |
 | `test-gpu.yml` | self-hosted `oasr-gpu` | nightly + manual | the full suite **with `--strict-assets`**, split per family, plus the `slow` and `concurrent` markers |
-| `test-gpu-modal.yml` | GitHub-hosted → Modal GPU | weekly + manual | the same per-family split, on one rented accelerator per architecture (sm_80 / 89 / 90 / 100 / 120) |
+| `test-gpu-modal.yml` | GitHub-hosted → Modal GPU | manual only | the same per-family split, on one rented accelerator per architecture (sm_80 / 89 / 90 / 100 / 120) |
 
 ## Running the gates locally
 
@@ -199,7 +199,7 @@ import error rather than a merge).
 | GPU | the reference box — one SM | one accelerator per architecture, `ARCH_SWEEP` |
 | checkpoints | already on disk | a Volume the container fills itself |
 | cost | none | GPU-minutes per run |
-| when | nightly sweep | weekly, on demand, and when the box is busy or wedged |
+| when | nightly sweep | on demand only — per PR, or when the box is busy or wedged |
 
 **Use the self-hosted box as the primary.** The assets are local and it is a
 machine somebody can look at. Modal exists because that box is also the
@@ -218,6 +218,23 @@ to skip its whole rule-table suite unless the running SM matched the rules, whic
 meant an SM120 table nobody could validate anywhere else. It now checks every
 *registered* architecture's table from any box, and the matrix is left to do what
 only it can: run the kernels.
+
+Nothing triggers the Modal workflow automatically — no schedule, no
+`pull_request` — because every run is rented GPU-minutes. Run it from
+**Actions → test-gpu-modal → Run workflow**, or:
+
+```bash
+gh workflow run test-gpu-modal.yml -f pr=123                  # test PR #123
+gh workflow run test-gpu-modal.yml -f pr=123 -f gpus=H100 -f suites=kernels
+gh workflow run test-gpu-modal.yml --ref my-branch            # a branch, no PR
+```
+
+With `pr` set, the job resolves the PR's head commit once, at the start (a push
+during the run is not what gets tested), checks that commit out, and posts the
+outcome on it as the `test-gpu-modal` commit status, so the result shows on the
+PR. A PR from a fork is refused unless `allow_fork` is ticked — see
+[Security](#security--this-repo-is-public). The same entry points run from a
+developer box:
 
 ```bash
 modal run ci/modal_app.py::main --gpus all                    # one per architecture
@@ -315,9 +332,11 @@ whether or not the submodule is checked out. That is why the workflow's
 `test-gpu.yml` triggers on `schedule` and `workflow_dispatch` only. **Never add
 `pull_request`** — a fork PR would execute arbitrary code on the maintainer's
 machine. The Modal workflow does not have that problem: the GitHub-hosted job
-only holds a token and the GPU work happens in Modal's sandbox. Fork PRs are not
-given secrets either, so `modal run` from a fork fails closed rather than running
-unauthenticated.
+only holds a token and the GPU work happens in Modal's sandbox. It is dispatch-only, so
+only someone with write access can start it. A dispatch with `pr=<n>` for a PR
+from a fork is refused unless `allow_fork` is ticked: the GitHub-hosted job
+*imports* the checked-out `ci/modal_app.py` with the Modal token in its
+environment, so a fork's code could read that token. Review the diff first.
 
 ## Why `test-cpu.yml` builds nothing
 
