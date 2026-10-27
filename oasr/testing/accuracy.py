@@ -3,7 +3,7 @@
 """Manifest loading and batched transcription for accuracy measurement.
 
 Shared by ``benchmarks/accuracy/accuracy.py`` (the sweep CLI) and
-``tests/test_accuracy.py`` (the regression gate) so the two cannot disagree
+``tests/accuracy/test_accuracy.py`` (the regression gate) so the two cannot disagree
 about what "run the manifest" means — a gate that measures something slightly
 different from the benchmark is a gate nobody trusts.
 
@@ -103,14 +103,19 @@ def transcribe(
     waves: Sequence["torch.Tensor"],
     batch_size: int,
     *,
-    warmup: bool = True,
     streaming: bool = False,
 ) -> Tuple[List[str], List[float]]:
-    """Transcribe in batches; returns ``(hypotheses, per_utterance_ms)``.
+    """Transcribe in batches; returns ``(hypotheses, per_request_ms)``.
 
-    The warm-up call matters for the *speed* half of a row: JIT compilation and
-    CUDA-graph capture happen on first use, so without it the first
-    configuration of any sweep reports compile time as if it were inference.
+    One pass, with no warm-up of its own.  A caller that reports speed runs it
+    twice and times the second call: JIT compilation and CUDA-graph capture
+    happen on the first use of each batch shape, and only a whole pass reaches
+    every shape the timed one will.  One warm-up utterance covered one shape and
+    left every other capture inside the measurement.
+
+    A request's latency is its batch's wall time.  The batched API returns every
+    row of a batch together, so each one waited for all of it; dividing by the
+    batch size reported a latency no request ever saw (16x too low at batch 16).
 
     ``streaming`` drives ``engine.transcribe`` (chunk by chunk) instead of
     ``transcribe_offline``.  Same manifest, same denominator, so the two rates are
@@ -120,11 +125,8 @@ def transcribe(
     import time
 
     go = engine.transcribe if streaming else engine.transcribe_offline
-    if warmup and waves:
-        go(list(waves[:1]))
-
     hyps: List[str] = []
-    per_utt_ms: List[float] = []
+    per_request_ms: List[float] = []
     for i in range(0, len(waves), batch_size):
         chunk = list(waves[i : i + batch_size])
         t0 = time.perf_counter()
@@ -132,7 +134,5 @@ def transcribe(
         dt_ms = 1000.0 * (time.perf_counter() - t0)
         texts = out if isinstance(out, list) else [out]
         hyps.extend(t if isinstance(t, str) else t.text for t in texts)
-        # Batch latency spread across its rows: the per-request number a caller
-        # of the batched API actually experiences.
-        per_utt_ms.extend([dt_ms / len(chunk)] * len(chunk))
-    return hyps, per_utt_ms
+        per_request_ms.extend([dt_ms] * len(chunk))
+    return hyps, per_request_ms
