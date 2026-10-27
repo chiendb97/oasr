@@ -31,6 +31,8 @@ pip-delete-this-directory.txt
 
 # Python environments
 .env*
+# The template is tracked; the `.env` copied from it holds machine paths and is not.
+!.env.example
 .venv
 env/
 venv/
