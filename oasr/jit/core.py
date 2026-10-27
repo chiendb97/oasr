@@ -384,6 +384,9 @@ class JitSpec:
             locked_compile(str(lib_path), self._compile)
         import tvm_ffi
 
+        from .errors import register as register_errors
+
+        register_errors()
         return tvm_ffi.load_module(str(lib_path))
 
 

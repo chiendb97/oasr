@@ -75,8 +75,7 @@ void {{ func_name }}(TensorView output, TensorView A, TensorView B, Optional C_o
                 reinterpret_cast<CutlassType*>(output.data_ptr()),
                 M, N, K, lda, ldb, ldc, 1.0f, stream,
                 static_cast<int>(split_k_slices));
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "GEMM SM90 kernel failed";
+        CHECK_GEMM_STATUS(status, "GEMM SM90 kernel {{ func_name }}");
         return true;
     });
 }
@@ -159,8 +158,7 @@ void {{ func_name }}_activation(TensorView output, TensorView A, TensorView B, O
         } else {
             TVM_FFI_ICHECK(false) << "Unsupported activation type: " << activation_type;
         }
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "GemmActivation SM90 kernel failed";
+        CHECK_GEMM_STATUS(status, "GemmActivation SM90 kernel {{ func_name }}_activation");
         return true;
     });
 }

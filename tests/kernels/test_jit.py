@@ -1491,10 +1491,44 @@ class TestProductionCompileSet:
         import oasr.jit.gemm as jg
 
         monkeypatch.setattr(jg, "_get_target_sm", lambda: sm)
+        monkeypatch.setattr(jg, "_FROZEN_PRODUCTION", {})
+        monkeypatch.setattr(jg, "_BUILT_PRODUCTION", {})
         prod = set(jg._level_configs("production"))
         tune = set(jg._level_configs("tune"))
         assert not (prod & tune)
         assert prod | tune == set(jg.get_unique_compile_configs(sm))
+
+    @pytest.mark.parametrize("family, native_only", [("gemm", False), ("bmm", True)])
+    def test_a_tuning_reload_cannot_make_the_modules_overlap(
+        self, family, native_only, monkeypatch
+    ):
+        """The tuning level re-derived production from the *reloaded* DB, so a config
+        the old DB named and the new one dropped was in both the production library
+        already loaded and the tuning module compiled after it."""
+        import oasr.jit.gemm as jg
+
+        sm = 120
+        monkeypatch.setattr(jg, "_get_target_sm", lambda: sm)
+        monkeypatch.setattr(jg, "_COMPILE_SET", "tuned")
+        monkeypatch.setattr(jg, "_FROZEN_PRODUCTION", {})
+        monkeypatch.setattr(jg, "_BUILT_PRODUCTION", {})
+        # Two configs only a tuning DB can bring into production.
+        dropped, added = sorted(
+            set(jg.get_unique_compile_configs(sm)) - set(jg.get_production_configs(sm))
+        )[:2]
+        monkeypatch.setattr(jg, "_tuned_compile_names", lambda _sm: [dropped])
+        level = {"family": family, "native_only": native_only}
+        prod = set(jg._level_configs("production", **level))
+        assert dropped in prod
+
+        monkeypatch.setattr(jg, "_tuned_compile_names", lambda _sm: [added])
+        jg._on_tuning_reload()
+        tune = set(jg._level_configs("tune", **level))
+        assert not (prod & tune), f"in both modules: {sorted(prod & tune)}"
+        assert added in tune, "a config the reloaded DB names must stay reachable"
+        assert set(jg._level_configs("production", **level)) == prod
+        if family == "gemm":  # dispatch only offers what the loaded library holds
+            assert jg._BUILT_PRODUCTION[sm] == frozenset(prod)
 
     def test_the_all_knob_restores_the_whole_space(self, monkeypatch):
         import oasr.jit.gemm as jg

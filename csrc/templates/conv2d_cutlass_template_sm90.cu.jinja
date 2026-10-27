@@ -77,8 +77,7 @@ void {{ func_name }}(TensorView output, TensorView input, TensorView filter, Opt
                 static_cast<int>(stride_h), static_cast<int>(stride_w),
                 static_cast<int>(dilation_h), static_cast<int>(dilation_w),
                 1.0f, stream);
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "Conv2D SM90 kernel failed";
+        CHECK_GEMM_STATUS(status, "Conv2D SM90 kernel {{ func_name }}");
         return true;
     });
 }
@@ -162,8 +161,7 @@ void {{ func_name }}_activation(TensorView output, TensorView input, TensorView 
         } else {
             TVM_FFI_ICHECK(false) << "Unsupported activation type: " << activation_type;
         }
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "Conv2DActivation SM90 kernel failed";
+        CHECK_GEMM_STATUS(status, "Conv2DActivation SM90 kernel {{ func_name }}_activation");
         return true;
     });
 }
@@ -226,8 +224,7 @@ void conv1d_{{ config_name }}(TensorView output, TensorView input, TensorView fi
                 reinterpret_cast<CutlassType*>(output.data_ptr()), B, 1, T, IC, K, 1, R, 0,
                 static_cast<int>(padding), 1, static_cast<int>(stride), 1,
                 static_cast<int>(dilation), 1.0f, stream);
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "Conv1D SM90 kernel failed";
+        CHECK_GEMM_STATUS(status, "Conv1D SM90 kernel conv1d_{{ config_name }}");
         return true;
     });
 }
@@ -313,8 +310,8 @@ void conv1d_{{ config_name }}_activation(TensorView output, TensorView input, Te
         } else {
             TVM_FFI_ICHECK(false) << "Unsupported activation type: " << activation_type;
         }
-        TVM_FFI_ICHECK(status == oasr::gemm::GemmStatus::SUCCESS)
-            << "Conv1DActivation SM90 kernel failed";
+        CHECK_GEMM_STATUS(status,
+                          "Conv1DActivation SM90 kernel conv1d_{{ config_name }}_activation");
         return true;
     });
 }
