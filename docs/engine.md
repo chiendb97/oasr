@@ -739,6 +739,14 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
      a wider over-read of the paged K/V, measured at **~1 %** of streaming
      throughput, because a replay only grows 1.04 → 1.41 ms from an empty cache
      to 82 s of history while an eager forward is flat at ~12 ms.
+   * with history eviction (`num_left_chunks >= 0`, or
+     `recycle_streaming_history`) the axis was unbounded for a different reason:
+     `cache_t1` was the stream's *offset*, which keeps growing after the cache
+     stops. It is the cached length now (`AttentionCacheManager.cached_frames`),
+     which eviction holds at `max_logical_blocks - 1` blocks, and an evicting
+     stream's ladder is built to exactly that, so it is a handful of rungs the
+     pre-warm covers. Positions are unaffected: they start at
+     `offset - cache_seqlens` per row.
    * the batch axis was pre-warmed at `{1, max_batch_size}` only, so every active
      width between them captured on first appearance. It now defaults to every
      width.

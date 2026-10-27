@@ -23,7 +23,7 @@ Streaming is paged-only; dense ``forward_chunk`` and its accompanying
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
@@ -287,6 +287,16 @@ class AttentionCacheManager:
         if state.logical_blocks:
             self._pool.free(state.logical_blocks)
         del self._streams[stream_id]
+
+    def cached_frames(self, stream_ids: Sequence[int]) -> int:
+        """The most history any of ``stream_ids`` holds, read host-side.
+
+        The ``cache_t1`` a forward over these streams needs: the host mirror of
+        the largest ``cache_seqlens`` among their rows, so no D2H sync.  Read it
+        after :meth:`prepare_chunks_batched`, which evicts first.  Unlike a
+        stream's encoder offset this stays bounded once history is evicted.
+        """
+        return max((self._streams[sid].num_committed_frames for sid in stream_ids), default=0)
 
     def slot_of(self, stream_id: int) -> int:
         """Return the slot id bound to ``stream_id``."""

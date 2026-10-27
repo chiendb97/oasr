@@ -309,8 +309,11 @@ for chunk in audio_chunks:                    # produced by feature extractor
     ctx.prepare_chunk()
     att_caches = ctx.get_att_caches()         # List[PagedKVCache]
     cnn_cache  = ctx.get_cnn_cache()
+    # cache_t1 is the history the stream *holds*, not its offset: with
+    # num_left_chunks=4 the offset grows forever while the cache does not.
     log_probs, new_cnn = model.forward_chunk_paged(
-        chunk, offset, att_caches, cnn_cache, cache_t1=offset)
+        chunk, offset, att_caches, cnn_cache,
+        cache_t1=att_mgr.cached_frames([sid]))
     ctx.commit_chunk_paged(log_probs.size(1), new_cnn)
     ctx.get_decoder().decode_chunk(log_probs)
     offset += log_probs.size(1)
@@ -356,7 +359,8 @@ batched_caches = [PagedKVCache(
     for l in range(cfg.num_layers)]
 
 log_probs, new_cnn = model.forward_chunk_paged(
-    xs_stacked, offset, batched_caches, cnn_stacked, cache_t1=offset)
+    xs_stacked, offset, batched_caches, cnn_stacked,
+    cache_t1=att_mgr.cached_frames([req.stream_id for req in group]))
 ```
 
 ## 8. Error Handling and Edge Cases

@@ -33,6 +33,7 @@ from ..graph_cache import (
     GraphedEncoderForward,
     cache_bucket_ladder,
     pick_cache_bucket,
+    round_up_bucket,
 )
 from ..request import Request
 from .base import StreamingEncoderBackend, register_streaming_backend
@@ -171,17 +172,34 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # a gather's cost, and a bound past the table extends the table to it.
         pos_enc = getattr(getattr(enc, "embed", None), "pos_enc", None)
         capacity = int(cache_config.max_stream_frames)
+        max_blocks = cache_config.max_logical_blocks
+        evicts = max_blocks is not None
         bound_offsets = getattr(pos_enc, "bound_offsets", None)
         if bound_offsets is not None:
-            evicts = cache_config.max_logical_blocks is not None
             bound_offsets(None if evicts else capacity + cs)
+        if max_blocks is not None and self._fixed_cache_t1 is None:
+            # ``cache_t1`` is the cached length (see ``_cache_t1``), and with
+            # eviction a forward sees at most ``max_logical_blocks - 1`` blocks of
+            # it: ``prepare_chunks_batched`` evicts to that before allocating the
+            # chunk's own.  Build the ladder to the bucket that length is handed,
+            # not to ``max_stream_frames``: that is a block more than any forward
+            # sees, and when it is not a tile multiple its floored top rung falls
+            # *below* reachable lengths, which then round up to a bucket the
+            # pre-warm never captured (``num_left_chunks=2`` at chunk 16 had the
+            # ladder ``[0]`` and asked for 64 from its second chunk on).
+            visible = (max_blocks - 1) * cache_config.block_size_frames
+            capacity = round_up_bucket(max(0, visible))
         # Two ceilings, and the ladder honours the lower.  The block table caps
         # how many frames a stream can cache (``max_stream_frames``); the
         # encoder's relative-position table caps the *attention key size*
         # ``cache_t1 + chunk_size`` it can serve as a plain gather.  Read the
-        # table's size after the bound above, which may have grown it.
+        # table's size after the bound above, which may have grown it.  With
+        # eviction declared there is no gather to protect -- every row past the
+        # table is computed -- so only an encoder that cannot compute them is held
+        # to its table.
         pos_limit = getattr(pos_enc, "max_len", None)
-        if pos_limit:
+        gathers = not (evicts and bound_offsets is not None)
+        if pos_limit and gathers:
             capacity = min(capacity, max(0, int(pos_limit) - cs))
         self._cache_ladder: List[int] = cache_bucket_ladder(
             capacity,
@@ -275,6 +293,24 @@ class PagedStreamingBackend(StreamingEncoderBackend):
     def state_cache(self) -> SlotStateCache:
         """Slot-addressed fixed-extent stream state (conv + declared extras)."""
         return self._state_mgr
+
+    def _cache_t1(self, stream_ids: Sequence[int]) -> int:
+        """The host-side ``cache_t1`` for a forward over ``stream_ids``.
+
+        It is the encoder's attention key extent (``cache_t1 + chunk``) and the
+        graph key's cache axis, so it must be the history the streams *hold*:
+        constant under a prefilled window, otherwise the most any of them has
+        cached, read after ``prepare_chunks_batched`` has evicted.  It used to be
+        the largest encoder *offset*, which equals the cached length only until
+        history is evicted (``num_left_chunks >= 0``, or recycled history) and
+        then grows for the life of the stream: a fresh graph bucket every 64
+        frames, captured on a live tick, until the cache saturated into eager --
+        and a relative-position bias as wide as the stream is old, every chunk.
+        Positions are unaffected: they start at ``offset - cache_seqlens`` per row.
+        """
+        if self._fixed_cache_t1 is not None:
+            return self._fixed_cache_t1
+        return self._att_mgr.cached_frames(stream_ids)
 
     def _call_chunk_forward(
         self,
@@ -448,8 +484,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         assert sid is not None, "reset requires an admitted stream"
         self._att_mgr.reset_stream(sid)
         self._state_mgr.reset_stream(sid)
-        # The position half of rule 13.  ``cache_t1`` is derived from this, so
-        # leaving it would tell the encoder the new turn continues the old one.
+        # The position half of rule 13.  The encoder's positions are derived from
+        # this, so leaving it would tell the encoder the new turn continues the
+        # old one.
         request.offset = 0
 
     def free(self, request: Request) -> None:
@@ -635,11 +672,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         # 2. Gather feature-chunk slices. CNN left-context is now read by
         #    the encoder itself via the SlotCnnCache descriptor (mirroring
         #    how K/V are written through PagedKVCache).
-        max_offset = max(req.offset for req in group)
-        # The host-side cache length the encoder sizes its position table from.
-        # Constant under a prefilled window; the growing per-stream offset
-        # otherwise.
-        cache_t1 = self._fixed_cache_t1 if self._fixed_cache_t1 is not None else max_offset
+        cache_t1 = self._cache_t1(stream_ids)  # type: ignore[arg-type]
         feature_chunks = [
             req.feature_buffer[req.feature_cursor : req.feature_cursor + window] for req in group
         ]
@@ -665,7 +698,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         cache_t1_bucket = (
             cache_t1
             if self._fixed_cache_t1 is not None
-            else pick_cache_bucket(max_offset, self._cache_ladder)
+            else pick_cache_bucket(cache_t1, self._cache_ladder)
         )
         out = None
         if self._use_cuda_graphs and self._graph_cache is not None:
@@ -781,14 +814,14 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         states = self._state_mgr.views(slot_ids_device)
         cnn_cache = states[CONV_STATE]
 
-        cache_t1 = self._fixed_cache_t1 if self._fixed_cache_t1 is not None else req.offset
+        cache_t1 = self._cache_t1([req.stream_id])  # type: ignore[list-item]
         # The ladder, as in the batched path: it is what the pre-warm covered, and
         # a flat 64-frame round is off the ladder past its knee, so a long stream
         # reaching here would have captured a graph on a live tick.
         cache_t1_bucket = (
             cache_t1
             if self._fixed_cache_t1 is not None
-            else pick_cache_bucket(req.offset, self._cache_ladder)
+            else pick_cache_bucket(cache_t1, self._cache_ladder)
         )
         nvtx_push("single.encoder_call")
         out = None

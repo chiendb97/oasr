@@ -460,7 +460,7 @@ class _RoutingModelStub:
         raise AssertionError("not called in this test")
 
 
-def _paged_backend(consumes, max_batch_size=2, pad_batch=None):
+def _paged_backend(consumes, max_batch_size=2, pad_batch=None, num_left_chunks=-1, recycle=False):
     from oasr.cache import CacheConfig
     from oasr.engine.streaming_backend.paged import PagedStreamingBackend
 
@@ -471,7 +471,8 @@ def _paged_backend(consumes, max_batch_size=2, pad_batch=None):
         hidden_dim=64,
         kernel_size=15,
         chunk_size=16,
-        num_left_chunks=-1,
+        num_left_chunks=num_left_chunks,
+        recycle_streaming_history=recycle,
         block_size_frames=16,
         max_num_blocks=32,
         max_blocks_per_seq=8,
@@ -1138,6 +1139,178 @@ def test_no_streaming_backend_accepts_a_missing_cache_config():
 # ---------------------------------------------------------------------------
 
 
+def _tiny_paged_conformer(*, graphs: bool, num_left_chunks: int = -1):
+    """A real causal Conformer (random weights) on the paged runtime, fp16 on CUDA."""
+    from oasr.cache.types import CacheConfig
+    from oasr.engine.streaming_backend.paged import PagedStreamingBackend
+    from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
+    from oasr.models.conformer.model import ConformerModel
+
+    dtype, chunk = torch.float16, 16
+    torch.manual_seed(7)
+    model = (
+        ConformerModel.from_config(
+            ConformerModelConfig(
+                encoder=ConformerEncoderConfig(
+                    input_size=80,
+                    output_size=256,  # head_dim 64, the shipped FMHA geometry
+                    num_blocks=2,
+                    attention_heads=4,
+                    linear_units=256,
+                    cnn_module_kernel=15,
+                    causal=True,
+                    embed_layer_norm=False,
+                ),
+                vocab_size=32,
+            )
+        )
+        .eval()
+        .to(device="cuda", dtype=dtype)
+    )
+    spec = model.cache_spec
+    cache_cfg = CacheConfig(
+        num_layers=spec.num_layers,
+        n_kv_head=spec.n_kv_head,
+        head_dim=spec.head_dim,
+        hidden_dim=spec.hidden_dim,
+        kernel_size=spec.conv_kernel_size,
+        chunk_size=chunk,
+        num_left_chunks=num_left_chunks,
+        block_size_frames=chunk,
+        max_num_blocks=128,
+        max_blocks_per_seq=32,
+        max_batch_size=2,
+        device=torch.device("cuda"),
+        dtype=dtype,
+    )
+    cfg = SimpleNamespace(device="cuda", dtype=dtype, chunk_size=chunk, use_cuda_graphs=graphs)
+    return PagedStreamingBackend(model, cfg, cache_cfg)
+
+
+class TestTheCacheKeyIsTheCachedLength:
+    """``cache_t1`` is the history a stream *holds*, so eviction keeps it bounded.
+
+    It used to be the largest encoder offset, which equals the cached length only
+    until history is evicted (``num_left_chunks >= 0``, or recycled history) and
+    then grows for the life of the stream.  Nothing fails: the attention mask
+    comes from ``cache_seqlens``, so the output is right either way.  What grew
+    was the graph key -- a fresh bucket every 64 frames, captured on a live tick
+    (51 buckets in 200 chunks on a real Conformer), until the cache saturated and
+    the stream ran eager for good -- and the relative-position bias, as wide as
+    the stream is old, on every chunk.  The outputs are bit-identical to the old
+    ones on the GPU; these tests pin the key.
+    """
+
+    CHUNKS = 200
+
+    def _drive(self, num_left_chunks, recycle=False, chunks=CHUNKS):
+        backend, _ = _paged_backend(
+            "log_probs", max_batch_size=1, num_left_chunks=num_left_chunks, recycle=recycle
+        )
+        seen = []
+
+        def chunk_forward(xs, offsets, caches, cnn_cache, cache_t1=0):
+            held = int(caches[0].cache_seqlens.max())  # what the rows really hold
+            seen.append({"cache_t1": cache_t1, "held": held, "offset": int(offsets.max())})
+            return xs.new_zeros(xs.size(0), 16, 3)  # one chunk of encoder frames
+
+        class _RecordingGraphs:
+            """The graph branch on CPU: note the key, decline, run eager."""
+
+            def replay(self, batch, frames, bucket, **_):
+                seen.append({"bucket": bucket})
+
+        backend._chunk_forward = chunk_forward  # noqa: SLF001
+        backend._use_cuda_graphs = True  # noqa: SLF001
+        backend._graph_cache = _RecordingGraphs()  # noqa: SLF001
+        req = _make_request(0, torch.zeros(backend.decoding_window + backend.stride * chunks, 80))
+        backend.allocate(req)
+        for _ in range(chunks):
+            backend.forward_step([req])
+        forwards = [s for s in seen if "cache_t1" in s]
+        buckets = [s["bucket"] for s in seen if "bucket" in s]
+        return backend, req, forwards, buckets
+
+    @pytest.mark.parametrize(
+        "num_left_chunks, recycle",
+        [(2, False), (3, False), (-1, True)],
+        ids=["left2", "left3_off_tile", "recycled"],
+    )
+    def test_eviction_keeps_the_key_on_the_ladder(self, num_left_chunks, recycle):
+        backend, req, forwards, buckets = self._drive(num_left_chunks, recycle)
+        assert req.offset == 16 * self.CHUNKS, "the stream ran past its window"
+
+        # The encoder is handed exactly what the batch holds, never its age.
+        assert all(f["cache_t1"] == f["held"] for f in forwards), forwards[-1]
+        visible = (backend._cache_config.max_logical_blocks - 1) * 16  # noqa: SLF001
+        assert max(f["cache_t1"] for f in forwards) == visible
+
+        # Every key is a rung the pre-warm captures, so none lands on a live tick.
+        ladder = set(backend.cache_bucket_ladder)
+        assert len(buckets) == self.CHUNKS
+        assert set(buckets) <= ladder, (sorted(set(buckets)), sorted(ladder))
+
+    def test_without_eviction_the_key_still_follows_the_offset(self):
+        """The control: whole history kept, so held length and offset coincide."""
+        backend, req, forwards, buckets = self._drive(-1, chunks=6)
+        assert [f["cache_t1"] for f in forwards] == [16 * i for i in range(6)]
+        assert all(f["cache_t1"] == f["offset"] == f["held"] for f in forwards)
+        assert set(buckets) <= set(backend.cache_bucket_ladder)
+
+    def test_the_single_path_keys_on_the_cached_length_too(self):
+        """``_forward_single`` reads the same helper; drive it past the window."""
+        backend, req, _, _ = self._drive(2, chunks=10)
+        seen = []
+        backend._chunk_forward = lambda xs, offs, caches, cnn, cache_t1=0: (  # noqa: SLF001
+            seen.append((cache_t1, int(caches[0].cache_seqlens.max()))) or xs.new_zeros(1, 16, 3)
+        )
+        backend._forward_single(  # noqa: SLF001
+            req, backend.decoding_window, backend.stride, backend._context, {}  # noqa: SLF001
+        )
+        assert seen == [(16, 16)], seen
+        assert req.offset == 16 * 11
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+    @pytest.mark.parametrize("graphs", [False, True], ids=["eager", "cuda_graphs"])
+    def test_bounding_the_key_does_not_change_what_is_decoded(self, graphs):
+        """Columns past the cached length are masked, so the narrower key decodes alike.
+
+        The reference keys on the offset, as the backend used to, so by the last
+        chunk it hands the encoder a key extent ~20x what the stream holds.  The two
+        agreed bit for bit on sm_120; the bound is the fp16 ladder because the
+        narrower positional projection may select another GEMM tile elsewhere.
+
+        The positional projection is scaled up so the oracle can see a positional
+        mistake at all: at random initialisation a key one tile *short* of what the
+        stream holds moved the log-probs by ~3 fp16 ulps, inside the ladder, and
+        scaled it moves them by ~0.2.
+        """
+        from helpers import tol
+
+        torch.manual_seed(21)
+        backend = _tiny_paged_conformer(graphs=graphs, num_left_chunks=2)
+        with torch.no_grad():
+            for layer in backend._model.encoder.encoders:  # noqa: SLF001
+                layer.self_attn.linear_pos.weight.mul_(16.0)
+        feats = torch.randn(
+            backend.decoding_window + backend.stride * 24, 80, dtype=torch.float16, device="cuda"
+        )
+
+        def run(key_on_offset: bool):
+            req = _make_request(int(key_on_offset), feats)
+            backend.allocate(req)
+            if key_on_offset:
+                backend._cache_t1 = lambda _sids: req.offset  # noqa: SLF001
+            outs = [backend.forward_step([req])[req.request_id].clone() for _ in range(24)]
+            backend.__dict__.pop("_cache_t1", None)
+            backend.free(req)
+            return outs
+
+        bounded, unbounded = run(False), run(True)
+        for step, (a, b) in enumerate(zip(bounded, unbounded)):
+            torch.testing.assert_close(a, b, **tol(torch.float16), msg=f"chunk {step}")
+
+
 class TestBackendReset:
     """Cache and position rewind together, or not at all.
 
@@ -1184,50 +1357,8 @@ class TestBackendReset:
         the block table from the persistent rows the reset rewrites — a reset
         that took a new slot would leave the graph pointing at the old row.
         """
-        from oasr.cache.types import CacheConfig
-        from oasr.engine.streaming_backend.paged import PagedStreamingBackend
-        from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
-        from oasr.models.conformer.model import ConformerModel
-
-        dtype, chunk = torch.float16, 16
-        torch.manual_seed(7)
-        model = (
-            ConformerModel.from_config(
-                ConformerModelConfig(
-                    encoder=ConformerEncoderConfig(
-                        input_size=80,
-                        output_size=256,  # head_dim 64, the shipped FMHA geometry
-                        num_blocks=2,
-                        attention_heads=4,
-                        linear_units=256,
-                        cnn_module_kernel=15,
-                        causal=True,
-                        embed_layer_norm=False,
-                    ),
-                    vocab_size=32,
-                )
-            )
-            .eval()
-            .to(device="cuda", dtype=dtype)
-        )
-        spec = model.cache_spec
-        cache_cfg = CacheConfig(
-            num_layers=spec.num_layers,
-            n_kv_head=spec.n_kv_head,
-            head_dim=spec.head_dim,
-            hidden_dim=spec.hidden_dim,
-            kernel_size=spec.conv_kernel_size,
-            chunk_size=chunk,
-            num_left_chunks=-1,
-            block_size_frames=chunk,
-            max_num_blocks=128,
-            max_blocks_per_seq=32,
-            max_batch_size=2,
-            device=torch.device("cuda"),
-            dtype=dtype,
-        )
-        cfg = SimpleNamespace(device="cuda", dtype=dtype, chunk_size=chunk, use_cuda_graphs=graphs)
-        backend = PagedStreamingBackend(model, cfg, cache_cfg)
+        dtype = torch.float16
+        backend = _tiny_paged_conformer(graphs=graphs)
         window = backend.decoding_window
 
         torch.manual_seed(21)

@@ -74,7 +74,7 @@ model; quantization (W8A8 int8 and fp8, SmoothQuant) is the ninth.
 13. **Never advance a stream past frames the encoder did not see without
     resetting its cache and position.** Both streaming backends assume every
     chunk is contiguous in encoder-frame time — the paged one advances
-    `req.offset` only on a forward, and `cache_t1` derives from it. Skipping a
+    `req.offset` only on a forward, and the encoder's positions derive from it. Skipping a
     silent chunk tells the encoder "this immediately follows the last one", so
     non-adjacent audio is spliced at contiguous relative positions and the conv
     cache carries left context across a gap that no longer exists. The primitive
@@ -362,6 +362,12 @@ extension cookbook for each axis.
 ### CUDA graphs & kernels
 - **Reusing a CUDA-graph replay buffer's output.** One buffer per shape key; a returned tensor
   is live only until the next replay *or capture*. Copy when a step can hit the same key twice.
+- **Keying a graph on how old a stream is rather than on what it holds.** The streaming
+  `cache_t1` is the attention key extent and a graph-key axis, so it must be the cached
+  length (`AttentionCacheManager.cached_frames`), not `req.offset`: they agree until
+  history is evicted, then the offset grows forever and so did the key -- a capture on a
+  live tick every 64 frames until the cache saturated into eager, and a bias as wide as
+  the stream was old. Outputs never changed, which is why nothing caught it.
 - **A tensor a CUDA graph reads, freed after capture.** A graph reads the *address* it was
   captured with; an `arange` or fill value built as a local of the capture function is freed on
   return and its address handed to the next allocation, so the replay reads garbage — a
