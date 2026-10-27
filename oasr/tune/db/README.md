@@ -71,24 +71,28 @@ barrier memset and the partial-tile fixup).  Regenerate in one go:
 ```bash
 set -a; source .env; set +a
 export CUDA_VISIBLE_DEVICES=0 OASR_TUNE_USER_DB=off
-oasr quantize $CKPT_DIR /tmp/u2pp_fused --recipe smoothquant_w8a8_fused \
+WORK=$(mktemp -d)
+oasr quantize $CKPT_DIR $WORK/u2pp_fused --recipe smoothquant_w8a8_fused \
     --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl
-for CK in "--ckpt-dir $CKPT_DIR --quantization int8_w8a8" "--ckpt-dir /tmp/u2pp_fused"; do
+for CK in "--ckpt-dir $CKPT_DIR --quantization int8_w8a8" "--ckpt-dir $WORK/u2pp_fused"; do
   oasr tune census $CK --service-mode offline --max-batch-size 32 \
       --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR \
-      --out /tmp/census_$((n++))_offline.json
+      --out $WORK/census_$((n++))_offline.json
   oasr tune census $CK --service-mode streaming --max-batch-size 64 --chunk-size 16 \
-      --out /tmp/census_$((n++))_streaming.json
+      --out $WORK/census_$((n++))_streaming.json
 done
-oasr tune build $(printf -- '--census %s ' /tmp/census_*.json) --family scaled_mm \
-    --out system --fresh --log /tmp/scaled_mm_measurements.jsonl
+oasr tune build $(printf -- '--census %s ' $WORK/census_*.json) --family scaled_mm \
+    --out system --fresh --log $WORK/scaled_mm_measurements.jsonl
 oasr tune diff <previous scaled_mm.json> oasr/tune/db/sm120/scaled_mm.json
 ```
 
 (`oasr tune …` / `oasr quantize …` are `python -m oasr.tune.cli …` /
 `python -m oasr.cli quantize …` where the console script is not installed.)
 `--family scaled_mm` leaves `gemm.json` alone; `--note "…"` records free text in
-the file's provenance.
+the file's provenance.  A census records its checkpoint by `model_name` (a Hub
+repo id, or the checkpoint directory's basename) and its manifest relative to the
+repository, never by an absolute path, so a shipped file carries no trace of the
+machine that measured it.
 
 ### `sm120/gemm.json` — Conformer widths re-measured (2026-09-29)
 

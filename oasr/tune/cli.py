@@ -35,8 +35,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 def _cmd_census(args) -> int:
-    import os
-
     from oasr.engine import ASREngine, EngineConfig
     from oasr.tune import census as C
 
@@ -66,7 +64,7 @@ def _cmd_census(args) -> int:
         extra = C.from_capture(args.capture)
         ss.points.extend(extra.points)
         ss.working_set_bytes = max(ss.working_set_bytes, extra.working_set_bytes)
-    ss.provenance["ckpt_dir"] = os.path.abspath(args.ckpt_dir)
+    ss.provenance["model_name"] = C.model_name(args.ckpt_dir)
     if args.architecture:
         ss.provenance["architecture"] = args.architecture
     if args.quantization:
