@@ -6,6 +6,7 @@
 #include <oasr/ctc_decoder.cuh>
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -43,6 +44,14 @@ struct CtcStreamGraphCache {
 
 std::mutex g_ctc_graph_mutex;
 std::unordered_map<void*, CtcStreamGraphCache> g_ctc_graph_cache;
+
+// Every entry that sizes, initialises, decodes or reads a beam refuses one the
+// kernels cannot hold (ctc_decoder::MAX_BEAM).  GpuDecoderConfig refuses it
+// first, when the decoder is built; this is the guard for a direct caller.
+void check_beam(int64_t beam) {
+  TVM_FFI_ICHECK(beam >= 1 && beam <= ctc_decoder::MAX_BEAM)
+      << "CTC beam size " << beam << " is outside [1, " << ctc_decoder::MAX_BEAM << "]";
+}
 
 // Capture one graph by running ``work`` inside a stream-capture region.
 // The capture stream must not be the default stream.
@@ -155,6 +164,7 @@ void ctc_decoder_release_graphs(TensorView state_buffer) {
 
 int64_t ctc_decoder_workspace_size(int64_t batch, int64_t beam,
                                    int64_t vocab_size, int64_t max_seq_len) {
+  check_beam(beam);
   return static_cast<int64_t>(
       ctc_decoder::calculate_workspace_size(batch, beam, vocab_size, max_seq_len));
 }
@@ -165,6 +175,7 @@ int64_t ctc_decoder_workspace_size(int64_t batch, int64_t beam,
 
 int64_t ctc_decoder_state_size(int64_t batch, int64_t beam,
                                int64_t vocab_size, int64_t max_seq_len) {
+  check_beam(beam);
   return static_cast<int64_t>(
       ctc_decoder::calculate_state_buffer_size(batch, beam, vocab_size, max_seq_len));
 }
@@ -184,6 +195,7 @@ void ctc_beam_search_decode(TensorView out_tokens, TensorView out_times,
                             TensorView seq_lengths, TensorView workspace,
                             int64_t beam, int64_t blank_id,
                             double blank_threshold) {
+  check_beam(beam);
   CHECK_INPUT(log_prob);
   CHECK_INPUT(seq_lengths);
   CHECK_INPUT(workspace);
@@ -239,6 +251,7 @@ void ctc_beam_search_init_state(TensorView state_buffer,
                                 int64_t batch, int64_t beam,
                                 int64_t vocab_size, int64_t max_seq_len,
                                 int64_t blank_id) {
+  check_beam(beam);
   CHECK_INPUT(state_buffer);
 
   cudaStream_t stream = get_stream(state_buffer.device());
@@ -261,6 +274,7 @@ void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
                           int64_t batch, int64_t vocab_size,
                           int64_t max_seq_len, int64_t use_paged_memory,
                           int64_t page_size) {
+  check_beam(beam);
   CHECK_INPUT(state_buffer);
   CHECK_INPUT(log_prob_frame);
   CHECK_DIM(2, log_prob_frame);
@@ -298,6 +312,7 @@ void ctc_beam_search_step(TensorView state_buffer, TensorView log_prob_frame,
 int64_t ctc_decoder_paged_workspace_size(int64_t batch, int64_t beam,
                                          int64_t vocab_size, int64_t max_seq_len,
                                          int64_t page_size) {
+  check_beam(beam);
   return static_cast<int64_t>(ctc_decoder::calculate_paged_workspace_size(
       static_cast<int>(batch), static_cast<int>(beam),
       static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
@@ -307,6 +322,7 @@ int64_t ctc_decoder_paged_workspace_size(int64_t batch, int64_t beam,
 int64_t ctc_decoder_paged_state_size(int64_t batch, int64_t beam,
                                      int64_t vocab_size, int64_t max_seq_len,
                                      int64_t page_size) {
+  check_beam(beam);
   return static_cast<int64_t>(ctc_decoder::calculate_paged_state_buffer_size(
       static_cast<int>(batch), static_cast<int>(beam),
       static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
@@ -323,6 +339,7 @@ void ctc_beam_search_decode_paged(TensorView out_tokens, TensorView out_times,
                                   TensorView seq_lengths, TensorView workspace,
                                   int64_t beam, int64_t blank_id,
                                   double blank_threshold, int64_t page_size) {
+  check_beam(beam);
   CHECK_INPUT(log_prob);
   CHECK_INPUT(seq_lengths);
   CHECK_INPUT(workspace);
@@ -380,6 +397,7 @@ void ctc_beam_search_init_state_paged(TensorView state_buffer,
                                       int64_t batch, int64_t beam,
                                       int64_t vocab_size, int64_t max_seq_len,
                                       int64_t blank_id, int64_t page_size) {
+  check_beam(beam);
   CHECK_INPUT(state_buffer);
 
   cudaStream_t stream = get_stream(state_buffer.device());
@@ -391,6 +409,44 @@ void ctc_beam_search_init_state_paged(TensorView state_buffer,
       static_cast<int>(blank_id),
       static_cast<int>(page_size), 0,  // num_pages=0 → auto
       stream);
+}
+
+// Diagnostic: how far a paged workspace's page accounting is off, summed over
+// every page -- sum |ref_count - entries naming the page in the two block
+// tables|.  Zero when every reference is held by a table entry; a leak (a count
+// no entry holds, lost to its row until the state is reset) or a dangling entry
+// shows as a positive number.  Reads ``workspace`` -- an offline paged workspace,
+// or with ``is_state`` a paged streaming state buffer -- after the stream has
+// drained.  Tests and debugging only; it copies the tables to the host.
+int64_t ctc_decoder_paged_accounting_error(TensorView workspace, int64_t is_state,
+                                           int64_t batch, int64_t beam, int64_t vocab_size,
+                                           int64_t max_seq_len, int64_t page_size) {
+  check_beam(beam);
+  CHECK_INPUT(workspace);
+  char* base = static_cast<char*>(workspace.data_ptr()) +
+               (is_state ? ctc_decoder::STATE_HEADER_SIZE : 0);
+  ctc_decoder::InternalData data;
+  ctc_decoder::setup_internal_data_paged_pointers(
+      &data, base, static_cast<int>(batch), static_cast<int>(beam),
+      static_cast<int>(vocab_size), static_cast<int>(max_seq_len),
+      static_cast<int>(page_size), 0);
+  const auto& ps = data.paged;
+  const size_t entries = static_cast<size_t>(batch) * beam * ps.max_logical_pages;
+  std::vector<int> refs(ps.num_pages), bt0(entries), bt1(entries);
+  TVM_FFI_ICHECK(cudaDeviceSynchronize() == cudaSuccess);
+  cudaMemcpy(refs.data(), ps.ref_counts, sizeof(int) * refs.size(), cudaMemcpyDeviceToHost);
+  cudaMemcpy(bt0.data(), ps.block_table[0], sizeof(int) * entries, cudaMemcpyDeviceToHost);
+  cudaMemcpy(bt1.data(), ps.block_table[1], sizeof(int) * entries, cudaMemcpyDeviceToHost);
+  std::vector<int> named(ps.num_pages, 0);
+  for (const std::vector<int>* bt : {&bt0, &bt1})
+    for (int phys : *bt)
+      if (phys != paged_memory::INVALID_PAGE) {
+        TVM_FFI_ICHECK(phys >= 0 && phys < ps.num_pages) << "block table names page " << phys;
+        ++named[phys];
+      }
+  int64_t error = 0;
+  for (int p = 0; p < ps.num_pages; ++p) error += std::abs(refs[p] - named[p]);
+  return error;
 }
 
 // =============================================================================
@@ -408,6 +464,7 @@ int64_t ctc_beam_search_chunk(TensorView state_buffer, TensorView log_prob_chunk
                               int64_t batch, int64_t vocab_size,
                               int64_t max_seq_len, int64_t use_paged_memory,
                               int64_t page_size, int64_t use_cuda_graphs) {
+  check_beam(beam);
   CHECK_INPUT(state_buffer);
   CHECK_INPUT(log_prob_chunk);
   CHECK_DIM(3, log_prob_chunk);
@@ -646,6 +703,13 @@ void ctc_beam_search_chunk_batched(TensorView state_ptrs,
                                    int64_t use_paged_memory,
                                    int64_t page_size,
                                    int64_t use_cuda_graphs) {
+  check_beam(beam);
+  // One log-prob row per stream: a state with batch > 1 has no rows of its own.
+  // Every path read stream i's rows at i .. i + batch - 1, so they overlapped the
+  // next stream's and the last read past the tensor.  A multi-row state decodes
+  // through ctc_beam_search_chunk.
+  TVM_FFI_ICHECK(batch == 1) << "the batched chunk decode takes batch-1 states; got batch "
+                             << batch;
   CHECK_INPUT(log_prob_chunk);
   CHECK_DIM(3, log_prob_chunk);
   TVM_FFI_ICHECK(log_prob_chunk.dtype().code == kDLFloat &&
@@ -850,6 +914,7 @@ void ctc_beam_search_read_state(TensorView out_tokens, TensorView out_times,
                                 int64_t step, int64_t batch, int64_t beam,
                                 int64_t vocab_size, int64_t max_seq_len,
                                 int64_t use_paged_memory, int64_t page_size) {
+  check_beam(beam);
   CHECK_INPUT(out_tokens);
   CHECK_INPUT(out_lengths);
   CHECK_INPUT(out_scores);
@@ -894,6 +959,7 @@ void ctc_beam_search_read_state_batched(TensorView out_tokens, TensorView out_ti
                                         int64_t batch, int64_t beam,
                                         int64_t vocab_size, int64_t max_seq_len,
                                         int64_t use_paged_memory, int64_t page_size) {
+  check_beam(beam);
   CHECK_INPUT(out_tokens);
   CHECK_INPUT(out_lengths);
   CHECK_INPUT(out_scores);

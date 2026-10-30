@@ -79,6 +79,9 @@ void ctc_beam_search_init_state_paged(TensorView state_buffer,
                                       int64_t batch, int64_t beam,
                                       int64_t vocab_size, int64_t max_seq_len,
                                       int64_t blank_id, int64_t page_size);
+int64_t ctc_decoder_paged_accounting_error(TensorView workspace, int64_t is_state,
+                                           int64_t batch, int64_t beam, int64_t vocab_size,
+                                           int64_t max_seq_len, int64_t page_size);
 
 // TVM-FFI symbol exports
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_workspace_size, ctc_decoder_workspace_size);
@@ -96,3 +99,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_paged_workspace_size, ctc_decoder_page
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_paged_state_size, ctc_decoder_paged_state_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_decode_paged, ctc_beam_search_decode_paged);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_beam_search_init_state_paged, ctc_beam_search_init_state_paged);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctc_decoder_paged_accounting_error,
+                              ctc_decoder_paged_accounting_error);

@@ -1364,6 +1364,274 @@ class TestCtcDecoderBatchedChunk:
 
 
 # ---------------------------------------------------------------------------
+# Capacity limits and edge rows (audit M18, M19, L2)
+# ---------------------------------------------------------------------------
+
+
+def _peaky_lp(batch: int, frames: int, vocab: int, seed: int) -> torch.Tensor:
+    """Random log-probs peaked enough that beams diverge, reorder and shrink --
+    which is what hands a paged slot an occupant shorter than its last one."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    logits = torch.randn(batch, frames, vocab, device="cuda", generator=gen)
+    return F.log_softmax(logits * 3.0, dim=-1)
+
+
+def _blank_heavy_lp(batch: int, frames: int, vocab: int, seed: int) -> torch.Tensor:
+    """ASR-like log-probs, mostly blank: beams diverge in length, so a slot is
+    sometimes handed a hypothesis shorter than the one it held two steps ago."""
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    logits = torch.randn(batch, frames, vocab, device="cuda", generator=gen)
+    logits[:, :, 0] += 2.0
+    return F.log_softmax(logits * 2.0, dim=-1)
+
+
+@pytest.mark.cuda
+class TestPagedPageAccounting:
+    """A paged slot's previous occupant (two steps back) could hold more pages
+    than the prefix that replaced it, and the append installed its new page over
+    the first of them without releasing it: the page stayed counted with no table
+    entry naming it until the state was reset.  With the default pool a row's
+    leaks stayed inside its partition (measured: up to ~400 of 24k pages on 600
+    frames), so outputs never showed it -- but the bump allocator had no bound,
+    and past the partition is the next row's pages.  What can be checked exactly
+    is the accounting: every reference is held by a table entry."""
+
+    @pytest.mark.parametrize("beam", [8, 40], ids=["fused", "legacy"])
+    def test_an_offline_decode_holds_no_reference_a_table_does_not(self, device, beam):
+        from oasr.functionals.ctc_decode import _get_ctc_decoder_module
+
+        mod = _get_ctc_decoder_module()
+        batch, frames, vocab = 3, 600, 60
+        lp = _blank_heavy_lp(batch, frames, vocab, seed=beam)
+        lens = torch.full((batch,), frames, dtype=torch.int32, device=device)
+        ws = torch.empty(
+            int(mod.ctc_decoder_paged_workspace_size(batch, beam, vocab, frames, 1)),
+            dtype=torch.uint8,
+            device=device,
+        )
+        tokens = torch.empty(batch, beam, frames, dtype=torch.int32, device=device)
+        lengths = torch.empty(batch, beam, dtype=torch.int32, device=device)
+        scores = torch.empty(batch, beam, dtype=torch.float32, device=device)
+        no_times = torch.empty(0, dtype=torch.int32, device=device)
+        mod.ctc_beam_search_decode_paged(
+            tokens, no_times, lengths, scores, lp, lens, ws, beam, 0, 1.0, 1
+        )
+        assert mod.ctc_decoder_paged_accounting_error(ws, 0, batch, beam, vocab, frames, 1) == 0
+
+        flat = ctc_beam_search_decode(lp, lens, beam_size=beam, blank_id=0, blank_threshold=1.0)
+        paged = ctc_beam_search_decode(
+            lp,
+            lens,
+            beam_size=beam,
+            blank_id=0,
+            blank_threshold=1.0,
+            use_paged_memory=True,
+            page_size=1,
+        )
+        _assert_results_match(flat, paged, f"beam={beam} flat-vs-paged")
+
+    @pytest.mark.parametrize("beam", [8, 40], ids=["fused", "legacy"])
+    def test_a_stream_holds_no_reference_a_table_does_not(self, device, beam):
+        from oasr.functionals.ctc_decode import _get_ctc_decoder_module
+
+        vocab, cap = 60, 64
+        dec = GpuStreamingDecoder(
+            GpuDecoderConfig(
+                beam_size=beam,
+                blank_id=0,
+                blank_threshold=1.0,
+                max_seq_len=cap,
+                use_paged_memory=True,
+                page_size=1,
+            ),
+            use_cuda_graphs=False,
+        )
+        state = dec.create_state(batch=1, vocab_size=vocab, device=device)
+        for c in range(40):
+            dec.decode_chunk(_blank_heavy_lp(1, 32, vocab, seed=c), state=state)
+        error = _get_ctc_decoder_module().ctc_decoder_paged_accounting_error(
+            state.buffer, 1, 1, beam, vocab, cap, 1
+        )
+        assert error == 0
+
+
+@pytest.mark.cuda
+class TestBeamWidthIsBounded:
+    """Beams above 32 take the legacy kernels, whose per-beam state lives in
+    shared arrays of 128: 200 overran them and 256 or more never advanced a
+    top-K loop, hanging the engine.  Nothing checked the width."""
+
+    @pytest.mark.parametrize("beam", [0, 129, 200, 256])
+    def test_the_config_refuses_a_width_the_kernels_cannot_hold(self, beam):
+        with pytest.raises(ValueError, match="beam_size"):
+            GpuDecoderConfig(beam_size=beam)
+
+    def test_the_launcher_refuses_it_too(self, device):
+        lp = _peaky_lp(1, 8, 20, seed=0)
+        lens = torch.full((1,), 8, dtype=torch.int32, device=device)
+        with pytest.raises(RuntimeError, match=r"outside \[1, 128\]"):
+            ctc_beam_search_decode(lp, lens, beam_size=129, blank_id=0)
+
+    @pytest.mark.parametrize("paged", [False, True], ids=["flat", "paged"])
+    def test_a_beam_wider_than_the_vocabulary_decodes(self, device, paged):
+        """Fewer finite candidates than beam slots: the legacy top-K padded with
+        the key a dead beam's candidates carry, so padding won slots and its id
+        named a source beam past ``beam`` -- a length read from uninitialised
+        shared memory.  Flat returned ``[1]`` for ``[1, 2]``; paged walked a wild
+        page index once the workspace had been used before."""
+        lp, lens = _make_batched_logp_gpu([[1, 0, 2], [3, 4, 1], [2]], 5, device)
+        res = ctc_beam_search_decode(
+            lp, lens, beam_size=40, blank_id=0, blank_threshold=0.98, use_paged_memory=paged
+        )
+        assert [res.tokens[b][0] for b in range(3)] == [[1, 2], [3, 4, 1], [2]]
+
+    def test_the_widest_beam_decodes(self, device):
+        lp = _peaky_lp(2, 40, 300, seed=1)
+        lens = torch.full((2,), 40, dtype=torch.int32, device=device)
+        kw = {"beam_size": 128, "blank_id": 0, "blank_threshold": 1.0, "max_seq_len": 40}
+        flat = ctc_beam_search_decode(lp, lens, **kw)
+        paged = ctc_beam_search_decode(lp, lens, use_paged_memory=True, **kw)
+        _assert_results_match(flat, paged, "beam=128 flat-vs-paged")
+
+
+def _leave_scores_behind(device, beam, paged):
+    """Decode a batch of the same shape first, so the next workspace the caching
+    allocator hands out holds real scores: a row that reads before it writes
+    then returns them instead of a lucky zero."""
+    lp, lens = _make_batched_logp_gpu([[1, 0, 2], [3, 4, 1], [2]], 5, device)
+    ctc_beam_search_decode(
+        lp, lens, beam_size=beam, blank_id=0, blank_threshold=0.98, use_paged_memory=paged
+    )
+
+
+@pytest.mark.cuda
+class TestARowThatDecodesNoFrame:
+    """A row whose frames are all blank-skipped, or that has none, never runs the
+    first step -- the only writer of its scores -- and returned whatever the
+    workspace held.  It now holds the empty hypothesis: log 1 on beam 0."""
+
+    @pytest.mark.parametrize("paged", [False, True], ids=["flat", "paged"])
+    @pytest.mark.parametrize("beam", [4, 40], ids=["fused", "legacy"])
+    def test_offline(self, device, paged, beam):
+        lp, lens = _make_batched_logp_gpu([[1, 0, 2], [0, 0, 0], [3]], 5, device)
+        lens[2] = 0
+        _leave_scores_behind(device, beam, paged)
+        res = ctc_beam_search_decode(
+            lp, lens, beam_size=beam, blank_id=0, blank_threshold=0.98, use_paged_memory=paged
+        )
+        assert res.tokens[0][0] == [1, 2]
+        for row in (1, 2):
+            assert res.lengths[row].tolist() == [0] * beam
+            assert res.scores[row, 0].item() == 0.0
+            assert (res.scores[row, 1:] < -1e30).all(), res.scores[row]
+
+    @pytest.mark.parametrize("paged", [False, True], ids=["flat", "paged"])
+    def test_a_stream_read_before_its_first_frame(self, device, paged):
+        cfg = GpuDecoderConfig(beam_size=4, blank_id=0, max_seq_len=16, use_paged_memory=paged)
+        used = GpuStreamingDecoder(cfg)
+        used.init_stream(1, 5, device=device)
+        used.decode_chunk(_make_logp_gpu(3, 5, [1, 0, 2], device))
+        used.finalize_stream()
+        del used  # its state buffer, scores written, goes back to the allocator
+        dec = GpuStreamingDecoder(
+            GpuDecoderConfig(beam_size=4, blank_id=0, max_seq_len=16, use_paged_memory=paged)
+        )
+        dec.init_stream(1, 5, device=device)
+        res = dec.finalize_stream()
+        assert res.lengths[0].tolist() == [0, 0, 0, 0]
+        assert res.scores[0, 0].item() == 0.0 and (res.scores[0, 1:] < -1e30).all()
+
+
+@pytest.mark.cuda
+class TestBatchedChunksTakeOneRowPerStream:
+    """``decode_chunk_batch`` takes one log-prob row per stream, but every path
+    read stream ``i``'s rows at ``i .. i + batch - 1``: a batch-2 state read its
+    neighbour's row, and the last stream read past the tensor."""
+
+    def test_a_multi_row_state_is_refused(self, device):
+        dec = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=16))
+        states = [dec.create_state(batch=2, vocab_size=5, device=device) for _ in range(2)]
+        with pytest.raises(ValueError, match="batch-1"):
+            dec.decode_chunk_batch(_peaky_lp(2, 4, 5, seed=0), states)
+
+    def test_the_launcher_refuses_it_too(self, device):
+        from oasr.functionals.ctc_decode import _get_ctc_decoder_module
+
+        dec = GpuStreamingDecoder(GpuDecoderConfig(beam_size=3, blank_id=0, max_seq_len=16))
+        state = dec.create_state(batch=2, vocab_size=5, device=device)
+        cpu_i32 = torch.zeros((1,), dtype=torch.int32)
+        with pytest.raises(RuntimeError, match="batch-1"):
+            _get_ctc_decoder_module().ctc_beam_search_chunk_batched(
+                torch.tensor([state.buffer.data_ptr()], dtype=torch.int64),
+                _peaky_lp(1, 4, 5, seed=0),
+                torch.empty(0, dtype=torch.uint8),
+                cpu_i32,
+                cpu_i32.clone(),
+                3,
+                0,
+                1.0,
+                2,
+                5,
+                16,
+                0,
+                16,
+                0,
+            )
+
+
+_FAR_ROW_SCRIPT = r"""
+import json, sys
+import torch, torch.nn.functional as F
+from oasr.functionals.ctc_decode import _get_ctc_decoder_module, ctc_beam_search_decode
+
+T, V, beam = 64, 50, int(sys.argv[1])
+gen = torch.Generator(device="cuda").manual_seed(0)
+row = F.log_softmax(torch.randn(T, V, device="cuda", generator=gen) * 3.0, dim=-1)
+# Three rows 2^30 floats apart: row 2 starts at element 2^31, past int32.  The
+# launcher takes any strides; the Python wrapper would have packed them.
+stride = 1 << 30
+storage = torch.empty(2 * stride + T * V, device="cuda")
+far = storage.as_strided((3, T, V), (stride, V, 1))
+for b in range(3):
+    far[b] = row
+lens = torch.full((3,), T, dtype=torch.int32, device="cuda")
+mod = _get_ctc_decoder_module()
+ws = torch.empty(int(mod.ctc_decoder_workspace_size(3, beam, V, T)), dtype=torch.uint8,
+                 device="cuda")
+tokens = torch.empty(3, beam, T, dtype=torch.int32, device="cuda")
+lengths = torch.empty(3, beam, dtype=torch.int32, device="cuda")
+scores = torch.empty(3, beam, dtype=torch.float32, device="cuda")
+mod.ctc_beam_search_decode(tokens, torch.empty(0, dtype=torch.int32, device="cuda"), lengths,
+                           scores, far, lens, ws, beam, 0, 0.98)
+got = [tokens[b, 0, : int(lengths[b, 0])].tolist() for b in range(3)]
+want = ctc_beam_search_decode(row.unsqueeze(0).contiguous(), lens[:1], beam_size=beam,
+                              blank_id=0, blank_threshold=0.98).tokens[0][0]
+print(json.dumps([g == want for g in got]))
+"""
+
+
+@pytest.mark.slow
+@pytest.mark.cuda
+@pytest.mark.parametrize("beam", [4, 40], ids=["fused", "legacy"])
+def test_a_row_past_two_to_the_31_elements_reads_its_own_frames(tmp_path, beam):
+    """The legacy kernels and the frame selection both of them use computed
+    ``bid * batch_stride + t * seq_stride`` in int32: a row starting past 2^31
+    elements (~64 x 7000 x 5000 floats) read before the tensor.  8 GiB, in a
+    subprocess: a fault there is sticky for the process."""
+    import json
+    import subprocess
+    import sys
+
+    script = tmp_path / "far_row.py"
+    script.write_text(_FAR_ROW_SCRIPT)
+    proc = subprocess.run(
+        [sys.executable, str(script), str(beam)], capture_output=True, text=True, timeout=900
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-4000:]
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == [True, True, True]
+
+
+# ---------------------------------------------------------------------------
 # Fused vs legacy: the same decode through both compiled module variants
 #
 # The fused single-kernel step replaces the 5-kernel prob-matrix/merge/top-K
@@ -1372,8 +1640,6 @@ class TestCtcDecoderBatchedChunk:
 # shared beam state breaks both arms and this is where that shows.
 # ---------------------------------------------------------------------------
 
-
-pytestmark = pytest.mark.slow
 
 SCORE_FLOOR = -1.0e30  # beams below this are NEG_INF filler
 
@@ -1427,9 +1693,9 @@ class _ForcedVariant:
         return False
 
 
-# Paged cases use short sequences: the legacy paged pipeline has a pre-existing
-# free-pool race that needs page-recycling pressure (long sequences, large
-# batch) to manifest; small shapes keep the legacy reference deterministic.
+# Paged cases use short sequences, from when the legacy paged pipeline pushed a
+# copy-on-write release while other sub-warps popped (fixed: deferred past the
+# last pop) and leaked a page per shrinking slot; the long cases are below.
 #: ``(thresh, paged, beam)`` is the axis set: whether the top-K pre-pass runs,
 #: which workspace, and whether the beam is under or over the fused cap.  The
 #: eleven hand-written rows collapsed to five once the pairs that differed
@@ -1444,6 +1710,7 @@ OFFLINE_CASES = [
 ]
 
 
+@pytest.mark.slow
 class TestFusedParityOffline:
     @pytest.mark.parametrize("case", OFFLINE_CASES)
     def test_offline_matches_legacy(self, device, case):
@@ -1477,6 +1744,7 @@ STREAM_CASES = [
 ]
 
 
+@pytest.mark.slow
 class TestFusedParityStreaming:
     @pytest.mark.parametrize("case", STREAM_CASES)
     def test_streaming_matches_legacy(self, device, case):
