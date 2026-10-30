@@ -222,8 +222,10 @@ rejects 3008.
 `oasr tune prebuild` compiles every JIT module a build loads, without a GPU, for
 the target named by `OASR_CUDA_ARCH_LIST`. The modules are compiled, never
 loaded, concurrently, with the job budget split by translation-unit count.
-`JitSpec`'s cache key has no device in it (sources, headers, flags, nvcc
-identity), so a GPU box sharing the JIT directory finds every library:
+`JitSpec`'s cache key has no device in it, only the sources, headers, compile
+commands and tool versions. A GPU box sharing the JIT directory therefore finds
+every library, provided it runs the same toolchain and environment (the same
+image, as `ci/modal_tune.py` uses for both stages):
 
 ```bash
 OASR_CUDA_ARCH_LIST=9.0 OASR_JIT_DIR=/shared/jit/sm90 oasr tune prebuild --census offline.json --jobs 32

@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 
+from oasr.jit.core import require_device_family
 from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
@@ -126,6 +127,9 @@ class ASREngine:
         self._config = config
         device_str = config.device
         dtype = config.dtype
+        # Before the weights: a device of another architecture than the one this
+        # process compiles for would load them, then fail at the first kernel.
+        require_device_family(device_str)
 
         logger.info("Loading model from %s ...", config.ckpt_dir)
         # ``load_pretrained`` accepts a local checkpoint dir (the common case —

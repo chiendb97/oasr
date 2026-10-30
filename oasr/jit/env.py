@@ -11,16 +11,16 @@ _PACKAGE_DIR = pathlib.Path(__file__).resolve().parent.parent
 # Source directories (relative to project root)
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
+#: This checkout's root.  The JIT cache key replaces it with a placeholder
+#: (``cpp_ext.build_identity``), so worktrees with the same sources share builds.
+OASR_PROJECT_ROOT = _PROJECT_ROOT
+
 OASR_CSRC_DIR = _PROJECT_ROOT / "csrc"
 OASR_INCLUDE_DIR = _PROJECT_ROOT / "include"
 OASR_TEMPLATE_DIR = _PROJECT_ROOT / "csrc" / "templates"
 
-# Generated source directory for Jinja2 templates
-OASR_GEN_SRC_DIR = pathlib.Path(
-    os.environ.get("OASR_GEN_SRC_DIR", pathlib.Path.home() / ".cache" / "oasr" / "generated")
-)
-
-# JIT build directory (Ninja builds, compiled .so artifacts)
+# JIT build directory (Ninja builds, compiled .so artifacts, and the rendered
+# sources each build compiled, beside it)
 OASR_JIT_DIR = pathlib.Path(
     os.environ.get(
         "OASR_JIT_DIR",
@@ -67,18 +67,21 @@ OASR_CUTLASS_INCLUDE_DIRS = _find_cutlass_include_dirs()
 def cutlass_version_stamp():
     """Identity of the CUTLASS headers the JIT will compile against.
 
-    Returned as ``(include_dir, version.h bytes)`` pairs so it can go straight
-    into a cache key.  ``JitSpec._content_hash`` folds this in: the hash covers
-    OASR's own sources and headers, but a JIT module that includes
-    ``cutlass/gemm/...`` also depends on *these* headers, and ``build_and_load``
-    short-circuits on an existing ``.so`` without consulting ninja.  Bumping
-    the submodule (4.4.2 -> 4.6.1, say) would otherwise keep loading binaries
-    built against the old CUTLASS, silently.
+    Returned as ``(include_dir, version.h bytes)`` pairs.  ``JitSpec._content_hash``
+    folds the bytes in: the hash covers OASR's own sources and headers, but a JIT
+    module that includes ``cutlass/gemm/...`` also depends on *these* headers,
+    and ``build_and_load`` short-circuits on an existing ``.so`` without
+    consulting ninja.  Bumping the submodule (4.4.2 -> 4.6.1, say) would
+    otherwise keep loading binaries built against the old CUTLASS, silently.
+    The directory is not hashed here; it reaches the key through the compile
+    commands, with this checkout's root abstracted.
 
     Only ``version.h`` is read, not the whole tree -- hashing several thousand
     third-party headers on every JIT call is not worth it, and a release bump
     always moves this file.  A *local edit* to a vendored CUTLASS header at a
-    fixed version still needs the cache cleared by hand.
+    fixed version still needs the cache cleared by hand, and it reaches every
+    checkout that shares the cache: checkouts with the same sources share its
+    entries.
     """
     stamp = []
     for inc in OASR_CUTLASS_INCLUDE_DIRS:

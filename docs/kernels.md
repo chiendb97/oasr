@@ -230,7 +230,8 @@ autotuner.
 |---|---|
 | `oasr/jit/core.py` | `JitSpec` (static sources) and `JinjaJitSpec` (Jinja-rendered), `gen_jit_spec()`, `gen_jinja_jit_spec()`, `build_and_load()` |
 | `oasr/jit/templates.py` | Jinja2 rendering (`get_template_env()`, `render_template()`) |
-| `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_GEN_SRC_DIR`), nvcc flags, `cutlass_version_stamp` |
+| `oasr/jit/env.py` | Path constants (`OASR_TEMPLATE_DIR`, `OASR_JIT_DIR`), `cutlass_version_stamp` |
+| `oasr/jit/cpp_ext.py` | The compile and link commands (`build_commands`), the `build.ninja` made from them, and their part of the cache key (`build_identity`) |
 | `oasr/jit/<family>.py` | Per-family generators: `gemm`, `conv`, `norm`, `activation`, `pooling`, `recurrent`, `softmax`, `topk`, `fft`, `features`, `ctc_decoder`, `wfst_decoder` |
 | `oasr/jit/fmha.py` | Fused attention, C++ CUTLASS/CuTe lane — one module per `(sm, dtype, head_dim)` **cell**, holding all 17 feature variants |
 | `oasr/jit/gated_mlp.py`, `oasr/jit/recurrent_step.py` | The gated-MLP and recurrent-step C++ CUTLASS/CuTe lanes — one module per `(sm, dtype, activation)` / `(sm, dtype, kind)` cell |
@@ -238,9 +239,33 @@ autotuner.
 | `oasr/jit/attention.py` | The backend arbiter, **and** the CuTeDSL lane — different model, see below |
 | `oasr/compilation_context.py` | `CompilationContext` detects GPU SMs at import time; pass `supported_major_versions=[...]` to `get_nvcc_flags_list()` for arch-restricted kernels |
 
-Compiled modules are cached in `~/.cache/oasr/jit/`, keyed on a hash that covers
-the sources, the `include/` tree, the nvcc flags, **and** the CUTLASS version
-stamp.
+Compiled modules are cached in `~/.cache/oasr/jit/<name>/<key>/` (`OASR_JIT_DIR`).
+The key covers what is compiled, how, and with which tools:
+
+- **What:** the sources (a rendered one by its text), the `include/` tree and
+  the `csrc/` headers by relative path and content, and the CUTLASS version
+  stamp.
+- **How:** the expanded compile and link commands, whatever put each flag
+  there: the module, `OASR_EXTRA_{CFLAGS,CUDAFLAGS,LDFLAGS}`, `CC`, `CXX`,
+  `OASR_NVCC` or the arch list.
+- **Which tools:** nvcc's build and the host compilers' and TVM-FFI's versions.
+
+Where the checkout sits is not in the key. Its root is replaced by a
+placeholder in the commands, so worktrees with the same sources share
+libraries. The tools' own paths stay in, because they select the tools.
+
+A rendered source stays in memory until its module is built. The build writes
+it into the key's directory, under `gen/`, so the file a build compiles is
+always the text its key hashed. Renderers used to write a shared path named
+after the variant, and another checkout rendering different text could
+replace that file between the hash and the compile.
+
+The key has no device in it. A process compiles for one architecture: the
+current device's, or the one `OASR_CUDA_ARCH_LIST` names. It keeps one module
+per family, so `ASREngine` refuses a device of another architecture at
+construction (`jit.core.require_device_family`). On a host with mixed GPUs,
+run one process per architecture and select its GPUs with
+`CUDA_VISIBLE_DEVICES`.
 
 A module is built under a file lock to `<name>.so.partial` and renamed into
 place only once the link has finished (`cubin_loader.locked_compile`), so the
@@ -299,7 +324,9 @@ hands the include directories to `nvcc` at runtime.
 Its `version.h` is folded into the JIT cache key. Without that, `build_and_load`
 short-circuits on an existing `.so` and a submodule bump keeps silently loading
 binaries built against the old headers. **Editing a vendored CUTLASS header
-without bumping the version still needs `rm -rf ~/.cache/oasr/jit`.**
+without bumping the version still needs `rm -rf ~/.cache/oasr/jit`.** The stale
+libraries also reach every other checkout that shares the cache, so give an
+experiment on vendored headers its own `OASR_JIT_DIR`.
 
 The CuTeDSL half of CUTLASS is the separate `nvidia-cutlass-dsl` wheel
 (`pip install -e .[attention]`, floor in `oasr/jit/attention.py::MIN_CUTEDSL_VERSION`),

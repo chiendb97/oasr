@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from . import env
-from .core import _TARGET_SMS, JitSpec, _get_target_sm, gen_jit_spec
+from .core import _TARGET_SMS, GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
 from .gemm import _SM_MAX_SMEM_BYTES, TileShape, TileShapeConfigs, _tile_is_buildable
 
 # =============================================================================
@@ -757,7 +757,6 @@ def gen_conv_module() -> JitSpec:
 
 def _render_all_conv2d_variants() -> List:
     """Render Jinja templates for all unique Conv2D tile configs."""
-    from .cubin_loader import write_if_different
     from .templates import render_template
 
     sm = _get_target_sm()
@@ -800,9 +799,7 @@ def _render_all_conv2d_variants() -> List:
                 with_activation=True,
             )
 
-        gen_path = env.OASR_GEN_SRC_DIR / "conv2d" / f"{variant_file_name}.cu"
-        write_if_different(gen_path, rendered)
-        source_paths.append(gen_path)
+        source_paths.append(GeneratedSource(f"{variant_file_name}.cu", rendered))
 
     return source_paths
 

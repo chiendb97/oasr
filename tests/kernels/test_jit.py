@@ -1452,6 +1452,207 @@ class TestCompilerIdentityIsInTheCacheKey:
         assert a != b
 
 
+class TestTheCacheKeyIsTheBuildNotTheCheckout:
+    """The key missed what reached the commands and held where the checkout sat.
+
+    ``OASR_EXTRA_*``, ``CC`` and ``CXX`` reached the compiler without reaching
+    the key, so changing one kept loading the library built without it; the
+    CUTLASS include path was in it, so every new worktree rebuilt the whole
+    cache.  The key now hashes the expanded commands, the checkout's root
+    abstracted, and the versions of the tools they name.
+    """
+
+    _ENV = (
+        "OASR_EXTRA_CFLAGS",
+        "OASR_EXTRA_CUDAFLAGS",
+        "OASR_EXTRA_LDFLAGS",
+        "CC",
+        "CXX",
+        "OASR_NVCC",
+    )
+
+    @pytest.fixture
+    def spec(self, monkeypatch, tmp_path):
+        """A spec whose commands expand without a CUDA toolkit, in a clean environment."""
+        import oasr.jit.core as core
+        import oasr.jit.cpp_ext as cpp_ext
+
+        monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/opt/cuda")
+        monkeypatch.setattr(cpp_ext, "_cuda_version_ge", lambda version: True)
+        for var in self._ENV:
+            monkeypatch.delenv(var, raising=False)
+        src = tmp_path / "k.cu"
+        src.write_text("// empty\n")
+        return core.gen_jit_spec("key_probe", [src])
+
+    @pytest.mark.parametrize(
+        "var, value",
+        [
+            ("OASR_EXTRA_CFLAGS", "-DPROBE=1"),
+            ("OASR_EXTRA_CUDAFLAGS", "-lineinfo"),
+            ("OASR_EXTRA_LDFLAGS", "-Wl,--as-needed"),
+            ("CC", "/opt/gcc-13/bin/gcc"),
+            ("CXX", "/opt/gcc-13/bin/g++"),
+            ("OASR_NVCC", "/opt/cuda-next/bin/nvcc"),
+        ],
+    )
+    def test_what_reaches_the_commands_reaches_the_key(self, spec, monkeypatch, var, value):
+        before = spec._content_hash()
+        monkeypatch.setenv(var, value)
+        assert spec._content_hash() != before
+
+    def test_a_host_compiler_upgraded_in_place_changes_the_key(self, spec, monkeypatch):
+        import oasr.jit.cpp_ext as cpp_ext
+
+        before = spec._content_hash()
+        monkeypatch.setattr(cpp_ext, "get_compiler_version", lambda command: "g++ (GCC) 99.1")
+        assert spec._content_hash() != before
+
+    def test_the_tvm_ffi_version_is_in_the_key(self, spec, monkeypatch):
+        import oasr.jit.cpp_ext as cpp_ext
+
+        before = spec._content_hash()
+        monkeypatch.setattr(cpp_ext.tvm_ffi, "__version__", "99.0.0", raising=False)
+        assert spec._content_hash() != before
+
+    def test_the_checkout_root_is_abstracted_not_dropped(self, spec):
+        from oasr.jit import env
+        from oasr.jit.cpp_ext import build_identity
+
+        identity = build_identity(extra_cuda_cflags=spec.extra_cuda_cflags)
+        assert str(env.OASR_PROJECT_ROOT) not in identity
+        assert "<oasr>/include" in identity
+
+    def test_where_cutlass_sits_is_not_in_the_key_but_its_version_is(self, spec, monkeypatch):
+        from oasr.jit import env
+
+        stamp = env.cutlass_version_stamp()
+        before = spec._content_hash()
+        moved = [("/elsewhere" + inc, version_h) for inc, version_h in stamp]
+        monkeypatch.setattr(env, "cutlass_version_stamp", lambda: moved)
+        assert spec._content_hash() == before
+        bumped = [(inc, version_h + b"// bumped\n") for inc, version_h in stamp]
+        monkeypatch.setattr(env, "cutlass_version_stamp", lambda: bumped)
+        assert spec._content_hash() != before
+
+    def test_without_a_toolkit_the_key_still_answers(self, monkeypatch, tmp_path):
+        """The CPU job computes keys and builds nothing; no nvcc must not raise there."""
+        import oasr.jit.core as core
+        import oasr.jit.cpp_ext as cpp_ext
+
+        def _no_toolkit():
+            raise RuntimeError("Could not find nvcc")
+
+        monkeypatch.setattr(cpp_ext, "get_cuda_path", _no_toolkit)
+        src = tmp_path / "k.cu"
+        src.write_text("// empty\n")
+        assert core.JitSpec(name="key_probe", sources=[src])._content_hash()
+
+
+class TestGeneratedSourcesAreKeyedByTheirText:
+    """A rendered source was written to a shared path named after its variant,
+    and the key hashed whatever that path held when it was read.  Another
+    checkout rendering other text under the same name could rewrite it between
+    the hash and the compile, and cache its library under this one's key.  The
+    text is now held in memory, keyed, and written into the build directory the
+    key names.
+    """
+
+    @pytest.fixture
+    def build(self, monkeypatch, tmp_path):
+        """``_compile`` without a compiler: returns the source texts each build compiled."""
+        from pathlib import Path
+
+        import oasr.jit.core as core
+        import oasr.jit.templates as templates
+
+        monkeypatch.setattr(core.env, "OASR_JIT_DIR", tmp_path / "jit")
+        monkeypatch.setattr(templates, "render_template", lambda name, **kw: f"// {kw['text']}\n")
+        monkeypatch.setattr(core, "require_known_cuda_arch", lambda what: None)
+        monkeypatch.setattr(core, "run_ninja", lambda **kw: None)
+        compiled = []
+
+        def _ninja(**kw):
+            compiled.append([Path(s).read_text() for s in kw["sources"]])
+            return ""
+
+        monkeypatch.setattr(core, "generate_ninja_build_for_op", _ninja)
+
+        def run(spec):
+            spec._compile(str(spec._get_lib_path()) + ".partial")
+            return compiled[-1]
+
+        return run
+
+    def test_a_build_compiles_the_text_its_key_was_computed_from(self, build):
+        from oasr.jit.core import JinjaJitSpec
+
+        mine = JinjaJitSpec("probe", "probe.cu.jinja", {"text": "mine"})
+        theirs = JinjaJitSpec("probe", "probe.cu.jinja", {"text": "theirs"})
+        assert mine._get_lib_dir() != theirs._get_lib_dir()
+        assert build(mine) == ["// mine\n"]
+        assert build(theirs) == ["// theirs\n"]
+
+    def test_the_source_is_written_beside_its_library(self, build, tmp_path):
+        from oasr.jit.core import JinjaJitSpec
+
+        spec = JinjaJitSpec("probe", "probe.cu.jinja", {"text": "mine"})
+        assert not (tmp_path / "jit").exists(), "rendering wrote before the build"
+        build(spec)
+        assert (spec._get_lib_dir() / "gen" / "probe.cu").read_text() == "// mine\n"
+
+    def test_a_resumed_build_keeps_the_source_file_it_wrote(self, build):
+        """An interrupted build resumes from its objects; a rewritten source, even
+        an identical one, has a newer mtime and ninja recompiles every object."""
+        from oasr.jit.core import JinjaJitSpec
+
+        spec = JinjaJitSpec("probe", "probe.cu.jinja", {"text": "mine"})
+        build(spec)
+        path = spec._get_lib_dir() / "gen" / "probe.cu"
+        inode = path.stat().st_ino
+        build(spec)
+        assert path.stat().st_ino == inode
+
+
+class TestOneArchitecturePerProcess:
+    """A process compiles and caches its kernels for one architecture, the
+    current device's, and nothing said so: a model on a device of another
+    family launched kernels built and tiled for the wrong one.
+    """
+
+    @pytest.fixture
+    def host(self, monkeypatch):
+        """cuda:0 an sm_120 (current), cuda:1 an sm_90, cuda:2 an sm_121."""
+        import torch
+
+        from oasr.jit import core
+
+        caps = {0: (12, 0), 1: (9, 0), 2: (12, 1)}
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: caps[index])
+        monkeypatch.setattr(core, "_detect_cuda_arch", lambda: caps[0])
+        monkeypatch.setattr(core, "_arch_from_env", lambda: None)
+        return core
+
+    @pytest.mark.parametrize("device", ["cuda", "cuda:0", "cuda:2", "cpu"])
+    def test_a_device_of_the_process_family_is_accepted(self, host, device):
+        host.require_device_family(device)
+
+    def test_a_device_of_another_family_is_refused_naming_the_way_out(self, host):
+        with pytest.raises(RuntimeError) as info:
+            host.require_device_family("cuda:1")
+        msg = str(info.value)
+        assert "sm_90" in msg and "sm_120" in msg and "CUDA_VISIBLE_DEVICES" in msg
+
+    def test_the_arch_override_sets_the_process_family(self, host, monkeypatch):
+        monkeypatch.setattr(host, "_detect_cuda_arch", lambda: (9, 0))
+        monkeypatch.setattr(host, "_arch_from_env", lambda: (9, 0))
+        host.require_device_family("cuda:1")
+        with pytest.raises(RuntimeError, match="OASR_CUDA_ARCH_LIST"):
+            host.require_device_family("cuda:0")
+
+
 class TestProductionCompileSet:
     """Production modules compile what the tuning DB references, not the whole space."""
 
@@ -1589,14 +1790,13 @@ class TestMixedGemmLane:
         assert set(native) == {n for n, c in everything.items() if jg.is_native_lane(c, sm)}
 
     @pytest.mark.parametrize("sm", _SM_MIXED)
-    def test_the_mma_half_renders_with_the_sm80_tag(self, sm, monkeypatch, tmp_path):
+    def test_the_mma_half_renders_with_the_sm80_tag(self, sm, monkeypatch):
         """``CutlassArch<90>`` / ``<100>`` are the 3.x tags (no InstructionShape), so
         the 2.x template must instantiate the Sm80 kernels; the 3.x one keeps the
         family's own."""
         import oasr.jit.gemm as jg
 
         monkeypatch.setattr(jg, "_get_target_sm", lambda: sm)
-        monkeypatch.setattr(jg.env, "OASR_GEN_SRC_DIR", tmp_path)
         space = jg.get_unique_compile_configs(sm)
         mma = next(n for n, c in space.items() if not jg.is_native_lane(c, sm))
         native = next(n for n, c in space.items() if jg.is_native_lane(c, sm))
@@ -1607,7 +1807,7 @@ class TestMixedGemmLane:
             with_activation=True,
             configs={mma: space[mma], native: space[native]},
         )
-        text = {p.name: p.read_text() for p in paths}
+        text = {p.name: p.text for p in paths}
         mma_src = text[f"gemm_sm{sm}_{mma}.cu"]
         native_src = text[f"gemm_sm{sm}_{native}.cu"]
         assert "CutlassGemmConfig<" in mma_src and ", 80>;" in mma_src
@@ -1806,20 +2006,22 @@ class TestAKilledOrUnfinishedLinkIsNeverLoaded:
         (tmp_path / "slow_cxx.sh").chmod(0o755)
         (tmp_path / "probe.cu").write_text(_PROBE_CU)
         (tmp_path / "load.py").write_text(_LOAD)
+        # Every process links with the same CXX, because CXX is in the cache key:
+        # a process with another one would build its own library rather than
+        # meet the slow link.
         return dict(
             os.environ,
             OASR_JIT_DIR=str(tmp_path / "jit"),
-            OASR_GEN_SRC_DIR=str(tmp_path / "gen"),
+            CXX=str(tmp_path / "slow_cxx.sh"),
             LINK_MARK=str(tmp_path / "linking"),
         )
 
     @staticmethod
-    def _start(tmp_path, env, slow_s=None):
+    def _start(tmp_path, env, slow_s=0):
         import subprocess
         import sys
 
-        if slow_s is not None:
-            env = dict(env, CXX=str(tmp_path / "slow_cxx.sh"), SLOW_LINK_S=str(slow_s))
+        env = dict(env, SLOW_LINK_S=str(slow_s))
         return subprocess.Popen(
             [sys.executable, str(tmp_path / "load.py"), str(tmp_path / "probe.cu")],
             env=env,
