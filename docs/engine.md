@@ -117,7 +117,14 @@ first, because B separate copies out of pageable memory would each synchronise
 the stream before staging themselves. The pack is a second full copy of the
 audio, and skipping it measures **1.13–1.19×** on this path;
 `max_pinned_audio_seconds` bounds how much the engine will page-lock per
-request, since that memory is process-global.
+request, and `max_pinned_audio_total_seconds` (default 3600 s, ~230 MB at
+16 kHz) how much across requests at once: that memory is process-global, and
+PyTorch's host cache keeps every block it frees. Past either cap a request gets
+ordinary heap memory. An idle engine also empties the host cache when it holds
+more than twice the total cap above its baseline. That happens after bursts of
+different lengths, since cached blocks are never reused across power-of-two size
+classes. It is never emptied unconditionally: page-locking afresh costs the next
+request 0.5-8 ms.
 
 ### 4.2 Streaming transcription (chunk-by-chunk)
 
@@ -410,6 +417,14 @@ The derivation is logged in full (`paged KV pool derived from VRAM: … | total=
 resident=… cap=… activation_reserve=… → available=…`) so the numbers are
 auditable. Nothing is measured — and no probe forward runs — unless a capacity
 was actually left unset. Both are unset by default.
+
+`bytes_per_block` and `blocks_per_seq` are in the geometry the pool is built
+with (`EngineConfig.streaming_cache_geometry`). For most encoders that is
+`block_size_frames` per page and, with unlimited history, `max_blocks_per_seq`
+pages per stream. An encoder with a trained attention window (Nemotron) instead
+pages by `chunk_size` and retains `ceil(window / chunk_size) + 1` pages, so its
+derived pool is exactly that per stream: 160 pages (0.23 GiB) at 32 streams,
+where sizing from the raw config gave 16384 (24 GiB).
 
 On a non-CUDA device there is nothing to measure, so `max_num_blocks=None` sizes
 the pool to its ceiling, `max_batch_size × blocks_per_seq`. On CUDA, when not even
