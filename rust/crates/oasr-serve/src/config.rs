@@ -310,12 +310,19 @@ pub struct Cli {
     /// Pinning is what lets the engine DMA each row of a micro-batch straight
     /// into the padded device batch instead of packing it into staging first —
     /// one copy of the waveform after the codec instead of two.  Page-locked
-    /// memory is process-global and the allocator keeps what it takes, so the
-    /// high-water is this cap times `--max-concurrent-requests`; `0` turns the
-    /// hand-off off entirely and everything falls back to ordinary heap
-    /// buffers, which is the older, slower, still-correct path.
+    /// memory is process-global and the allocator keeps what it takes, so what
+    /// is pinned at once is bounded by `--max-pinned-audio-total-seconds`; `0`
+    /// turns the hand-off off entirely and everything falls back to ordinary
+    /// heap buffers, which is the older, slower, still-correct path.
     #[arg(long)]
     pub max_pinned_audio_seconds: Option<f64>,
+    /// Offline: most audio held in page-locked memory at once, across every
+    /// request, in seconds.  Engine default 3600 (~230 MB at 16 kHz).  A request
+    /// past it gets ordinary heap memory, and an idle engine returns the host
+    /// cache's pages when it holds more than this cap could need.  `0` turns the
+    /// hand-off off, like `--max-pinned-audio-seconds 0`.
+    #[arg(long)]
+    pub max_pinned_audio_total_seconds: Option<f64>,
     /// Offline: pack several utterances into one gapless varlen encoder forward
     /// instead of padding each micro-batch.  Requires ``service_mode=offline``.
     #[arg(long)]
@@ -766,6 +773,12 @@ impl Cli {
                     .or_insert(Value::Number(n));
             }
         }
+        if let Some(v) = self.max_pinned_audio_total_seconds {
+            if let Some(n) = Number::from_f64(v) {
+                obj.entry("max_pinned_audio_total_seconds")
+                    .or_insert(Value::Number(n));
+            }
+        }
         if let Some(b) = self.enable_sequence_packing {
             obj.entry("enable_sequence_packing")
                 .or_insert(Value::Bool(b));
@@ -992,6 +1005,20 @@ mod tests {
         let unset: Value =
             serde_json::from_str(&cli(&[]).build_engine_config_json().unwrap()).unwrap();
         assert_eq!(unset.get("max_pinned_audio_seconds"), None);
+        assert_eq!(unset.get("max_pinned_audio_total_seconds"), None);
+
+        let total: Value = serde_json::from_str(
+            &cli(&["--max-pinned-audio-total-seconds", "600"])
+                .build_engine_config_json()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            total
+                .get("max_pinned_audio_total_seconds")
+                .and_then(|v| v.as_f64()),
+            Some(600.0)
+        );
 
         let off: Value = serde_json::from_str(
             &cli(&["--max-pinned-audio-seconds", "0"])

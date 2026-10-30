@@ -547,6 +547,95 @@ class TestTheDefaultPool:
         assert cache.blocks_per_stream == per_stream
 
 
+class TestAWindowedPool:
+    """The pool is sized in the geometry it is built with (audit M1).
+
+    An encoder with a trained attention window (Nemotron) retains
+    ``ceil(window / chunk) + 1`` pages of ``chunk_size`` frames per stream, and
+    ``build_cache_config`` builds the pool that way.  Both sizing paths read the
+    config's own ``block_size_frames`` and ``num_left_chunks`` instead.  At 32
+    streams Nemotron derived 16384 pages (24 GiB) for the 160 it retains, and at
+    ``chunk_size=28`` it priced each page at 16 frames and ran out of memory
+    allocating 1.75x the budget it had measured.
+    """
+
+    WINDOW = 56  # Nemotron's: sliding_window 57, less the current frame
+
+    @staticmethod
+    def _spec(window=WINDOW):
+        from oasr.models.base import CacheSpec
+
+        return CacheSpec(
+            num_layers=2, n_kv_head=4, head_dim=32, hidden_dim=128, fixed_attention_window=window
+        )
+
+    @staticmethod
+    def _engine(device):
+        from oasr.engine.engine import ASREngine
+
+        engine = ASREngine.__new__(ASREngine)
+        engine._device = torch.device(device)
+        return engine
+
+    def test_a_cpu_engine_sizes_it_to_the_window(self):
+        cfg = EngineConfig(ckpt_dir="x", device="cpu", max_batch_size=4, chunk_size=16)
+        self._engine("cpu")._autosize_kv_pool(cfg, cache_spec=self._spec(), consumes="log_probs")
+        per_stream = -(-self.WINDOW // 16) + 1
+        assert cfg.max_num_blocks == 4 * per_stream
+        built = cfg.build_cache_config(self._spec())
+        assert built.max_num_blocks == built.max_batch_size * built.blocks_per_stream
+
+    @pytest.mark.parametrize("chunk", [16, 28], ids=["chunk16", "chunk28"])
+    @pytest.mark.parametrize("pages", [400, 100_000], ids=["tight", "roomy"])
+    def test_the_pool_it_builds_fits_the_memory_it_measured(self, chunk, pages):
+        """The CUDA branch on a stub: the derived pool, built, fits ``available``."""
+        from oasr.engine.memory import MemoryProfile, bytes_per_kv_block
+
+        spec = self._spec()
+        page = bytes_per_kv_block(
+            num_layers=spec.num_layers,
+            block_size_frames=chunk,
+            n_kv_head=spec.n_kv_head,
+            head_dim=spec.head_dim,
+            dtype=torch.float16,
+        )
+        # ``pages`` of the real page size left over once the activation reserve
+        # (which has a floor) is taken.
+        reserve = MemoryProfile(1 << 40, 1 << 40, 0, 1.0).activation_reserve_bytes
+        room = pages * page + reserve
+        profile = MemoryProfile(
+            total_bytes=room, free_bytes=room, activation_bytes=0, utilization=1.0
+        )
+        assert profile.available_bytes == pages * page
+        engine = self._engine("cuda")
+        engine._profile_device_memory = lambda config, consumes: profile
+        cfg = EngineConfig(
+            ckpt_dir="x", device="cpu", dtype=torch.float16, max_batch_size=32, chunk_size=chunk
+        )
+        engine._autosize_kv_pool(cfg, cache_spec=spec, consumes="log_probs")
+        built = cfg.build_cache_config(spec)
+        assert built.block_size_frames == chunk
+        assert built.max_num_blocks * page <= profile.available_bytes
+        assert built.max_num_blocks == built.max_batch_size * built.blocks_per_stream
+
+    def test_an_explicit_pool_the_window_fits_is_not_called_starved(self, caplog):
+        """The explicit check read ``num_left_chunks=-1`` and warned that every
+        stream would be cut short, for a pool that holds the whole window."""
+        spec = self._spec()
+        cfg = EngineConfig(
+            ckpt_dir="x", device="cpu", max_batch_size=300, max_num_blocks=2048, chunk_size=16
+        )
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
+            self._engine("cpu")._check_explicit_kv_pool(cfg, spec)
+        assert not caplog.records
+        cfg.build_cache_config(spec)  # and the pool really does hold it
+
+    def test_without_a_window_the_geometry_is_the_configs(self):
+        cfg = EngineConfig(ckpt_dir="x", block_size_frames=32, num_left_chunks=3)
+        assert cfg.streaming_cache_geometry(None) == (32, 3)
+        assert cfg.streaming_cache_geometry(self._spec(window=None)) == (32, 3)
+
+
 # ---------------------------------------------------------------------------
 # The pool invariant, checked at construction
 #

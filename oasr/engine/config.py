@@ -503,6 +503,14 @@ class EngineConfig:
     # Maximum request duration eligible for page-locked input memory.  Longer
     # requests use ordinary heap memory; ``0`` disables pinned allocation.
     max_pinned_audio_seconds: float = 300.0
+    # Ceiling on page-locked request audio held at once, across every request.
+    # Past it a request gets ordinary heap memory, as one past the per-request
+    # cap does.  Page-locked memory is process-global and PyTorch's host cache
+    # keeps every block it frees, so without this a burst of long requests
+    # pinned up to the per-request cap times the concurrency for the life of the
+    # process.  An idle engine also returns the cache's pages when it holds more
+    # than this cap could need.  3600 s is ~230 MB at 16 kHz.
+    max_pinned_audio_total_seconds: float = 3600.0
 
     # Kernel-selection tuning at construction; see TuningConfig.
     tuning: Any = None
@@ -730,6 +738,28 @@ class EngineConfig:
     # CacheConfig builder
     # ------------------------------------------------------------------
 
+    def streaming_cache_geometry(self, cache_spec: Optional[CacheSpec]) -> Tuple[int, int]:
+        """``(block_size_frames, num_left_chunks)`` the streaming pool is built with.
+
+        This config's own values, unless the encoder declares a trained attention
+        window.  A trained window is not a knob: how much history the model may
+        attend to is baked into its mask, so the retained cache comes from the
+        model rather than from ``EngineConfig``.  One page per chunk keeps
+        eviction aligned with the trained chunk grid, and the retained window is
+        rounded *up* — any excess is masked by the encoder's own
+        ``chunked_limited`` bias, which it builds regardless.
+
+        One definition for everything that sizes the pool: :meth:`build_cache_config`
+        builds it, and ``ASREngine`` sizes ``max_num_blocks`` from free VRAM
+        before that.  Sized from the config's raw values instead, the derived
+        pool was ~100x what a windowed stream retains, and priced each page at
+        ``block_size_frames`` while the pool paged by ``chunk_size``.
+        """
+        window = None if cache_spec is None else cache_spec.fixed_attention_window
+        if window is None:
+            return int(self.block_size_frames), int(self.num_left_chunks)
+        return int(self.chunk_size), -(-int(window) // int(self.chunk_size)) + 1  # ceil + current
+
     def build_cache_config(self, cache_spec: CacheSpec) -> CacheConfig:
         """Derive a :class:`CacheConfig` from a model's :class:`CacheSpec`.
 
@@ -753,19 +783,10 @@ class EngineConfig:
                 "a CUDA device (ASREngine resolves it at construction). Set an "
                 "explicit block count to build a cache config directly."
             )
-        block_size = self.block_size_frames
-        num_left_chunks = self.num_left_chunks
+        block_size, num_left_chunks = self.streaming_cache_geometry(cache_spec)
         window = cache_spec.fixed_attention_window
         prefill = window is not None
         if window is not None:
-            # A trained fixed window is not a knob: how much history the model may
-            # attend to is baked into its mask, so the engine derives the retained
-            # cache from the model rather than from ``EngineConfig``.  One page per
-            # chunk keeps eviction aligned with the trained chunk grid, and the
-            # retained window is rounded *up* — any excess is masked by the
-            # encoder's own ``chunked_limited`` bias, which it builds regardless.
-            block_size = self.chunk_size
-            num_left_chunks = -(-int(window) // self.chunk_size) + 1  # ceil + current
             if self.num_left_chunks != -1:
                 logger.warning(
                     "num_left_chunks=%d ignored: this encoder declares a trained "

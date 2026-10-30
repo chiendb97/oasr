@@ -245,7 +245,7 @@ class ASREngine:
             if config.max_num_blocks is None:
                 self._autosize_kv_pool(config, cache_spec, consumes)
             else:
-                self._check_explicit_kv_pool(config)
+                self._check_explicit_kv_pool(config, cache_spec)
             cache_config = config.build_cache_config(cache_spec)
         self._model_runner = ModelRunner(
             model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
@@ -494,7 +494,7 @@ class ASREngine:
     # VRAM-aware capacity sizing
     # ------------------------------------------------------------------
 
-    def _check_explicit_kv_pool(self, config: EngineConfig) -> None:
+    def _check_explicit_kv_pool(self, config: EngineConfig, cache_spec=None) -> None:
         """Warn when an explicit ``max_num_blocks`` cannot serve ``max_batch_size``.
 
         The derived path already refuses a pool below
@@ -516,14 +516,17 @@ class ASREngine:
 
         A warning rather than a raise: an operator may genuinely want a bounded
         history, and ``num_left_chunks >= 0`` makes a small pool correct by
-        design.  What must not happen is it going unsaid.
+        design — so does an encoder's trained attention window, which the
+        geometry comes from when ``cache_spec`` declares one.  What must not
+        happen is it going unsaid.
         """
         blocks = int(config.max_num_blocks or 0)
         batch = max(1, int(config.max_batch_size))
         floor = batch * MIN_BLOCKS_PER_STREAM
-        if blocks >= floor or config.num_left_chunks >= 0:
+        block_size, num_left_chunks = config.streaming_cache_geometry(cache_spec)
+        if blocks >= floor or num_left_chunks >= 0:
             return
-        frames = blocks * int(config.block_size_frames) // batch
+        frames = blocks * block_size // batch
         logger.warning(
             "max_num_blocks=%d is below the %d blocks max_batch_size=%d needs "
             "(%d per stream): every stream gets %d encoder frames of history and "
@@ -560,10 +563,18 @@ class ASREngine:
         # exact requirement (the pool has no capacity gate — see
         # ``CacheConfig.__post_init__``), so the floor and the ceiling coincide
         # and the derivation degenerates into "check that it fits".
+        #
+        # The geometry is the one ``build_cache_config`` builds the pool with.
+        # An encoder's trained window makes it ``ceil(window / chunk) + 1``
+        # chunk-sized pages; sized from the config's raw values instead, Nemotron
+        # at 32 streams derived 16384 pages for the 160 it retains, and at
+        # ``chunk_size=28`` priced them at 16 frames and ran out of memory
+        # allocating 1.75x the measured budget.
         batch = max(1, int(config.max_batch_size))
-        if config.num_left_chunks >= 0:
-            frames = int(config.chunk_size) * int(config.num_left_chunks)
-            per_stream = max(1, -(-frames // int(config.block_size_frames)))
+        block_size, num_left_chunks = config.streaming_cache_geometry(cache_spec)
+        if num_left_chunks >= 0:
+            frames = int(config.chunk_size) * num_left_chunks
+            per_stream = max(1, -(-frames // block_size))
             per_stream = min(per_stream, int(config.max_blocks_per_seq))
             floor_per_stream = per_stream
         else:
@@ -582,7 +593,7 @@ class ASREngine:
             return
         per_block = bytes_per_kv_block(
             num_layers=cache_spec.num_layers,
-            block_size_frames=int(config.block_size_frames),
+            block_size_frames=block_size,
             n_kv_head=cache_spec.n_kv_head,
             head_dim=cache_spec.head_dim,
             dtype=config.dtype,
@@ -600,7 +611,7 @@ class ASREngine:
             sizing.describe(),
             profile.describe(),
         )
-        if sizing.limited_by == "block_table" and config.num_left_chunks < 0:
+        if sizing.limited_by == "block_table" and num_left_chunks < 0:
             # The card could afford more, but no stream could address it.  Say so:
             # the remaining lever is the per-stream ceiling, not the pool size, and
             # the operator has no way to tell those apart from the number alone.
@@ -1978,7 +1989,25 @@ class ASREngine:
             if self._longform is not None and self._longform:
                 # Replace per-window child outputs with one stitched parent.
                 outputs = self._longform.absorb(outputs)
+            if self._input_processor.wants_pinned_trim:
+                self._trim_pinned_audio_when_idle()
             return outputs
+
+    def _trim_pinned_audio_when_idle(self) -> None:
+        """Let the input processor return excess page-locked pages once nothing is in flight.
+
+        Idle is the only safe and cheap moment: nothing in flight can be holding
+        a buffer, and the dispatcher stops stepping an idle engine, so this runs
+        once per busy-to-idle transition.  Housekeeping must not fail a step.
+        """
+        try:
+            if self._executor.num_running() or self._executor.num_waiting():
+                return
+            if self._overlap_admit and self._num_admit_inflight():
+                return
+            self._input_processor.trim_pinned_audio()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("trimming the page-locked host cache failed")
 
     def metrics_snapshot(self) -> Dict:
         """Drain engine-scope metrics for the serving front-end's exporter.

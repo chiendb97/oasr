@@ -976,6 +976,12 @@ class TestStreamingEngine:
         window = streaming_engine._model.encoder.fixed_attention_window  # noqa: SLF001
         assert cache_config.prefilled_cache_frames >= window
         assert cache_config.block_size_frames == cache_config.chunk_size
+        # And the pool was *sized* in that geometry, not just built in it: the
+        # derived pool is the window every stream retains, not
+        # ``max_blocks_per_seq`` pages each (16384 for 160 at 32 streams).
+        assert cache_config.max_num_blocks == (
+            cache_config.max_batch_size * cache_config.blocks_per_stream
+        )
         # Every declared state got a buffer: the conv left-context plus one tail
         # per subsampling stage.
         names = backend.state_cache.names
