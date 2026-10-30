@@ -7,10 +7,13 @@
 # Ninja-based compilation for CUDA/C++ extensions with proper flag
 # construction, dependency tracking, and parallel builds.
 
+import dataclasses
 import functools
+import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import sysconfig
@@ -252,6 +255,117 @@ def build_cuda_cflags(
 
 
 # ---------------------------------------------------------------------------
+# Build commands, and their identity in the cache key
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class BuildCommands:
+    """Everything a module's compile and link commands are made of.
+
+    One source for both the ``build.ninja`` a build runs and the cache key that
+    names its library (:func:`build_identity`), so a flag cannot reach the
+    compiler without reaching the key -- the way ``OASR_EXTRA_*``, ``CC`` and
+    ``CXX`` once did.
+    """
+
+    cuda_home: str
+    cxx: str
+    nvcc: str
+    common_cflags: List[str]
+    cflags: List[str]
+    cuda_cflags: List[str]
+    ldflags: List[str]
+
+
+def build_commands(
+    extra_cflags: Optional[List[str]] = None,
+    extra_cuda_cflags: Optional[List[str]] = None,
+    extra_ldflags: Optional[List[str]] = None,
+    extra_include_dirs: Optional[List[Path]] = None,
+) -> BuildCommands:
+    """The expanded commands for one module, environment overrides included."""
+    cuda_home = get_cuda_path()
+    common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
+    cflags = build_cflags(common_cflags, extra_cflags)
+    cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+
+    ldflags = [
+        "-shared",
+        f"-L{cuda_home}/lib64",
+        f"-L{cuda_home}/lib64/stubs",
+        "-lcudart",
+        "-lcuda",
+    ]
+
+    env_extra_ldflags = parse_env_flags("OASR_EXTRA_LDFLAGS")
+    if env_extra_ldflags:
+        ldflags += env_extra_ldflags
+
+    if extra_ldflags is not None:
+        ldflags += extra_ldflags
+
+    return BuildCommands(
+        cuda_home=cuda_home,
+        cxx=os.environ.get("CXX", "c++"),
+        nvcc=os.environ.get("OASR_NVCC", f"{cuda_home}/bin/nvcc"),
+        common_cflags=common_cflags,
+        cflags=cflags,
+        cuda_cflags=cuda_cflags,
+        ldflags=ldflags,
+    )
+
+
+@functools.cache
+def get_compiler_version(command: str) -> str:
+    """The first line ``<command> --version`` prints, or ``"unknown"``.
+
+    A host compiler upgraded in place keeps its path, so the commands alone
+    would not see it.
+    """
+    try:
+        out = subprocess.run(
+            shlex.split(command) + ["--version"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "unknown"
+    lines = out.stdout.strip().splitlines()
+    return lines[0] if out.returncode == 0 and lines else "unknown"
+
+
+def build_identity(
+    extra_cflags: Optional[List[str]] = None,
+    extra_cuda_cflags: Optional[List[str]] = None,
+    extra_ldflags: Optional[List[str]] = None,
+    extra_include_dirs: Optional[List[Path]] = None,
+) -> str:
+    """The part of a module's cache key that says how it is built.
+
+    The expanded commands (:func:`build_commands`) and the versions of the tools
+    they name -- the host compilers and TVM-FFI; the nvcc build is keyed by
+    :class:`~oasr.jit.core.JitSpec` itself.  This checkout's root is replaced by
+    a placeholder: the headers under it are keyed by content, so where it sits
+    on disk says nothing about the library, and keying it made every new
+    worktree rebuild the whole cache.
+
+    Without a CUDA toolkit nothing can be built, so no library could carry the
+    key; the error that says so stands in for the commands.
+    """
+    try:
+        cmds = build_commands(extra_cflags, extra_cuda_cflags, extra_ldflags, extra_include_dirs)
+    except (RuntimeError, OSError) as exc:
+        return f"unbuildable: {exc}"
+    root = str(jit_env.OASR_PROJECT_ROOT)
+    text = json.dumps(dataclasses.asdict(cmds), sort_keys=True)
+    text = re.sub(re.escape(root) + r"(?=[/\s\"]|$)", "<oasr>", text)
+    # nvcc's host compiler is -ccbin's when CC is set, else the gcc on PATH.
+    hosts = sorted({cmds.cxx, os.environ.get("CC") or "gcc"})
+    versions = [f"{h}: {get_compiler_version(h)}" for h in hosts]
+    versions.append(f"tvm_ffi: {getattr(tvm_ffi, '__version__', 'unknown')}")
+    return "\n".join([text] + versions)
+
+
+# ---------------------------------------------------------------------------
 # Ninja build file generation
 # ---------------------------------------------------------------------------
 
@@ -274,42 +388,21 @@ def generate_ninja_build_for_op(
 
     Returns the content of the ``build.ninja`` file as a string.
     """
-    cuda_home = get_cuda_path()
-    common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
-    cflags = build_cflags(common_cflags, extra_cflags)
-    cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
-
-    ldflags = [
-        "-shared",
-        f"-L{cuda_home}/lib64",
-        f"-L{cuda_home}/lib64/stubs",
-        "-lcudart",
-        "-lcuda",
-    ]
-
-    env_extra_ldflags = parse_env_flags("OASR_EXTRA_LDFLAGS")
-    if env_extra_ldflags:
-        ldflags += env_extra_ldflags
-
-    if extra_ldflags is not None:
-        ldflags += extra_ldflags
-
-    cxx = os.environ.get("CXX", "c++")
-    nvcc = os.environ.get("OASR_NVCC", f"{cuda_home}/bin/nvcc")
+    cmds = build_commands(extra_cflags, extra_cuda_cflags, extra_ldflags, extra_include_dirs)
 
     lines = [
         "ninja_required_version = 1.3",
         f"name = {name}",
-        f"cuda_home = {cuda_home}",
-        f"cxx = {cxx}",
-        f"nvcc = {nvcc}",
+        f"cuda_home = {cmds.cuda_home}",
+        f"cxx = {cmds.cxx}",
+        f"nvcc = {cmds.nvcc}",
         "",
-        "common_cflags = " + _join_multiline(common_cflags),
-        "cflags = " + _join_multiline(cflags),
+        "common_cflags = " + _join_multiline(cmds.common_cflags),
+        "cflags = " + _join_multiline(cmds.cflags),
         "post_cflags =",
-        "cuda_cflags = " + _join_multiline(cuda_cflags),
+        "cuda_cflags = " + _join_multiline(cmds.cuda_cflags),
         "cuda_post_cflags =",
-        "ldflags = " + _join_multiline(ldflags),
+        "ldflags = " + _join_multiline(cmds.ldflags),
         "",
         "rule compile",
         "  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags",

@@ -46,8 +46,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from . import arch_facts, env
-from .core import JitSpec, _get_target_sm, gen_jit_spec
-from .cubin_loader import write_if_different
+from .core import GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
 from .templates import render_template
 
 __all__ = [
@@ -455,7 +454,6 @@ def gen_fmha_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
             f"memory at head_dim {head_dim} (padded {d})"
         )
     name = cell_name(sm, dtype_str, head_dim)
-    out_dir = env.OASR_GEN_SRC_DIR / "fmha"
     sources: List = []
     for mask, has_bias, paged in _variants():
         func = variant_symbol(sm, dtype_str, head_dim, mask, has_bias, paged)
@@ -471,9 +469,7 @@ def gen_fmha_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
             has_bias=has_bias,
             paged_kv=paged,
         )
-        path = out_dir / f"{func}.cu"
-        write_if_different(path, rendered)
-        sources.append(path)
+        sources.append(GeneratedSource(f"{func}.cu", rendered))
     for mask, has_bias, paged in _split_variants():
         func = variant_symbol(sm, dtype_str, head_dim, mask, has_bias, paged, split=True)
         rendered = render_template(
@@ -486,9 +482,7 @@ def gen_fmha_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
             has_bias=has_bias,
             paged_kv=paged,
         )
-        path = out_dir / f"{func}.cu"
-        write_if_different(path, rendered)
-        sources.append(path)
+        sources.append(GeneratedSource(f"{func}.cu", rendered))
     sources.append(env.OASR_CSRC_DIR / "fmha_jit_binding.cu")
     return gen_jit_spec(name, sources)
 
@@ -534,7 +528,6 @@ def gen_fmha_kv8_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
     d = padded_head_dim(head_dim)
     if not resolve_config_kv8(sm, 16, head_dim).valid:
         raise RuntimeError(f"fmha_kv8: no fp8-KV tile fits sm_{sm} at head_dim {head_dim}")
-    out_dir = env.OASR_GEN_SRC_DIR / "fmha"
     sources: List = []
     for paged in _PAGED_MODES:
         for split in (False, True):
@@ -549,9 +542,7 @@ def gen_fmha_kv8_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
                 paged_kv=paged,
                 split=split,
             )
-            path = out_dir / f"{func}.cu"
-            write_if_different(path, rendered)
-            sources.append(path)
+            sources.append(GeneratedSource(f"{func}.cu", rendered))
     sources.append(env.OASR_CSRC_DIR / "fmha_jit_binding.cu")
     return gen_jit_spec(kv8_cell_name(sm, dtype_str, head_dim), sources)
 

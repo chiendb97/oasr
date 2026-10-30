@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from . import env
-from .core import _TARGET_SMS, JitSpec, _get_target_sm, gen_jit_spec
+from .core import _TARGET_SMS, GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
 
 logger = logging.getLogger("oasr.jit.gemm")
 
@@ -1031,7 +1031,6 @@ def _render_all_variants(
     Returns:
         List of Path objects for the rendered ``.cu`` files.
     """
-    from .cubin_loader import write_if_different
     from .templates import render_template
 
     sm = _get_target_sm()
@@ -1095,9 +1094,7 @@ def _render_all_variants(
                 pingpong=cfg.pingpong,
                 with_activation=with_activation,
             )
-        gen_path = env.OASR_GEN_SRC_DIR / family / f"{variant_file_name}.cu"
-        write_if_different(gen_path, rendered)
-        source_paths.append(gen_path)
+        source_paths.append(GeneratedSource(f"{variant_file_name}.cu", rendered))
 
     return source_paths
 
@@ -1126,7 +1123,6 @@ def _render_bmm_general_variants() -> List:
     Same pattern as the tile variants above — the grid lives in one template
     rather than in near-duplicate files under ``csrc/``.
     """
-    from .cubin_loader import write_if_different
     from .templates import render_template
 
     source_paths = []
@@ -1139,9 +1135,7 @@ def _render_bmm_general_variants() -> List:
             layout=layout,
             element=element,
         )
-        gen_path = env.OASR_GEN_SRC_DIR / "bmm" / f"{op_name}.cu"
-        write_if_different(gen_path, rendered)
-        source_paths.append(gen_path)
+        source_paths.append(GeneratedSource(f"{op_name}.cu", rendered))
     return source_paths
 
 

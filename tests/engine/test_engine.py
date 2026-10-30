@@ -495,6 +495,28 @@ def _stub_model(capability):
     return root
 
 
+def test_construction_refuses_a_device_of_another_architecture_before_loading(monkeypatch):
+    """A process compiles its kernels for one architecture, the current device's.
+    An engine on a device of another family would load its weights and then fail
+    at the first kernel, so construction refuses it before the load."""
+    import oasr.engine.engine as engine_mod
+    import oasr.jit.core as jit_core
+    from oasr.engine.config import EngineConfig
+
+    def _no_load(*args, **kwargs):
+        raise AssertionError("the checkpoint was loaded before the device was checked")
+
+    caps = {0: (12, 0), 1: (9, 0)}
+    monkeypatch.setattr(engine_mod, "load_pretrained", _no_load)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=None: caps[index])
+    monkeypatch.setattr(jit_core, "_detect_cuda_arch", lambda: caps[0])
+    monkeypatch.setattr(jit_core, "_arch_from_env", lambda: None)
+    with pytest.raises(RuntimeError, match="CUDA_VISIBLE_DEVICES"):
+        engine_mod.ASREngine(EngineConfig(ckpt_dir="/nonexistent", device="cuda:1"))
+
+
 # --------------------------------------------------------------------------- #
 # Decode-strategy registry / dispatch
 # --------------------------------------------------------------------------- #

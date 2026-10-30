@@ -57,8 +57,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from . import arch_facts, env
-from .core import JitSpec, _get_target_sm, gen_jit_spec
-from .cubin_loader import write_if_different
+from .core import GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
 from .measured import Machine, MeasuredOn, note_extrapolation
 from .templates import render_template
 
@@ -370,7 +369,6 @@ def gen_recurrent_step_module(sm: int, dtype_str: str, kind: str) -> JitSpec:
             f"recurrent_step: no tile fits sm_{sm}'s {smem_budget(sm)} B of shared memory"
         )
     name = cell_name(sm, dtype_str, kind)
-    out_dir = env.OASR_GEN_SRC_DIR / "recurrent_step"
     sources: List = []
     for index, tile in enumerate(TILES):
         if not tile_valid(tile, sm, 2, gates):
@@ -393,9 +391,7 @@ def gen_recurrent_step_module(sm: int, dtype_str: str, kind: str) -> JitSpec:
             tile_index=index,
             tile=tile,
         )
-        path = out_dir / f"{func}.cu"
-        write_if_different(path, rendered)
-        sources.append(path)
+        sources.append(GeneratedSource(f"{func}.cu", rendered))
     sources.append(env.OASR_CSRC_DIR / "recurrent_step_jit_binding.cu")
     return gen_jit_spec(name, sources)
 

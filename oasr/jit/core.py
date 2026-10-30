@@ -8,6 +8,7 @@ Mirrors FlashInfer's JIT architecture:
 - ``JitSpec`` / ``JinjaJitSpec`` for specifying compilation units
 """
 
+import dataclasses
 import functools
 import hashlib
 import logging
@@ -15,14 +16,20 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from . import env
 from .cpp_ext import (
+    build_identity,
     generate_ninja_build_for_op,
     run_ninja,
 )
-from .cubin_loader import is_complete_shared_object, locked_compile, write_if_different
+from .cubin_loader import (
+    atomic_write_bytes,
+    is_complete_shared_object,
+    locked_compile,
+    write_if_different,
+)
 
 logger = logging.getLogger("oasr.jit")
 
@@ -229,6 +236,37 @@ def _gencode_target(sm: int, major: int) -> str:
     return f"{sm}a" if major >= 9 else f"{sm}"
 
 
+def require_device_family(device) -> None:
+    """Refuse a CUDA *device* that does not run the kernel family this process builds.
+
+    A process compiles every JIT module for one architecture --
+    :func:`_get_cuda_arch`, the current device's unless ``OASR_CUDA_ARCH_LIST``
+    names one -- and holds each in a module cache with no device in its key,
+    beside config defaults (``GEMM_DEFAULT``, ``CONV2D_DEFAULT``) resolved for it
+    at import.  A model on a device of another family would launch kernels built
+    and tiled for the wrong one.  The engine calls this at construction, before
+    loading any weights; one process per architecture is the way out.
+    """
+    import torch
+
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    current = torch.cuda.current_device()
+    index = device.index if device.index is not None else current
+    major, minor = torch.cuda.get_device_capability(index)
+    target = _get_cuda_arch()
+    if sm_family(major, minor) == sm_family(*target):
+        return
+    source = "OASR_CUDA_ARCH_LIST" if _arch_from_env() is not None else f"cuda:{current}"
+    raise RuntimeError(
+        f"cuda:{index} is sm_{major}{minor}, but this process compiles its kernels for "
+        f"sm_{target[0]}{target[1]} (from {source}), and OASR builds and caches one "
+        f"architecture per process.  Run one process per architecture, selecting "
+        f"its GPUs with CUDA_VISIBLE_DEVICES."
+    )
+
+
 def _get_target_sm() -> int:
     """The compiled kernel family for this device, or raise naming the device.
 
@@ -278,6 +316,49 @@ def _project_headers():
                 yield root, p
 
 
+@dataclasses.dataclass(frozen=True)
+class GeneratedSource:
+    """A rendered translation unit, kept in memory until its module is built.
+
+    The cache key hashes :attr:`text`, and the build writes it into the
+    directory that key names (:meth:`JitSpec._compile`), so the file a build
+    compiles is a function of the key.  Renderers used to write a shared,
+    name-keyed path that the key was then hashed from: two checkouts rendering
+    different text under one name could swap the file between the hash and the
+    compile, and cache one source's library under the other's key.
+    """
+
+    name: str
+    text: str
+
+    @property
+    def suffix(self) -> str:
+        return Path(self.name).suffix
+
+
+Source = Union[Path, GeneratedSource]
+
+
+def _source_order(src: Source) -> Tuple[int, str]:
+    # Generated sources by name, then files by path: a checkout's root sorts
+    # files among themselves but never moves them relative to the generated ones.
+    return (0, src.name) if isinstance(src, GeneratedSource) else (1, str(src))
+
+
+def _materialize(src: GeneratedSource, build_dir: Path) -> Path:
+    """Write *src* into *build_dir* and return the path.
+
+    Atomic, and skipped when the file already holds the text, so a build that
+    was interrupted resumes with its objects intact rather than rebuilding all
+    of them for a newer source mtime.
+    """
+    path = build_dir / "gen" / src.name
+    data = src.text.encode()
+    if not (path.is_file() and path.read_bytes() == data):
+        atomic_write_bytes(str(path), data)
+    return path
+
+
 class JitSpec:
     """Specification for a JIT-compiled CUDA module.
 
@@ -290,28 +371,44 @@ class JitSpec:
     def __init__(
         self,
         name: str,
-        sources: List[Path],
+        sources: Sequence[Union[Path, str, GeneratedSource]],
         extra_cuda_cflags: Optional[List[str]] = None,
         extra_include_dirs: Optional[List[Path]] = None,
         extra_ldflags: Optional[List[str]] = None,
     ):
         self.name = name
-        self.sources = [Path(s) for s in sources]
+        self.sources: List[Source] = [
+            s if isinstance(s, GeneratedSource) else Path(s) for s in sources
+        ]
         self.extra_cuda_cflags = extra_cuda_cflags or []
         self.extra_include_dirs = [Path(d) for d in (extra_include_dirs or [])]
         self.extra_ldflags = extra_ldflags or []
 
     def _content_hash(self) -> str:
-        """Compute hash of all source files + project headers + flags for
-        cache invalidation."""
+        """The cache key: what is compiled, how, and by which tools.
+
+        What: the sources (generated ones by their text), OASR's headers by
+        relative path and content, and CUTLASS's version.  How: the expanded
+        compile and link commands (:func:`~oasr.jit.cpp_ext.build_identity`),
+        whatever put each flag there -- the module, ``OASR_EXTRA_*``, ``CC`` /
+        ``CXX``, the arch list.  Which tools: nvcc's build, the host compilers'
+        and TVM-FFI's versions.  Not where the checkout is: its root is
+        abstracted out of the commands, and nothing under it is keyed by path.
+        """
         h = hashlib.sha256()
         h.update(self.name.encode())
-        for flag in sorted(self.extra_cuda_cflags):
-            h.update(flag.encode())
-        for flag in sorted(self.extra_ldflags):
-            h.update(flag.encode())
-        for src in sorted(self.sources, key=str):
-            if src.exists():
+        h.update(
+            build_identity(
+                extra_cuda_cflags=self.extra_cuda_cflags,
+                extra_ldflags=self.extra_ldflags,
+                extra_include_dirs=self.extra_include_dirs,
+            ).encode()
+        )
+        for src in sorted(self.sources, key=_source_order):
+            if isinstance(src, GeneratedSource):
+                h.update(src.name.encode())
+                h.update(src.text.encode())
+            elif src.exists():
                 h.update(src.read_bytes())
             else:
                 h.update(str(src).encode())
@@ -322,8 +419,7 @@ class JitSpec:
         # generated code for every GEMM/BMM/Conv2D module.  See
         # ``env.cutlass_version_stamp`` for why this is version.h and not the
         # whole tree.
-        for inc, version_h in env.cutlass_version_stamp():
-            h.update(inc.encode())
+        for _inc, version_h in env.cutlass_version_stamp():
             h.update(version_h)
         # And the compiler: ptxas register allocation -- and with it which tile
         # wins -- moves between patch releases, and a toolkit upgrade otherwise
@@ -345,16 +441,21 @@ class JitSpec:
         """Compile sources into a shared library at exactly ``lib_path`` (``jobs`` parallel).
 
         Under :func:`~oasr.jit.cubin_loader.locked_compile` that is a staging
-        name in the module's build directory, not the cached ``.so``.
+        name in the module's build directory, not the cached ``.so``.  The
+        generated sources are written there too, beside the library they make.
         """
         require_known_cuda_arch(f"module {self.name!r}")
         output = Path(lib_path)
         build_dir = output.parent
         build_dir.mkdir(parents=True, exist_ok=True)
+        sources = [
+            _materialize(s, build_dir) if isinstance(s, GeneratedSource) else s
+            for s in self.sources
+        ]
 
         ninja_content = generate_ninja_build_for_op(
             name=self.name,
-            sources=self.sources,
+            sources=sources,
             extra_cuda_cflags=self.extra_cuda_cflags,
             extra_include_dirs=self.extra_include_dirs,
             extra_ldflags=self.extra_ldflags,
@@ -400,7 +501,8 @@ class JinjaJitSpec(JitSpec):
 
     Instead of compiling static source files, this renders a Jinja2 template
     with baked-in configuration (tile sizes, SM version, etc.) to produce
-    a self-contained ``.cu`` file that instantiates exactly one kernel config.
+    a self-contained ``.cu`` (a :class:`GeneratedSource`) that instantiates
+    exactly one kernel config.
     """
 
     def __init__(
@@ -426,14 +528,13 @@ class JinjaJitSpec(JitSpec):
             extra_ldflags=extra_ldflags,
         )
 
-    def _render_source(self, name: str) -> Path:
-        """Render the Jinja template to a generated .cu file."""
+    def _render_source(self, name: str) -> GeneratedSource:
+        """Render the Jinja template to the text of a generated .cu file."""
         from .templates import render_template
 
-        rendered = render_template(self.template_name, **self.template_vars)
-        gen_path = env.OASR_GEN_SRC_DIR / name / f"{name}.cu"
-        write_if_different(gen_path, rendered)
-        return gen_path
+        return GeneratedSource(
+            f"{name}.cu", render_template(self.template_name, **self.template_vars)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +572,7 @@ def _default_cuda_cflags(gencode_target: Optional[str] = None) -> List[str]:
 
 def gen_jit_spec(
     name: str,
-    sources: List[Path],
+    sources: Sequence[Union[Path, GeneratedSource]],
     extra_cuda_cflags: Optional[List[str]] = None,
     extra_ldflags: Optional[List[str]] = None,
     gencode_target: Optional[str] = None,

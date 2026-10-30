@@ -57,7 +57,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from . import env
-from .core import JitSpec, _get_target_sm, gen_jit_spec
+from .core import GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
 from .gemm import _SM_MAX_SMEM_BYTES, TileShape, _epilogue_covers_warp, _smem_bytes
 
 logger = logging.getLogger(__name__)
@@ -1086,7 +1086,6 @@ _epoch: Callable[[], int] = _register_with_tuning_db()
 
 
 def _render_variants(configs: Dict[str, AnyScaledMmConfig]) -> List:
-    from .cubin_loader import write_if_different
     from .templates import render_template
 
     sm = _get_target_sm()
@@ -1113,14 +1112,11 @@ def _render_variants(configs: Dict[str, AnyScaledMmConfig]) -> List:
             quant_func_name=None if cfg.stream_k else scaled_mm_quant_func_name(cfg),
             sm_version=sm,
         )
-        path = env.OASR_GEN_SRC_DIR / "scaled_mm" / f"{variant}.cu"
-        write_if_different(path, rendered)
-        paths.append(path)
+        paths.append(GeneratedSource(f"{variant}.cu", rendered))
     return paths
 
 
-def _render_native_variant(cfg: NativeScaledMmConfig):
-    from .cubin_loader import write_if_different
+def _render_native_variant(cfg: NativeScaledMmConfig) -> GeneratedSource:
     from .templates import render_template
 
     variant = f"scaled_mm_{cfg.compile_name}"
@@ -1138,9 +1134,7 @@ def _render_native_variant(cfg: NativeScaledMmConfig):
         schedule=cfg.cpp_schedule,
         sm_version=cfg.sm,
     )
-    path = env.OASR_GEN_SRC_DIR / "scaled_mm_native" / f"{variant}.cu"
-    write_if_different(path, rendered)
-    return path
+    return GeneratedSource(f"{variant}.cu", rendered)
 
 
 #: The JIT module of each format's ``mma.sync`` lane.

@@ -323,7 +323,8 @@ extension cookbook for each axis.
 ### Build & JIT
 - **Stale JIT cache.** Editing a vendored CUTLASS header without bumping `version.h` leaves
   the cache short-circuiting on an old `.so`. `rm -rf ~/.cache/oasr/jit`, and confirm a fresh
-  hash directory before trusting a kernel benchmark.
+  hash directory before trusting a kernel benchmark. The key omits the checkout path, so
+  worktrees share the cache; give an experiment on vendored headers its own `OASR_JIT_DIR`.
 - **Changing `[tool.isort]` without `[tool.ruff.lint.isort]`** (or vice versa). Both sort
   imports and mirror `known_first_party` / `combine_as_imports` /
   `force_sort_within_sections`; change them together or the two tools fight and CI flaps.

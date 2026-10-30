@@ -26,8 +26,7 @@ import functools
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-from . import env
-from .core import JitSpec, _get_target_sm, gen_jit_spec
+from .core import GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
 from .gemm import _SM_MAX_SMEM_BYTES, TileShape, _epilogue_covers_warp, _smem_bytes
 
 #: Operand alignment: 16-byte int8 loads along C, 16-byte output stores along K.
@@ -164,7 +163,6 @@ def scaled_conv2d_func_name(cfg: ScaledConvConfig) -> str:
 
 
 def _render_variants(configs: Dict[str, ScaledConvConfig]) -> List:
-    from .cubin_loader import write_if_different
     from .templates import render_template
 
     sm = _get_target_sm()
@@ -184,9 +182,7 @@ def _render_variants(configs: Dict[str, ScaledConvConfig]) -> List:
             stages=cfg.stages,
             sm_version=sm,
         )
-        path = env.OASR_GEN_SRC_DIR / "scaled_conv" / f"{variant}.cu"
-        write_if_different(path, rendered)
-        paths.append(path)
+        paths.append(GeneratedSource(f"{variant}.cu", rendered))
     return paths
 
 
