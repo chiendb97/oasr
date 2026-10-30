@@ -439,7 +439,18 @@ for p in range(num_pages_used):
     phys = block_table_src[bk_src * max_lp + p]
     block_table_dst[bk_dst * max_lp + p] = phys
     atomicAdd(&ref_counts[phys], 1)     # acquire
+for p in range(num_pages_used, max_lp): # the previous occupant's longer tail
+    old_phys = block_table_dst[bk_dst * max_lp + p]
+    if old_phys == INVALID_PAGE: break  # a slot's pages are a prefix of its row
+    free_page(old_phys)
+    block_table_dst[bk_dst * max_lp + p] = INVALID_PAGE
 ```
+
+The second loop matters: a slot's previous occupant (two steps back) can hold
+more pages than the prefix that replaces it, and without the release the
+append below installed a fresh page over the first of them. Each such step
+leaked a page, and the row's bump allocator walked off its partition into the
+next row's pages (the last row's, past the pool).
 
 **Pass 2 — Append / CoW** (one thread per output beam): write the
 new token into the last logical page. Three cases:
@@ -453,7 +464,11 @@ new token into the last logical page. Three cases:
   shared with a sibling beam — copy the page contents to a fresh
   `new_phys`, redirect `block_table_dst`, decrement the old
   reference, set `ref_counts[new_phys] = 1`, then write. If
-  `ref_counts == 1`, it's already exclusive — write in place.
+  `ref_counts == 1`, it's already exclusive — write in place. A
+  reference that drops to zero here is pushed to `free_pool` only after
+  the step's last pop: a push bumps the stack size before it writes the
+  slot, so a concurrent pop by another sub-warp could read the slot
+  first.
 
 The `__syncthreads()` between Pass 1 and Pass 2 ensures every
 `free_page` push is visible before any `alloc_page` pop, otherwise an
@@ -525,7 +540,8 @@ Determinism notes (differences from the legacy pipeline, validated by
   The legacy shared pool could pop a `free_pool` slot before the
   concurrent push wrote it and could push still-referenced pages,
   which made large paged offline decodes nondeterministic (corrupted
-  low-rank beams).
+  low-rank beams). Both paths now also release a slot's stale tail in
+  the fork (above).
 
 The offline launchers also pass the step index by value
 (`step_const`) so no per-step device-counter update is needed; the
@@ -615,7 +631,11 @@ counters and blank-skip bitmaps travel **by value** in one ~2 KB
 kernel-parameter struct (no device pointer table, no H2D upload).
 Streams are fully independent (own buffers, own per-row paged-allocator
 partitions), so concurrent blocks cannot interact and results are
-bit-identical to the sequential path. Deltas must be 128-byte-aligned
+bit-identical to the sequential path. The log-probs carry one row per
+stream (`[N, chunk_T, V]`), so the batched call takes batch-1 states and
+refuses others; every path read stream `i`'s rows at `i .. i + batch - 1`,
+into the next stream's. A multi-row state decodes through
+`ctc_beam_search_chunk`. Deltas must be 128-byte-aligned
 for the shared-offset trick (always true for torch-allocated states);
 misaligned groups fall back to per-stream launches.
 
@@ -784,9 +804,14 @@ token IDs.
 | `free_pool` | `[num_pages]` `int` | LIFO stack of recycled physical pages. |
 | `free_pool_size` | `int` | Top of the recycle stack. |
 
-Sizing: `num_pages = batch * beam * (max_logical_pages + 1)` by default
-(steady-state plus one full beam slab to absorb the step-1 CoW burst
-before the recycle pool warms up). `page_size = 16` (one cache line)
+Sizing: `num_pages = batch * beam * (max_logical_pages + 1)` by default, so
+each row owns `ppr = beam * (max_lp + 1)` pages, and that is exactly what a
+row can need. The fork leaves the destination table referencing source pages
+only (at most `beam * max_lp`; everything it held before is released), and the
+append takes at most one page per output beam. `alloc_page` still stops at
+the row's end: a pop with nothing left returns `INVALID_PAGE` and the beam
+keeps its prefix without appending, as at the output cap, rather than taking
+a page of the next row. `page_size = 16` (one cache line)
 fits the device-side `paged_read` / `paged_seq_compare` helpers.
 
 ### 4.3 `StreamingState`
@@ -1026,7 +1051,7 @@ across requests without `cudaMalloc`.
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `beam_size` | 10 | Beam width. Workspace scales linearly. ≤ 128 is supported by `first_step_kernel` shared-memory layout. |
+| `beam_size` | 10 | Beam width, 1 to 128 (`MAX_BEAM_SIZE`). Workspace scales linearly. Beams above 32 take the legacy kernels, whose per-beam state lives in shared arrays of 128; a wider beam overran them (200) or hung a top-K loop (256+). `GpuDecoderConfig` refuses it at construction -- that is, when an engine builds its decode strategy -- and every launcher refuses it again. |
 | `blank_id` | 0 | CTC blank index. Hard-coded in token filtering. |
 | `blank_threshold` | 0.98 | Probability above which an offline frame is skipped. Use `1.0` to disable, `0.0` to skip all (no-op). Streaming ignores this — pre-filter in Python if needed. |
 | `max_seq_len` | `None` | Cap on decoded tokens per row. `None` offline sizes the output to the input's `T` frames, which no CTC hypothesis can outgrow, so nothing is cut. A stream's state is allocated before its length is known, so streaming resolves `None` to `STREAMING_MAX_SEQ_LEN` (4096 tokens, ~0.7 MiB of state per stream). A hypothesis that reaches a cap stops growing and the engine reports the request as `finish_reason="length"`. The old fixed default of 200 silently cut every transcript past ~200 tokens -- about a minute of speech at a 500-unit vocabulary. |
@@ -1136,14 +1161,17 @@ ctc_beam_search_decode_batch(
 | Output tensors wrong rank | launcher | `CHECK_DIM` failure. |
 | `max_out_len < beam_count` of best beam | offline | Tokens truncated by `cudaMemcpy2DAsync` to `max_out_len` (only with an explicit `max_seq_len`; the default output is `T` wide). `lengths` still reports the full count. |
 | `step ≥ max_seq_len` reached mid-chunk | `ctc_beam_search_chunk` | Loop breaks early; returns the saturated `step`. |
-| `select_seq_lens[b] == 0` (all frames are blank-dominant) | `first_step_kernel` | Early return; that batch's beams stay zero-init. |
+| `select_seq_lens[b] == 0` (all frames are blank-dominant, or a zero length), or a stream read before its first frame | every init path | The row never runs the first step, which writes its scores; they start as the empty hypothesis (beam 0 at 0.0, the others at `-FLT_MAX`, lengths 0). They used to be whatever the workspace held. |
 | `blank_threshold ≥ 1.0` | offline | All frames selected (no skipping). |
 | `blank_threshold ≤ 0.0` | offline | `log_threshold = NEG_INF` — no frame ever passes; output is empty. |
-| Paged `num_pages` exhausted | runtime | `alloc_page` falls through to `atomicAdd(next_free_page, 1)`; if it exceeds `num_pages` the page index is invalid. **Caller must size correctly.** Default sizing covers worst-case CoW burst plus steady state. |
+| Paged row out of pages | `alloc_page` | Bounded at the row's partition end: returns `INVALID_PAGE` and the beam keeps its prefix. Unreachable with the default sizing (§4.2); it used to walk into the next row's pages. |
 | `is_speech_mask` length ≠ `chunk_T` | `ctc_beam_search_chunk` | `TVM_FFI_ICHECK`. |
 | `is_speech_mask` not uint8 | same | rejected. |
 | `actual_frame_index != step` | `streaming_step` | Tiny `set_select_seq_step_kernel` patches `select_seqs[b, step]`. |
-| `beam > 128` | `first_step_kernel` | The `smem.topk.{keys, vals}[128]` arrays cap beam at 128. |
+| `beam < 1` or `beam > 128` | `GpuDecoderConfig`, every launcher | Refused (`ValueError` / `RuntimeError`). |
+| `decode_chunk_batch` with a batch > 1 state | Python + launcher | Refused; one log-prob row per stream. |
+| Fewer finite candidates than beam slots (a vocabulary narrower than the beam) | legacy top-K (`beam > 32`) | Padding slots carry `PAD_KEY = -inf` and real candidates are clamped to `>= NEG_INF`, so padding never wins a slot. At `NEG_INF` it tied with a dead beam's candidates, and its id named a source beam past `beam`: garbage tokens on the flat path, a wild page index on the paged one. |
+| Log-prob offsets past 2^31 elements | every kernel | 64-bit (`B x T x V` passes 2^31 at ~64 x 7000 x 5000). The legacy kernels and the shared frame selection computed them in `int`. |
 
 The Python wrapper is purposely thin: errors raised by `TVM_FFI_ICHECK`
 propagate as `RuntimeError`. There is no soft-failure path.

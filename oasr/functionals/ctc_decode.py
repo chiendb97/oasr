@@ -56,6 +56,11 @@ from oasr.utils.nvtx import nvtx_pop, nvtx_push
 #: restarts the beam) should set ``max_seq_len`` itself.
 STREAMING_MAX_SEQ_LEN = 4096
 
+#: The widest beam the decoder runs (``ctc_decoder::MAX_BEAM``).  Beams above 32
+#: take the legacy kernels, whose per-beam state lives in shared arrays of 128: a
+#: beam of 200 overran them and 256 or more hung the decode.
+MAX_BEAM_SIZE = 128
+
 
 @dataclass
 class GpuDecoderConfig:
@@ -88,6 +93,16 @@ class GpuDecoderConfig:
     max_seq_len: Optional[int] = None
     use_paged_memory: bool = False
     page_size: int = 16
+
+    def __post_init__(self) -> None:
+        # Beam width is an engine-level setting, so this is where an engine that
+        # cannot decode is refused: when its decode strategy builds the config.
+        if not 1 <= self.beam_size <= MAX_BEAM_SIZE:
+            raise ValueError(f"beam_size must be in [1, {MAX_BEAM_SIZE}], got {self.beam_size}")
+        if self.page_size < 1:
+            raise ValueError(f"page_size must be >= 1, got {self.page_size}")
+        if self.max_seq_len is not None and self.max_seq_len < 1:
+            raise ValueError(f"max_seq_len must be None or >= 1, got {self.max_seq_len}")
 
 
 @dataclass
@@ -982,8 +997,8 @@ class GpuStreamingDecoder:
             Log-probability tensor ``[N, chunk_T, vocab_size]`` on CUDA,
             float32.  ``N`` must equal ``len(states)``.
         states : list of StreamState
-            One :class:`StreamState` per row of ``log_probs``, in the same
-            order.  Each state's ``step`` and ``actual_frame_idx`` are
+            One batch-1 :class:`StreamState` per row of ``log_probs``, in the
+            same order (a multi-row state decodes through :meth:`decode_chunk`).  Each state's ``step`` and ``actual_frame_idx`` are
             updated in place after the call.
         is_speech_mask : torch.Tensor, optional
             CPU uint8 tensor ``[N, chunk_T]``; rows of 0 mark blank frames
@@ -1018,6 +1033,13 @@ class GpuStreamingDecoder:
                     "decode_chunk_batch: all states must share (batch, "
                     "vocab_size); got mixed values"
                 )
+        if batch != 1:
+            # One log-prob row per stream, so a multi-row state has no rows of
+            # its own here; the kernels read past its stream's row into the next.
+            raise ValueError(
+                f"decode_chunk_batch takes batch-1 states (one log-prob row each); got "
+                f"batch {batch} -- decode a multi-row state with decode_chunk"
+            )
 
         state_ptrs = torch.tensor(
             [s.buffer.data_ptr() for s in states], dtype=torch.int64, device="cpu"

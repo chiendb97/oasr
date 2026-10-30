@@ -271,6 +271,15 @@ static constexpr int MAX_BLOCKS_PER_BATCH = 16;
 // Use -FLT_MAX to match the reference and for correct CUB sort sentinel behavior.
 static constexpr float NEG_INF = -FLT_MAX;
 
+// The key the legacy top-K kernels give a padding slot -- a position past the
+// candidates, whose id names no (beam, char).  It must rank strictly below every
+// real candidate, which is clamped to >= NEG_INF: at NEG_INF it tied with a dead
+// beam's candidates, so with fewer finite candidates than beam slots (a
+// vocabulary narrower than the beam) padding won slots, and its id decoded to a
+// source beam past ``beam`` -- a length read from uninitialised shared memory,
+// garbage tokens on the flat path and a wild page index on the paged one.
+static constexpr float PAD_KEY = -INFINITY;
+
 // =============================================================================
 // FastDivmod — precomputed fast integer division
 // =============================================================================
@@ -416,11 +425,20 @@ __inline__ __device__ float logprob_add(float a, float b) {
 //   the free_pool stack.  The push is safe to call from multiple concurrent
 //   threads as long as each physical page is freed by exactly one logical
 //   "owner" (ensured by the fork loop which handles each bk_dst slot once).
+//
+// Capacity: a row owns ppr = beam * (max_lp + 1) pages, and never needs more.
+// The fork leaves the destination table referencing source pages only (at most
+// beam * max_lp of them; every page it held before is released), and the append
+// takes at most one page per output beam.  The bump allocation still stops at
+// the row's end (``page_end``, exclusive): past it is the next row's partition,
+// and past the last row the end of the pool.  A pop that finds nothing returns
+// INVALID_PAGE and the caller keeps the prefix without appending, as at the
+// output cap -- it cannot happen while the accounting above holds.
 // =============================================================================
 
 __device__ __forceinline__ int alloc_page(int* __restrict__ free_pool,
                                           int* __restrict__ free_pool_size,
-                                          int* __restrict__ next_free_page) {
+                                          int* __restrict__ next_free_page, int page_end) {
     // Atomically pop one index from the free_pool stack.
     int idx = atomicAdd(free_pool_size, -1) - 1;
     if (idx >= 0) {
@@ -428,7 +446,8 @@ __device__ __forceinline__ int alloc_page(int* __restrict__ free_pool,
     }
     // Pool was empty (or raced to empty); undo the decrement and allocate fresh.
     atomicAdd(free_pool_size, 1);
-    return atomicAdd(next_free_page, 1);
+    const int fresh = atomicAdd(next_free_page, 1);
+    return fresh < page_end ? fresh : paged_memory::INVALID_PAGE;
 }
 
 __device__ __forceinline__ void free_page(int phys,
@@ -597,7 +616,8 @@ __global__ void init_select_kernel(const float* __restrict__ log_prob, int batch
         for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM) {
             int t = t_offset + ITEMS_PER_THREAD * tx + ITEM;
             if (t < actual_len) {
-                float lp = log_prob[bid * batch_stride + t * seq_stride + blank_id * vocab_stride];
+                float lp = log_prob[(int64_t)bid * batch_stride + (int64_t)t * seq_stride +
+                    (int64_t)blank_id * vocab_stride];
                 selected[ITEM] = (lp < log_threshold) ? 1 : 0;
             } else {
                 selected[ITEM] = 0;
@@ -666,7 +686,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_kernel(
     int values[ITEMS_PER_THREAD];
 
     const int items_per_iter = BLOCK_SIZE * ITEMS_PER_THREAD;
-    const int lp_base = bid * batch_stride + first_t * seq_stride;
+    // int64: B x T x V passes 2^31 elements at ~64 x 7000 x 5000.
+    const int64_t lp_base = (int64_t)bid * batch_stride + (int64_t)first_t * seq_stride;
 
     // First iteration: load first items_per_iter vocabulary entries.
 #pragma unroll
@@ -825,7 +846,8 @@ __global__ void prob_matrix_kernel(const float* __restrict__ log_prob, int batch
             prev = raw_prev;
         }
 
-        float cur_prob = log_prob[bid * batch_stride + t * seq_stride + char_idx * vocab_stride];
+        float cur_prob = log_prob[(int64_t)bid * batch_stride + (int64_t)t * seq_stride +
+            (int64_t)char_idx * vocab_stride];
 
         int idout = char_idx + (beam_idx + bid * beam) * ldc;
 
@@ -903,7 +925,8 @@ __global__ void prob_space_blank_kernel(const float* __restrict__ log_prob, int 
     }
 
     // --- Blank ---
-    float blank_prob = log_prob[bid * batch_stride + t * seq_stride + blank_id * vocab_stride];
+    float blank_prob = log_prob[(int64_t)bid * batch_stride + (int64_t)t * seq_stride +
+        (int64_t)blank_id * vocab_stride];
     int blank_slot = blank_id + (bid * beam + beam_idx) * ldc;
     ptable[blank_slot] = logprob_add(blank_prob, logsumexp(prev.x, prev.y));
     // Only write ptablen[blank_slot] = NEG_INF when last_char == blank_id.
@@ -919,7 +942,8 @@ __global__ void prob_space_blank_kernel(const float* __restrict__ log_prob, int 
 
     // --- Space (optional) ---
     if (space_id >= 0 && space_id != blank_id) {
-        float space_prob = log_prob[bid * batch_stride + t * seq_stride + space_id * vocab_stride];
+        float space_prob = log_prob[(int64_t)bid * batch_stride + (int64_t)t * seq_stride +
+            (int64_t)space_id * vocab_stride];
         int space_slot = space_id + (bid * beam + beam_idx) * ldc;
         ptablen[space_slot] = logprob_add(space_prob, logsumexp(prev.x, prev.y));
         ptable[space_slot] = NEG_INF;
@@ -1037,10 +1061,10 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase1_kernel(
         if (pos < my_count && global_idx < all_items) {
             float p = ptable[bid * all_items + global_idx];
             float pn = ptablen[bid * all_items + global_idx];
-            keys[ITEM] = logsumexp(p, pn);
+            keys[ITEM] = fmaxf(logsumexp(p, pn), NEG_INF);  // NaN, -inf -> NEG_INF
             values[ITEM] = global_idx;
         } else {
-            keys[ITEM] = NEG_INF;
+            keys[ITEM] = PAD_KEY;
             values[ITEM] = chunk_start + pos;
         }
     }
@@ -1059,10 +1083,10 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase1_kernel(
                 if (new_global < chunk_end) {
                     float p = ptable[bid * all_items + new_global];
                     float pn = ptablen[bid * all_items + new_global];
-                    keys[ITEM] = logsumexp(p, pn);
+                    keys[ITEM] = fmaxf(logsumexp(p, pn), NEG_INF);
                     values[ITEM] = new_global;
                 } else {
-                    keys[ITEM] = NEG_INF;
+                    keys[ITEM] = PAD_KEY;
                     values[ITEM] = new_global;
                 }
             }
@@ -1140,7 +1164,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
             keys[ITEM] = topk_key_buffer[rw_offset + pos];
             values[ITEM] = topk_value_buffer[rw_offset + pos];
         } else {
-            keys[ITEM] = NEG_INF;
+            keys[ITEM] = PAD_KEY;
             values[ITEM] = pos;
         }
     }
@@ -1159,7 +1183,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_kernel(
                     keys[ITEM] = topk_key_buffer[new_idx];
                     values[ITEM] = topk_value_buffer[new_idx];
                 } else {
-                    keys[ITEM] = NEG_INF;
+                    keys[ITEM] = PAD_KEY;
                 }
             }
         }
@@ -1330,6 +1354,13 @@ __global__ void fixup_parity_kernel(const int* __restrict__ select_seq_lens, int
 // updates deterministic. Larger beams and validation use the legacy pipeline.
 
 static constexpr int FUSED_MAX_BEAM = 32;
+
+// The widest beam any path decodes, and every launcher refuses a wider one.
+// Beams above FUSED_MAX_BEAM take the legacy kernels, which hold per-beam
+// state in shared arrays of 128 and advance their streaming top-K loops by
+// (items per iteration - beam), 256 items in phase 2: a beam of 200 overran
+// shared memory, and 256 or more never advanced, hanging the decoder.
+static constexpr int MAX_BEAM = 128;
 
 // Frames covered by one chunk-level top-K pre-pass launch.  Both the offline
 // step loop and the streaming chunk launchers tile their frame loops by this,
@@ -1807,7 +1838,7 @@ __device__ __forceinline__ void fused_step_body(
     const int* __restrict__ block_table_src,
     int* __restrict__ block_table_dst, int* __restrict__ ref_counts,
     int* __restrict__ next_free_page, int* __restrict__ free_pool,
-    int* __restrict__ free_pool_size, int page_size, int max_lp) {
+    int* __restrict__ free_pool_size, int page_size, int max_lp, int page_end) {
     using Smem = FusedStepSmem<BLOCK_SIZE, BEAM_CAP>;
     const int tid = threadIdx.x;
 
@@ -2114,6 +2145,19 @@ __device__ __forceinline__ void fused_step_body(
                 block_table_dst[bk_dst * max_lp + p] = phys;
                 atomicAdd(&ref_counts[phys], 1);
             }
+            // The slot's previous occupant (two steps back) may have held more
+            // pages than this prefix: release them.  The append below installed
+            // a new page over the first of them without releasing it, so each
+            // such step leaked a page, and the row's bump allocator walked into
+            // the next row's partition.  A slot's pages are a prefix of its
+            // table, so each lane stops at its first empty entry.
+            for (int p = n_pages + lane; p < max_lp; p += WRITE_THREADS) {
+                const int old_phys = block_table_dst[bk_dst * max_lp + p];
+                if (old_phys == paged_memory::INVALID_PAGE)
+                    break;
+                free_page(old_phys, free_pool, free_pool_size, ref_counts);
+                block_table_dst[bk_dst * max_lp + p] = paged_memory::INVALID_PAGE;
+            }
         }
         // All free_page pushes must be visible before any alloc_page pop.
         __syncthreads();
@@ -2158,11 +2202,16 @@ __device__ __forceinline__ void fused_step_body(
                 int last_lp = write_pos / page_size;
                 int off = write_pos - last_lp * page_size;
                 if (off == 0) {
-                    int new_phys = alloc_page(free_pool, free_pool_size, next_free_page);
-                    block_table_dst[bk_dst * max_lp + last_lp] = new_phys;
-                    ref_counts[new_phys] = 1;
-                    page_storage[new_phys * page_size + 0] = char_id;
-                    time_storage[new_phys * page_size + 0] = frame;
+                    int new_phys =
+                        alloc_page(free_pool, free_pool_size, next_free_page, page_end);
+                    if (new_phys == paged_memory::INVALID_PAGE) {
+                        clen_dst[dst] = prevlen;  // see alloc_page: keep the prefix
+                    } else {
+                        block_table_dst[bk_dst * max_lp + last_lp] = new_phys;
+                        ref_counts[new_phys] = 1;
+                        page_storage[new_phys * page_size + 0] = char_id;
+                        time_storage[new_phys * page_size + 0] = frame;
+                    }
                 } else {
                     int bt_idx = bk_dst * max_lp + last_lp;
                     int phys = block_table_dst[bt_idx];
@@ -2174,10 +2223,16 @@ __device__ __forceinline__ void fused_step_body(
                         // pop of this step — a concurrent pop could otherwise
                         // read the reserved free_pool slot before this thread
                         // writes it.)
-                        cow_new = alloc_page(free_pool, free_pool_size, next_free_page);
-                        cow_old = phys;
-                        cow_bt = bt_idx;
-                        cow_off = off;
+                        cow_new =
+                            alloc_page(free_pool, free_pool_size, next_free_page, page_end);
+                        if (cow_new == paged_memory::INVALID_PAGE) {
+                            cow_new = -1;  // no copy: the shared page stays as it is
+                            clen_dst[dst] = prevlen;
+                        } else {
+                            cow_old = phys;
+                            cow_bt = bt_idx;
+                            cow_off = off;
+                        }
                     } else {
                         page_storage[phys * page_size + off] = char_id;
                         time_storage[phys * page_size + off] = frame;
@@ -2316,7 +2371,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void fused_step_kernel(
         pprev, clast, clen_src, clen_dst, clist_src, clist_dst, ctime_src, ctime_dst, t,
         score, ldc, beam, ldbeam, ldseq_len, blank_id, space_id, page_storage, time_storage,
         block_table_src, block_table_dst,
-        ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp);
+        ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp,
+        (bid + 1) * pages_per_row);
 }
 
 // Decode one frame tile per launch while carrying beam state in-kernel. Offline
@@ -2475,7 +2531,8 @@ __device__ __forceinline__ void fused_chunk_loop(
                 dstp ? ctime1 : ctime0, frame_for_gap, score, ldc, beam, ldbeam,
                 ldseq_len, blank_id, space_id, page_storage, time_storage,
                 srcp ? block_table1 : block_table0, dstp ? block_table1 : block_table0,
-                ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp);
+                ref_counts, next_free_page, free_pool, free_pool_size, page_size, max_lp,
+                (bid + 1) * pages_per_row);
         }
 
         // Publish this step's global-state writes to the next iteration.
@@ -3242,6 +3299,25 @@ inline cudaError_t ctc_prefix_beam_search_step(InternalData* data, const float* 
 // Host launcher: full batch decode (offline)
 // =============================================================================
 
+// A row that decodes no frame -- every frame blank-skipped, a zero length, or a
+// stream read before its first chunk -- never runs the first step, which is
+// what writes every beam's score; its scores were whatever the workspace held.
+// It holds the empty hypothesis: log 1 for beam 0 (skipped frames are taken as
+// certain blanks, as everywhere else), and nothing for the other beams.  A row
+// that does decode overwrites all of them at its first step.
+__global__ void init_empty_scores_kernel(float* __restrict__ score, int ldbeam, int batch) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch * ldbeam)
+        return;
+    score[i] = (i % ldbeam == 0) ? 0.0f : NEG_INF;
+}
+
+inline void init_empty_scores(InternalData* data, int batch, cudaStream_t stream) {
+    const int n = batch * data->ldbeam;
+    init_empty_scores_kernel<<<(n + 255) / 256, 256, 0, stream>>>(data->score, data->ldbeam,
+                                                                  batch);
+}
+
 // Upper bound on the selected (non-blank-dominant) frames of any row: the tile
 // loop's trip count.
 //
@@ -3313,6 +3389,7 @@ inline cudaError_t ctc_beam_search_decode_batch(
         cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
     }
     cudaMemsetAsync(data.select_seq_lens, 0, sizeof(int) * batch, stream);
+    init_empty_scores(&data, batch, stream);
 
     // Blank threshold: convert from probability space to log space.
     // User passes blank_threshold as a probability (e.g. 0.99).
@@ -3468,6 +3545,7 @@ inline void init_streaming_state(void* state_buffer, int batch, int beam, int vo
     cudaMemsetAsync(state_buffer, 0, sizeof(int) * 2, stream);
 
     // Initialise GPU buffers.
+    init_empty_scores(&state.data, batch, stream);
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);
     cudaMemsetAsync(state.data.clen[0], 0, sizeof(int) * batch * state.data.ldbeam, stream);
     cudaMemsetAsync(state.data.clen[1], 0, sizeof(int) * batch * state.data.ldbeam, stream);
@@ -4244,7 +4322,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void first_step_paged_kernel(
     int values[ITEMS_PER_THREAD];
 
     const int items_per_iter = BLOCK_SIZE * ITEMS_PER_THREAD;
-    const int lp_base = bid * batch_stride + first_t * seq_stride;
+    // int64: B x T x V passes 2^31 elements at ~64 x 7000 x 5000.
+    const int64_t lp_base = (int64_t)bid * batch_stride + (int64_t)first_t * seq_stride;
 
 #pragma unroll
     for (int ITEM = 0; ITEM < ITEMS_PER_THREAD; ++ITEM) {
@@ -4448,7 +4527,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
             keys[ITEM] = topk_key_buffer[rw_offset + pos];
             values[ITEM] = topk_value_buffer[rw_offset + pos];
         } else {
-            keys[ITEM] = NEG_INF;
+            keys[ITEM] = PAD_KEY;
             values[ITEM] = pos;
         }
     }
@@ -4467,7 +4546,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
                     keys[ITEM] = topk_key_buffer[new_idx];
                     values[ITEM] = topk_value_buffer[new_idx];
                 } else {
-                    keys[ITEM] = NEG_INF;
+                    keys[ITEM] = PAD_KEY;
                 }
             }
         }
@@ -4519,10 +4598,29 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
             block_table_dst[bk_dst * max_lp + p] = phys;
             atomicAdd(&ref_counts[phys], 1);
         }
+        // Release what the slot held past the new prefix (see the fused fork:
+        // the append installed over it without a release, leaking a page).
+        for (int p = num_pages_used + tid_in_sub; p < max_lp; p += WRITE_THREADS) {
+            const int old_phys = block_table_dst[bk_dst * max_lp + p];
+            if (old_phys == paged_memory::INVALID_PAGE)
+                break;
+            free_page(old_phys, free_pool, free_pool_size, ref_counts);
+            block_table_dst[bk_dst * max_lp + p] = paged_memory::INVALID_PAGE;
+        }
     }
 
     // Barrier: all free_page pushes must be complete before alloc_page pops.
     __syncthreads();
+
+    // Copy-on-write releases are pushed only after the last pop of this step:
+    // a push bumps free_pool_size before it writes the slot, so a concurrent
+    // pop by another sub-warp could read the slot first and get a stale page.
+    __shared__ int defer_free[128];  // beam <= 128: one release per output beam
+    __shared__ int defer_n;
+    if (tx == 0)
+        defer_n = 0;
+    __syncthreads();
+    const int page_end = (bid + 1) * pages_per_row;
 
     // =========================================================================
     // Pass 2: Append / CoW — scalar per output beam (tid_in_sub == 0 only).
@@ -4563,35 +4661,49 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
 
             if (off == 0) {
                 // Starting a new logical page: allocate a fresh or recycled page.
-                int new_phys = alloc_page(free_pool, free_pool_size, next_free_page);
-                block_table_dst[bk_dst * max_lp + last_lp] = new_phys;
-                ref_counts[new_phys] = 1;
-                page_storage[new_phys * page_size + 0] = char_id;
-                if (time_storage)
-                    time_storage[new_phys * page_size + 0] = emit_frame;
+                int new_phys = alloc_page(free_pool, free_pool_size, next_free_page, page_end);
+                if (new_phys == paged_memory::INVALID_PAGE) {
+                    clen_dst[dst_base] = prevlen;  // see alloc_page: keep the prefix
+                } else {
+                    block_table_dst[bk_dst * max_lp + last_lp] = new_phys;
+                    ref_counts[new_phys] = 1;
+                    page_storage[new_phys * page_size + 0] = char_id;
+                    if (time_storage)
+                        time_storage[new_phys * page_size + 0] = emit_frame;
+                }
             } else {
                 // Writing within an existing page: CoW if shared.
                 int bt_idx = bk_dst * max_lp + last_lp;
                 int phys = block_table_dst[bt_idx];
                 if (ref_counts[phys] > 1) {
                     // Copy-on-write: allocate a fresh/recycled page and copy.
-                    int new_phys = alloc_page(free_pool, free_pool_size, next_free_page);
-                    for (int i = 0; i < page_size; ++i) {
-                        page_storage[new_phys * page_size + i] =
-                            page_storage[phys * page_size + i];
-                        if (time_storage)
-                            time_storage[new_phys * page_size + i] =
-                                time_storage[phys * page_size + i];
+                    int new_phys =
+                        alloc_page(free_pool, free_pool_size, next_free_page, page_end);
+                    if (new_phys == paged_memory::INVALID_PAGE) {
+                        clen_dst[dst_base] = prevlen;
+                        phys = paged_memory::INVALID_PAGE;  // no write into a shared page
+                    } else {
+                        for (int i = 0; i < page_size; ++i) {
+                            page_storage[new_phys * page_size + i] =
+                                page_storage[phys * page_size + i];
+                            if (time_storage)
+                                time_storage[new_phys * page_size + i] =
+                                    time_storage[phys * page_size + i];
+                        }
+                        block_table_dst[bt_idx] = new_phys;
+                        // Release one reference from the old page (the bt_dst
+                        // slot); a page that drops to zero is pushed below.
+                        if (atomicSub(&ref_counts[phys], 1) == 1)
+                            defer_free[atomicAdd(&defer_n, 1)] = phys;
+                        ref_counts[new_phys] = 1;
+                        phys = new_phys;
                     }
-                    block_table_dst[bt_idx] = new_phys;
-                    // Release one reference from the old page (the bt_dst slot).
-                    free_page(phys, free_pool, free_pool_size, ref_counts);
-                    ref_counts[new_phys] = 1;
-                    phys = new_phys;
                 }
-                page_storage[phys * page_size + off] = char_id;
-                if (time_storage)
-                    time_storage[phys * page_size + off] = emit_frame;
+                if (phys != paged_memory::INVALID_PAGE) {
+                    page_storage[phys * page_size + off] = char_id;
+                    if (time_storage)
+                        time_storage[phys * page_size + off] = emit_frame;
+                }
             }
         }
 
@@ -4605,6 +4717,11 @@ __global__ __launch_bounds__(BLOCK_SIZE) void topk_phase2_paged_kernel(
         float pn = ptablen[bid * ldc * beam + id];
         pprev[dst_base] = make_float2(p, pn);
     }
+
+    // Every pop of this step is done: push the copy-on-write releases.
+    __syncthreads();
+    for (int i = tx; i < defer_n; i += BLOCK_SIZE)
+        free_pool[atomicAdd(free_pool_size, 1)] = defer_free[i];
 }
 
 // =============================================================================
@@ -4879,6 +4996,7 @@ inline cudaError_t ctc_beam_search_decode_batch_paged(
         cudaMemsetAsync(data.ptablen, 0xcc, sizeof(float) * batch * beam * data.ldc, stream);
     }
     cudaMemsetAsync(data.select_seq_lens, 0, sizeof(int) * batch, stream);
+    init_empty_scores(&data, batch, stream);
 
     float log_threshold = (blank_threshold <= 0.0f)   ? NEG_INF
                           : (blank_threshold >= 1.0f) ? 0.0f
@@ -4966,6 +5084,7 @@ inline void init_streaming_state_paged(void* state_buffer, int batch, int beam,
     cudaMemsetAsync(state_buffer, 0, sizeof(int) * 2, stream);
 
     // Initialise beam-state buffers
+    init_empty_scores(&state.data, batch, stream);
     cudaMemsetAsync(state.data.clast, 0, sizeof(int) * batch * state.data.ldbeam, stream);
     cudaMemsetAsync(state.data.clen[0], 0, sizeof(int) * batch * state.data.ldbeam, stream);
     cudaMemsetAsync(state.data.clen[1], 0, sizeof(int) * batch * state.data.ldbeam, stream);
