@@ -611,11 +611,12 @@ request, so both executors contain it instead.
 |---|---|---|
 | `OfflineExecutor` | Re-runs a failed micro-batch **one request at a time**, so only the culprit is rejected — **except on OOM**, where the batch fails whole | Retrying under memory pressure is how one over-large request cascades |
 | `StreamingExecutor` | Fails the whole ready cohort | The batched forward has no per-stream boundary, and retrying per stream would double-commit the chunk for streams that already advanced |
+| AR decode (`IncrementalArStrategy.advance`) | Fails the **decode group** whose step raised, returns its decoder KV, and keeps advancing the others; rows that finished before the failure keep their finals | A group's rows share one batched forward, and its partly-written step cannot be replayed. A dense merge that fails part-way fails the group it was merging into, whose cache it had begun to release |
 
 Terminal outputs carry `finish_reason="error"` plus `RequestOutput.error_stage`,
 which becomes the `stage` label on the `oasr_requests_failed_total` metric
-(`offline_forward`, `offline_oom`, `prefill_oom`, `streaming_forward`,
-`streaming_features`) — see [serving.md](serving.md).
+(`offline_forward`, `offline_oom`, `prefill_oom`, `decode_step`, `decode_oom`,
+`streaming_forward`, `streaming_features`) — see [serving.md](serving.md).
 
 ## 9. Performance Considerations
 

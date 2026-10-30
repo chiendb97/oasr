@@ -19,7 +19,18 @@ per-layer KV cache carried in an opaque state dict and indexed **per row**
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 from torch import nn
@@ -433,7 +444,7 @@ class WhisperDecoder(BaseDecoder):
         self,
         enc_out: torch.Tensor,
         prompt_ids: torch.Tensor,
-        capacity: Optional[int] = None,
+        capacity: Union[int, Sequence[int], None] = None,
         kv_manager: Optional["DecoderKVCacheManager"] = None,
         all_positions: bool = False,
         kv_cache_dtype: Optional[str] = None,
@@ -449,14 +460,16 @@ class WhisperDecoder(BaseDecoder):
         position, not the last one.
 
         ``capacity`` (optional): total self-attention KV length this generation
-        may reach (prompt + generation cap).  When given, the per-layer K/V
-        buffers are preallocated once and each :meth:`step` writes its own row's
-        slot in place — which is also what makes the state **mergeable**, since a
-        ``cat``-grown cache has no room to hold rows at different offsets.
+        may reach (prompt + generation cap), for the batch or one per row.  When
+        given, the per-layer K/V buffers are preallocated once, as wide as the
+        widest row, and each :meth:`step` writes its own row's slot in place —
+        which is also what makes the state **mergeable**, since a ``cat``-grown
+        cache has no room to hold rows at different offsets.
 
         ``kv_manager`` (optional, requires ``capacity``): page the decoder KV
         out of a shared pool instead — the self-attention one slot per row that
-        grows a page at a time, and the cross-attention a second, fixed-extent
+        grows a page at a time and reserves that row's own capacity, and the
+        cross-attention a second, fixed-extent
         slot per row holding the whole encoder window (:func:`build_cross_kv`),
         written here once per layer and only read after.  The prompt's own
         forward already reads the cross K/V back through the pages, so prefill
@@ -471,13 +484,12 @@ class WhisperDecoder(BaseDecoder):
         n = len(self.layers)
         layers = [cast(_DecoderLayer, layer) for layer in self.layers]
         B, P = prompt_ids.shape
-        cap = None if capacity is None else max(int(capacity), P)
         kv = build_kv(
             n,
             B,
             prompt_ids.device,
             prefill_len=P,
-            cap=cap,
+            cap=capacity,
             manager=kv_manager,
             kv_cache=kv_cache_dtype,
         )

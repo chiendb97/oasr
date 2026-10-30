@@ -136,11 +136,12 @@ class AedDecodeStrategy(IncrementalArStrategy):
             # capacity → the decoder preallocates its KV buffers and every step
             # writes its own row's slot in place.  It is also what makes the
             # state mergeable: a cat-grown cache has no room to hold rows at
-            # different offsets.
+            # different offsets.  One per row, so a paged row reserves its own
+            # cap rather than its batch's longest (see ``_row_capacity``).
             logits, state = self._decoder().prefill(
                 enc_out,
                 prompt_ids,
-                capacity=prompt_ids.size(1) + max(max_new) + 1,
+                capacity=[self._row_capacity(prompt_ids.size(1), m) for m in max_new],
                 kv_manager=self.kv_manager(),
                 **({"all_positions": True} if no_speech else {}),
                 **self._kv_cache_kwargs(),

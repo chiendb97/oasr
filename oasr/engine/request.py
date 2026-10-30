@@ -66,9 +66,11 @@ class DecodingOptions:
         the best hypothesis only.
     max_new_tokens : int, optional
         Per-request generation cap for the incremental AR strategies
-        (AED / LLM), overriding ``EngineConfig.max_new_tokens``; still clamped
-        by the model's position-embedding capacity.  Ignored by
-        frame-synchronous families.
+        (AED / LLM).  It can lower ``EngineConfig.max_new_tokens`` but not
+        raise it: the engine's value is the ceiling the decoder-KV pool and the
+        admission budget are sized for.  Also clamped by the model's
+        position-embedding capacity; a clamp that binds ends the row with
+        ``finish_reason="length"``.  Ignored by frame-synchronous families.
     temperature : float
         ``0.0`` (default) — greedy.  ``> 0`` enables sampling for the AR
         strategies: logits are divided by the temperature before the
@@ -297,7 +299,9 @@ class RequestOutput:
         full audio) and for partial outputs.
     error_stage : str, optional
         Which stage failed, when ``finish_reason == "error"`` — e.g.
-        ``"offline_forward"``, ``"streaming_forward"``, ``"prefill_oom"``.
+        ``"offline_forward"``, ``"streaming_forward"``, ``"prefill_oom"``, or
+        ``"decode_step"`` / ``"decode_oom"`` for an AR decode group whose step
+        failed.
         Set alongside ``finish_reason`` rather than folded into it so the
         serving layer's error envelope stays a stable two-value vocabulary
         while ``oasr_requests_failed_total{stage}`` still says *where*.

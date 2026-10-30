@@ -862,6 +862,204 @@ class TestTaskAndLanguagePrompt:
 
 
 # ---------------------------------------------------------------------------
+# Decoder-KV accounting: what a decode group reserves, and that it comes back
+# ---------------------------------------------------------------------------
+
+
+class TestDecoderKvAccounting:
+    """One pool harness for the AR decode groups' reserve and release.
+
+    The tiny Whisper on CPU with paged decoder KV, its pool sized exactly as
+    the engine sizes it: ``max_decode_slots`` rows at the ``max_new_tokens``
+    ceiling, plus each row's cross-attention window.  EOS is suppressed, so
+    every row runs to its cap and every length is exact.
+    """
+
+    CEILING = 8
+    BLOCK = 4
+
+    def _strategy(self, *, storage="paged", slots=2, merge=False):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.decode.aed import AedDecodeStrategy
+        from oasr.engine.decode.detokenize import Detokenizer
+
+        torch.manual_seed(0)
+        model = WhisperModel(_tiny_config(suppress_tokens=[0, 1, 61])).eval()
+        strat = AedDecodeStrategy(
+            EngineConfig(ckpt_dir="x", max_decode_slots=slots), Detokenizer(None, None), model
+        )
+        strat.options = replace(
+            strat.options,
+            kv_storage=storage,
+            kv_block_tokens=self.BLOCK,
+            max_new_tokens=self.CEILING,
+            merge_groups=merge,
+        )
+        return strat
+
+    @staticmethod
+    def _requests(*caps, prefix="r"):
+        from oasr.engine.request import DecodingOptions, Request
+
+        return [
+            Request(
+                audio=torch.zeros(16000),
+                request_id=f"{prefix}{i}",
+                streaming=False,
+                decoding=None if cap is None else DecodingOptions(max_new_tokens=cap),
+            )
+            for i, cap in enumerate(caps)
+        ]
+
+    @staticmethod
+    def _begin(strat, requests):
+        cfg = strat._mcfg
+        enc = torch.randn(len(requests), cfg.max_source_positions, cfg.d_model)
+        strat.begin_offline(requests, enc, torch.tensor([enc.size(1)] * len(requests)))
+
+    @staticmethod
+    def _drive(strat):
+        from oasr.engine.generation import StepBudget
+
+        finals = {}
+        for _ in range(100):
+            if not strat.has_pending():
+                break
+            for out in strat.advance(StepBudget(max_steps=8)):
+                if out.finished:
+                    assert out.request_id not in finals, f"two finals for {out.request_id}"
+                    finals[out.request_id] = out
+        assert not strat.has_pending()
+        return finals
+
+    def _pages(self, positions):
+        return -(-positions // self.BLOCK)
+
+    # -- reserve (audit M5) -------------------------------------------------
+
+    def test_one_requests_cap_does_not_get_its_batch_refused(self):
+        """The prefill reserved every row at its batch's longest cap.
+
+        The pool holds two rows at the ceiling (4 + 13 pages each, 34 in all).
+        A request asking for 29 tokens — within the model's 32 positions — made
+        both rows reserve 32 positions (8 + 13 pages each, 42 in all), so the
+        pool refused the batch, and the row that asked for nothing special
+        failed with it.  The cap is clamped to the ceiling now, and the
+        clamped row ends the way every capped row ends.
+        """
+        strat = self._strategy()
+        mgr = strat.kv_manager()
+        assert mgr.pool.num_blocks == 2 * (self._pages(8 + self.CEILING) + self._pages(50))
+        self._begin(strat, self._requests(None, 29))
+        finals = self._drive(strat)
+        for rid in ("r0", "r1"):
+            assert finals[rid].finish_reason == "length"
+            assert len(finals[rid].tokens[0]) == self.CEILING
+        assert mgr.pool.num_free_blocks == mgr.pool.num_blocks and mgr.num_active() == 0
+
+    def test_each_row_reserves_its_own_cap(self):
+        """A row that asked for one token reserves its prompt and that token.
+
+        Not the batch's longest row: ``can_admit`` counts every live slot at its
+        declared ceiling, so a ceiling taken from a neighbour holds pool the row
+        will never write.
+        """
+        strat = self._strategy()
+        mgr = strat.kv_manager()
+        self._begin(strat, self._requests(1, None))
+        prompt = len(strat._prompt)
+        cross = 2 * self._pages(strat._mcfg.max_source_positions)
+        own = self._pages(prompt + 1) + self._pages(prompt + self.CEILING)
+        assert mgr.reserved_blocks() == own + cross
+
+    def test_a_row_at_the_ceiling_stays_within_its_budget(self):
+        """The pool gives each row ``_position_budget`` positions, in pages.
+
+        The prefill reserved one position more than a row can write (``+ 1``),
+        which is a whole page past the budget when the budget is a multiple of
+        the page size, so a pool full of rows at the ceiling refused its last
+        batch.  For the speech-LLM that row is a 30 s clip under the default
+        prompt.  Here the prompt estimate is the prompt itself and
+        ``prompt + ceiling`` is exactly four pages.
+        """
+        strat = self._strategy()
+        strat._prompt_len_estimate = lambda: len(strat._prompt)
+        strat.options = replace(strat.options, max_new_tokens=self.BLOCK * 4 - len(strat._prompt))
+        mgr = strat.kv_manager()
+        self._begin(strat, self._requests(None, None))
+        assert mgr.reserved_blocks() == mgr.pool.num_blocks
+        assert len(self._drive(strat)) == 2
+
+    def test_a_dense_group_is_as_wide_as_its_widest_clamped_row(self):
+        strat = self._strategy(storage="dense")
+        assert strat.kv_manager() is None
+        self._begin(strat, self._requests(20, 1))
+        kv = strat._groups[0].state["kv"]
+        assert kv.k[0].size(2) == len(strat._prompt) + self.CEILING
+
+    # -- release (audit M4) -------------------------------------------------
+
+    def test_a_failed_step_fails_its_group_and_returns_its_pages(self):
+        """The group was off the queue with its pages held when its step raised.
+
+        And the exception left ``advance``, failing every request in flight.
+        Now the group alone fails, its pages go straight back, and the other
+        group decodes to its cap.
+        """
+        strat = self._strategy(slots=3)
+        mgr = strat.kv_manager()
+        self._begin(strat, self._requests(None, None, prefix="doomed"))
+        doomed = set(strat._groups[0].state["kv"].slots)
+        self._begin(strat, self._requests(None, prefix="ok"))
+        real = strat._step
+
+        def step(tokens, state):
+            if doomed & set(state["kv"].slots):
+                raise torch.cuda.OutOfMemoryError("simulated")
+            return real(tokens, state)
+
+        strat._step = step
+        finals = self._drive(strat)
+        for rid in ("doomed0", "doomed1"):
+            assert finals[rid].finish_reason == "error"
+            assert finals[rid].error_stage == "decode_oom"
+        assert finals["ok0"].finish_reason == "length"
+        assert len(finals["ok0"].tokens[0]) == self.CEILING
+        assert mgr.pool.num_free_blocks == mgr.pool.num_blocks and mgr.num_active() == 0
+
+    def test_a_failed_merge_fails_the_group_it_was_merging_into(self, monkeypatch):
+        """A dense merge releases each source layer as it copies it.
+
+        So an OOM on a copy has already destroyed part of the generating
+        group's cache.  The state was marked consumed only once every layer
+        was copied, so the group still looked live, its next step allocated the
+        lost layer afresh, and it went on decoding against zeros where its keys
+        had been — to a ``"length"`` final with a different transcript and no
+        error anywhere.  Now the merge marks both states consumed first, and
+        the strategy fails the group it was merging into.
+        """
+        from oasr.cache import decoder_state
+        from oasr.engine.generation import StepBudget
+
+        strat = self._strategy(storage="dense", merge=True)
+        self._begin(strat, self._requests(None, prefix="old"))
+        strat.advance(StepBudget(max_steps=2))
+
+        def oom_on_first_copy(a, b, width):
+            a[0] = b[0] = None  # what the real one drops before allocating the copy
+            raise torch.cuda.OutOfMemoryError("simulated")
+
+        monkeypatch.setattr(decoder_state, "_consume_cat", oom_on_first_copy)
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            self._begin(strat, self._requests(None, prefix="new"))
+        monkeypatch.undo()
+        finals = self._drive(strat)
+        assert set(finals) == {"old0"}  # the executor refuses the new batch itself
+        assert finals["old0"].finish_reason == "error"
+        assert finals["old0"].error_stage == "decode_oom"
+
+
+# ---------------------------------------------------------------------------
 # Converter + registry + native round trip (real snapshot)
 # ---------------------------------------------------------------------------
 

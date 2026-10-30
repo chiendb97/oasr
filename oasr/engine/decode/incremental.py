@@ -24,10 +24,11 @@ from __future__ import annotations
 import logging
 from abc import abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from oasr.cache import DecoderKvExhausted
 from oasr.models.base import first_compute_parameter
 
 from ..generation import select_next_tokens
@@ -178,7 +179,13 @@ class ArOptions:
     max_new_tokens: int = option(
         448,
         legacy="max_new_tokens",
-        doc="Default generation cap; DecodingOptions.max_new_tokens overrides per request.",
+        doc=(
+            "Generation cap, and the ceiling for DecodingOptions.max_new_tokens: a "
+            "request may ask for fewer tokens, not more.  The decoder-KV pool and the "
+            "admission budget are sized from it, so a row past it would claim KV "
+            "nobody budgeted for.  A row that reaches it stops with "
+            "finish_reason='length'."
+        ),
     )
     beam_size: int = option(
         1,
@@ -312,6 +319,9 @@ class IncrementalArStrategy(DecodeStrategy):
     ) -> None:
         super().__init__(config, detok, model)
         self._groups: List[ArGroup] = []
+        #: Error finals for groups that failed outside :meth:`advance` (a merge
+        #: during :meth:`begin_offline`), handed out by the next ``advance``.
+        self._failed: List[RequestOutput] = []
         #: Paged decoder-KV pool, or ``None`` for dense storage; ``_UNSET`` until
         #: the first prefill decides (see :meth:`kv_manager`).
         self._kv_manager: Any = _UNSET
@@ -707,17 +717,35 @@ class IncrementalArStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
 
     def _row_cap(self, request: Request, capacity: int) -> int:
-        """Per-row generation cap: request override else engine default, clamped.
+        """Per-row generation cap: the request's, else the engine's, clamped.
 
-        ``capacity`` is the row's remaining position budget in the decoder.
+        ``capacity`` is the row's remaining position budget in the decoder.  The
+        engine's ``max_new_tokens`` is a ceiling as well as the default: the pool
+        and the admission budget give every row that many positions, so one
+        request asking for more would reserve past its share and get its whole
+        prefill batch refused.  A clamp that binds is reported the way every cap
+        is, as ``finish_reason="length"``.
         """
+        ceiling = int(self.options.max_new_tokens)
         opts = getattr(request, "decoding", None)
         requested = (
-            opts.max_new_tokens
-            if opts is not None and opts.max_new_tokens is not None
-            else int(self.options.max_new_tokens)
+            opts.max_new_tokens if opts is not None and opts.max_new_tokens is not None else ceiling
         )
-        return max(1, min(int(requested), capacity))
+        return max(1, min(int(requested), ceiling, capacity))
+
+    @staticmethod
+    def _row_capacity(prompt_len: int, max_new: int) -> int:
+        """Positions a row's decoder KV must hold: its prompt plus its cap.
+
+        A row writes its prompt, then one position per generated token except
+        the last, which is never fed back: ``prompt_len + max_new - 1`` at most,
+        so this keeps one spare.  It is also within :meth:`_position_budget`,
+        which is what the pool and the admission budget give each row.  The
+        extra ``+ 1`` this once added put a row at the ceiling one position past
+        that budget, which is a whole page when the budget is a multiple of the
+        page size.
+        """
+        return int(prompt_len) + int(max_new)
 
     # ------------------------------------------------------------------
     # Incremental protocol (shared)
@@ -790,7 +818,18 @@ class IncrementalArStrategy(DecodeStrategy):
             if isinstance(group, ArBeamGroup) or not can_merge(group.state, fresh.state):
                 continue
             logits = torch.cat([group.last_logits, fresh.last_logits], dim=0)
-            group.extend(fresh, merge(group.state, fresh.state), logits)
+            try:
+                merged = merge(group.state, fresh.state)
+            except Exception as exc:
+                # A dense merge releases each source layer as it copies it, so
+                # one that raised part-way (an OOM on the copy) has already
+                # destroyed part of *both* caches.  The incumbent cannot go on
+                # generating, and the fresh rows are refused by the caller.
+                self._groups = [g for g in self._groups if g is not group]
+                self._failed.extend(self._fail_group(group, exc))
+                self._release(fresh.state)
+                raise
+            group.extend(fresh, merged, logits)
             return True
         return False
 
@@ -818,32 +857,98 @@ class IncrementalArStrategy(DecodeStrategy):
         )
 
     def has_pending(self) -> bool:
-        return bool(self._groups)
+        return bool(self._groups) or bool(self._failed)
 
     def advance(self, budget: "StepBudget") -> List[RequestOutput]:
-        outputs: List[RequestOutput] = []
+        """Advance the groups round-robin within ``budget``, one group at a time.
+
+        A group whose step raises is failed alone (:meth:`_fail_group`): its
+        rows get error finals and its KV goes back.  Without that, the group
+        was off the queue with its pages still held, and the exception left
+        ``step()`` and failed every request in flight through the dispatcher.
+        """
+        outputs: List[RequestOutput] = self._failed
+        self._failed = []
         advanced: List[ArGroup] = []
         while self._groups and budget.take():
             # Round-robin: pop the front group, advance it one batched step,
             # re-queue it at the back if it still has active rows.
             group = self._groups.pop(0)
-            if isinstance(group, ArBeamGroup):
-                outputs.extend(self._advance_beam_group(group))
-            else:
-                outputs.extend(self._advance_group(group))
+            try:
+                if isinstance(group, ArBeamGroup):
+                    self._advance_beam_group(group, outputs)
+                else:
+                    self._advance_group(group, outputs)
+            except Exception as exc:  # noqa: BLE001 — one group must not take the tick
+                outputs.extend(self._fail_group(group, exc, outputs))
+                continue
             if group.requests:
                 self._groups.append(group)
                 if not any(g is group for g in advanced):
                     advanced.append(group)
-        if self.emit_partials and advanced:
-            beams = [g for g in advanced if isinstance(g, ArBeamGroup)]
-            greedy = [g for g in advanced if not isinstance(g, ArBeamGroup)]
-            outputs.extend(self._partials(greedy))
-            outputs.extend(self._beam_partials(beams))
+        if self.emit_partials:
+            for group in advanced:
+                try:
+                    if isinstance(group, ArBeamGroup):
+                        outputs.extend(self._beam_partials([group]))
+                    else:
+                        outputs.extend(self._partials([group]))
+                except Exception as exc:  # noqa: BLE001 — as above
+                    self._groups = [g for g in self._groups if g is not group]
+                    outputs.extend(self._fail_group(group, exc, outputs))
         return outputs
 
-    def _advance_group(self, group: ArGroup) -> List[RequestOutput]:
-        """Select one token per active row, retire finished rows, take one step."""
+    def _fail_group(
+        self,
+        group: ArGroup,
+        exc: BaseException,
+        emitted: Sequence[RequestOutput] = (),
+    ) -> List[RequestOutput]:
+        """Error finals for ``group``'s rows, with its decoder KV handed back.
+
+        ``group`` is already off the queue.  A row that finished before the
+        failure keeps its final, which is in ``emitted``; every other row gets
+        ``finish_reason="error"``.  ``error_stage`` is ``decode_oom`` for an
+        allocation that failed (device memory, or the decoder-KV pool) and
+        ``decode_step`` otherwise.
+        """
+        done = {out.request_id for out in emitted if out.finished}
+        failed = [req for req in group.requests if req.request_id not in done]
+        oom = isinstance(exc, (torch.cuda.OutOfMemoryError, DecoderKvExhausted))
+        stage = "decode_oom" if oom else "decode_step"
+        logger.warning(
+            "%s: decode group of %d row(s) failed (%s: %s); failing requests %s",
+            self.decode_type,
+            len(group.requests),
+            type(exc).__name__,
+            exc,
+            [req.request_id for req in failed],
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+        try:
+            self._release(group.state)
+        except Exception:  # pragma: no cover - the backstop is PagedDecoderKv.__del__
+            logger.exception("%s: releasing a failed group's decoder KV raised", self.decode_type)
+        group.state = {}
+        group.requests = []
+        return [
+            RequestOutput(
+                request_id=req.request_id,
+                text="",
+                tokens=[[]],
+                finished=True,
+                finish_reason="error",
+                error_stage=stage,
+            )
+            for req in failed
+        ]
+
+    def _advance_group(self, group: ArGroup, outputs: List[RequestOutput]) -> None:
+        """Select one token per active row, retire finished rows, take one step.
+
+        Finals go into ``outputs`` as rows finish, before the ``select`` and the
+        step, so a step that then fails cannot take them with it.
+        """
         logits = self._process_logits(group.last_logits.float(), group)
         next_tokens = select_next_tokens(logits, group.opts)  # (B_active,)
 
@@ -860,7 +965,8 @@ class IncrementalArStrategy(DecodeStrategy):
                     finished_rows.append(row)
                     reasons[row] = "length"
 
-        outputs = [self._finalize_row(group, row, reasons[row]) for row in finished_rows]
+        for row in finished_rows:
+            outputs.append(self._finalize_row(group, row, reasons[row]))
         if finished_rows:
             keep = [r for r in range(len(group.requests)) if r not in finished_rows]
             group.keep_rows(keep)
@@ -876,13 +982,12 @@ class IncrementalArStrategy(DecodeStrategy):
         if group.requests:
             with torch.no_grad():
                 group.last_logits, group.state = self._step(next_tokens, group.state)
-        return outputs
 
     # ------------------------------------------------------------------
     # Beam advance
     # ------------------------------------------------------------------
 
-    def _advance_beam_group(self, group: ArBeamGroup) -> List[RequestOutput]:
+    def _advance_beam_group(self, group: ArBeamGroup, outputs: List[RequestOutput]) -> None:
         """One batched beam step over every live slot of every live request.
 
         Structure mirrors :meth:`_advance_group` — score, reorder, retire, step —
@@ -934,7 +1039,8 @@ class IncrementalArStrategy(DecodeStrategy):
             group.tokens[b] = fresh
         group.scores = new_scores
 
-        outputs, keep = self._retire_finished_requests(group)
+        finals, keep = self._retire_finished_requests(group)
+        outputs.extend(finals)
         if group.requests:
             # Restrict the fed tokens to the surviving slots, in the same flat
             # order ``_retire_finished_requests`` left the state in.
@@ -942,7 +1048,6 @@ class IncrementalArStrategy(DecodeStrategy):
                 chosen = chosen.index_select(0, keep)
             with torch.no_grad():
                 group.last_logits, group.state = self._step(chosen, group.state)
-        return outputs
 
     def _retire_finished_requests(
         self, group: ArBeamGroup
@@ -1105,6 +1210,8 @@ class IncrementalArStrategy(DecodeStrategy):
     # ------------------------------------------------------------------
 
     def free_session(self, request: Request) -> None:
+        # A request whose group already failed holds no KV, only its error final.
+        self._failed = [out for out in self._failed if out.request_id != request.request_id]
         for group in self._groups:
             if request not in group.requests:
                 continue

@@ -3,7 +3,7 @@
   "paths": [
     "oasr"
   ],
-  "total": 373,
+  "total": 372,
   "files": {
     "oasr/cache/decoder_kv.py": 3,
     "oasr/checkpoints/bundle.py": 1,
@@ -20,7 +20,7 @@
     "oasr/engine/decode/base.py": 2,
     "oasr/engine/decode/ctc_gpu.py": 2,
     "oasr/engine/decode/ctc_wfst.py": 3,
-    "oasr/engine/decode/incremental.py": 8,
+    "oasr/engine/decode/incremental.py": 7,
     "oasr/engine/decode/incremental_beam.py": 1,
     "oasr/engine/decode/llm.py": 15,
     "oasr/engine/decode/paraformer.py": 7,

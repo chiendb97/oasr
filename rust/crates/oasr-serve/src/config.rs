@@ -102,8 +102,9 @@ pub struct Cli {
     #[arg(long)]
     pub llm_prompt: Option<String>,
     /// AR generation length cap per request (AED / LLM decode families).
-    /// Engine default 448.  Per-request `max_new_tokens` decoding options
-    /// override it.
+    /// Engine default 448.  Per-request `max_new_tokens` decoding options can
+    /// lower it, not raise it: the decoder-KV pool and the admission budget
+    /// are sized for this value.
     #[arg(long)]
     pub max_new_tokens: Option<u32>,
     /// Ceiling on total decoder-KV bytes across in-flight AR requests, in GiB.
