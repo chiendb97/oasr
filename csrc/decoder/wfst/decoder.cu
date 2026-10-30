@@ -46,6 +46,9 @@ namespace oasr::wfst {
 
 using namespace kernels;
 
+// Segment length of a long offline batch without winners-log GC (even: parity).
+constexpr int32_t kLongSegmentSteps = 256;
+
 // 1-D grid for the flattened K2 kernels: enough blocks to fill the device even when a
 // single lane holds all the work, and to keep multi-lane aggregate steps as deeply
 // pipelined as the old (160, lanes) grid; excess blocks read one int and exit.
@@ -211,6 +214,85 @@ struct GpuDecoder::Impl {
     return static_cast<T*>(p);
   }
 
+  template <typename T>
+  void Free(T* p, int64_t count) {
+    auto it = std::find(allocs.begin(), allocs.end(), static_cast<void*>(p));
+    if (it == allocs.end()) return;
+    allocs.erase(it);
+    cudaFree(p);
+    fixed_bytes -= count * sizeof(T);
+  }
+
+  // Every size that scales with the frame count, written into `out`. Offline `frames` is
+  // a capacity that GrowFrames raises; streaming it is the longest chunk. Throws before
+  // writing anything.
+  void FrameSizes(int32_t frames, Sizes& out) const {
+    const DecoderConfig& cfg = opts.cfg;
+    // One emitting arc per step plus one hop per epsilon-closure pass: on an
+    // epsilon-heavy (TLG) graph a best path runs up to (1 + eps_iterations) arcs a frame,
+    // and a cap of frames + 2 dropped the start of every long enough transcript.
+    const int64_t hops = 1 + (host_graph->has_eps ? std::max(0, cfg.eps_iterations) : 0);
+    const int64_t path = (static_cast<int64_t>(frames) + 2) * hops;
+    if (frames <= 0 || path > (1LL << 30))
+      throw std::runtime_error("max_frames out of the supported range");
+    out.path_cap = static_cast<int32_t>(path);
+    out.seg_cap = frames + 2;
+    out.fin_cap = 0;
+    if (cfg.gc_interval > 0) {
+      // Streaming: fin_cap bounds the per-round host drain AND the device backtrack
+      // tail (path_cap) — the tail spans the live window (conv lag + chunk), not one
+      // chunk. Offline keeps path_cap; its GC segments always fit it.
+      out.fin_cap = cfg.streaming ? std::max(out.path_cap, 4096) : out.path_cap;
+      if (cfg.streaming) out.path_cap = out.fin_cap;
+    }
+    out.snap_frames = opts.debug_snapshots ? frames + 2 : 0;
+  }
+
+  void DropGraphs() {
+    for (auto& [b, e] : graph_execs) cudaGraphExecDestroy(e);
+    for (auto& [b, e] : steps_execs) cudaGraphExecDestroy(e);
+    graph_execs.clear();
+    steps_execs.clear();
+  }
+
+  // Offline, max_frames is where the frame-scaled buffers start, not a limit on the
+  // input (it was one: a longer utterance raised "T > max_frames" at decode, after its
+  // whole encoder forward). A longer batch doubles the capacity until it fits, replaces
+  // those buffers, and drops every captured graph, whose kernels bake the old pointers
+  // and sizes in. Whole-batch graphs stay capped at graph_frames: a batch beyond them
+  // runs the segmented loop, which replays one graph per segment length.
+  //
+  // Every new buffer exists before anything is freed or resized, so an allocation that
+  // fails leaves the decoder as it was (what it did allocate stays owned by `allocs`).
+  void GrowFrames(int64_t frames) {
+    int64_t cap = opts.cfg.max_frames;
+    while (cap < frames) cap *= 2;
+    Sizes grown = sz;
+    FrameSizes(static_cast<int32_t>(std::min<int64_t>(cap, INT32_MAX)), grown);
+    const int64_t L = sz.lanes;
+    const int64_t q = sz.main_q;
+    Workspace next = ws;
+    next.arc_out = Alloc<int32_t>(L * grown.path_cap);
+    if (sz.lat_cap > 0) next.lat_seg = Alloc<int2>(L * grown.seg_cap);
+    if (sz.fin_cap > 0) next.fin_arcs = Alloc<int32_t>(L * grown.fin_cap);
+    if (sz.snap_frames > 0) {
+      next.snap = Alloc<int2>(L * grown.snap_frames * q);
+      next.snap_len = Alloc<int32_t>(L * grown.snap_frames);
+    }
+    if (sz.fin_cap > 0) gc_fin_h.resize(L * grown.fin_cap);
+    DropGraphs();
+    Free(ws.arc_out, L * sz.path_cap);
+    if (sz.lat_cap > 0) Free(ws.lat_seg, L * sz.seg_cap);
+    if (sz.fin_cap > 0) Free(ws.fin_arcs, L * sz.fin_cap);
+    if (sz.snap_frames > 0) {
+      Free(ws.snap, L * sz.snap_frames * q);
+      Free(ws.snap_len, L * sz.snap_frames);
+    }
+    ws = next;
+    sz = grown;
+    opts.cfg.max_frames = static_cast<int32_t>(cap);
+  }
+
   // Commits the winners arena (and the parallel per-token score arrays in lattice mode)
   // up to `entries` and publishes the committed capacity to the device-side limit.
   void SetArenaCommit(int64_t entries) {
@@ -361,6 +443,7 @@ struct GpuDecoder::Impl {
     StreamGcStampKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz);
     StreamGcConvergeKernel<<<static_cast<unsigned>(sz.lanes), 256, 0, stream>>>(ws, sz);
     StreamGcFinalizeKernel<<<(sz.lanes + 63) / 64, 64, 0, stream>>>(ws, sz);
+    StreamGcRebaseKernel<<<static_cast<unsigned>(sz.lanes), 256, 0, stream>>>(ws, sz);
   }
 
   // Host half (after the sync): unscramble each channel's phase ring — fin_len reports
@@ -469,7 +552,7 @@ struct GpuDecoder::Impl {
   int32_t BucketFor(int32_t T_max) const {
     int32_t need = T_max + 1;  // steps 0..T_max inclusive
     int32_t b = (need <= 256) ? (need + 31) / 32 * 32 : (need + 63) / 64 * 64;
-    return std::min<int32_t>(b, opts.cfg.max_frames + 1);
+    return std::min<int32_t>(b, graph_frames + 1);
   }
 
   cudaGraphExec_t CaptureGraph(const std::function<void(cudaStream_t)>& body) {
@@ -534,14 +617,53 @@ struct GpuDecoder::Impl {
   }
 
   int32_t* d_T = nullptr;
+  int32_t graph_frames = 0;  // longest batch a whole-batch graph covers (constructed
+                             // max_frames; offline growth leaves it alone)
 
+  // Construction allocates as it goes, so a throw part-way (an out-of-memory reservation,
+  // a bad option found after the first cudaMalloc) must free what exists by then: the
+  // destructor of an object whose constructor threw never runs.
   Impl(const GraphImage& g, const Options& o) : opts(o), host_graph(&g) {
+    try {
+      Init(g, o);
+    } catch (...) {
+      Release();
+      // A failed cudaMalloc also leaves itself as the runtime's last error. The
+      // exception reports it; left there, the next launch check elsewhere in the
+      // process would report it as its own.
+      cudaGetLastError();
+      throw;
+    }
+  }
+
+  void Release() {
+    DropGraphs();
+    for (auto& [b, e] : chunk_execs) cudaGraphExecDestroy(e);
+    chunk_execs.clear();
+    for (void* p : allocs) cudaFree(p);
+    allocs.clear();
+    if (stream != nullptr) cudaStreamDestroy(stream);
+    stream = nullptr;
+  }
+
+  void Init(const GraphImage& g, const Options& o) {
     WFST_CUDA_CHECK(cudaSetDevice(o.device));
     WFST_CUDA_CHECK(cudaStreamCreate(&stream));
 
     const DecoderConfig& cfg = o.cfg;
     if (cfg.max_active_states <= 0 || cfg.max_active_states > (1 << 23))
       throw std::runtime_error("max_active_states out of supported range [1, 8M]");
+    // Per-lane tables are int32-indexed: the hash holds >= 4 x main_q slots and the
+    // candidate buffer cand_factor x main_q. Overflowing them sized a negative buffer.
+    const int64_t main_q = static_cast<int64_t>(cfg.main_q_factor) * cfg.max_active_states;
+    if (cfg.main_q_factor < 1 || cfg.cand_factor < 1 || main_q > (1LL << 28) ||
+        main_q * cfg.cand_factor > (1LL << 30))
+      throw std::runtime_error(
+          "main_q_factor x max_active_states must be in [1, 2^28] and its cand_factor "
+          "multiple at most 2^30");
+    if (cfg.max_lanes < 1 || cfg.eps_iterations < 0 || cfg.min_active_states < 0)
+      throw std::runtime_error("max_lanes must be >= 1, eps_iterations and "
+                               "min_active_states >= 0");
     sz.lanes = cfg.max_lanes;
     sz.main_q = cfg.main_q_capacity();
     sz.claims_cap = 2 * sz.main_q;
@@ -565,7 +687,6 @@ struct GpuDecoder::Impl {
             : std::min<int64_t>(512LL << 20,
                                 std::max<int64_t>(64LL << 20, (16LL << 20) * sz.lanes));
     sz.arena_cap = static_cast<int32_t>(std::min<int64_t>(want, arena_budget));
-    sz.path_cap = cfg.max_frames + 2;
     if (cfg.lat_prune_interval < 0 || (cfg.lat_prune_interval & 1))
       throw std::runtime_error("lat_prune_interval must be even (buffer-parity invariant)");
     if (cfg.gc_interval < 0 || (cfg.gc_interval & 1))
@@ -577,12 +698,9 @@ struct GpuDecoder::Impl {
             "lattice keeps every token reachable; nothing is collectible)");
       if (g.num_arcs >= (1LL << 30))
         throw std::runtime_error("winners-log GC requires graph arc ids < 2^30");
-      // Streaming: fin_cap bounds the per-round host drain AND the device backtrack
-      // tail (path_cap) — the tail spans the live window (conv lag + chunk), not one
-      // chunk. Offline keeps path_cap; its GC segments always fit it.
-      sz.fin_cap = cfg.streaming ? std::max(cfg.max_frames + 2, 4096) : sz.path_cap;
-      if (cfg.streaming) sz.path_cap = sz.fin_cap;
     }
+    FrameSizes(cfg.max_frames, sz);
+    graph_frames = cfg.max_frames;
     // Interval mode holds only ~one window of candidates — a much smaller arena works.
     sz.lat_cap = !cfg.lattice ? 0
                  : cfg.lat_prune_interval > 0
@@ -600,6 +718,9 @@ struct GpuDecoder::Impl {
                         ? std::min<int64_t>(cfg.stream_log_entries,
                                             (1LL << 30) / sz.lanes)
                         : sz.arena_cap / sz.lanes;
+      // Ids stay below two ring laps plus one round's appends (StreamGcRebaseKernel), so
+      // a ring of at most 2^28 entries (2 GiB a channel) keeps them inside int32.
+      cap = std::min<int64_t>(cap, 1LL << 28);
       const size_t chunk = LazyRegion::ChunkBytesFor(o.device);
       if (chunk > 0) {
         const int64_t per_chunk = static_cast<int64_t>(chunk / sizeof(int2));
@@ -611,7 +732,6 @@ struct GpuDecoder::Impl {
     if (cfg.streaming && cfg.lattice)
       throw std::runtime_error("lattice mode is not supported with streaming (v1)");
     channel_used.assign(sz.lanes, false);
-    sz.snap_frames = o.debug_snapshots ? cfg.max_frames + 2 : 0;
 
     // Graph to device: shared with every other decoder built from it on this device.
     dev_graph = AcquireDeviceGraph(g, o.device);
@@ -724,13 +844,7 @@ struct GpuDecoder::Impl {
     return static_cast<size_t>(sz.stream_log_cap) * sizeof(int2);
   }
 
-  ~Impl() {
-    for (auto& [b, e] : graph_execs) cudaGraphExecDestroy(e);
-    for (auto& [b, e] : chunk_execs) cudaGraphExecDestroy(e);
-    for (auto& [b, e] : steps_execs) cudaGraphExecDestroy(e);
-    for (void* p : allocs) cudaFree(p);
-    if (stream != nullptr) cudaStreamDestroy(stream);
-  }
+  ~Impl() { Release(); }
 };
 
 GpuDecoder::GpuDecoder(const GraphImage& graph, const Options& opts)
@@ -773,12 +887,12 @@ int32_t GpuDecoder::CreateStream() {
     // Map this channel's winners slice (unmapped while the channel was closed).
     im.winners_mem.EnsureRange(static_cast<size_t>(lane) * im.StreamSliceBytes(),
                                im.StreamSliceBytes());
-    StreamCreateKernel<<<1, 1, 0, im.stream>>>(im.ws, im.sz, im.dg, lane,
-                                               im.opts.cfg.search_beam);
+    StreamCreateKernel<<<(im.sz.lanes + 63) / 64, 64, 0, im.stream>>>(
+        im.ws, im.sz, im.dg, lane, im.opts.cfg.search_beam);
     if (im.dg.eps_count != nullptr) {
-      // Initial closure of the start frontier. Touches only this lane's state (other
-      // lanes gate on phase), and launches no buffer swap — parity is preserved. The
-      // eps phase never reads log-probs, so the descriptor state is irrelevant here.
+      // Initial closure of the start frontier. Touches only this lane's state (the
+      // create kernel parked every other lane), and launches no buffer swap — parity is
+      // preserved. The eps phase never reads log-probs, so the descriptor is irrelevant.
       im.LaunchStepTail(im.stream, im.ws);
     }
     return lane;
@@ -816,6 +930,8 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
   if (channels.size() != lens.size()) throw std::runtime_error("channels/lens mismatch");
   if (chunk_frames > cfg.max_frames)
     throw std::runtime_error("chunk_frames > max_frames (max chunk length)");
+  if (vocab_stride < im.host_graph->vocab_size)
+    throw std::runtime_error("log_probs have fewer columns than the graph's vocab_size");
   WFST_CUDA_CHECK(cudaSetDevice(im.opts.device));
   im.EnsureStaging(vocab_stride);
   const size_t elem = im.lp_elem();
@@ -826,6 +942,7 @@ std::vector<GpuDecoder::StreamPartial> GpuDecoder::AdvanceChunk(
     const int32_t lane = channels[i];
     if (lane < 0 || lane >= sz.lanes || !im.channel_used[lane])
       throw std::runtime_error("invalid channel");
+    if (h_len[lane] != 0) throw std::runtime_error("channel listed twice");
     if (lens[i] < 0 || lens[i] > chunk_frames) throw std::runtime_error("bad chunk len");
     h_len[lane] = lens[i];
     max_len = std::max(max_len, lens[i]);
@@ -965,9 +1082,18 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
   const Sizes& sz = im.sz;
   const DecoderConfig& cfg = im.opts.cfg;
   if (cfg.streaming) throw std::runtime_error("use AdvanceChunk/FinalizeStream in streaming mode");
-  if (batch > sz.lanes) throw std::runtime_error("batch > max_lanes");
-  if (max_frames > cfg.max_frames) throw std::runtime_error("T > max_frames");
+  if (batch < 0 || batch > sz.lanes) throw std::runtime_error("batch > max_lanes");
+  if (static_cast<int64_t>(frames.size()) != batch)
+    throw std::runtime_error("one frame count per batch row expected");
+  for (int32_t t : frames) {
+    if (t < 0 || t > max_frames) throw std::runtime_error("a row's frame count is outside [0, T]");
+  }
+  if (vocab_stride < im.host_graph->vocab_size)
+    throw std::runtime_error("log_probs have fewer columns than the graph's vocab_size");
   WFST_CUDA_CHECK(cudaSetDevice(im.opts.device));
+  int32_t T_max = 0;
+  for (int32_t t : frames) T_max = std::max(T_max, t);
+  if (T_max > cfg.max_frames) im.GrowFrames(T_max);
 
   // Lane lengths + batch size to device (zero-pad unused lanes).
   std::vector<int32_t> t_host(sz.lanes, 0);
@@ -978,12 +1104,11 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
   WFST_CUDA_CHECK(cudaMemcpyAsync(im.d_batch, &batch32, sizeof(int32_t),
                                   cudaMemcpyHostToDevice, im.stream));
 
-  int32_t T_max = 0;
-  for (int32_t t : frames) T_max = std::max(T_max, t);
-
   const bool use_graphs = im.opts.use_cuda_graphs && !im.opts.debug_snapshots;
   const bool interval_mode = cfg.lattice && cfg.lat_prune_interval > 0;
   const bool gc_on = cfg.gc_interval > 0;
+  // Beyond the whole-batch graphs' range: the segmented loop, without collection.
+  const bool segmented = gc_on || T_max > im.graph_frames;
   std::vector<LaneCounters> lanes(batch);
   std::vector<int32_t> arc_out(batch * sz.path_cap);
   std::vector<int32_t> arc_len(batch);
@@ -1034,26 +1159,30 @@ std::vector<DecodeResult> GpuDecoder::DecodeBatch(const void* d_log_probs, int64
       BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(
           im.ws, sz);
-    } else if (gc_on) {
+    } else if (segmented) {
       // 1-best segmented loop: same kernels and order as the whole-batch graph, split
       // into even-step segment graphs so the winners-log GC can run from the host in
-      // between (never inside a captured graph).
+      // between (never inside a captured graph). A long batch without GC runs it too,
+      // in segments rounded up to 32 steps: steps past a lane's end idle it, as a
+      // whole-batch graph's bucket padding does, and the segment graphs stay few.
       im.SetLpDesc(d_log_probs, max_frames * vocab_stride, vocab_stride, im.stream);
-      im.GcAttemptBegin();
+      if (gc_on) im.GcAttemptBegin();
       InitKernel<<<(sz.lanes + 255) / 256, 256, 0, im.stream>>>(im.ws, sz, im.dg, im.d_T,
                                                                 im.d_batch, cfg.search_beam);
       if (im.dg.eps_count != nullptr) im.LaunchStepTail(im.stream, im.ws);
       const int32_t total_steps = T_max + 1;
       int32_t done = 0;
       while (done < total_steps) {
-        const int32_t n = std::min(cfg.gc_interval, ((total_steps - done) + 1) / 2 * 2);
+        const int32_t left = total_steps - done;
+        const int32_t n = gc_on ? std::min(cfg.gc_interval, (left + 1) / 2 * 2)
+                                : std::min(kLongSegmentSteps, (left + 31) / 32 * 32);
         if (use_graphs) {
           WFST_CUDA_CHECK(cudaGraphLaunch(im.StepsExec(n), im.stream));
         } else {
           im.LaunchFrameSteps(im.stream, n);
         }
         done += n;
-        if (done < total_steps) im.RunWinnersGc();
+        if (gc_on && done < total_steps) im.RunWinnersGc();
       }
       BacktrackKernel<<<(sz.lanes + 63) / 64, 64, 0, im.stream>>>(im.ws, sz);
       HashSanitizeKernel<<<dim3(64, static_cast<unsigned>(sz.lanes)), 256, 0, im.stream>>>(

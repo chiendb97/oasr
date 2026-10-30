@@ -21,7 +21,9 @@ struct DecoderConfig {
                                // loose-admit superset needs headroom over the exact set)
 
   int32_t max_lanes = 32;      // max concurrent utterances per batch
-  int32_t max_frames = 4096;   // max T per utterance (final step excluded)
+  int32_t max_frames = 4096;   // offline: initial frame capacity, grown on demand (and the
+                               // longest batch a whole-batch CUDA graph covers); streaming:
+                               // the longest chunk
 
   int32_t gc_interval = 0;  // >0 (even): winners-log GC every N offline steps. 1-best
                             // runs a segmented host loop; interval-lattice mode GCs at
@@ -41,7 +43,7 @@ struct DecoderConfig {
                                    // audio; the final exact pass is unchanged)
   bool fp16_logprobs = false;  // consume fp16 log-probs (f32 accumulation inside)
   bool streaming = false;      // chunked decoding (k2 online beam semantics; per-lane
-                               // winners regions; max_frames = max CHUNK length)
+                               // winners rings, at most 2^28 entries each)
 
   int32_t main_q_capacity() const { return main_q_factor * max_active_states; }
   int32_t cand_capacity() const { return cand_factor * main_q_capacity(); }

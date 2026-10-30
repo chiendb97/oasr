@@ -872,3 +872,384 @@ def test_toy_strategy_keeps_a_turns_overflow_on_the_streams_final(wide_fan_fst):
     assert final.tokens[0] == _FAN_WORDS
     assert partial.search_overflow & OVERFLOW_ARENA and final.search_overflow & OVERFLOW_ARENA
     strategy.free_session(req)
+
+
+# ---------------------------------------------------------------------------
+# Capacity limits that bound without an error (audit M15, M16, M17, L6)
+# ---------------------------------------------------------------------------
+
+#: Epsilon graph: state 0 emits word 100 + k on label k into state 1, and an epsilon
+#: arc returns to 0, so every word frame puts two arcs on the best path -- what a TLG's
+#: word boundaries do.  Label 5 is the epsilon id; log-prob rows keep a column for it.
+_EPS_VOCAB = 6
+
+
+def _write_eps_graph(path: str) -> None:
+    from oasr.decoder.wfst.graph_image import build_image, write_image
+
+    arcs = [(0, 0, 0, 0)] + [(0, 1, k, 100 + k) for k in range(1, 5)] + [(0, 2, -1, 0)]
+    arcs += [(1, 0, 5, 0)]
+    row_splits = np.zeros(4, dtype=np.int64)
+    for src, *_ in arcs:
+        row_splits[src + 1] += 1
+    aux_row_splits, pool = [0], []
+    for *_, word in arcs:
+        if word:
+            pool.append(word)
+        aux_row_splits.append(len(pool))
+    img = build_image(
+        np.cumsum(row_splits).astype(np.int32),
+        np.array([a[1] for a in arcs], dtype=np.int32),
+        np.array([a[2] for a in arcs], dtype=np.int32),
+        np.zeros(len(arcs), dtype=np.float32),
+        aux_row_splits=np.array(aux_row_splits, dtype=np.int32),
+        aux_pool=np.array(pool, dtype=np.int32),
+        vocab_size=_EPS_VOCAB,
+        epsilon_id=5,
+    )
+    write_image(img, path)
+
+
+def _eps_case(seed: int, frames: int):
+    """``([T, V] log-probs, the words they decode to)``: every frame a word."""
+    gen = torch.Generator().manual_seed(seed)
+    labels = torch.randint(1, 5, (frames,), generator=gen).tolist()
+    lp = torch.full((frames, _EPS_VOCAB), -10.0)
+    lp[torch.arange(frames), torch.tensor(labels)] = 0.0
+    return lp, [100 + k for k in labels]
+
+
+@pytest.fixture(scope="module")
+def eps_fst(tmp_path_factory):
+    _module()
+    path = str(tmp_path_factory.mktemp("wfst") / "eps.img")
+    _write_eps_graph(path)
+    return path
+
+
+def test_an_epsilon_heavy_path_keeps_its_first_words(eps_fst):
+    """The best-path buffer held ``max_frames + 2`` arcs, but on an epsilon graph a
+    path runs up to one arc per closure pass on top of each frame's.  The backtrack
+    walks newest to oldest, so the first words were the ones dropped, silently: here
+    the first 32 of 64."""
+    from oasr.decoder.wfst_decoder import WfstDecoderSearch
+
+    lp, words = _eps_case(0, 64)
+    search = WfstDecoderSearch(eps_fst, _loop_opts(max_frames=64))
+    tokens, _ = search.decode_offline(lp.cuda())
+    assert tokens[0] == words
+    assert search.overflow == 0
+    assert _cpu_decode(eps_fst, lp)[0] == words
+
+
+def test_a_lane_whose_path_outgrows_its_buffer_is_flagged(toy_fst):
+    """Where the buffer still binds -- the gc-off streaming decoder sizes it for one
+    chunk -- the cut is now reported rather than returned as a whole transcript."""
+    from oasr.decoder.wfst_decoder import OVERFLOW_PATH, _get_graph
+
+    mod = _module()
+    graph = _get_graph(toy_fst)
+    logp = _toy_logp([1] + [0] * 40 + [2] + [0] * 18, "cuda")
+
+    def final_bits(gc):
+        dec = int(
+            mod.wfst_create_decoder(
+                graph, 20.0, 8.0, 1, 100, 1, 1, 8, 0, 16, 4, 1, 0, 0, 1, 0, 3, 0, 0, gc
+            )
+        )
+        ch = int(mod.wfst_create_stream(dec))
+        for s in range(0, logp.size(0), 8):
+            piece = logp[s : s + 8].unsqueeze(0).contiguous()
+            outs = [torch.empty((1, 8), dtype=torch.int32)]
+            outs += [torch.empty((1,), dtype=torch.int32) for _ in range(3)]
+            lens = torch.tensor([piece.size(1)], dtype=torch.int32)
+            mod.wfst_advance_chunk(
+                dec, torch.tensor([ch], dtype=torch.int32), piece, lens, 0, *outs
+            )
+        meta = torch.empty((3,), dtype=torch.int32)
+        mod.wfst_finalize_stream(
+            dec,
+            ch,
+            torch.empty((64,), dtype=torch.int32),
+            torch.empty((1,), dtype=torch.int32),
+            torch.empty((1,), dtype=torch.float64),
+            meta,
+        )
+        mod.wfst_free_decoder(dec)
+        return int(meta[2])
+
+    assert final_bits(gc=0) & OVERFLOW_PATH
+    assert final_bits(gc=2) == 0
+
+
+@pytest.mark.parametrize("gc_interval", [0, 8], ids=["whole", "gc"])
+def test_an_utterance_longer_than_max_frames_decodes(loop_fst, gc_interval):
+    """``max_frames`` was a hard limit that nothing declared: a longer utterance
+    raised ``T > max_frames`` from the decoder, after its whole encoder forward.  It is
+    now the starting capacity, grown to fit, and a batch beyond the whole-batch graphs
+    runs in segments -- with the same result as a decoder built large enough."""
+    from oasr.decoder.wfst_decoder import WfstDecoderScope, WfstDecoderSearch
+
+    long_lp, long_words = _loop_case(1, 700)
+    short_lp, short_words = _loop_case(2, 50)
+    grown = WfstDecoderSearch(
+        loop_fst, _loop_opts(max_frames=256, gc_interval=gc_interval), WfstDecoderScope()
+    )
+    roomy = WfstDecoderSearch(
+        loop_fst, _loop_opts(max_frames=1024, gc_interval=gc_interval), WfstDecoderScope()
+    )
+    tokens, scores = grown.decode_offline(long_lp)
+    assert tokens[0] == long_words and grown.overflow == 0
+    assert scores[0] == pytest.approx(roomy.decode_offline(long_lp)[1][0], abs=1e-4)
+
+    # Batched with a short row, and again after the growth dropped the old graphs.
+    packed = torch.full((2, 700, _LOOP_VOCAB), -30.0, device="cuda")
+    packed[0], packed[1, :50] = long_lp, short_lp
+    for _ in range(2):
+        tokens, _ = grown.decode_offline_batch(packed, [700, 50])
+        assert tokens == [long_words, short_words]
+        assert grown.decode_offline(short_lp)[0][0] == short_words
+
+
+def _fan_lap_stream(fst, n, ring_entries, blocks):
+    """Stream ``blocks`` of ``[1, 2, word]`` through an ``n``-state fan graph in
+    128-frame chunks; returns (words, the words it must decode to, overflow bits).
+    Label 1 fans out to every burst state and label 2 converges them again, so the
+    collector advances every chunk while the ring takes up to ``n + 1`` entries a
+    frame.  The words are random and dense: a walk that reads the wrong ring slot
+    follows a stale chain only a few frames before an old cut stops it, and it shows
+    only if those frames held a word."""
+    from oasr.decoder.wfst_decoder import WfstDecoderScope, WfstDecoderSearch
+
+    gen = torch.Generator().manual_seed(n)
+    words = torch.randint(3, 5, (blocks,), generator=gen).tolist()
+    labels = [lab for w in words for lab in (1, 2, w)]
+    opts = _fan_opts(max_active_states=n, max_streams=1, stream_log_entries=ring_entries)
+    search = WfstDecoderSearch(fst, opts, WfstDecoderScope())
+    lp = _fan_logp(labels + _FAN_SPEECH[1:])
+    for start in range(0, lp.size(0), 128):
+        search.search(lp[start : start + 128])
+    search.finalize_search()
+    return search.outputs[0], [100 * w for w in words] + _FAN_WORDS, search.overflow
+
+
+def test_streaming_ids_rebased_every_ring_lap_keep_the_transcript(wide_fan_fst):
+    """Streaming winner ids only grow, so past 2^31 appends they went negative.  They
+    are now moved down by whole ring laps each time the collector passes one.  A
+    stream that laps the smallest ring (one 4Mi-entry mapping chunk) three times keeps
+    every word, and there is one every three frames."""
+    words, expected, bits = _fan_lap_stream(wide_fan_fst, 8192, 1, 1000)
+    assert words == expected and bits == 0
+
+
+_PAST_INT32_SCRIPT = r"""
+import json, os, sys
+sys.path[:0] = [sys.argv[2], os.path.dirname(sys.argv[2])]  # tests/decoders, tests/
+from test_wfst import _fan_lap_stream, _write_fan_graph
+
+_write_fan_graph(sys.argv[1], 65536)
+# ~117k entries a block (measured): 2^31 of them in ~18.3k blocks, 22k for a margin.
+# A 16Mi-entry ring holds two 128-frame chunks of them.
+words, expected, bits = _fan_lap_stream(sys.argv[1], 65536, 16 << 20, 22000)
+print(json.dumps({"complete": words == expected, "overflow": bits}))
+"""
+
+
+@pytest.mark.slow
+def test_a_stream_lives_past_two_to_the_31_winner_entries(tmp_path):
+    """How long the ids lasted depends on the frontier: here 2^31 entries take ~55k
+    frames and ~130 ring laps (~25 s).  Before the rebase the next id wrapped negative and indexed the
+    ring out of bounds.  In a subprocess: a fault there is sticky for the process."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    _module()
+    script = tmp_path / "run.py"
+    script.write_text(_PAST_INT32_SCRIPT)
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    proc = subprocess.run(
+        [sys.executable, str(script), str(tmp_path / "fan64k.img"), tests_dir],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-4000:]
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert result == {"complete": True, "overflow": 0}
+
+
+#: Deep-epsilon graph: label 1 leads to state 1, then an epsilon chain 1 -> 2 -> 3 -> 4
+#: -> 5.  Three closure passes a frame reach state 4, whose label-2 arc emits word 40;
+#: only a fourth pass reaches state 5, whose label-2 arc (word 50) scores higher.
+_DEEP_VOCAB = 4
+
+
+def _write_deep_eps_graph(path: str) -> None:
+    from oasr.decoder.wfst.graph_image import build_image, write_image
+
+    arcs = [(0, 0, 0, 0.0, 0), (0, 1, 1, 0.0, 10)]
+    arcs += [(s, s + 1, 3, 0.0, 0) for s in range(1, 4)]
+    arcs += [(4, 6, 2, 0.0, 40), (4, 5, 3, 0.0, 0), (5, 6, 2, 1.0, 50)]
+    arcs += [(6, 6, 0, 0.0, 0), (6, 7, -1, 0.0, 0)]
+    row_splits = np.zeros(9, dtype=np.int64)
+    for src, *_ in arcs:
+        row_splits[src + 1] += 1
+    aux_row_splits, pool = [0], []
+    for *_, word in arcs:
+        if word:
+            pool.append(word)
+        aux_row_splits.append(len(pool))
+    img = build_image(
+        np.cumsum(row_splits).astype(np.int32),
+        np.array([a[1] for a in arcs], dtype=np.int32),
+        np.array([a[2] for a in arcs], dtype=np.int32),
+        np.array([a[3] for a in arcs], dtype=np.float32),
+        aux_row_splits=np.array(aux_row_splits, dtype=np.int32),
+        aux_pool=np.array(pool, dtype=np.int32),
+        vocab_size=_DEEP_VOCAB,
+        epsilon_id=3,
+    )
+    write_image(img, path)
+
+
+def _deep_logp(labels) -> torch.Tensor:
+    lp = torch.full((len(labels), _DEEP_VOCAB), -10.0)
+    lp[torch.arange(len(labels)), torch.tensor(labels)] = 0.0
+    return lp
+
+
+def test_opening_a_stream_leaves_the_others_alone(tmp_path):
+    """Opening a channel runs the epsilon closure of its start frontier, and that
+    launch took every lane still in a real or epsilon phase -- which a live stream is
+    after a chunk that ended on a real frame (8 frames here; 128 in the wrapper).  It
+    got three more closure passes, reached state 5, and decoded ``[10, 50]`` instead of
+    ``[10, 40]``: its transcript depended on when another stream opened."""
+    from oasr.decoder.wfst_decoder import WfstDecoderScope, WfstDecoderSearch
+
+    _module()
+    fst = str(tmp_path / "deep.img")
+    _write_deep_eps_graph(fst)
+    first, second = _deep_logp([0] * 7 + [1]), _deep_logp([2] + [0] * 7)
+    opts = _loop_opts(max_streams=2)
+    assert _cpu_decode(fst, torch.cat([first, second]))[0] == [10, 40]
+
+    def run(open_another: bool):
+        scope = WfstDecoderScope()
+        live = WfstDecoderSearch(fst, opts, scope)
+        live.search(first.cuda())
+        other = WfstDecoderSearch(fst, opts, scope)
+        if open_another:
+            other.search(second.cuda())
+        live.search(second.cuda())
+        live.finalize_search()
+        other.reset()
+        return live.outputs[0]
+
+    assert run(open_another=False) == [10, 40]
+    assert run(open_another=True) == [10, 40]
+
+
+def _patch_image(src: str, dst: str, patch) -> None:
+    """Copy a graph image, letting ``patch(header, arcs)`` edit it (both writable)."""
+    data = bytearray(open(src, "rb").read())
+    header = np.frombuffer(data, dtype=np.int64, count=1, offset=48 + 8 * 2)  # offsets[2]
+    arcs_off = int(header[0])
+    meta = np.frombuffer(data, dtype=np.int32, count=2, offset=32)  # vocab, start
+    num_arcs = int(np.frombuffer(data, dtype=np.int64, count=1, offset=24)[0])
+    arcs = np.frombuffer(data, dtype=np.int32, count=2 * num_arcs, offset=arcs_off)
+    patch(meta, arcs)
+    open(dst, "wb").write(bytes(data))
+
+
+@pytest.mark.parametrize(
+    "what, patch",
+    [
+        ("start state", lambda meta, arcs: meta.__setitem__(1, 99)),
+        ("destination", lambda meta, arcs: arcs.__setitem__(0, 99)),
+        ("label", lambda meta, arcs: arcs.__setitem__(3, 7)),
+    ],
+)
+def test_a_corrupt_graph_image_is_refused_at_load(toy_fst, tmp_path, what, patch):
+    """The loader checked the counts and the two ends of ``row_splits``; a state, arc
+    destination or label out of range loaded, and the decoder read past its arrays."""
+    mod = _module()
+    bad = str(tmp_path / "bad.img")
+    _patch_image(toy_fst, bad, patch)
+    with pytest.raises(RuntimeError, match="corrupt graph image"):
+        mod.wfst_load_graph(bad)
+
+
+def test_the_launchers_refuse_buffers_they_would_overrun(toy_fst):
+    """Each of these was read or written out of bounds: a length past the tensor, a
+    log-prob tensor narrower than the graph's labels or in the other dtype, and
+    output buffers with fewer rows than the batch."""
+    from oasr.decoder.wfst_decoder import (
+        WfstDecoderOptions,
+        _get_module,
+        _get_offline_decoder,
+        _run_decode_batch,
+    )
+
+    mod = _get_module()
+    dec = _get_offline_decoder(toy_fst, WfstDecoderOptions(max_frames=64), 0).handle
+    lp = _toy_logp([1, 0, 2], "cuda").unsqueeze(0).contiguous()
+    with pytest.raises(RuntimeError, match="outside"):
+        _run_decode_batch(mod, dec, lp, [4])
+    with pytest.raises(RuntimeError, match="columns"):
+        _run_decode_batch(mod, dec, lp[..., :2].contiguous(), [3])
+    with pytest.raises(RuntimeError, match="float32"):
+        _run_decode_batch(mod, dec, lp.half(), [3])
+    with pytest.raises(RuntimeError, match="rows"):
+        mod.wfst_decode_batch(
+            dec,
+            torch.cat([lp, lp]),
+            torch.tensor([3, 3], dtype=torch.int32),
+            torch.empty((1, 8), dtype=torch.int32),
+            torch.empty((2,), dtype=torch.int32),
+            torch.empty((2,), dtype=torch.float64),
+            torch.empty((2, 3), dtype=torch.int32),
+        )
+    words, _, oks, _ = _run_decode_batch(mod, dec, lp, [3])
+    assert oks == [True] and words == [_TOY_WORDS]
+
+
+_LEAK_SCRIPT = r"""
+import sys
+import torch
+from oasr.decoder.wfst_decoder import _get_graph, _get_module
+
+mod, graph = _get_module(), _get_graph(sys.argv[1])
+torch.cuda.init()
+free0 = torch.cuda.mem_get_info()[0]
+# 2^28-token frontiers: nine 1 GiB arrays per lane before the candidate buffers, and
+# enough lanes that the whole workspace cannot fit, so construction fails part-way.
+lanes = int(free0 // (2**28 * 4 * 20)) + 1
+try:
+    mod.wfst_create_decoder(graph, 20.0, 8.0, 1, 2**23, 1, lanes, 64, 0, 32, 2, 1,
+                            0, 0, 0, 0, 3, 0, 0, 0)
+    print("constructed")
+except Exception as exc:
+    print("failed", str(exc).splitlines()[0][:200])
+print(free0 - torch.cuda.mem_get_info()[0])
+"""
+
+
+def test_a_decoder_that_fails_to_construct_frees_what_it_allocated(toy_fst, tmp_path):
+    """The constructor allocates as it goes, and a C++ object whose constructor throws
+    is never destroyed: everything allocated before an out-of-memory stayed allocated
+    for the life of the process.  In a subprocess, where nothing else holds memory."""
+    import subprocess
+    import sys
+
+    _module()
+    script = tmp_path / "leak.py"
+    script.write_text(_LEAK_SCRIPT)
+    proc = subprocess.run(
+        [sys.executable, str(script), toy_fst], capture_output=True, text=True, timeout=600
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-4000:]
+    status, held = proc.stdout.strip().splitlines()[-2:]
+    assert status.startswith("failed"), "construction did not fail, so nothing was under test"
+    assert int(held) < 64 << 20, f"{int(held) >> 20} MiB still held after the failure"

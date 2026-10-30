@@ -16,7 +16,8 @@ struct DecodeResult {
   double score = 0.0;
   std::vector<int32_t> arc_path;  // graph arc ids, time order
   std::vector<int32_t> words;     // aux_pool values > 0 along the path
-  uint32_t overflow = 0;          // bit0 cand, bit1 hash, bit2 winners-log, bit3 frontier
+  uint32_t overflow = 0;  // kOverflow* bits: 1 candidates, 2 hash probes, 4 winners log,
+                          // 8 claims, 16 frontier, 32 best path cut at path_cap
   // Debug (cfg.debug_snapshots): per-frame frontier after recombination, sorted by state.
   // snapshots[0] = start frontier; snapshots[t+1] = after frame t; last = final tokens.
   std::vector<std::vector<std::pair<int32_t, float>>> snapshots;
@@ -42,9 +43,10 @@ class GpuDecoder {
   GpuDecoder& operator=(const GpuDecoder&) = delete;
 
   // log_probs: device pointer, fp32 (or fp16 when cfg.fp16_logprobs), [batch,
-  // max_frames, vocab_stride] contiguous. frames[b] = real frame count of lane b
-  // (<= max_frames). batch <= cfg.max_lanes. Synchronizes at the end (single D2H);
-  // returns per-lane results.
+  // max_frames, vocab_stride] contiguous, vocab_stride >= the graph's vocab_size.
+  // frames[b] = real frame count of lane b (<= max_frames). batch <= cfg.max_lanes. No
+  // frame limit: a batch longer than cfg.max_frames grows the decoder's frame capacity.
+  // Synchronizes at the end (single D2H); returns per-lane results.
   std::vector<DecodeResult> DecodeBatch(const void* d_log_probs, int64_t batch,
                                         int64_t max_frames, int64_t vocab_stride,
                                         const std::vector<int32_t>& frames);

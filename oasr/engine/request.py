@@ -329,8 +329,9 @@ class RequestOutput:
         Capacity limits the decoder's search hit and could not recover from, so
         the transcript may be missing words — the WFST decoder's overflow bits
         (``oasr.decoder.wfst_decoder.OVERFLOW_*``: 1 candidates, 2 hash probes,
-        4 winners arena or streaming ring, 8 state claims, 16 frontier).  A lane
-        that overflowed and was then decoded again within bounds does not set it.
+        4 winners arena or streaming ring, 8 state claims, 16 frontier, 32 best
+        path cut short at its start).  A lane that overflowed and was then decoded
+        again within bounds does not set it.
         ``None`` when the search stayed within its limits, and for decode
         families that have none.
     """

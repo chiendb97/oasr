@@ -8,6 +8,29 @@
 namespace oasr::wfst {
 namespace kernels {
 
+// Walks one lane's winners chain from `w` (newest -> oldest) into `out`, at most path_cap
+// arcs; returns how many. A longer chain loses its OLDEST arcs -- the start of the
+// transcript -- so it is flagged rather than returned as if complete. With the collector
+// on (fin_cap > 0, graph arc ids < 2^30) the arc field is masked: a round that hit its
+// hop cap leaves its convergence stamp on live entries, and bit 30 is not part of an arc.
+__device__ inline int32_t WalkChain(const Workspace& ws, const Sizes& sz, int32_t lane,
+                                    int32_t w, int32_t floor, int32_t* out) {
+  int32_t len = 0;
+  while (w >= floor) {
+    const int2 e = WinnersEntry(ws, sz, lane, w);
+    if (e.y >= 0) {
+      if (len == sz.path_cap) {
+        ws.lanes[lane].overflow |= kOverflowPath;
+        break;
+      }
+      out[len++] = sz.fin_cap > 0 ? e.y & ~kGcStampBit : e.y;
+    }
+    if (e.x == w) break;  // safety
+    w = e.x;
+  }
+  return len;
+}
+
 // Partial hypothesis: backtrack from the best CURRENT frontier token of each requested
 // lane (d_chunk_len marks the lanes advanced this call).
 __global__ void PartialBacktrackKernel(Workspace ws, Sizes sz, const int32_t* d_chunk_len) {
@@ -35,16 +58,8 @@ __global__ void PartialBacktrackKernel(Workspace ws, Sizes sz, const int32_t* d_
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    const int32_t floor = *ws.gc_floor;
-    int32_t w = winner[static_cast<int32_t>(sh_best[0] & 0xFFFFFFFFull)];
-    int32_t len = 0;
-    while (w >= floor && len < sz.path_cap) {
-      const int2 e = WinnersEntry(ws, sz, lane, w);
-      if (e.y >= 0) out[len++] = e.y;
-      if (e.x == w) break;
-      w = e.x;
-    }
-    ws.arc_out_len[lane] = len;
+    const int32_t w = winner[static_cast<int32_t>(sh_best[0] & 0xFFFFFFFFull)];
+    ws.arc_out_len[lane] = WalkChain(ws, sz, lane, w, *ws.gc_floor, out);
   }
 }
 
@@ -71,18 +86,8 @@ __global__ void BacktrackKernel(Workspace ws, Sizes sz) {
   if (lane >= sz.lanes) return;
   const LaneCounters& lc = ws.lanes[lane];
   int32_t* out = ws.arc_out + static_cast<int64_t>(lane) * sz.path_cap;
-  int32_t len = 0;
-  if (lc.status == 1) {
-    const int32_t floor = *ws.gc_floor;
-    int32_t w = lc.final_tok;
-    while (w >= floor && len < sz.path_cap) {
-      const int2 e = WinnersEntry(ws, sz, lane, w);
-      if (e.y >= 0) out[len++] = e.y;
-      if (e.x == w) break;  // safety
-      w = e.x;
-    }
-  }
-  ws.arc_out_len[lane] = len;
+  ws.arc_out_len[lane] =
+      lc.status == 1 ? WalkChain(ws, sz, lane, lc.final_tok, *ws.gc_floor, out) : 0;
 }
 
 }  // namespace kernels
