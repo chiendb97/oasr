@@ -452,7 +452,6 @@ def _cuda_rng_works(device: torch.device) -> bool:
         return False
 
 
-@pytest.mark.cuda
 class TestStrategyGraphRelease:
     """Every decode graph cache is released by a tuning reload and by shutdown.
 
@@ -522,6 +521,7 @@ class TestStrategyGraphRelease:
         assert overriding, "no family overrides shutdown, so this checked nothing"
 
 
+@pytest.mark.cuda
 class TestTheHazardIsReal:
     """Without a reset, an aborted capture breaks RNG for the whole process."""
 
