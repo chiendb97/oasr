@@ -1001,6 +1001,7 @@ def test_step_counts_and_logs_results_the_search_could_not_complete(caplog):
     eng._longform = None
     eng._executor = SimpleNamespace(step=lambda: list(outs))
     eng._metrics = m.EngineMetrics()
+    eng._input_processor = SimpleNamespace(wants_pinned_trim=False)  # no pinned audio
 
     with caplog.at_level(logging.WARNING, logger="oasr.engine.engine"):
         assert eng.step() == outs

@@ -16,6 +16,7 @@ them -- stayed in ``tests/features/``.
 
 from __future__ import annotations
 
+import gc
 import random
 
 import pytest
@@ -882,6 +883,107 @@ class TestPinnedAudioBuffers:
         p = self._proc()
         assert p.new_audio_buffer(0) is None
         assert p.new_audio_buffer(-1) is None
+
+    # -- the total, across requests (audit M6) -------------------------------
+
+    @pytest.mark.cuda
+    def test_the_total_is_capped_across_requests(self, device):
+        """The per-request cap alone left the total to the concurrency: a burst
+        of long requests pinned that many buffers at once."""
+        p = self._proc(
+            device="cuda", max_pinned_audio_seconds=1.0, max_pinned_audio_total_seconds=2.0
+        )
+        sr = p._feature_config.sample_rate
+        a, b = p.new_audio_buffer(sr), p.new_audio_buffer(sr)
+        assert a is not None and b is not None
+        assert p.new_audio_buffer(1) is None, "past the total, the caller uses the heap"
+        del a
+        gc.collect()
+        assert p.new_audio_buffer(sr) is not None, "a freed buffer gives its share back"
+
+    @pytest.mark.cuda
+    def test_a_view_keeps_its_buffer_counted(self, device):
+        """Counted down when the *storage* dies: a long-form window or a numpy
+        wrapper keeps the pages pinned after the tensor object is gone."""
+        p = self._proc(device="cuda")
+        buf = p.new_audio_buffer(16000)
+        view = buf[100:200].numpy()
+        del buf
+        gc.collect()
+        assert p.pinned_audio_samples == 16000
+        del view
+        gc.collect()
+        assert p.pinned_audio_samples == 0
+
+    @pytest.mark.cuda
+    def test_an_idle_trim_returns_what_the_cap_could_not_need(self, device):
+        """PyTorch's host cache keeps every freed block in a power-of-two size
+        class it never shares, so bursts of different lengths, each within the
+        cap, leave more cached than the cap allows.  The idle trim gives it back
+        — and leaves a steady workload's cache alone, because page-locking
+        afresh costs each next request ~0.5 ms."""
+        from oasr.engine.input_processor import _host_cache_bytes
+
+        cap = 32_000  # samples: 2 s at 16 kHz, 128 KB
+        p = self._proc(
+            device="cuda",
+            max_pinned_audio_seconds=cap / 16000,
+            max_pinned_audio_total_seconds=cap / 16000,
+        )
+        torch.accelerator.empty_host_cache()
+        p._pinned_host_baseline = _host_cache_bytes()  # a fresh process's cache
+        for _ in range(3):  # steady: one size, so one burst's worth stays cached
+            bufs = [p.new_audio_buffer(4000) for _ in range(8)]
+            del bufs
+            gc.collect()
+            assert p.trim_pinned_audio() is False
+        for n in (1000, 2000, 8000):  # three more size classes, each a full cap
+            bufs = [p.new_audio_buffer(n) for _ in range(cap // n)]
+            assert all(b is not None for b in bufs)
+            del bufs
+            gc.collect()
+        held = _host_cache_bytes() - p._pinned_host_baseline
+        assert held > 2 * 4 * cap, "the bursts did not overfill the cache; nothing under test"
+        assert p.trim_pinned_audio() is True
+        assert _host_cache_bytes() - p._pinned_host_baseline < held
+        assert p.trim_pinned_audio() is False, "nothing handed out since"
+
+    @pytest.mark.cuda
+    def test_no_trim_while_pinned_audio_is_live(self, device):
+        p = self._proc(device="cuda", max_pinned_audio_total_seconds=1.0)
+        p._pinned_host_baseline = -(1 << 40)  # any cache at all looks oversized
+        buf = p.new_audio_buffer(16000)
+        assert p.trim_pinned_audio() is False
+        assert p.wants_pinned_trim, "still to check once the buffer is gone"
+        del buf
+        gc.collect()
+        assert p.trim_pinned_audio() is True
+
+    def test_the_engine_trims_only_when_nothing_is_in_flight(self):
+        """``ASREngine.step`` hands the trim its one safe moment, the idle tick."""
+        import threading
+        from types import SimpleNamespace
+
+        from oasr.engine.engine import ASREngine
+
+        calls = []
+        running = [1]
+        eng = ASREngine.__new__(ASREngine)
+        eng._lock = threading.RLock()
+        eng._overlap_admit = False
+        eng._longform = None
+        eng._metrics = SimpleNamespace(enabled=False)
+        eng._executor = SimpleNamespace(
+            step=lambda: [], num_running=lambda: running[0], num_waiting=lambda: 0
+        )
+        eng._input_processor = SimpleNamespace(
+            wants_pinned_trim=True, trim_pinned_audio=lambda: calls.append(1)
+        )
+        eng.step()
+        assert calls == [], "a request is still running"
+        running[0] = 0
+        eng.step()
+        assert calls == [1]
 
     @pytest.mark.cuda
     def test_pinned_and_unpinned_batches_agree(self, device):

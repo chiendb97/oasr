@@ -748,7 +748,8 @@ Beyond `--max-batch-size` / `--chunk-size` / `--preferred-batch-sizes` /
 `--schedule-policy` / `--max-offline-pad-ratio`, the server now forwards the full
 `EngineConfig` tuning surface: `--max-batch-frames`, `--length-bucket-ratio`,
 `--max-wait-time`, `--streaming-cohort-admit`, `--partial-decode-interval`,
-`--overlap-partial-readback`, `--max-pinned-audio-seconds`,
+`--overlap-partial-readback`, `--max-pinned-audio-seconds` /
+`--max-pinned-audio-total-seconds`,
 `--enable-sequence-packing` / `--max-packed-frames`,
 and the default-off `--use-ctc-cuda-graphs` / `--use-feature-cuda-graphs`
 (**keep them off** — both measured to regress; `.artifacts/engine_perf.md` §1).
@@ -759,11 +760,16 @@ and the default-off `--use-ctc-cuda-graphs` / `--use-feature-cuda-graphs`
 the waveform is copied once rather than twice: the engine can then DMA each row
 of a micro-batch straight into the padded device batch instead of packing the
 batch into staging first. Worth **1.13–1.19×** on the engine's offline path
-(`.artifacts/engine_perf.md` §10.7). `--max-pinned-audio-seconds` bounds it —
-page-locked memory is process-global and the allocator keeps what it takes, so
-the high-water is that cap times `--max-concurrent-requests`. A request past the
-cap, or `0`, falls back to ordinary heap buffers, which is the older path and
-still correct.
+(`.artifacts/engine_perf.md` §10.7). Page-locked memory is process-global and
+the allocator keeps what it takes, so it is bounded twice:
+- `--max-pinned-audio-seconds` caps one request.
+- `--max-pinned-audio-total-seconds` (default 3600) caps all of them at once.
+  Without it, the high-water mark was the per-request cap times
+  `--max-concurrent-requests`.
+
+A request past either cap, or a `0`, falls back to ordinary heap buffers, which
+is the older path and still correct. An idle engine also returns the host
+cache's pages once they exceed what the total cap could need.
 
 **Memory sizing.** `--max-num-blocks 0` hands the paged KV pool to the engine,
 which derives it from free VRAM at startup (`--gpu-memory-utilization`, default

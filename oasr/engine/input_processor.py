@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import weakref
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -94,6 +96,11 @@ _FEATURE_HEADROOM_APPENDS = 16
 _FEATURE_HEADROOM_MAX = 1024
 
 
+def _host_cache_bytes() -> int:
+    """Page-locked bytes PyTorch's host allocator holds, live and cached alike."""
+    return int(torch.cuda.host_memory_stats().get("allocated_bytes.current", 0))
+
+
 def _suffix(segments: List[torch.Tensor], start: int) -> torch.Tensor:
     """``torch.cat(segments)[start:]``, without materialising the concatenation.
 
@@ -136,6 +143,11 @@ class InputProcessor:
     device : torch.device
         Target device for output tensors.
     """
+
+    #: A class attribute as well as an instance one, because ``ASREngine.step``
+    #: reads it every step and the admission tests build a processor without
+    #: ``__init__``: such a processor has handed out no pinned audio.
+    _pinned_audio_since_trim: bool = False
 
     def __init__(
         self,
@@ -182,6 +194,26 @@ class InputProcessor:
             if device.type == "cuda"
             else 0
         )
+        # The same offer, bounded across requests: samples handed out and still
+        # referenced, against ``max_pinned_audio_total_seconds``.  Counted down
+        # by a finalizer on each buffer's *storage*, so a view that outlives the
+        # tensor (a long-form window, a ``numpy()`` wrapper) keeps it counted.
+        self._max_pinned_audio_total_samples = (
+            int(
+                float(getattr(config, "max_pinned_audio_total_seconds", 0.0) or 0.0)
+                * self._feature_config.sample_rate
+            )
+            if device.type == "cuda"
+            else 0
+        )
+        self._pinned_audio_lock = threading.Lock()
+        self._pinned_audio_live = 0
+        #: Set when a buffer is handed out; :meth:`trim_pinned_audio` looks at
+        #: the host cache only then.
+        self._pinned_audio_since_trim = False
+        #: Bytes the host cache held after the last trim: what the process keeps
+        #: page-locked for reasons other than request audio (staging, mostly).
+        self._pinned_host_baseline = 0
 
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
@@ -391,17 +423,25 @@ class InputProcessor:
         depend on it.
 
         Returns ``None`` — meaning "allocate ordinary memory yourself" — for a
-        CPU engine, a non-positive size, or a request longer than
-        ``EngineConfig.max_pinned_audio_seconds``.  Declining is not an error:
-        page-locked memory is process-global and the caching host allocator
-        keeps what it takes, so an unbounded offer would let one long request
-        hold a permanent reservation.
+        CPU engine, a non-positive size, a request longer than
+        ``EngineConfig.max_pinned_audio_seconds``, or one that would take the
+        audio pinned across requests past ``max_pinned_audio_total_seconds``.
+        Declining is not an error: page-locked memory is process-global and the
+        caching host allocator keeps what it takes, so an unbounded offer would
+        let one long request — or a burst of them — hold a permanent
+        reservation.
         """
         if num_samples <= 0 or num_samples > self._max_pinned_audio_samples:
             return None
+        with self._pinned_audio_lock:
+            if self._pinned_audio_live + num_samples > self._max_pinned_audio_total_samples:
+                return None
+            self._pinned_audio_live += num_samples
+            self._pinned_audio_since_trim = True
         try:
-            return torch.empty(num_samples, dtype=torch.float32, pin_memory=True)
+            buf = torch.empty(num_samples, dtype=torch.float32, pin_memory=True)
         except RuntimeError:
+            self._unpin_audio(num_samples)
             # No usable CUDA context to page-lock against.  The caller's
             # fallback is a correct, slightly slower path, so this is a
             # capability answer rather than a failure — but it should never be
@@ -409,6 +449,59 @@ class InputProcessor:
             logger.warning("cannot allocate pinned host memory; audio buffers stay on the heap")
             self._max_pinned_audio_samples = 0
             return None
+        weakref.finalize(buf.untyped_storage(), self._unpin_audio, num_samples)
+        return buf
+
+    def _unpin_audio(self, num_samples: int) -> None:
+        with self._pinned_audio_lock:
+            self._pinned_audio_live -= num_samples
+
+    @property
+    def pinned_audio_samples(self) -> int:
+        """Samples of page-locked request audio handed out and still referenced."""
+        return self._pinned_audio_live
+
+    @property
+    def wants_pinned_trim(self) -> bool:
+        """Whether :meth:`trim_pinned_audio` has anything to look at."""
+        return self._pinned_audio_since_trim
+
+    def trim_pinned_audio(self) -> bool:
+        """Return host-cache pages past what the pinned-audio cap could need.
+
+        Called by the engine when it goes idle.  The total cap bounds the audio
+        page-locked *at once*, but PyTorch's host cache keeps every block it
+        frees, in power-of-two size classes it never shares: a burst of short
+        requests leaves one class full, a later burst of long ones another, and
+        what is cached can add up past the cap.  So when no pinned audio is
+        live and the cache holds more than twice the cap (the rounding of a
+        full cap) above what it held after the last trim, it is emptied.
+
+        Never unconditionally: page-locking afresh costs ~0.5 ms for a buffer of
+        up to 2 MiB and ~8 ms for a 300 s one, against microseconds for a cached
+        block, so emptying on every idle would charge that to each request that
+        reaches a quiet server.  Returns whether the cache was emptied.
+        """
+        if not self._pinned_audio_since_trim:
+            return False
+        with self._pinned_audio_lock:
+            if self._pinned_audio_live:
+                return False  # still in use; look again at the next idle
+            self._pinned_audio_since_trim = False
+        budget = 2 * 4 * self._max_pinned_audio_total_samples  # float32 samples
+        held = _host_cache_bytes()
+        if held - self._pinned_host_baseline <= budget:
+            return False
+        torch.accelerator.empty_host_cache()
+        self._pinned_host_baseline = _host_cache_bytes()
+        logger.info(
+            "idle: returned %.1f MiB of page-locked host memory (the cache held %.1f MiB, "
+            "above %.1f MiB for max_pinned_audio_total_seconds)",
+            (held - self._pinned_host_baseline) / 2**20,
+            held / 2**20,
+            budget / 2**20,
+        )
+        return True
 
     def release_staging(self) -> None:
         """Drop the reusable staging buffers (called on engine teardown / idle).
