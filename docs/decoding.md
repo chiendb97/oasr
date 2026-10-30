@@ -442,7 +442,7 @@ at the PyO3 boundary.
 | Field | Applies to |
 |---|---|
 | `n_best` | beam families — the executor detokenizes the top N into `RequestOutput.nbest_texts` on finals |
-| `max_new_tokens` | AR families |
+| `max_new_tokens` | AR families. Lowers the engine's `max_new_tokens`, never raises it: the decoder-KV pool and the admission budget are sized for the engine's value, so a larger request is clamped and ends with `finish_reason="length"` |
 | `temperature`, `top_k`, `top_p` | AR families, via `generation/sampling.py::select_next_tokens`; greedy stays a batched argmax fast path |
 | `prompt` | LLM only (memoized suffix re-encode); also settable deployment-wide as `EngineConfig.llm_prompt` |
 | `task` (`"transcribe"` / `"translate"`) | families with a task token — AED (Whisper). **Rejected** elsewhere |

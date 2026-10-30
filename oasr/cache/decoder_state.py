@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -455,6 +455,12 @@ class DecoderKv(_RowIndexed):
         At the shapes this runs on (a 7B row's decoder KV is ~0.4 GiB) that is the
         difference between a merge and an OOM.  Neither ``self`` nor ``other`` is
         usable afterwards; the caller replaces both with the result.
+
+        Marked consumed *before* the first layer is released, so a merge that
+        fails part-way leaves two states that refuse to run.  Marked after, an
+        OOM on one layer's copy left that layer ``None`` in a state that still
+        looked live, and the next step allocated it afresh: the group kept
+        decoding against zeros where its keys had been.
         """
         self._check_live()
         other._check_live()
@@ -466,11 +472,11 @@ class DecoderKv(_RowIndexed):
             int(self.cap or 0),
             int(other.cap or 0),
         )
+        self.consumed = other.consumed = True
         k = _consume_cat(self.k, other.k, width)
         v = _consume_cat(self.v, other.v, width)
         k_scale = _consume_cat(self.k_scale, other.k_scale, width)
         v_scale = _consume_cat(self.v_scale, other.v_scale, width)
-        self.consumed = other.consumed = True
         starts = None
         if self.starts is not None and other.starts is not None:
             starts = torch.cat([self.starts, other.starts])
@@ -544,29 +550,32 @@ class PagedDecoderKv(_RowIndexed):
         device: torch.device,
         *,
         prefill_len: int,
-        capacity: int,
+        capacity: Union[int, Sequence[int]],
         starts: Optional[torch.Tensor] = None,
     ) -> "PagedDecoderKv":
         """Reserve one slot per row, with pages for the prompt already mapped.
 
-        ``capacity`` is the row's whole position budget (prompt + generation
-        cap); only the prompt's pages are allocated now, the rest as the rows
-        fill them — which is the difference from a capacity buffer.  The pool is
-        checked against every live slot's *ceiling* first, so a batch that could
-        run the pool out several seconds into generation is refused here instead;
-        and anything already registered is rolled back, so a refused batch leaks
-        no pages.
+        ``capacity`` is a row's whole position budget (prompt + generation
+        cap), one for every row or one per row; each slot reserves its own row's,
+        so a row that asked for ten tokens does not hold the pool against its
+        batch's longest.  Only the prompt's pages are allocated now, the rest as
+        the rows fill them — which is the difference from a capacity buffer.  The
+        pool is checked against every live slot's *ceiling* first, so a batch
+        that could run the pool out several seconds into generation is refused
+        here instead; and anything already registered is rolled back, so a
+        refused batch leaks no pages.
         """
         from .decoder_kv import DecoderKvExhausted
 
         slots: List[str] = []
-        max_new = max(0, int(capacity) - int(prefill_len))
+        caps = _row_capacities(capacity, batch_size, int(prefill_len))
         try:
-            for _ in range(batch_size):
+            for cap in caps:
+                max_new = cap - int(prefill_len)
                 if not manager.can_admit(max_new, int(prefill_len)):
                     raise DecoderKvExhausted(
                         f"decoder KV pool cannot admit {batch_size} more row(s) at "
-                        f"{int(capacity)} positions each: "
+                        f"up to {max(caps)} positions each: "
                         f"{manager.pool.num_free_blocks}/{manager.pool.num_blocks} "
                         "blocks free and the live slots' ceilings claim the rest. "
                         "Lower max_decode_slots or max_new_tokens, or raise "
@@ -825,7 +834,7 @@ def build_kv(
     device: torch.device,
     *,
     prefill_len: int,
-    cap: Optional[int],
+    cap: Union[int, Sequence[int], None],
     manager: Optional["DecoderKVCacheManager"] = None,
     starts: Optional[torch.Tensor] = None,
     kv_cache: Optional[str] = None,
@@ -837,12 +846,18 @@ def build_kv(
     quantizes a dense cache; a paged one is quantized iff its pool is, and the
     two must agree -- a mismatch is a wiring bug, not something to resolve
     quietly in either direction.
+
+    ``cap`` is each row's position budget, one for the batch or one per row, and
+    never less than ``prefill_len``.  A dense cache is one buffer, so it is as
+    wide as the widest row; a paged one reserves each row's own.
     """
     if kv_cache == "auto":
         kv_cache = None
+    caps = None if cap is None else _row_capacities(cap, batch_size, prefill_len)
     if manager is None:
+        width = None if caps is None else max(caps, default=prefill_len)
         return DecoderKv.empty(
-            num_layers, batch_size, device, starts=starts, cap=cap, kv_cache=kv_cache
+            num_layers, batch_size, device, starts=starts, cap=width, kv_cache=kv_cache
         )
     if bool(manager.quantized) != (kv_cache is not None):
         raise ValueError(
@@ -850,7 +865,7 @@ def build_kv(
             f"{'fp8' if manager.quantized else str(manager.pool.config.dtype)}; the pool is "
             "built for the configured KV format and the decoder must be told the same one"
         )
-    if cap is None:
+    if caps is None:
         raise ValueError(
             "paged decoder KV needs a capacity: the pool reserves each row's "
             "position budget at admission so growth cannot fail mid-generation"
@@ -860,9 +875,24 @@ def build_kv(
         batch_size,
         device,
         prefill_len=prefill_len,
-        capacity=cap,
+        capacity=caps,
         starts=starts,
     )
+
+
+def _row_capacities(capacity: Union[int, Sequence[int]], batch_size: int, floor: int) -> List[int]:
+    """One position budget per row from a ``capacity`` given once or per row.
+
+    Each is at least ``floor`` (the prompt), which is where the prompt is
+    written whatever the caller asked for.
+    """
+    if isinstance(capacity, Sequence):
+        caps = [int(c) for c in capacity]
+        if len(caps) != batch_size:
+            raise ValueError(f"capacity has {len(caps)} entries for a batch of {batch_size} rows")
+    else:
+        caps = [int(capacity)] * batch_size
+    return [max(c, int(floor)) for c in caps]
 
 
 def build_cross_kv(

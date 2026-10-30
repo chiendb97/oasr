@@ -518,7 +518,9 @@ class _FakeArDecoder:
         return {"seeds": state["seeds"].index_select(0, keep.cpu()), "pos": state["pos"]}
 
 
-def _ar_strategy(*, partials: bool, eos_token: int = -1, max_new_tokens: int = 4):
+def _ar_strategy(
+    *, partials: bool, eos_token: int = -1, max_new_tokens: int = 4, render=None, **decode_options
+):
     """A minimal IncrementalArStrategy subclass over the fake decoder."""
     from oasr.engine.decode.incremental import IncrementalArStrategy, Prefill
 
@@ -539,8 +541,8 @@ def _ar_strategy(*, partials: bool, eos_token: int = -1, max_new_tokens: int = 4
 
     decoder = _FakeArDecoder()
     model = SimpleNamespace(decoder=decoder)
-    detok = _fake_detok()
-    cfg = SimpleNamespace(max_new_tokens=max_new_tokens)
+    detok = _fake_detok() if render is None else _fake_detok(render)
+    cfg = SimpleNamespace(max_new_tokens=max_new_tokens, decode_options=decode_options)
     return _Strategy(cfg, detok, model), decoder
 
 
@@ -616,6 +618,174 @@ class TestIncrementalArBase:
         assert [r.request_id for r in group.requests] == ["r0", "r2"]
         assert group.last_logits.size(0) == 2
         assert decoder.select_calls[-1] == [0, 2]
+
+    def test_a_request_cannot_raise_the_engine_cap(self):
+        """Audit M5: the engine's ``max_new_tokens`` is a ceiling, not only a default.
+
+        The pool and the admission budget give each row that many positions; a
+        request asking for more reserved past its share.  It is clamped, and the
+        clamp reports itself the way every cap does, as ``"length"``.  Asking
+        for fewer still works.
+        """
+        from oasr.engine.request import DecodingOptions
+
+        strat, _ = _ar_strategy(partials=False, max_new_tokens=3)
+        more, fewer = self._requests(2)
+        more.decoding = DecodingOptions(max_new_tokens=50)
+        fewer.decoding = DecodingOptions(max_new_tokens=2)
+        finals, _ = self._drive(strat, [more, fewer])
+        assert len(finals["r0"].tokens[0]) == 3 and finals["r0"].finish_reason == "length"
+        assert len(finals["r1"].tokens[0]) == 2 and finals["r1"].finish_reason == "length"
+
+    # -- one group's failure (audit M4) --------------------------------------
+
+    def _finals_of(self, strat, max_ticks=20):
+        """Drive to completion; every request gets exactly one final."""
+        finals = {}
+        for _ in range(max_ticks):
+            if not strat.has_pending():
+                break
+            for out in strat.advance(StepBudget(max_steps=8)):
+                if out.finished:
+                    assert out.request_id not in finals, f"two finals for {out.request_id}"
+                    finals[out.request_id] = out
+        assert not strat.has_pending()
+        return finals
+
+    @staticmethod
+    def _fail_steps_of_width(decoder, width, exc):
+        """Make the fake decoder's step raise ``exc`` for groups of ``width`` rows."""
+        real = decoder.step
+
+        def step(tokens, state):
+            if state["seeds"].numel() == width:
+                raise exc
+            return real(tokens, state)
+
+        decoder.step = step
+
+    @staticmethod
+    def _assert_failed(out, stage):
+        assert out.finish_reason == "error" and out.error_stage == stage
+        assert out.text == "" and out.tokens == [[]]
+
+    def test_a_failing_step_fails_its_group_alone(self):
+        """A group was taken off the queue before it stepped, with no ``try``.
+
+        So a step that raised dropped the group with its KV still held, and the
+        exception left ``advance`` (and ``step()``) and failed every request in
+        flight through the dispatcher.  Two groups here (the fake decoder has no
+        ``merge``); the two-row one fails, the one-row one runs to its cap.
+        """
+        strat, decoder = _ar_strategy(partials=False, max_new_tokens=3)
+        strat.begin_offline(self._requests(2), torch.zeros(2, 2, 4), torch.tensor([2, 2]))
+        lone = Request(audio=None, request_id="lone", streaming=False)
+        strat.begin_offline([lone], torch.zeros(1, 2, 4), torch.tensor([2]))
+        self._fail_steps_of_width(decoder, 2, RuntimeError("simulated kernel failure"))
+        finals = self._finals_of(strat)
+        assert sorted(finals) == ["lone", "r0", "r1"]
+        self._assert_failed(finals["r0"], "decode_step")
+        self._assert_failed(finals["r1"], "decode_step")
+        assert finals["lone"].finish_reason == "length" and finals["lone"].tokens == [[1, 2, 3]]
+
+    def test_rows_that_finished_before_the_failure_keep_their_finals(self):
+        """Row 1 emits EOS on the same advance whose step then raises.
+
+        Its final was made before the step, so it must survive with its
+        reason, and the failure must not hand it a second, error, final.
+        """
+        strat, decoder = _ar_strategy(partials=False, eos_token=2, max_new_tokens=5)
+        strat.begin_offline(self._requests(2), torch.zeros(2, 2, 4), torch.tensor([2, 2]))
+        self._fail_steps_of_width(decoder, 1, RuntimeError("simulated"))
+        finals = self._finals_of(strat)
+        assert finals["r1"].finish_reason == "stop" and finals["r1"].tokens == [[]]
+        self._assert_failed(finals["r0"], "decode_step")
+
+    @pytest.mark.parametrize(
+        "exc",
+        [torch.cuda.OutOfMemoryError("simulated"), "pool"],
+        ids=["device", "decoder_kv_pool"],
+    )
+    def test_an_allocation_that_fails_is_a_decode_oom(self, exc):
+        from oasr.cache import DecoderKvExhausted
+
+        if exc == "pool":
+            exc = DecoderKvExhausted("simulated")
+        strat, decoder = _ar_strategy(partials=False, max_new_tokens=3)
+        strat.begin_offline(self._requests(1), torch.zeros(1, 2, 4), torch.tensor([2]))
+        self._fail_steps_of_width(decoder, 1, exc)
+        self._assert_failed(self._finals_of(strat)["r0"], "decode_oom")
+
+    def test_a_failing_beam_group_fails_alone(self):
+        strat, decoder = _ar_strategy(partials=False, max_new_tokens=3, beam_size=2)
+        strat.begin_offline(self._requests(2), torch.zeros(2, 2, 4), torch.tensor([2, 2]))
+        lone = Request(audio=None, request_id="lone", streaming=False)
+        strat.begin_offline([lone], torch.zeros(1, 2, 4), torch.tensor([2]))
+        # Beam rows are ``B * k``: the two-request group steps four rows.
+        self._fail_steps_of_width(decoder, 4, RuntimeError("simulated"))
+        finals = self._finals_of(strat)
+        self._assert_failed(finals["r0"], "decode_step")
+        self._assert_failed(finals["r1"], "decode_step")
+        assert finals["lone"].finish_reason == "length" and len(finals["lone"].tokens[0]) == 3
+
+    def test_a_partial_that_cannot_be_rendered_fails_its_group_alone(self):
+        """Partials are rendered after the step loop, for every group it moved."""
+        from oasr.engine.request import DecodingOptions
+
+        def render(ids):
+            if 2 in ids:  # row 1 of the two-row group (seed 2) emits a 2 first
+                raise ValueError("simulated detokenizer failure")
+            return " ".join(map(str, ids))
+
+        strat, _ = _ar_strategy(partials=True, max_new_tokens=3, render=render)
+        strat.begin_offline(self._requests(2), torch.zeros(2, 2, 4), torch.tensor([2, 2]))
+        # Seed 1 emits 1, 2, 3, ...: one token, so it never renders a 2.
+        lone = Request(
+            audio=None,
+            request_id="lone",
+            streaming=False,
+            decoding=DecodingOptions(max_new_tokens=1),
+        )
+        strat.begin_offline([lone], torch.zeros(1, 2, 4), torch.tensor([2]))
+        finals = self._finals_of(strat)
+        self._assert_failed(finals["r0"], "decode_step")
+        self._assert_failed(finals["r1"], "decode_step")
+        assert finals["lone"].finish_reason == "length"
+
+    def test_the_executor_keeps_ticking_past_a_failed_group(self):
+        """End to end: ``step()`` returns the error final and does not raise.
+
+        Before, the exception left ``step()``: the serving dispatcher errors
+        and aborts every request in flight on that, and an in-process caller
+        was left with the failed group's requests parked in the executor,
+        holding decode slots, because no final ever came for them.
+        """
+        strat, decoder = _ar_strategy(partials=False, max_new_tokens=3)
+        ex = OfflineExecutor(
+            scheduler=FakeScheduler(),
+            input_processor=FakeInputProcessor(),
+            model_runner=FakeModelRunner(),
+            output_processor=FakeOutputProcessor(strat),
+            device=torch.device("cpu"),
+            decode_steps_per_tick=4,
+            max_decode_slots=8,
+            max_batch_size=2,
+        )
+        a, b = _admit(ex, "a"), _admit(ex, "b")
+        ex.step()  # prefills a and b as one two-row group
+        late = _admit(ex, "late")
+        self._fail_steps_of_width(decoder, 2, RuntimeError("simulated"))
+        outs = {}
+        for _ in range(10):
+            for out in ex.step():
+                outs[out.request_id] = out
+            if not ex.has_pending():
+                break
+        self._assert_failed(outs["a"], "decode_step")
+        self._assert_failed(outs["b"], "decode_step")
+        assert outs["late"].finish_reason == "length"
+        assert a.state == b.state == late.state == RequestState.FINISHED
+        assert ex.num_running() == 0 and not ex.has_pending()
 
     def test_non_applicable_surfaces_raise(self):
         strat, _ = _ar_strategy(partials=False)

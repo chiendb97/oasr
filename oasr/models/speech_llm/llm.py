@@ -42,7 +42,7 @@ kernel would have to copy whole, once per layer per step.  Paged-KV storage
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union, cast
 
 import torch
 from torch import nn
@@ -212,7 +212,7 @@ class Qwen2Lm(BaseDecoder):
         self,
         inputs_embeds: torch.Tensor,
         valid: torch.Tensor,
-        capacity: Optional[int] = None,
+        capacity: Union[int, Sequence[int], None] = None,
         kv_manager: Optional["DecoderKVCacheManager"] = None,
         kv_cache_dtype: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -224,12 +224,14 @@ class Qwen2Lm(BaseDecoder):
         the last position is the newest real token for every row.
 
         ``capacity`` (optional): total KV length this generation may reach
-        (prompt + generation cap).  When given, the per-layer K/V buffers are
-        preallocated once and each :meth:`step` writes its token slot in
-        place instead of re-copying the cache via ``torch.cat``.
+        (prompt + generation cap), for the batch or one per row.  When given,
+        the per-layer K/V buffers are preallocated once, as wide as the widest
+        row, and each :meth:`step` writes its token slot in place instead of
+        re-copying the cache via ``torch.cat``.
 
         ``kv_manager`` (optional, requires ``capacity``): page the KV out of a
-        shared pool instead of preallocating a per-group buffer.
+        shared pool instead of preallocating a per-group buffer; each row
+        reserves its own capacity there.
 
         ``kv_cache_dtype`` (``"fp8_e4m3"``): store the KV as fp8 with
         per-(token, kv-head) scales (a paged pool must have been built fp8).
@@ -244,7 +246,7 @@ class Qwen2Lm(BaseDecoder):
             B,
             inputs_embeds.device,
             prefill_len=P,
-            cap=None if capacity is None else max(int(capacity), P),
+            cap=capacity,
             manager=kv_manager,
             # Left padding *is* the per-row start offset: HF's masked-generate
             # convention puts every row's real prompt flush against the right of
