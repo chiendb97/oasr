@@ -1524,16 +1524,17 @@ class TestTheCacheKeyIsTheBuildNotTheCheckout:
         assert "<oasr>/include" in identity
 
     def test_where_cutlass_sits_is_not_in_the_key_but_its_version_is(self, spec, monkeypatch):
+        """A stamp of its own: the CPU job checks out no submodule, and the real
+        stamp is then empty, which no bump can change."""
         from oasr.jit import env
 
-        stamp = env.cutlass_version_stamp()
-        before = spec._content_hash()
-        moved = [("/elsewhere" + inc, version_h) for inc, version_h in stamp]
-        monkeypatch.setattr(env, "cutlass_version_stamp", lambda: moved)
-        assert spec._content_hash() == before
-        bumped = [(inc, version_h + b"// bumped\n") for inc, version_h in stamp]
-        monkeypatch.setattr(env, "cutlass_version_stamp", lambda: bumped)
-        assert spec._content_hash() != before
+        def stamp(inc, version_h):
+            monkeypatch.setattr(env, "cutlass_version_stamp", lambda: [(inc, version_h)])
+            return spec._content_hash()
+
+        before = stamp("/here/3rdparty/cutlass/include", b"#define CUTLASS_MINOR 6\n")
+        assert stamp("/elsewhere/cutlass/include", b"#define CUTLASS_MINOR 6\n") == before
+        assert stamp("/here/3rdparty/cutlass/include", b"#define CUTLASS_MINOR 7\n") != before
 
     def test_without_a_toolkit_the_key_still_answers(self, monkeypatch, tmp_path):
         """The CPU job computes keys and builds nothing; no nvcc must not raise there."""
