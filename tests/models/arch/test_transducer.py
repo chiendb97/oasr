@@ -929,6 +929,34 @@ class TestTransducerBeamSearch:
         assert strat._beam_graphs is not None and strat._beam_graphs.stats()["hits"] == 3
         assert streamed == [o.tokens for o in offline]
 
+    @pytest.mark.parametrize("how", ["reload_tuning", "shutdown"])
+    def test_both_release_paths_drop_the_beam_graphs(self, how):
+        """``_beam_graphs`` was missing from the caches ``release_graphs`` walks.
+
+        So a tuning reload left the beam loop replaying the kernels it captured
+        while eager decoding ran the new selections (rule 11), and ``shutdown``
+        (which released no decode graph at all) left its pool held.  Both now
+        drop the capture, and the next chunk re-captures with the same answer.
+        """
+        from helpers.transducer import exact_transducer, integer_frames
+
+        model = exact_transducer(torch.bfloat16, blank_bias=8.0, seed=5)
+        enc = integer_frames(2, 20, torch.bfloat16, seed=5)
+        lengths = torch.full((2,), 20, device="cuda")
+        strat = self._frame_loop(self._strategy(model, beam=4, max_sym=1, graphs=True))
+        with torch.no_grad():
+            first = [o.tokens for o in strat.decode_offline(enc, lengths)]
+        cache = strat._beam_graphs
+        assert cache is not None and cache.num_captured == 1
+        if how == "reload_tuning":
+            strat.release_graphs()  # what ASREngine.reload_tuning calls
+        else:
+            strat.shutdown()  # what ASREngine.shutdown calls
+        assert cache.num_captured == 0
+        with torch.no_grad():
+            again = [o.tokens for o in strat.decode_offline(enc, lengths)]
+        assert cache.stats()["captures"] == 2 and again == first
+
     def test_beam_graph_capture_budget_declines_rather_than_growing(self):
         from helpers.transducer import exact_transducer, integer_frames
 

@@ -849,11 +849,22 @@ class InputProcessor:
         #
         # ``record_stream`` is the second half: without it the allocator can hand
         # ``feats``'s block to a later feature step while the append still reads it.
+        consumer = None
         if cuda_stream is not None and self._device.type == "cuda":
             consumer = torch.cuda.current_stream(self._device)
             consumer.wait_stream(cuda_stream)
             feats.record_stream(consumer)
         self._distribute_streaming_features(inputs, feats, feat_lens_cpu)
+        if consumer is not None and self._feature_graph is not None:
+            # The reverse hand-off: when ``feats`` is the captured graph's
+            # output, the next replay rewrites it in place on ``cuda_stream``,
+            # so it must wait for the append just enqueued here.  Without it, a
+            # current stream running a tick behind (load, or the encoder forward
+            # still queued) appended the *next* tick's frames in this one's
+            # place.  Negative control: ``TestStreamingFeatureGraphReuse``.
+            # Marked after an eager tick too, which only orders a replay after
+            # an append that does not need it.
+            self._feature_graph.mark_consumed(consumer)
 
     def _collect_streaming_inputs(
         self, requests: List[Request], frame_len: int

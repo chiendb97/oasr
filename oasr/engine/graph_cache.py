@@ -679,6 +679,10 @@ class GraphedFeatureExtraction(_BestEffortCapture):
 
         self._max_bucket = self._buckets[-1] if self._buckets else 0
         self._captured: Dict[int, _CapturedFeatureShape] = {}
+        #: Recorded on the consumer's stream once every read of the last
+        #: replay's output is enqueued (:meth:`mark_consumed`); the next replay,
+        #: of any bucket, waits for it on the GPU.
+        self._consumed: Optional[torch.cuda.Event] = None
         self._init_failure_tracking("streaming feature", max_capture_failures)
 
     # ------------------------------------------------------------------
@@ -776,11 +780,31 @@ class GraphedFeatureExtraction(_BestEffortCapture):
             if T > 0:
                 state.padded_host_buf[:B_active, :T].copy_(padded_cpu)
             state.lengths_host_buf[:B_active].copy_(lengths_cpu)
+        if self._consumed is not None:
+            # The output side of the same hazard: ``feats_out`` is rewritten in
+            # place, and the previous replay's consumer reads it on its own
+            # stream, behind whatever is queued there.  Any bucket, not only
+            # this one: buckets share a graph pool, so another bucket's
+            # intermediates can occupy memory this one's output was captured
+            # over.  A GPU-side wait — the host does not park.
+            torch.cuda.current_stream(self._device).wait_event(self._consumed)
         state.graph.replay()
         event = torch.cuda.Event()
         event.record()
         state.ready = event
         return state.feats_out
+
+    def mark_consumed(self, stream: "torch.cuda.Stream") -> None:
+        """Say that every read of the last replay's output is enqueued on ``stream``.
+
+        The caller reads ``feats_out`` on its own stream, after a
+        ``wait_stream`` on the feature stream, and the next replay must not
+        rewrite it until that read has run.  Recording here and waiting in
+        :meth:`replay` orders exactly that, on the GPU.
+        """
+        event = torch.cuda.Event()
+        event.record(stream)
+        self._consumed = event
 
     # ------------------------------------------------------------------
     # Capture
@@ -801,6 +825,7 @@ class GraphedFeatureExtraction(_BestEffortCapture):
                 pass
         self._captured.clear()
         self._failed.clear()
+        self._consumed = None
 
     def _capture(self, bucket: int) -> Optional[_CapturedFeatureShape]:
         device = self._device

@@ -619,15 +619,20 @@ class DecodeStrategy(ABC):
         return None
 
     def shutdown(self) -> None:
-        """Release resources the family holds for the life of the engine.  Default: none.
+        """Release resources the family holds for the life of the engine.
 
         Called once from :meth:`ASREngine.shutdown`.  For what an engine *must not*
         leave behind until garbage collection: a family's own device allocations.
+        The default releases the family's captured decode graphs, whose private
+        pools nothing else returns (see :meth:`release_graphs`); an override
+        calls it too.
         """
-        return None
+        self.release_graphs()
 
     #: Attributes a family may hold a CUDA-graph cache in (each with ``release()``).
-    _GRAPH_CACHE_ATTRS = ("_graphs", "_pred_graphs", "_loop_graphs")
+    #: A cache missing here is skipped by both callers: a tuning reload leaves it
+    #: replaying the old kernels, and shutdown leaves its pool held.
+    _GRAPH_CACHE_ATTRS = ("_graphs", "_pred_graphs", "_loop_graphs", "_beam_graphs")
 
     def release_graphs(self) -> None:
         """Release every captured decode graph this family holds.
@@ -636,6 +641,8 @@ class DecodeStrategy(ABC):
         tuning-DB reload (``ASREngine.reload_tuning``) must drop them to make the
         new selections take effect -- otherwise eager and replayed decode steps
         would run different GEMMs, which rule 11 forbids.  They re-capture lazily.
+        Also what :meth:`shutdown` does by default: ``CUDAGraph.reset()`` is the
+        only thing that returns a capture's private pool.
         """
         for name in self._GRAPH_CACHE_ATTRS:
             cache = getattr(self, name, None)

@@ -107,6 +107,7 @@ class CtcWfstDecodeStrategy(DecodeStrategy):
     def shutdown(self) -> None:
         """Free this engine's GPU decoders (a stream still open keeps its own)."""
         self._wfst_scope.close()
+        super().shutdown()
 
     @staticmethod
     def _load_word_table(fst_path: Optional[str]) -> Optional[Dict[int, str]]:
