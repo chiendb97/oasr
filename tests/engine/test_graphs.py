@@ -453,6 +453,75 @@ def _cuda_rng_works(device: torch.device) -> bool:
 
 
 @pytest.mark.cuda
+class TestStrategyGraphRelease:
+    """Every decode graph cache is released by a tuning reload and by shutdown.
+
+    ``DecodeStrategy.release_graphs`` walks ``_GRAPH_CACHE_ATTRS``, so a cache
+    stored under a name that list does not carry is invisible to both callers:
+    ``ASREngine.reload_tuning`` leaves it replaying the kernels it captured
+    while eager runs the new selections (rule 11), and ``shutdown`` leaves its
+    private pool held for the life of the process.  The transducer's beam loop
+    (``_beam_graphs``) was that cache, and ``shutdown`` released nothing at all.
+    CPU-only: the bookkeeping, not a capture.  The captures themselves are
+    released in ``test_transducer.py::...test_both_release_paths_drop_the_beam_graphs``.
+    """
+
+    @staticmethod
+    def _strategy_modules():
+        import importlib
+        import pkgutil
+
+        import oasr.engine.decode as pkg
+
+        for info in pkgutil.iter_modules(pkg.__path__):
+            yield importlib.import_module(f"{pkg.__name__}.{info.name}")
+
+    def test_every_cache_a_family_builds_is_one_release_walks(self):
+        import inspect
+        import re
+
+        from oasr.engine.decode.base import DecodeStrategy
+
+        assigned = set()
+        for module in self._strategy_modules():
+            source = inspect.getsource(module)
+            assigned |= set(re.findall(r"self\.(_\w+)\s*=\s*\w*GraphCache\(", source))
+        assert assigned, "found no graph cache at all; the pattern is out of date"
+        missing = assigned - set(DecodeStrategy._GRAPH_CACHE_ATTRS)
+        assert not missing, f"graph caches release_graphs never reaches: {sorted(missing)}"
+
+    def test_shutdown_releases_every_listed_cache(self):
+        from types import SimpleNamespace
+
+        from oasr.engine.decode.base import DecodeStrategy
+
+        class _Cache:
+            released = 0
+
+            def release(self):
+                self.released += 1
+
+        caches = {name: _Cache() for name in DecodeStrategy._GRAPH_CACHE_ATTRS}
+        strategy = SimpleNamespace(_GRAPH_CACHE_ATTRS=DecodeStrategy._GRAPH_CACHE_ATTRS, **caches)
+        strategy.release_graphs = lambda: DecodeStrategy.release_graphs(strategy)
+        DecodeStrategy.shutdown(strategy)
+        assert {name: c.released for name, c in caches.items()} == dict.fromkeys(caches, 1)
+
+    def test_a_family_that_overrides_shutdown_still_releases_its_graphs(self):
+        import inspect
+
+        from oasr.engine.decode.base import _REGISTRY
+
+        list(self._strategy_modules())  # every family registered
+        overriding = [cls for cls in set(_REGISTRY.values()) if "shutdown" in vars(cls)]
+        for cls in overriding:
+            source = inspect.getsource(cls.shutdown)
+            assert (
+                "super().shutdown()" in source or "self.release_graphs()" in source
+            ), f"{cls.__name__}.shutdown releases nothing DecodeStrategy.shutdown would"
+        assert overriding, "no family overrides shutdown, so this checked nothing"
+
+
 class TestTheHazardIsReal:
     """Without a reset, an aborted capture breaks RNG for the whole process."""
 

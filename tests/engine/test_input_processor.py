@@ -982,6 +982,83 @@ class TestStreamingFeatureStreamHandoff:
             torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
 
+class TestStreamingFeatureGraphReuse:
+    """A feature-graph replay must not overwrite an output still being read.
+
+    With ``use_feature_cuda_graphs`` every replay of a bucket writes the same
+    captured ``feats_out``, on the feature stream, and the append that reads it
+    into each ``feature_buffer`` runs on the current stream, behind whatever is
+    queued there.  A replay waited only for its own previous replay's H2D, so
+    when the current stream lagged a tick (under load, or with the encoder
+    forward of the previous step still queued) the next replay rewrote
+    ``feats_out`` before the previous append read it: that tick's frames were
+    the next tick's, and nothing raised.
+
+    The reproduction **congests the current stream on purpose**, so tick 1's
+    append is still queued when tick 2 replays.  The bucket is captured first:
+    a capture synchronizes the device, which would drain the congestion.
+    """
+
+    def _processor_and_requests(self, device, n=3):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.input_processor import InputProcessor
+        from oasr.engine.request import Request
+        from oasr.features import FeatureConfig
+
+        cfg = EngineConfig(
+            ckpt_dir="x",
+            device=str(device),
+            dtype=torch.float32,
+            max_batch_size=8,
+            feature_config=FeatureConfig(feature_type="fbank", num_mel_bins=80, dither=0.0),
+            use_cuda_graphs=True,
+            use_feature_cuda_graphs=True,
+        )
+        proc = InputProcessor(cfg, device)
+        assert proc._feature_graph is not None, "the graph path is what is under test"
+        chunk = proc.streaming_audio_chunk_samples
+        g = torch.Generator().manual_seed(1234)  # same audio in both arms
+        reqs = []
+        for i in range(n):
+            req = Request(None, request_id=f"r{i}", streaming=True)
+            proc.prepare_streaming(req)
+            for _ in range(2):  # one chunk per tick, two ticks, neither the last
+                proc.append_streaming_chunk(req, torch.rand(chunk, generator=g) * 2 - 1)
+            reqs.append(req)
+        return proc, reqs
+
+    @staticmethod
+    def _features(reqs):
+        return [r.feature_buffer[: r.feature_frames].clone() for r in reqs]
+
+    @pytest.mark.cuda
+    def test_a_replay_waits_for_the_previous_ticks_append(self, device):
+        proc_ref, reqs_ref = self._processor_and_requests(device)
+        stream_ref = torch.cuda.Stream(device=device)
+        for _ in range(2):
+            proc_ref.extract_streaming_batch(reqs_ref, cuda_stream=stream_ref)
+            torch.cuda.synchronize()
+        reference = self._features(reqs_ref)
+
+        proc, reqs = self._processor_and_requests(device)
+        feat_stream = torch.cuda.Stream(device=device)
+        fg = proc._feature_graph
+        t_pad = fg.t_pad
+        with torch.cuda.stream(feat_stream):
+            fg.replay(len(reqs), torch.zeros(len(reqs), t_pad), torch.full((len(reqs),), t_pad))
+        torch.cuda.synchronize()
+        # ~0.1 s of nothing on the current stream: both ticks' appends queue
+        # behind it, while the feature stream is free to replay.
+        torch.cuda._sleep(250_000_000)
+        for _ in range(2):
+            proc.extract_streaming_batch(reqs, cuda_stream=feat_stream)
+        torch.cuda.synchronize()
+
+        for i, (got, ref) in enumerate(zip(self._features(reqs), reference)):
+            assert got.shape == ref.shape, f"stream {i}"
+            torch.testing.assert_close(got, ref, rtol=0, atol=0, msg=f"stream {i}")
+
+
 # ===========================================================================
 # stft_frame / mel_log kernels (KG23's shared primitives)
 # ===========================================================================
