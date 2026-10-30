@@ -59,6 +59,10 @@ OVERFLOW_HASH = 2  # hash probe bound exceeded
 OVERFLOW_ARENA = 4  # winners arena (offline) or ring (streaming) full
 OVERFLOW_CLAIMS = 8  # distinct-state claims list full
 OVERFLOW_KEPT = 16  # surviving frontier > main_q
+OVERFLOW_PATH = 32  # best path longer than its buffer: the transcript's start was dropped
+#: What the rescue instance can absorb: its tables are twice the size.  Its best-path
+#: buffer is not (it sizes from the same frame count), so a cut path is only reported.
+_RESCUABLE = OVERFLOW_CAND | OVERFLOW_HASH | OVERFLOW_ARENA | OVERFLOW_CLAIMS | OVERFLOW_KEPT
 
 
 @functools.cache
@@ -176,6 +180,8 @@ class WfstDecoderOptions:
         self.min_active_states = min_active_states
         self.max_active_states = max_active_states
         self.blank_skip_thresh = blank_skip_thresh
+        # Offline: the decoder's initial frame capacity, not a limit -- a longer
+        # utterance grows it.  (Streaming chunks are _STREAM_CHUNK_FRAMES.)
         self.max_frames = max_frames
         self.max_streams = max_streams
         # Lane pool of the shared offline decoder; a batched decode of B utterances
@@ -343,9 +349,10 @@ class WfstDecoderSearch:
     frontier capacity.  Streaming, a winners-ring overrun is the one limit the decoder
     cannot outlive in place — the lane's collector stops for good and its transcript
     freezes — so the chunk is decoded again on a fresh channel, after the words already
-    decoded.  Whatever was not recovered is reported: :attr:`overflow` (the last search
-    or single decode) and :attr:`batch_overflow` (the last batch) hold the
-    ``OVERFLOW_*`` bits, 0 when the result is complete.
+    decoded.  A best path longer than its buffer (``OVERFLOW_PATH``) is not decoded
+    again: the rescue's buffer is no larger.  Whatever was not recovered is reported:
+    :attr:`overflow` (the last search or single decode) and :attr:`batch_overflow` (the
+    last batch) hold the ``OVERFLOW_*`` bits, 0 when the result is complete.
     """
 
     wants_device_tensor = True
@@ -502,7 +509,7 @@ class WfstDecoderSearch:
         words, scores, _, overflow = _run_decode_batch(
             _get_module(), dec.handle, logp.unsqueeze(0).contiguous(), [int(logp.size(0))]
         )
-        if overflow[0]:
+        if overflow[0] & _RESCUABLE:
             words, scores, overflow = self._rescue([logp], device)
         self._overflow = overflow[0]
         return [words[0]], [scores[0]]
@@ -557,7 +564,8 @@ class WfstDecoderSearch:
             for i in range(len(w)):
                 tokens[start + i] = w[i]
                 scores[start + i] = s[i]
-                if o[i]:
+                self._batch_overflow[start + i] = o[i]
+                if o[i] & _RESCUABLE:
                     flagged.append((start + i, rows[i]))
         if flagged:
             w, s, o = self._rescue([row for _, row in flagged], device)

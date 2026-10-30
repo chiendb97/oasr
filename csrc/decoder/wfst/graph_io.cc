@@ -46,6 +46,39 @@ class File {
   std::FILE* f_;
 };
 
+// Every index the decoder follows without a check, checked once here: the device walks
+// row ranges, arc destinations and log-prob columns, and the host maps arcs to words,
+// so a malformed image read out of bounds instead of failing to load. One pass over the
+// arcs, at load.
+void Validate(const GraphImage& g) {
+  auto fail = [](const char* what) {
+    throw std::runtime_error(std::string("corrupt graph image: ") + what);
+  };
+  if (g.start_state < 0 || g.start_state >= g.num_states) fail("start state out of range");
+  for (int64_t s = 0; s < g.num_states; ++s) {
+    const int32_t begin = g.row_splits[s], end = g.row_splits[s + 1];
+    if (end < begin) fail("row_splits decrease");
+    const int32_t finals = g.final_count[s];
+    const int32_t eps = g.has_eps ? g.eps_count[s] : 0;
+    if (finals < 0 || eps < 0 || finals + eps > end - begin)
+      fail("a state's final or epsilon count exceeds its arcs");
+    const int32_t s32 = static_cast<int32_t>(s);
+    for (int32_t a = begin; a < end; ++a) {
+      const int32_t dest = g.Dest(a), label = g.Ilabel(a);
+      if (dest < 0 || dest >= g.num_states) fail("arc destination out of range");
+      const bool final_arc = a >= g.FinalBegin(s32) && a < g.FinalEnd(s32);
+      if (final_arc ? label != -1 : (label < 0 || label >= g.vocab_size))
+        fail("arc label out of range, or a final arc outside its state's final range");
+    }
+  }
+  if (g.aux_row_splits.front() != 0 ||
+      static_cast<size_t>(g.aux_row_splits.back()) != g.aux_pool.size())
+    fail("aux_row_splits do not span the aux pool");
+  for (int64_t a = 0; a < g.num_arcs; ++a) {
+    if (g.aux_row_splits[a + 1] < g.aux_row_splits[a]) fail("aux_row_splits decrease");
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<GraphImage> LoadGraphImage(const std::string& path) {
@@ -58,7 +91,8 @@ std::unique_ptr<GraphImage> LoadGraphImage(const std::string& path) {
   if (h.version != 1 && h.version != 2)
     throw std::runtime_error("unsupported graph image version");
   if (h.version == 1) h.offsets[6] = 0;  // v1: no epsilon section
-  if (h.num_states <= 0 || h.num_arcs < 0 || h.num_states >= (1LL << 31))
+  if (h.num_states <= 0 || h.num_arcs < 0 || h.num_states >= (1LL << 31) ||
+      h.num_arcs >= (1LL << 31) || h.aux_pool_size < 0 || h.vocab_size <= 0)
     throw std::runtime_error("invalid graph image counts");
 
   auto img = std::make_unique<GraphImage>();
@@ -90,6 +124,7 @@ std::unique_ptr<GraphImage> LoadGraphImage(const std::string& path) {
 
   if (img->row_splits.front() != 0 || img->row_splits.back() != img->num_arcs)
     throw std::runtime_error("corrupt row_splits in graph image");
+  Validate(*img);
   return img;
 }
 

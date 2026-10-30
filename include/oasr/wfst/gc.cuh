@@ -41,6 +41,20 @@ __device__ inline int32_t GcAnchor(const Workspace& ws, const Sizes& sz, int32_t
   return -1;
 }
 
+// Clears the convergence stamps a round set on `anchor`'s chain (the stamp pass's own
+// bounded traversal). A round that aborts must still do this: a stamp left on a live
+// entry is read back as bit 30 of its arc.
+__device__ inline void GcClearStamps(const Workspace& ws, const Sizes& sz, int32_t lane,
+                                     int32_t anchor, int32_t floor) {
+  int32_t w = anchor;
+  for (int32_t hops = 0; w >= floor && hops < sz.fin_cap; ++hops) {
+    int2& e = WinnersEntry(ws, sz, lane, w);
+    if (e.y >= 0 && (e.y & kGcStampBit)) e.y = e.y & ~kGcStampBit;
+    if (e.x == w) break;
+    w = e.x;
+  }
+}
+
 __global__ void GcStampKernel(Workspace ws, Sizes sz) {
   const int32_t lane = blockIdx.x * blockDim.x + threadIdx.x;
   if (lane >= sz.lanes) return;
@@ -99,7 +113,11 @@ __global__ void GcFinalizeKernel(Workspace ws, Sizes sz) {
   const int32_t conv = ws.gc_conv[lane];
   const int32_t anchor = GcAnchor(ws, sz, lane);
   if (anchor < 0 || conv == INT32_MAX) return;    // no live chain
-  if (conv < 0) return;                           // converge aborted (defensive)
+  if (conv < 0) {                                 // converge aborted (defensive)
+    // An arena-overflow lane was never stamped; any other lane was.
+    if ((lc.overflow & kOverflowArena) == 0) GcClearStamps(ws, sz, lane, anchor, *ws.gc_floor);
+    return;
+  }
   // 1-best finished lanes finalize COMPLETELY: emit from final_tok itself and mark the
   // lane done — its chain no longer bounds the unmap watermark. (Lattice mode keeps
   // final_tok: LatSeed/LatEmit still index tok_bwd with it.)
@@ -137,8 +155,8 @@ __global__ void GcFinalizeKernel(Workspace ws, Sizes sz) {
   while (w >= floor) {
     const int2 e = ws.winners[w];
     if (e.y >= 0) {
-      if (len >= sz.fin_cap) {  // defensive; matches Backtrack's own truncation cap
-        atomicOr(&lc.overflow, kOverflowArena);
+      if (len >= sz.fin_cap) {  // the prefix below `start` is lost: same as a backtrack's
+        atomicOr(&lc.overflow, kOverflowPath);
         break;
       }
       fin[len++] = e.y & ~kGcStampBit;
@@ -211,8 +229,14 @@ __global__ void StreamGcFinalizeKernel(Workspace ws, Sizes sz) {
   if (lane >= sz.lanes) return;
   LaneCounters& lc = ws.lanes[lane];
   const int32_t conv = ws.gc_conv[lane];
-  if (conv < 0) return;
   const int32_t anchor = ws.tok_winner[0][static_cast<int64_t>(lane) * sz.main_q];
+  if (conv < 0) {
+    // The stamp pass skipped exactly these lanes; any other was stamped, and a walker
+    // that hit the hop cap left the stamps for this pass to clear.
+    if (lc.status == 0 && lc.frontier_size > 0 && (lc.overflow & kOverflowArena) == 0)
+      GcClearStamps(ws, sz, lane, anchor, 0);
+    return;
+  }
   // Clear the stamps on [anchor, conv] (same bounded traversal as the stamp pass).
   int32_t w = anchor;
   for (int32_t hops = 0; w >= 0 && hops < sz.fin_cap; ++hops) {
@@ -228,8 +252,12 @@ __global__ void StreamGcFinalizeKernel(Workspace ws, Sizes sz) {
   int32_t lag = 0;
   w = WinnersEntry(ws, sz, lane, conv).x;
   while (w >= 0) {
-    const int2 e = WinnersEntry(ws, sz, lane, w);
+    int2& entry = WinnersEntry(ws, sz, lane, w);
+    const int2 e = entry;
     if (e.y >= 0) {
+      // Unstamp on the way: what a drain longer than fin_cap leaves above the cut stays
+      // live, and the stamp pass reached below conv.
+      if (e.y & kGcStampBit) entry.y = e.y & ~kGcStampBit;
       fin[emits % sz.fin_cap] = e.y & ~kGcStampBit;
       ++emits;
       if (lag >= sz.fin_cap) {
@@ -248,6 +276,41 @@ __global__ void StreamGcFinalizeKernel(Workspace ws, Sizes sz) {
   // Sentinel the cut and advance the writer's wrap guard: [gc_root, log_len) is live.
   WinnersEntry(ws, sz, lane, cut).x = INT32_MIN;
   lc.gc_root = cut;
+}
+
+// Streaming ids are logical and only ever grow, so a channel that lived long enough
+// would run them past INT32_MAX -- about 2^31 appends, a day or so of audio -- and the
+// next id would index the ring with a negative number. Once the collector has moved
+// the root a whole ring lap or more, every live id moves down by whole laps: a multiple
+// of the ring maps each id to the same slot, so no entry moves, and ids stay below two
+// laps plus one round's appends (the ring is capped at 2^28 entries). It runs every lap,
+// so a mistake here shows within seconds of streaming, not after a day.
+__global__ void StreamGcRebaseKernel(Workspace ws, Sizes sz) {
+  const int32_t lane = blockIdx.x;
+  LaneCounters& lc = ws.lanes[lane];
+  const int32_t cap = sz.stream_log_cap;
+  const int32_t root = lc.gc_root;
+  // A degraded lane may hold stale pointers, and the wrapper replaces its channel.
+  if (lc.status != 0 || lc.frontier_size <= 0 || (lc.overflow & kOverflowArena) != 0 ||
+      root < cap)
+    return;
+  const int32_t delta = root / cap * cap;
+  const int32_t end = min(lc.log_len, root + cap);  // an EpsResolve overshoot is not in it
+  int32_t* winner = ws.tok_winner[0] + static_cast<int64_t>(lane) * sz.main_q;
+  for (int32_t i = threadIdx.x; i < lc.frontier_size; i += blockDim.x) winner[i] -= delta;
+  for (int32_t id = root + threadIdx.x; id < end; id += blockDim.x) {
+    int2& e = WinnersEntry(ws, sz, lane, id);
+    if (e.x >= delta) {
+      e.x -= delta;
+    } else if (e.x >= 0) {
+      e.x = INT32_MIN;  // a dead entry pointing below the window: nothing walks it
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    lc.gc_root = root - delta;
+    lc.log_len -= delta;
+  }
 }
 
 }  // namespace kernels

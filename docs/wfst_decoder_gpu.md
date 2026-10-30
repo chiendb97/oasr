@@ -131,6 +131,16 @@ Graphs load from a binary `hlg.img` (mmap-friendly, versioned):
 | `aux_row_splits[A+1]`, `aux_pool` | i32 | ragged word ids per arc (CSR) |
 | `eps_count[N]` | i32 | v2 + has-eps only (TLG) |
 
+The loader validates every index the decoder later follows without a check:
+the start state, monotonic `row_splits`, per-state final and epsilon counts,
+each arc's destination and label (final arcs inside their state's final range,
+every other label below `vocab_size`), and the aux CSR. A malformed image
+fails to load (`corrupt graph image: ...`) rather than reading out of bounds
+at decode. The launchers likewise check every tensor they read or write by
+pointer: log-probs on the decoder's device, in its dtype, packed and at least
+`vocab_size` wide; lengths inside `[0, T]`; output buffers dense, of the right
+dtype, with a row per batch row.
+
 Export once, offline (k2 is imported *only* here):
 
 ```bash
@@ -277,8 +287,22 @@ claims_cap = 2 · main_q                            # distinct dest states / ste
 cand_cap   = cand_factor · main_q                  # admitted candidates / step
 hash_cap   = next_pow2(2 · claims_cap)             # per-lane slots
 arena_cap  = min(512 Mi, max(64 Mi, 16 Mi · lanes))   # winners entries (shared)
-path_cap   = max_frames + 2
+path_cap   = (max_frames + 2) · (1 + eps_iterations)  # best-path arcs / lane;
+                                                   # the factor is 1 on ε-free graphs
+seg_cap    = max_frames + 2                        # lattice segments / lane
 ```
+
+`main_q ≤ 2²⁸` and `cand_cap ≤ 2³⁰` (the per-lane tables are int32-indexed);
+construction refuses larger. Offline, `max_frames` is the *initial* frame
+capacity, not a limit: a batch whose longest row exceeds it doubles the
+capacity until it fits, reallocates what scales with it (`path_cap`,
+`seg_cap`, the GC drain, debug snapshots) and drops every captured graph.
+Whole-batch graphs stay capped at the constructed `max_frames`; a longer batch
+runs the segmented loop of §6.3 (with GC only when `gc_interval > 0`), in
+256-step segment graphs. A best path on an ε graph carries one arc per
+closure pass on top of each frame's, which is why `path_cap` scales with
+`eps_iterations`: sized by frames alone, it dropped the start of long
+transcripts on TLG graphs.
 
 | Structure | Layout | Sizing | Allocation |
 |---|---|---|---|
@@ -446,12 +470,14 @@ the C++ API (`LastLatticeRecords`).
 | 4 | `kOverflowArena` | winners/lattice arena full | offline **automatic**: grow-commit + re-run; reported only at full reserved capacity. Streaming: the channel's ring overran — see §8.1 |
 | 8 | `kOverflowClaims` | distinct-state claims list full | caller: rescue; `HashSanitizeKernel` wipes the lane's table at batch end (a claims overflow leaves CAS-claimed slots the targeted clear can't see) |
 | 16 | `kOverflowKept` | surviving frontier > `main_q` | caller: rescue |
+| 32 | `kOverflowPath` | best path longer than `path_cap`: the walk stopped, so its OLDEST arcs (the start of the transcript) are missing | reported only — a rescue instance's buffer is no larger. Binds on the gc-off streaming decoder (one chunk of buffer) and, pathologically, when one closure pass chains several hops |
 
 Any non-zero overflow means the lane's result may be degraded, and not only
 by a missing tail: tokens are dropped in claim order, not score order, so the
 best path can be among them, and on a synthetic burst an overflowed lane both
 dropped and *inserted* words. The Python wrapper (`WfstDecoderSearch`)
-re-decodes every flagged offline lane on a two-lane rescue instance with
+re-decodes every offline lane flagged with a capacity bit (1-16) on a two-lane
+rescue instance with
 `main_q_factor=64` (the main instance uses 32), and reports what the rescue
 could not absorb through `overflow` / `batch_overflow` →
 `DecoderResult.overflow` → `RequestOutput.search_overflow` and
@@ -486,9 +512,9 @@ mode is not supported with streaming.
 
 With `gc_interval = 0` a channel's region is a hard cap on stream length
 (`kOverflowArena` once `log_len` hits `stream_log_cap`) **and** long-stream
-backtracks silently truncate to the newest `path_cap = max_frames + 2` arcs —
-a T=251 utterance streamed in 128-frame chunks returns only the suffix of its
-words. `gc_interval > 0` (any even value; the streaming Python wrapper always
+backtracks truncate to the newest `path_cap` arcs (one chunk's worth) — a
+T=251 utterance streamed in 128-frame chunks returns only the suffix of its
+words, flagged `kOverflowPath`. `gc_interval > 0` (any even value; the streaming Python wrapper always
 enables it) fixes both: after every `AdvanceChunk`, a lane-local GC round
 (`StreamGc*` kernels, outside the captured chunk graph) finds each live
 channel's convergence point, cuts the chain there, and drains the finalized
@@ -507,6 +533,29 @@ hypothesis stops growing for the rest of the stream. `WfstDecoderSearch`
 therefore abandons the channel, keeps the last complete hypothesis, and decodes
 the chunk again on a fresh channel — losing the search context across the
 burst, never the audio after it — and reports the overrun.
+
+Logical ids only grow, so a channel that lived past 2³¹ appends would have run
+them negative and indexed its ring out of bounds — a function of the frontier
+(~33k frames on a 65k-wide one), not only of hours. `StreamGcRebaseKernel`
+runs after each round: once `gc_root` has passed a whole ring lap, every live
+id (the frontier's, the window's back-pointers, `gc_root`, `log_len`) moves
+down by whole laps. A multiple of `stream_log_cap` maps each id to the same
+slot, so no entry moves, and ids stay below two laps plus one round's appends;
+the ring is capped at 2²⁸ entries for that bound to fit int32. It runs every
+lap, so a mistake in it shows within seconds of streaming.
+
+A round whose convergence walk hits its hop cap (`fin_cap`) clears the stamps
+it set, and the drain unstamps the entries it leaves live above the cut; the
+backtracks also mask the stamp bit. A stamp left on a live entry otherwise
+came back as bit 30 of an arc id, which the host then used to index its word
+table.
+
+Opening a channel runs the epsilon closure of its start frontier, and that
+launch would take every lane still in a real or epsilon phase — a live stream
+whose last chunk ended on a real frame, as a full 128-frame chunk does — giving
+it extra closure passes, so its search depended on when other streams opened.
+`StreamCreateKernel` parks every other lane at `kPhaseDone` first; the next
+step's K1 recomputes every phase, so nothing else changes.
 
 Measured: an hour-long synthetic stream (90k frames, LJS tiled) decodes with
 constant 42 MiB committed and results bit-identical between a minimal ring
@@ -579,8 +628,9 @@ channel keeps its decoder alive until the channel is released.
 - **Offline**: `decode_offline(logp)` / `decode_offline_batch(enc_out,
   lengths)` — rows are length-clipped and blank-skipped exactly as the
   single-utterance path, then decoded in `≤ max_offline_lanes` padded
-  sub-batches (defaults: 8 lanes, `main_q_factor=32`, `cand_factor=3`,
-  `max_frames=4096`). The engine's `CtcWfstDecodeStrategy`
+  sub-batches (defaults: 8 lanes, `main_q_factor=32`, `cand_factor=3`, an
+  initial `max_frames=4096` that a longer utterance grows). The engine's
+  `CtcWfstDecodeStrategy`
   (`oasr/engine/decode/ctc_wfst.py`) calls the batched path and raises
   `wfst_max_offline_lanes` to `max_batch_size`.
 - **Streaming**: the searcher protocol (`reset`/`search`/`finalize_search`)
@@ -642,8 +692,8 @@ nsys profile --cuda-graph-trace=node -t cuda python benchmarks/decoders/wfst.py 
 These are properties of the design, not a to-do list:
 
 - **Vocab < 65,535** — u16 ilabel encoding; checked at graph upload.
-- **Streaming logical ids hit the int32 wall** after ~2³¹ appends per channel
-  (~35 h of continuous audio). Recycle channels at utterance boundaries.
+- **A streaming ring holds at most 2²⁸ entries** (2 GiB a channel), so rebased
+  ids stay inside int32 (§8.1).
 - **Exact-score ties are run-nondeterministic** — the same class of
   nondeterminism as k2. `scripts/wfst_parity_check.py` excludes score ties for
   this reason.

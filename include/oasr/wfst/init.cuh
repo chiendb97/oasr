@@ -36,8 +36,8 @@ __global__ void InitKernel(Workspace ws, Sizes sz, DeviceGraph g, const int32_t*
   if (lane == 0) *ws.arena_cursor = sz.lanes;
   if (sz.lat_cap > 0) {
     ws.tok_fwd[lane] = 0.0f;
-    for (int32_t i = 0; i < sz.path_cap; ++i)
-      ws.lat_seg[static_cast<int64_t>(lane) * sz.path_cap + i] = make_int2(0, 0);
+    for (int32_t i = 0; i < sz.seg_cap; ++i)
+      ws.lat_seg[static_cast<int64_t>(lane) * sz.seg_cap + i] = make_int2(0, 0);
     if (lane == 0) {
       *ws.lat_cursor = 0;
       *ws.lat_out_cursor = 0;
@@ -65,9 +65,20 @@ __global__ void StreamResetKernel(Workspace ws, Sizes sz, int32_t lane) {
   lc.phase = kPhaseDone;
 }
 
+// One thread per lane. Every other lane is parked at kPhaseDone: the creation launch is
+// followed by the epsilon-closure passes for the new lane's start frontier, and those
+// passes take any lane still in kPhaseReal / kPhaseEps -- which a live stream is when its
+// last chunk ended on a real frame (a full 128-frame chunk does). It then got extra
+// closure passes, so its search depended on when other streams opened. Parking changes
+// nothing else: the next step's K1 sets every lane's phase afresh.
 __global__ void StreamCreateKernel(Workspace ws, Sizes sz, DeviceGraph g, int32_t lane,
                                    float search_beam) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  const int32_t l = blockIdx.x * blockDim.x + threadIdx.x;
+  if (l >= sz.lanes) return;
+  if (l != lane) {
+    ws.lanes[l].phase = kPhaseDone;
+    return;
+  }
   LaneCounters& lc = ws.lanes[lane];
   lc = LaneCounters{};
   lc.T = INT32_MAX;

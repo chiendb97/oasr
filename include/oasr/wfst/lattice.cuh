@@ -30,7 +30,7 @@ __global__ void LatSeedKernel(Workspace ws, Sizes sz) {
 
 __global__ void LatBackwardStepKernel(Workspace ws, Sizes sz, int32_t t) {
   const int32_t lane = blockIdx.y;
-  const int2 seg = ws.lat_seg[static_cast<int64_t>(lane) * sz.path_cap + t];
+  const int2 seg = ws.lat_seg[static_cast<int64_t>(lane) * sz.seg_cap + t];
   for (int32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < seg.y;
        i += gridDim.x * blockDim.x) {
     const int4 e = ws.lat[seg.x + i];
@@ -93,7 +93,7 @@ __global__ void LatIntervalCompactKernel(Workspace ws, Sizes sz, float output_be
   __shared__ int32_t sh_base;
   __shared__ int32_t sh_frame_total;
   for (int32_t t = 0; t < t_now; ++t) {
-    int2* seg = &ws.lat_seg[static_cast<int64_t>(lane) * sz.path_cap + t];
+    int2* seg = &ws.lat_seg[static_cast<int64_t>(lane) * sz.seg_cap + t];
     const int2 s = *seg;
     if (s.y == 0) continue;
     // Pass A: count this frame's survivors.
@@ -159,9 +159,9 @@ __global__ void LatEmitKernel(Workspace ws, Sizes sz, DeviceGraph g, float outpu
   int32_t emitted = 0;
   if (lc.status == 1) {
     const float best = lc.final_score;
-    const int32_t last_seg = min(lc.T + 1, sz.path_cap - 1);
+    const int32_t last_seg = min(lc.T + 1, sz.seg_cap - 1);
     for (int32_t t = 0; t <= last_seg; ++t) {
-      const int2 seg = ws.lat_seg[static_cast<int64_t>(lane) * sz.path_cap + t];
+      const int2 seg = ws.lat_seg[static_cast<int64_t>(lane) * sz.seg_cap + t];
       for (int32_t base = 0; base < seg.y; base += blockDim.x) {
         const int32_t j = base + threadIdx.x;
         int32_t keep = 0;
@@ -232,7 +232,7 @@ __global__ void LatPersistKernel(Workspace ws, Sizes sz, DeviceGraph g) {
   if (phase == kPhaseDone || (lc.next_raw == 0 && lc.cand_count == 0)) return;
   const int64_t lane64 = lane;
   const int32_t total = min(lc.cand_count, sz.cand_cap);
-  const int32_t seg_idx = min(lc.t, sz.path_cap - 1);
+  const int32_t seg_idx = min(lc.t, sz.seg_cap - 1);
   const int2* cand = ws.cand + lane64 * sz.cand_cap;
   const float* cand_end = ws.cand_end + lane64 * sz.cand_cap;
   const uint32_t* hkey = ws.hash_key + lane64 * sz.hash_cap;
@@ -251,7 +251,7 @@ __global__ void LatPersistKernel(Workspace ws, Sizes sz, DeviceGraph g) {
       atomicOr(&lc.overflow, kOverflowArena);
       count = max(0, lat_lim - sh_base);
     }
-    ws.lat_seg[lane64 * sz.path_cap + seg_idx] = make_int2(sh_base, count);
+    ws.lat_seg[lane64 * sz.seg_cap + seg_idx] = make_int2(sh_base, count);
   }
   __syncthreads();
   const int32_t emit_boundary = lc.cand_emit;

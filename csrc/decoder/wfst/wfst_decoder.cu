@@ -42,15 +42,61 @@ struct GraphHandle {
 struct DecoderHandle {
   std::shared_ptr<GraphImage> graph;
   std::unique_ptr<GpuDecoder> dec;
+  bool fp16 = false;  // the log-prob dtype the decoder reads
+  int device = 0;
 };
+
+constexpr DLDataType kFloat64 = {kDLFloat, 64, 1};
+
+inline GraphHandle* graph_of(int64_t handle) {
+  auto* gh = reinterpret_cast<GraphHandle*>(handle);
+  TVM_FFI_ICHECK(gh != nullptr) << "null graph handle";
+  return gh;
+}
+
+inline DecoderHandle* decoder_of(int64_t handle) {
+  auto* dh = reinterpret_cast<DecoderHandle*>(handle);
+  TVM_FFI_ICHECK(dh != nullptr) << "null decoder handle";
+  return dh;
+}
 
 inline void check_cpu(TensorView t, const char* what) {
   TVM_FFI_ICHECK(t.device().device_type == kDLCPU) << what << " must be a CPU tensor";
 }
 
-// Read a CPU int32 1-D tensor into a host vector of length n.
-inline std::vector<int32_t> read_i32(TensorView t, int64_t n) {
-  check_cpu(t, "int32 input");
+// The launchers read and write host buffers by raw pointer, so each must be a dense CPU
+// tensor of the expected dtype and rank, with at least `rows` rows: a short or strided
+// one was read or written out of bounds.
+inline void check_host(TensorView t, DLDataType dtype, int ndim, int64_t rows,
+                       const char* what) {
+  check_cpu(t, what);
+  TVM_FFI_ICHECK(t.dtype() == dtype) << what << " has the wrong dtype";
+  TVM_FFI_ICHECK(t.ndim() == ndim) << what << " must be " << ndim << "-D";
+  TVM_FFI_ICHECK(t.IsContiguous()) << what << " must be contiguous";
+  TVM_FFI_ICHECK(t.size(0) >= rows) << what << " has fewer than " << rows << " rows";
+}
+
+// The device log-probs: packed [rows, T, V] on the decoder's device, in its dtype, wide
+// enough for every label the graph reads.
+inline void check_log_probs(const DecoderHandle& dh, TensorView lp) {
+  CHECK_INPUT(lp);
+  TVM_FFI_ICHECK(lp.ndim() == 3) << "log_probs must be [B, T, V]";
+  TVM_FFI_ICHECK(lp.device().device_id == dh.device)
+      << "log_probs are on cuda:" << lp.device().device_id << ", the decoder on cuda:"
+      << dh.device;
+  TVM_FFI_ICHECK(lp.dtype() == (dh.fp16 ? oasr::dl_float16 : oasr::dl_float32))
+      << "log_probs must be " << (dh.fp16 ? "float16" : "float32") << " for this decoder";
+  // The decode kernels read the tensor in place (device-resident descriptor).
+  TVM_FFI_ICHECK(lp.IsContiguous()) << "log_probs must be a packed [B, T, V] tensor";
+  TVM_FFI_ICHECK(lp.size(2) >= dh.graph->vocab_size)
+      << "log_probs have " << lp.size(2) << " columns; the graph's labels need "
+      << dh.graph->vocab_size;
+}
+
+// Read a CPU int32 1-D tensor of exactly n entries into a host vector.
+inline std::vector<int32_t> read_i32(TensorView t, int64_t n, const char* what) {
+  check_host(t, oasr::dl_int32, 1, n, what);
+  TVM_FFI_ICHECK(t.size(0) == n) << what << " must have " << n << " entries";
   const int32_t* p = static_cast<const int32_t*>(t.data_ptr());
   return std::vector<int32_t>(p, p + n);
 }
@@ -82,9 +128,8 @@ void wfst_free_graph(int64_t graph_handle) {
 
 // out_info: CPU int64 [5] = {num_states, num_arcs, vocab_size, start_state, finals_at_end}
 void wfst_graph_info(int64_t graph_handle, TensorView out_info) {
-  auto* gh = reinterpret_cast<GraphHandle*>(graph_handle);
-  TVM_FFI_ICHECK(gh != nullptr) << "null graph handle";
-  check_cpu(out_info, "out_info");
+  GraphHandle* gh = graph_of(graph_handle);
+  check_host(out_info, {kDLInt, 64, 1}, 1, 5, "out_info");
   int64_t* p = static_cast<int64_t*>(out_info.data_ptr());
   p[0] = gh->graph->num_states;
   p[1] = gh->graph->num_arcs;
@@ -105,8 +150,7 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
                             int64_t lat_prune_interval, int64_t eps_iterations,
                             int64_t arena_budget_entries, int64_t stream_log_entries,
                             int64_t gc_interval) {
-  auto* gh = reinterpret_cast<GraphHandle*>(graph_handle);
-  TVM_FFI_ICHECK(gh != nullptr) << "null graph handle";
+  GraphHandle* gh = graph_of(graph_handle);
 
   GpuDecoder::Options opts;
   opts.cfg.search_beam = static_cast<float>(search_beam);
@@ -130,7 +174,8 @@ int64_t wfst_create_decoder(int64_t graph_handle, double search_beam, double out
   opts.debug_snapshots = false;
   opts.use_cuda_graphs = use_cuda_graphs != 0;
 
-  auto* dh = new DecoderHandle{gh->graph, std::make_unique<GpuDecoder>(*gh->graph, opts)};
+  auto* dh = new DecoderHandle{gh->graph, std::make_unique<GpuDecoder>(*gh->graph, opts),
+                               opts.cfg.fp16_logprobs, opts.device};
   return reinterpret_cast<int64_t>(dh);
 }
 
@@ -139,9 +184,8 @@ void wfst_free_decoder(int64_t handle) { delete reinterpret_cast<DecoderHandle*>
 // out_stats: CPU int64 [4] = {reserved_bytes, committed_bytes, fixed_bytes,
 // arena_high_water_entries} for the decoder's device memory.
 void wfst_decoder_mem_stats(int64_t handle, TensorView out_stats) {
-  auto* dh = reinterpret_cast<DecoderHandle*>(handle);
-  TVM_FFI_ICHECK(dh != nullptr) << "null decoder handle";
-  check_cpu(out_stats, "out_stats");
+  DecoderHandle* dh = decoder_of(handle);
+  check_host(out_stats, {kDLInt, 64, 1}, 1, 4, "out_stats");
   const GpuDecoder::MemStats s = dh->dec->GetMemStats();
   int64_t* p = static_cast<int64_t*>(out_stats.data_ptr());
   p[0] = s.reserved_bytes;
@@ -160,19 +204,18 @@ void wfst_decoder_mem_stats(int64_t handle, TensorView out_stats) {
 void wfst_decode_batch(int64_t handle, TensorView log_probs, TensorView lengths,
                        TensorView out_words, TensorView out_word_lens, TensorView out_scores,
                        TensorView out_meta) {
-  auto* dh = reinterpret_cast<DecoderHandle*>(handle);
-  TVM_FFI_ICHECK(dh != nullptr) << "null decoder handle";
-  CHECK_INPUT(log_probs);
-  TVM_FFI_ICHECK(log_probs.ndim() == 3) << "log_probs must be [B, T, V]";
+  DecoderHandle* dh = decoder_of(handle);
+  check_log_probs(*dh, log_probs);
   const int64_t batch = log_probs.size(0);
   const int64_t max_frames = log_probs.size(1);
   const int64_t vocab = log_probs.size(2);
-  // The decode kernels read the tensor in place (device-resident descriptor).
-  TVM_FFI_ICHECK(log_probs.stride(2) == 1 && log_probs.stride(1) == vocab &&
-                 log_probs.stride(0) == max_frames * vocab)
-      << "log_probs must be a packed [B, T, V] tensor";
-  std::vector<int32_t> frames = read_i32(lengths, batch);
-  const int64_t cap = out_words.size(out_words.ndim() - 1);
+  std::vector<int32_t> frames = read_i32(lengths, batch, "lengths");
+  check_host(out_words, oasr::dl_int32, 2, batch, "out_words");
+  check_host(out_word_lens, oasr::dl_int32, 1, batch, "out_word_lens");
+  check_host(out_scores, kFloat64, 1, batch, "out_scores");
+  check_host(out_meta, oasr::dl_int32, 2, batch, "out_meta");
+  TVM_FFI_ICHECK(out_meta.size(1) == 3) << "out_meta must be [B, 3]";
+  const int64_t cap = out_words.size(1);
 
   std::vector<DecodeResult> res =
       dh->dec->DecodeBatch(log_probs.data_ptr(), batch, max_frames, vocab, frames);
@@ -195,12 +238,10 @@ void wfst_decode_batch(int64_t handle, TensorView log_probs, TensorView lengths,
 // Streaming
 // ---------------------------------------------------------------------------
 
-int64_t wfst_create_stream(int64_t handle) {
-  return reinterpret_cast<DecoderHandle*>(handle)->dec->CreateStream();
-}
+int64_t wfst_create_stream(int64_t handle) { return decoder_of(handle)->dec->CreateStream(); }
 
 void wfst_release_stream(int64_t handle, int64_t channel) {
-  reinterpret_cast<DecoderHandle*>(handle)->dec->ReleaseStream(static_cast<int32_t>(channel));
+  decoder_of(handle)->dec->ReleaseStream(static_cast<int32_t>(channel));
 }
 
 // channels: CPU int32 [C]; log_probs: CUDA [C, Tc, V]; lengths: CPU int32 [C].
@@ -210,16 +251,18 @@ void wfst_advance_chunk(int64_t handle, TensorView channels, TensorView log_prob
                         TensorView lengths, int64_t want_partial, TensorView out_words,
                         TensorView out_word_lens, TensorView out_channels,
                         TensorView out_overflow) {
-  auto* dh = reinterpret_cast<DecoderHandle*>(handle);
-  TVM_FFI_ICHECK(dh != nullptr) << "null decoder handle";
-  CHECK_INPUT(log_probs);
-  TVM_FFI_ICHECK(log_probs.ndim() == 3) << "log_probs must be [C, Tc, V]";
-  const int64_t num = channels.size(0);
-  std::vector<int32_t> chans = read_i32(channels, num);
-  std::vector<int32_t> lens = read_i32(lengths, num);
+  DecoderHandle* dh = decoder_of(handle);
+  check_log_probs(*dh, log_probs);
+  const int64_t num = log_probs.size(0);
+  std::vector<int32_t> chans = read_i32(channels, num, "channels");
+  std::vector<int32_t> lens = read_i32(lengths, num, "lengths");
+  check_host(out_words, oasr::dl_int32, 2, num, "out_words");
+  check_host(out_word_lens, oasr::dl_int32, 1, num, "out_word_lens");
+  check_host(out_channels, oasr::dl_int32, 1, num, "out_channels");
+  check_host(out_overflow, oasr::dl_int32, 1, num, "out_overflow");
   const int64_t chunk_frames = log_probs.size(1);
   const int64_t vocab = log_probs.size(2);
-  const int64_t cap = out_words.size(out_words.ndim() - 1);
+  const int64_t cap = out_words.size(1);
 
   std::vector<GpuDecoder::StreamPartial> parts = dh->dec->AdvanceChunk(
       chans, log_probs.data_ptr(), chunk_frames, vocab, lens, want_partial != 0);
@@ -239,10 +282,13 @@ void wfst_advance_chunk(int64_t handle, TensorView channels, TensorView log_prob
 // out_meta: CPU int32 [3].
 void wfst_finalize_stream(int64_t handle, int64_t channel, TensorView out_words,
                           TensorView out_word_len, TensorView out_score, TensorView out_meta) {
-  auto* dh = reinterpret_cast<DecoderHandle*>(handle);
-  TVM_FFI_ICHECK(dh != nullptr) << "null decoder handle";
+  DecoderHandle* dh = decoder_of(handle);
+  check_host(out_words, oasr::dl_int32, 1, 0, "out_words");
+  check_host(out_word_len, oasr::dl_int32, 1, 1, "out_word_len");
+  check_host(out_score, kFloat64, 1, 1, "out_score");
+  check_host(out_meta, oasr::dl_int32, 1, 3, "out_meta");
   DecodeResult r = dh->dec->FinalizeStream(static_cast<int32_t>(channel));
-  const int64_t cap = out_words.size(out_words.ndim() - 1);
+  const int64_t cap = out_words.size(0);
   write_words(static_cast<int32_t*>(out_words.data_ptr()), cap,
               static_cast<int32_t*>(out_word_len.data_ptr()), r.words);
   static_cast<double*>(out_score.data_ptr())[0] = r.score;

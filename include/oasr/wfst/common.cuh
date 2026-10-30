@@ -26,6 +26,8 @@ constexpr uint32_t kOverflowHash = 2u;      // probe bound exceeded
 constexpr uint32_t kOverflowArena = 4u;     // shared winners arena full
 constexpr uint32_t kOverflowClaims = 8u;    // raw distinct-state claims list full
 constexpr uint32_t kOverflowKept = 16u;     // surviving frontier > main_q
+constexpr uint32_t kOverflowPath = 32u;     // best path longer than path_cap: its oldest
+                                            // arcs (the start of the transcript) dropped
 
 // Lane phase for the current step.
 enum Phase : int32_t {
@@ -232,7 +234,9 @@ struct Sizes {
   int32_t hash_cap;   // power of two
   int32_t lp_half;    // log-probs stored as fp16
   int32_t arena_cap;  // shared winners-arena entries (global)
-  int32_t path_cap;   // max best-path arcs per lane (max_frames + 2)
+  int32_t path_cap;   // max best-path arcs per lane: (max_frames + 2) steps, each one
+                      // emitting arc plus one hop per epsilon-closure pass
+  int32_t seg_cap;    // lattice segments per lane, one per step (max_frames + 2)
   int32_t lat_cap;    // shared lattice-candidate arena entries (0 = 1-best mode)
   int32_t stream_log_cap;  // streaming: per-lane winners RING entries (0 = batch mode)
   int32_t fin_cap;    // GC: per-lane finalized-arc staging entries (0 = GC off)
