@@ -16,38 +16,62 @@ bool same_dtype(const TensorView& lhs, const TensorView& rhs) {
            lhs.dtype().lanes == rhs.dtype().lanes;
 }
 
-void check_add_norm_inputs(TensorView output, TensorView input, TensorView residual,
-                           TensorView weight, Optional bias_opt) {
+// The rows of a row-wise norm.  The kernels walk `base + row * hidden_size` in
+// memory order, so the rows must tile memory, and the output must have the
+// input's layout for input row j and output row j to be the same logical row.
+// Returns the hidden size.
+int64_t check_norm_rows(TensorView output, TensorView input) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
-    CHECK_INPUT(residual);
-    CHECK_INPUT(weight);
     CHECK_DEVICE(input, output);
-    CHECK_DEVICE(input, residual);
-    CHECK_DEVICE(input, weight);
     TVM_FFI_ICHECK(input.ndim() >= 1) << "Norm input must have at least one dimension";
     CHECK_ROW_DENSE_INPUT(input);
     CHECK_SAME_LAYOUT(input, output);
-    CHECK_SAME_LAYOUT(input, residual);
-    TVM_FFI_ICHECK(same_dtype(input, output) && same_dtype(input, residual) &&
-                   same_dtype(input, weight))
-        << "Input, residual, weight, and output must have the same dtype";
-
-    int64_t hidden_size = input.size(input.ndim() - 1);
+    TVM_FFI_ICHECK(same_dtype(input, output)) << "Norm input and output must have the same dtype";
+    const int64_t hidden_size = input.size(input.ndim() - 1);
     TVM_FFI_ICHECK(hidden_size > 0) << "Norm hidden dimension must be positive";
-    TVM_FFI_ICHECK(weight.ndim() == 1 && weight.size(0) == hidden_size)
-        << "Norm weight must be 1-D with length equal to the input's last dimension";
-    CHECK_CONTIGUOUS_INPUT(weight);
+    return hidden_size;
+}
 
+// A per-channel operand (a weight, a bias, a running statistic, a CMVN vector):
+// the kernels read `channels` elements from its base, in the input's dtype.
+void check_channel_operand(const TensorView& input, const TensorView& operand, int64_t channels,
+                           const char* what) {
+    CHECK_INPUT(operand);
+    CHECK_DEVICE(input, operand);
+    CHECK_CONTIGUOUS_INPUT(operand);
+    TVM_FFI_ICHECK(same_dtype(input, operand)) << "Norm " << what << " must have the input dtype";
+    TVM_FFI_ICHECK(operand.ndim() == 1 && operand.size(0) == channels)
+        << "Norm " << what << " must be 1-D with length equal to the input's last dimension ("
+        << channels << ")";
+}
+
+void check_norm_affine(const TensorView& input, const TensorView& weight, const Optional& bias_opt,
+                       int64_t hidden_size) {
+    check_channel_operand(input, weight, hidden_size, "weight");
     if (bias_opt.has_value()) {
-        TensorView bias = bias_opt.value();
-        CHECK_INPUT(bias);
-        CHECK_DEVICE(input, bias);
-        CHECK_CONTIGUOUS_INPUT(bias);
-        TVM_FFI_ICHECK(same_dtype(input, bias)) << "Norm bias must have the input dtype";
-        TVM_FFI_ICHECK(bias.ndim() == 1 && bias.size(0) == hidden_size)
-            << "Norm bias must be 1-D with length equal to the input's last dimension";
+        check_channel_operand(input, bias_opt.value(), hidden_size, "bias");
     }
+}
+
+// An add-norm's `residual` is read row by row alongside the input, so it needs
+// the input's layout as well as its dtype.
+void check_add_norm_inputs(TensorView output, TensorView input, TensorView residual,
+                           TensorView weight, Optional bias_opt) {
+    const int64_t hidden_size = check_norm_rows(output, input);
+    CHECK_INPUT(residual);
+    CHECK_DEVICE(input, residual);
+    CHECK_SAME_LAYOUT(input, residual);
+    TVM_FFI_ICHECK(same_dtype(input, residual)) << "Norm residual must have the input dtype";
+    check_norm_affine(input, weight, bias_opt, hidden_size);
+}
+
+// A norm's `residual_out` is written where `residual` was read.
+void check_residual_out(TensorView input, TensorView residual_out) {
+    CHECK_INPUT(residual_out);
+    CHECK_DEVICE(input, residual_out);
+    CHECK_SAME_LAYOUT(input, residual_out);
+    TVM_FFI_ICHECK(same_dtype(input, residual_out)) << "Residual output must have the input dtype";
 }
 
 // The quant-out norms write an 8-bit tensor (int8, or float8_e4m3fn) and a
@@ -109,11 +133,7 @@ int64_t check_norm_quant_args(const char* name, TensorView out_q, TensorView sca
 
 void layernorm(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
                double eps) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(weight);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
+    check_norm_affine(input, weight, bias_opt, check_norm_rows(output, input));
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -144,11 +164,11 @@ void layernorm(TensorView output, TensorView input, TensorView weight, Optional 
 // =============================================================================
 
 void bias_norm(TensorView output, TensorView input, TensorView bias, TensorView log_scale) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(bias);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
+    check_channel_operand(input, bias, check_norm_rows(output, input), "bias");
+    CHECK_INPUT(log_scale);
+    CHECK_DEVICE(input, log_scale);
+    TVM_FFI_ICHECK(log_scale.numel() == 1 && same_dtype(input, log_scale))
+        << "BiasNorm log_scale must be one element of the input dtype";
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -176,11 +196,7 @@ void bias_norm(TensorView output, TensorView input, TensorView bias, TensorView 
 
 void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
              double eps) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(weight);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
+    check_norm_affine(input, weight, bias_opt, check_norm_rows(output, input));
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -212,9 +228,12 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, Optional bi
 
 void batchnorm1d(TensorView output, TensorView input, TensorView weight, TensorView bias,
                  TensorView running_mean, TensorView running_var, double eps) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
     CHECK_DIM(3, input);
+    const int64_t num_channels = check_norm_rows(output, input);
+    check_channel_operand(input, weight, num_channels, "weight");
+    check_channel_operand(input, bias, num_channels, "bias");
+    check_channel_operand(input, running_mean, num_channels, "running_mean");
+    check_channel_operand(input, running_var, num_channels, "running_var");
 
     unsigned int batch_size = input.size(0);
     unsigned int seq_len = input.size(1);
@@ -243,9 +262,14 @@ void batchnorm1d(TensorView output, TensorView input, TensorView weight, TensorV
 
 void groupnorm(TensorView output, TensorView input, TensorView weight, TensorView bias,
                int64_t num_groups, double eps) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
     CHECK_DIM(3, input);
+    const int64_t num_channels = check_norm_rows(output, input);
+    check_channel_operand(input, weight, num_channels, "weight");
+    check_channel_operand(input, bias, num_channels, "bias");
+    // One block normalizes a row, with each group reduced by its own threads.
+    TVM_FFI_ICHECK(num_groups >= 1 && num_groups <= 1024 && num_channels % num_groups == 0)
+        << "GroupNorm needs 1 <= num_groups <= 1024 dividing the " << num_channels
+        << " channels, got " << num_groups;
 
     unsigned int batch_size = input.size(0);
     unsigned int seq_len = input.size(1);
@@ -272,12 +296,7 @@ void groupnorm(TensorView output, TensorView input, TensorView weight, TensorVie
 
 void addlayernorm(TensorView output, TensorView input, TensorView residual, TensorView weight,
                   Optional bias_opt, double eps, double alpha) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(residual);
-    CHECK_INPUT(weight);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
+    check_add_norm_inputs(output, input, residual, weight, bias_opt);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -311,17 +330,8 @@ void addlayernorm(TensorView output, TensorView input, TensorView residual, Tens
 void addlayernorm_residual(TensorView output, TensorView residual_out, TensorView input,
                            TensorView residual, TensorView weight, Optional bias_opt, double eps,
                            double alpha) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(residual);
-    CHECK_INPUT(residual_out);
-    CHECK_INPUT(weight);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
-    // This kernel reads `residual` and writes `residual_out` row-wise too, so
-    // both share the input's layout.
-    CHECK_SAME_LAYOUT(input, residual);
-    CHECK_SAME_LAYOUT(input, residual_out);
+    check_add_norm_inputs(output, input, residual, weight, bias_opt);
+    check_residual_out(input, residual_out);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -441,10 +451,7 @@ void addrmsnorm_residual(TensorView output, TensorView residual_out, TensorView 
                          TensorView residual, TensorView weight, Optional bias_opt, double eps,
                          double alpha) {
     check_add_norm_inputs(output, input, residual, weight, bias_opt);
-    CHECK_INPUT(residual_out);
-    CHECK_DEVICE(input, residual_out);
-    CHECK_SAME_LAYOUT(input, residual_out);
-    TVM_FFI_ICHECK(same_dtype(input, residual_out)) << "Residual output must have the input dtype";
+    check_residual_out(input, residual_out);
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -475,10 +482,9 @@ void addrmsnorm_residual(TensorView output, TensorView residual_out, TensorView 
 // =============================================================================
 
 void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(mean);
-    CHECK_INPUT(istd);
+    const int64_t num_features = check_norm_rows(output, input);
+    check_channel_operand(input, mean, num_features, "mean");
+    check_channel_operand(input, istd, num_features, "istd");
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -506,11 +512,7 @@ void cmvn(TensorView output, TensorView input, TensorView mean, TensorView istd)
 
 void layernorm_activation(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
                           double eps, int64_t activation_type) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(weight);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
+    check_norm_affine(input, weight, bias_opt, check_norm_rows(output, input));
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -539,11 +541,7 @@ void layernorm_activation(TensorView output, TensorView input, TensorView weight
 
 void rmsnorm_activation(TensorView output, TensorView input, TensorView weight, Optional bias_opt,
                         double eps, int64_t activation_type) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_INPUT(weight);
-    CHECK_ROW_DENSE_INPUT(input);
-    CHECK_SAME_LAYOUT(input, output);
+    check_norm_affine(input, weight, bias_opt, check_norm_rows(output, input));
 
     unsigned int num_rows = 1;
     for (int i = 0; i < input.ndim() - 1; ++i) {
@@ -573,9 +571,12 @@ void rmsnorm_activation(TensorView output, TensorView input, TensorView weight, 
 void batchnorm_activation(TensorView output, TensorView input, TensorView weight, TensorView bias,
                           TensorView running_mean, TensorView running_var, double eps,
                           int64_t activation_type) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
     CHECK_DIM(3, input);
+    const int64_t num_channels = check_norm_rows(output, input);
+    check_channel_operand(input, weight, num_channels, "weight");
+    check_channel_operand(input, bias, num_channels, "bias");
+    check_channel_operand(input, running_mean, num_channels, "running_mean");
+    check_channel_operand(input, running_var, num_channels, "running_var");
 
     unsigned int batch_size = input.size(0);
     unsigned int seq_len = input.size(1);
@@ -601,9 +602,12 @@ void batchnorm_activation(TensorView output, TensorView input, TensorView weight
 
 void batchnorm_swish(TensorView output, TensorView input, TensorView weight, TensorView bias,
                      TensorView running_mean, TensorView running_var, double eps) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
     CHECK_DIM(3, input);
+    const int64_t num_channels = check_norm_rows(output, input);
+    check_channel_operand(input, weight, num_channels, "weight");
+    check_channel_operand(input, bias, num_channels, "bias");
+    check_channel_operand(input, running_mean, num_channels, "running_mean");
+    check_channel_operand(input, running_var, num_channels, "running_var");
 
     unsigned int batch_size = input.size(0);
     unsigned int seq_len = input.size(1);

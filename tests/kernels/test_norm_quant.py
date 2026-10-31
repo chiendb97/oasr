@@ -97,6 +97,15 @@ def _unfused_add(x, r, w, b, eps=1e-5, alpha=1.0, qeps=QUANT_EPS):
     return q, scale, s
 
 
+def _shifted(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s values at an address two bytes past a vector boundary."""
+    buf = torch.empty(t.numel() + 1, device=t.device, dtype=t.dtype)
+    out = buf[1:].view(t.shape)
+    out.copy_(t)
+    assert out.data_ptr() % 16 != 0
+    return out
+
+
 def _assert_equal(got, want, what: str) -> None:
     for name, a, b in zip(("q", "scale", "residual_out"), got, want):
         assert a.dtype == b.dtype and a.shape == b.shape, f"{what}: {name} {a.shape} vs {b.shape}"
@@ -179,6 +188,23 @@ class TestBitExactVsUnfused:
             _unfused_add(x, r0, w, b),
             "unaligned add_layer_norm_residual_quant",
         )
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_unaligned_parameters_take_the_scalar_path(self, dtype):
+        """An unaligned weight or bias sends LayerNorm to its scalar kernel (it
+        used to fault in the vector one), so the fused launchers must follow."""
+        rows, hidden = 64, 512
+        x, r, w0, b0 = _inputs(rows, hidden, dtype, seed=10)
+        for name, (w, b) in {
+            "weight": (_shifted(w0), b0),
+            "bias": (w0, _shifted(b0)),
+        }.items():
+            _assert_equal(layer_norm_quant(x, w, b), _unfused(x, w, b), f"unaligned {name}")
+            _assert_equal(
+                add_layer_norm_residual_quant(x, r, w, b),
+                _unfused_add(x, r, w, b),
+                f"unaligned {name}, add",
+            )
 
     def test_unaligned_int8_destination(self):
         """The int8 store is 8 bytes wide only when ``out`` allows it."""

@@ -32,12 +32,13 @@ def topk(
     in ASR (up to ~8192 elements per row).
 
     Args:
-        input: CUDA tensor of shape ``[..., num_cols]``.
+        input: CUDA tensor of shape ``[..., num_cols]``. A non-contiguous one
+            is materialized once.
         k: Number of top elements. Must satisfy ``1 <= k <= num_cols``.
         out_values: Optional pre-allocated output for values, shape ``[..., k]``,
-            same dtype as *input*.
+            same dtype as *input*, contiguous.
         out_indices: Optional pre-allocated output for indices, shape ``[..., k]``,
-            dtype ``torch.int32``.
+            dtype ``torch.int32``, contiguous.
 
     Returns:
         A ``(values, indices)`` tuple, both of shape ``[..., k]``.
@@ -47,9 +48,12 @@ def topk(
     Note:
         Only the last dimension is supported (``dim=-1``).
         Only largest=True is supported.
-        ``num_cols`` is limited to approximately 8192 for float32 inputs
-        (larger for float16/bfloat16) due to shared-memory constraints.
+        ``num_cols`` is limited to 16384 (the row is held in registers).
+        Ordering matches ``torch.topk``: ``-inf`` entries are selected like any
+        other value once the larger ones run out, and NaN ranks above ``+inf``.
+        Tied values come back in an unspecified order, as from ``torch.topk``.
     """
+    input = input.contiguous()
     out_shape = input.shape[:-1] + (k,)
     if out_values is None:
         out_values = torch.empty(out_shape, device=input.device, dtype=input.dtype)

@@ -16,47 +16,38 @@ using namespace oasr;
 void glu(TensorView output, TensorView input) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-
-    unsigned int batch_size = input.size(0);
-    unsigned int seq_len = input.size(1);
-    unsigned int channels = input.size(2) / 2;
+    CHECK_DEVICE(input, output);
+    // Rows are read at `input + row * 2C` and written at `output + row * C`.
+    // Checking only the last stride let a slice of a wider buffer through, and
+    // its rows were read at the wrong offsets.
+    CHECK_CONTIGUOUS_INPUT(input);
+    CHECK_CONTIGUOUS_INPUT(output);
+    TVM_FFI_ICHECK(input.ndim() >= 1) << "GLU input must have at least one dimension";
+    const int64_t gated = input.size(input.ndim() - 1);
+    TVM_FFI_ICHECK(gated % 2 == 0)
+        << "GLU halves the last dimension, which must be even; got " << gated;
+    const int64_t channels = gated / 2;
+    TVM_FFI_ICHECK(output.ndim() == input.ndim() && [&] {
+        for (int i = 0; i < input.ndim() - 1; ++i) {
+            if (output.size(i) != input.size(i))
+                return false;
+        }
+        return output.size(output.ndim() - 1) == channels;
+    }()) << "GLU output must be the input's shape with the last dimension halved";
+    TVM_FFI_ICHECK(input.dtype().code == output.dtype().code &&
+                   input.dtype().bits == output.dtype().bits &&
+                   input.dtype().lanes == output.dtype().lanes)
+        << "GLU input and output must have the same dtype";
+    const int64_t rows = gated == 0 ? 0 : input.numel() / gated;
 
     cudaStream_t stream = get_stream(input.device());
 
     DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
         cudaError_t status = activation::GLU<c_type>(static_cast<const c_type*>(input.data_ptr()),
-                                                     static_cast<c_type*>(output.data_ptr()),
-                                                     batch_size, seq_len, channels, stream);
+                                                     static_cast<c_type*>(output.data_ptr()), rows,
+                                                     channels, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "GLU kernel failed: " << cudaGetErrorString(status);
-        return true;
-    });
-}
-
-// =============================================================================
-// Swish launcher
-// =============================================================================
-
-void swish(TensorView output, TensorView input) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-
-    unsigned int batch_size = input.size(0);
-    unsigned int seq_len = input.size(1);
-    unsigned int channels = input.size(2);
-
-    cudaStream_t stream = get_stream(input.device());
-
-    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = activation::Swish<c_type>(static_cast<const c_type*>(input.data_ptr()),
-                                                       static_cast<c_type*>(output.data_ptr()),
-                                                       batch_size, seq_len, channels, stream);
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "Swish kernel failed: " << cudaGetErrorString(status);
         return true;
     });
 }
@@ -141,52 +132,14 @@ void relu(TensorView output, TensorView input) {
     elementwise_activation(output, input, ReluActivation{}, "Relu");
 }
 
-// =============================================================================
-// Swoosh-L launcher (elementwise; input/output must be contiguous)
-// =============================================================================
-
-void swoosh_l(TensorView output, TensorView input) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-
-    int64_t n = 1;
-    for (int i = 0; i < input.ndim(); ++i) {
-        n *= input.size(i);
-    }
-
-    cudaStream_t stream = get_stream(input.device());
-
-    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = activation::SwooshL<c_type>(
-            static_cast<const c_type*>(input.data_ptr()), static_cast<c_type*>(output.data_ptr()),
-            static_cast<int>(n), stream);
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "SwooshL kernel failed: " << cudaGetErrorString(status);
-        return true;
-    });
+void swish(TensorView output, TensorView input) {
+    elementwise_activation(output, input, SwishActivation{}, "Swish");
 }
 
-// =============================================================================
-// Swoosh-R launcher (elementwise; input/output must be contiguous)
-// =============================================================================
+void swoosh_l(TensorView output, TensorView input) {
+    elementwise_activation(output, input, SwooshLActivation{}, "SwooshL");
+}
 
 void swoosh_r(TensorView output, TensorView input) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-
-    int64_t n = 1;
-    for (int i = 0; i < input.ndim(); ++i) {
-        n *= input.size(i);
-    }
-
-    cudaStream_t stream = get_stream(input.device());
-
-    DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
-        cudaError_t status = activation::SwooshR<c_type>(
-            static_cast<const c_type*>(input.data_ptr()), static_cast<c_type*>(output.data_ptr()),
-            static_cast<int>(n), stream);
-        TVM_FFI_ICHECK(status == cudaSuccess)
-            << "SwooshR kernel failed: " << cudaGetErrorString(status);
-        return true;
-    });
+    elementwise_activation(output, input, SwooshRActivation{}, "SwooshR");
 }

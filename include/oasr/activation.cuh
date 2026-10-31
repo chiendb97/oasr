@@ -23,25 +23,22 @@ namespace activation {
 // =============================================================================
 
 template <typename T, int VecSize>
-__global__ void gluKernel(const T* __restrict__ input,  // [batch, seq_len, 2 * channels]
-                          T* __restrict__ output,       // [batch, seq_len, channels]
-                          int batch_size, int seq_len, int channels) {
-    const int total_elements = batch_size * seq_len * channels;
-    const int total_vec_elements = total_elements / VecSize;
-    const int vec_channels = channels / VecSize;
+__global__ void gluKernel(const T* __restrict__ input,  // [rows, 2 * channels]
+                          T* __restrict__ output,       // [rows, channels]
+                          int64_t rows, int64_t channels) {
+    const int64_t vec_channels = channels / VecSize;
+    const int64_t total_vec_elements = rows * vec_channels;
 
-    for (int vid = blockIdx.x * blockDim.x + threadIdx.x; vid < total_vec_elements;
-         vid += gridDim.x * blockDim.x) {
-        const int vec_c = vid % vec_channels;
-        const int pos = vid / vec_channels;
+    for (int64_t vid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         vid < total_vec_elements; vid += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t pos = vid / vec_channels;
+        const int64_t c_offset = (vid - pos * vec_channels) * VecSize;
 
-        const int c_offset = vec_c * VecSize;
-
-        const int input_idx1 = pos * (2 * channels) + c_offset;
+        const int64_t input_idx1 = pos * (2 * channels) + c_offset;
         Vec<T, VecSize> val_vec;
         val_vec.load(input + input_idx1);
 
-        const int input_idx2 = pos * (2 * channels) + channels + c_offset;
+        const int64_t input_idx2 = input_idx1 + channels;
         Vec<T, VecSize> gate_vec;
         gate_vec.load(input + input_idx2);
 
@@ -54,34 +51,7 @@ __global__ void gluKernel(const T* __restrict__ input,  // [batch, seq_len, 2 * 
             out_vec[v] = static_cast<T>(x * sigmoid_gate);
         }
 
-        const int out_idx = pos * channels + c_offset;
-        out_vec.store(output + out_idx);
-    }
-}
-
-// =============================================================================
-// Swish Kernel (vectorized)
-// =============================================================================
-
-template <typename T, int VecSize>
-__global__ void swishKernel(const T* __restrict__ input, T* __restrict__ output, int batch_size,
-                            int seq_len, int channels) {
-    const int total_elements = batch_size * seq_len * channels;
-    const int total_vec_elements = total_elements / VecSize;
-
-    for (int vid = blockIdx.x * blockDim.x + threadIdx.x; vid < total_vec_elements;
-         vid += gridDim.x * blockDim.x) {
-        Vec<T, VecSize> v_in;
-        v_in.load(input + vid * VecSize);
-
-        Vec<T, VecSize> v_out;
-#pragma unroll
-        for (int v = 0; v < VecSize; v++) {
-            float x = static_cast<float>(v_in[v]);
-            v_out[v] = static_cast<T>(oasr::swish(x));
-        }
-
-        v_out.store(output + vid * VecSize);
+        out_vec.store(output + pos * channels + c_offset);
     }
 }
 
@@ -131,90 +101,34 @@ __global__ void elementwiseStridedRowsKernel(const T* __restrict__ input, T* __r
 }
 
 // =============================================================================
-// Swoosh-L / Swoosh-R Kernels (vectorized, elementwise over a flat buffer)
-// =============================================================================
-
-template <typename T, int VecSize>
-__global__ void swooshLKernel(const T* __restrict__ input, T* __restrict__ output, int n) {
-    const int total_vec_elements = n / VecSize;
-    for (int vid = blockIdx.x * blockDim.x + threadIdx.x; vid < total_vec_elements;
-         vid += gridDim.x * blockDim.x) {
-        Vec<T, VecSize> v_in;
-        v_in.load(input + vid * VecSize);
-
-        Vec<T, VecSize> v_out;
-#pragma unroll
-        for (int v = 0; v < VecSize; v++) {
-            v_out[v] = static_cast<T>(oasr::swoosh_l(static_cast<float>(v_in[v])));
-        }
-        v_out.store(output + vid * VecSize);
-    }
-}
-
-template <typename T, int VecSize>
-__global__ void swooshRKernel(const T* __restrict__ input, T* __restrict__ output, int n) {
-    const int total_vec_elements = n / VecSize;
-    for (int vid = blockIdx.x * blockDim.x + threadIdx.x; vid < total_vec_elements;
-         vid += gridDim.x * blockDim.x) {
-        Vec<T, VecSize> v_in;
-        v_in.load(input + vid * VecSize);
-
-        Vec<T, VecSize> v_out;
-#pragma unroll
-        for (int v = 0; v < VecSize; v++) {
-            v_out[v] = static_cast<T>(oasr::swoosh_r(static_cast<float>(v_in[v])));
-        }
-        v_out.store(output + vid * VecSize);
-    }
-}
-
-// =============================================================================
 // Typed Launchers — raw pointer interface, returns cudaError_t
 // =============================================================================
 
+// GLU over the last axis of a contiguous [rows, 2 * channels] input.  The
+// vector path also needs both pointers on a vector boundary: the halves sit
+// `channels` apart, so a whole number of vectors keeps the gate half aligned
+// with the value half.
 template <typename T>
-cudaError_t GLU(const T* input, T* output, int batch_size, int seq_len, int channels,
-                cudaStream_t stream) {
-    const int total_elements = batch_size * seq_len * channels;
-
-    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
-
-    if (channels % kVecSize == 0) {
-        const int total_vec_elements = total_elements / kVecSize;
-        const int block_size = 256;
-        int grid_size = (total_vec_elements + block_size - 1) / block_size;
-        grid_size = std::min(grid_size, 65535);
-        gluKernel<T, kVecSize>
-            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
-    } else {
-        const int block_size = 256;
-        const int grid_size = (total_elements + block_size - 1) / block_size;
-        gluKernel<T, 1>
-            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
+cudaError_t GLU(const T* input, T* output, int64_t rows, int64_t channels, cudaStream_t stream) {
+    const int64_t total_elements = rows * channels;
+    if (total_elements == 0) {
+        return cudaSuccess;
     }
 
-    return cudaGetLastError();
-}
-
-template <typename T>
-cudaError_t Swish(const T* input, T* output, int batch_size, int seq_len, int channels,
-                  cudaStream_t stream) {
-    const int total_elements = batch_size * seq_len * channels;
-
     constexpr int kVecSize = VecTypeTrait<T>::VecSize;
+    constexpr int kBlockSize = 256;
 
-    if (channels % kVecSize == 0) {
-        const int total_vec_elements = total_elements / kVecSize;
-        const int block_size = 256;
-        int grid_size = (total_vec_elements + block_size - 1) / block_size;
-        grid_size = std::min(grid_size, 65535);
-        swishKernel<T, kVecSize>
-            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
+    if (channels % kVecSize == 0 && oasr::isAligned<T, kVecSize>(input) &&
+        oasr::isAligned<T, kVecSize>(output)) {
+        int64_t grid_size = (total_elements / kVecSize + kBlockSize - 1) / kBlockSize;
+        grid_size = std::min<int64_t>(grid_size, 65535);
+        gluKernel<T, kVecSize>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, rows, channels);
     } else {
-        const int block_size = 256;
-        const int grid_size = (total_elements + block_size - 1) / block_size;
-        swishKernel<T, 1>
-            <<<grid_size, block_size, 0, stream>>>(input, output, batch_size, seq_len, channels);
+        int64_t grid_size = (total_elements + kBlockSize - 1) / kBlockSize;
+        grid_size = std::min<int64_t>(grid_size, 65535);
+        gluKernel<T, 1>
+            <<<static_cast<int>(grid_size), kBlockSize, 0, stream>>>(input, output, rows, channels);
     }
 
     return cudaGetLastError();
@@ -295,42 +209,23 @@ cudaError_t Relu(const T* input, T* output, int64_t n, cudaStream_t stream) {
     return Elementwise(input, output, n, ReluActivation{}, stream);
 }
 
+// Swish and the Zipformer Swooshes are plain elementwise maps.  They had
+// kernels of their own that counted elements in `int` and took the vector path
+// on `n % VecSize` alone, so an unaligned pointer (any `x[1:]`) faulted with
+// `misaligned address`; the shared kernel checks both and counts in 64 bits.
 template <typename T>
-cudaError_t SwooshL(const T* input, T* output, int n, cudaStream_t stream) {
-    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
-    const int block_size = 256;
-
-    if (n % kVecSize == 0) {
-        const int total_vec_elements = n / kVecSize;
-        int grid_size = (total_vec_elements + block_size - 1) / block_size;
-        grid_size = std::min(grid_size, 65535);
-        swooshLKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(input, output, n);
-    } else {
-        int grid_size = (n + block_size - 1) / block_size;
-        grid_size = std::min(grid_size, 65535);
-        swooshLKernel<T, 1><<<grid_size, block_size, 0, stream>>>(input, output, n);
-    }
-
-    return cudaGetLastError();
+cudaError_t Swish(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, SwishActivation{}, stream);
 }
 
 template <typename T>
-cudaError_t SwooshR(const T* input, T* output, int n, cudaStream_t stream) {
-    constexpr int kVecSize = VecTypeTrait<T>::VecSize;
-    const int block_size = 256;
+cudaError_t SwooshL(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, SwooshLActivation{}, stream);
+}
 
-    if (n % kVecSize == 0) {
-        const int total_vec_elements = n / kVecSize;
-        int grid_size = (total_vec_elements + block_size - 1) / block_size;
-        grid_size = std::min(grid_size, 65535);
-        swooshRKernel<T, kVecSize><<<grid_size, block_size, 0, stream>>>(input, output, n);
-    } else {
-        int grid_size = (n + block_size - 1) / block_size;
-        grid_size = std::min(grid_size, 65535);
-        swooshRKernel<T, 1><<<grid_size, block_size, 0, stream>>>(input, output, n);
-    }
-
-    return cudaGetLastError();
+template <typename T>
+cudaError_t SwooshR(const T* input, T* output, int64_t n, cudaStream_t stream) {
+    return Elementwise(input, output, n, SwooshRActivation{}, stream);
 }
 
 }  // namespace activation

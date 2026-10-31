@@ -509,8 +509,9 @@ def use_softmax_kernel(x: torch.Tensor) -> bool:
 
     Row-wise over the last dimension, so it has the norm kernels' scope
     (``DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16`` in ``csrc/softmax.cu`` covers
-    fp32/fp16/bf16) and the norm kernels' stride requirement — the launcher
-    asserts a contiguous last dimension.
+    fp32/fp16/bf16) and the norm kernels' layout requirement: rows that tile
+    memory (:func:`is_row_dense`).  A contiguous last dimension alone used to
+    pass a padded row stride, which the kernel read at the wrong offsets.
 
     Its own gate rather than a reuse of :func:`use_norm_kernel` so a softmax
     that falls back is counted as a softmax, not filed under a norm reason.
@@ -521,8 +522,8 @@ def use_softmax_kernel(x: torch.Tensor) -> bool:
         return out_of_scope("CPU tensor")
     if x.dtype not in NORM_DTYPES:
         return out_of_scope(f"dtype {x.dtype}")
-    if x.stride(-1) != 1:
-        return take_policy("softmax-last-dim-not-contiguous")
+    if not is_row_dense(x):
+        return take_policy("softmax-rows-not-dense")
     return True
 
 

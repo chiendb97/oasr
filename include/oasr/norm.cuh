@@ -366,28 +366,25 @@ __global__ void batchNorm1DKernel(const T* __restrict__ input, T* __restrict__ o
 // GroupNorm Kernel
 // =============================================================================
 
+// One block per row.  Group g is reduced by threads
+// [g * threads_per_group, (g + 1) * threads_per_group), a power of two (the
+// shuffle reduction pairs lanes by xor); threads past the last group, which
+// fill out the last warp, carry zeros through the shuffles and write nothing.
 template <typename T, int VecSize>
 __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ output,
                                 const T* __restrict__ weight, const T* __restrict__ bias,
-                                int batch_size, int seq_len, int channels, int num_groups,
-                                float eps) {
+                                int channels, int num_groups, int threads_per_group, float eps) {
     using VecT = oasr::Vec<T, VecSize>;
 
     int channels_per_group = channels / num_groups;
     float inv_channels_per_group = 1.0f / static_cast<float>(channels_per_group);
 
-    int idx = blockIdx.x;
-    int seq_idx = idx % seq_len;
-    int batch_idx = idx / seq_len;
-
-    const T* row = input + (batch_idx * seq_len + seq_idx) * channels;
-    T* out_row = output + (batch_idx * seq_len + seq_idx) * channels;
-
-    // thread_per_group should be a power-of-2
-    int threads_per_group = blockDim.x / num_groups;
+    const T* row = input + static_cast<int64_t>(blockIdx.x) * channels;
+    T* out_row = output + static_cast<int64_t>(blockIdx.x) * channels;
 
     int my_group = threadIdx.x / threads_per_group;
     int local_tid = threadIdx.x % threads_per_group;
+    const bool in_a_group = my_group < num_groups;
 
     int lane = threadIdx.x & (oasr::WARP_SIZE - 1);
 
@@ -398,19 +395,21 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
 
     // ---- Phase 1: thread-local accumulation for assigned group (vectorized) ----
     float psum = 0.0f, psq = 0.0f;
-    const T* gptr = row + my_group * channels_per_group;
-    int vec_channels_per_group = channels_per_group / VecSize;
-    for (int vec_i = local_tid; vec_i < vec_channels_per_group; vec_i += threads_per_group) {
-        VecT v;
-        v.load(gptr + vec_i * VecSize);
-        psum += oasr::vecSum(v);
-        psq += oasr::vecSumSquares(v);
-    }
-    for (int i = vec_channels_per_group * VecSize + local_tid; i < channels_per_group;
-         i += threads_per_group) {
-        float v = static_cast<float>(gptr[i]);
-        psum += v;
-        psq += v * v;
+    if (in_a_group) {
+        const T* gptr = row + my_group * channels_per_group;
+        int vec_channels_per_group = channels_per_group / VecSize;
+        for (int vec_i = local_tid; vec_i < vec_channels_per_group; vec_i += threads_per_group) {
+            VecT v;
+            v.load(gptr + vec_i * VecSize);
+            psum += oasr::vecSum(v);
+            psq += oasr::vecSumSquares(v);
+        }
+        for (int i = vec_channels_per_group * VecSize + local_tid; i < channels_per_group;
+             i += threads_per_group) {
+            float v = static_cast<float>(gptr[i]);
+            psum += v;
+            psq += v * v;
+        }
     }
 
     // ---- Phase 2: Tree reduction ----
@@ -421,7 +420,7 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
     }
 
     if (threads_per_group <= oasr::WARP_SIZE) {
-        if (local_tid == 0) {
+        if (in_a_group && local_tid == 0) {
             float mean = psum * inv_channels_per_group;
             group_mean[my_group] = mean;
             group_inv_std[my_group] = rsqrtf(psq * inv_channels_per_group - mean * mean + eps);
@@ -431,14 +430,14 @@ __global__ void groupNormKernel(const T* __restrict__ input, T* __restrict__ out
         int warp_idx = local_tid / oasr::WARP_SIZE;
         float* wbuf = smem + 2 * num_groups;
 
-        if (lane == 0) {
+        if (in_a_group && lane == 0) {
             int bi = my_group * warps_per_group + warp_idx;
             wbuf[bi] = psum;
             wbuf[num_groups * warps_per_group + bi] = psq;
         }
         __syncthreads();
 
-        if (local_tid == 0) {
+        if (in_a_group && local_tid == 0) {
             float s = 0.0f, sq = 0.0f;
             int base = my_group * warps_per_group;
             int sq_base = num_groups * warps_per_group + base;
@@ -1110,6 +1109,16 @@ __global__ void biasNormKernel(const T* __restrict__ input, T* __restrict__ outp
 // Typed Launcher Functions (raw pointer interface, returning cudaError_t)
 // =============================================================================
 
+// Whether every operand the vector path touches sits on a vector boundary.  It
+// loads the per-channel parameters (weight, bias, running statistics)
+// `VecSize` elements at a time just as it does the rows, so a parameter that is
+// a slice of a larger buffer faults with `misaligned address` unless it is
+// checked too.  An absent (null) operand passes.
+template <typename T, int VecSize, typename... Ptrs>
+inline bool allAligned(Ptrs... ptrs) {
+    return (isAligned<T, VecSize>(ptrs) && ...);
+}
+
 // ---- LayerNorm ----
 
 template <typename T>
@@ -1119,8 +1128,8 @@ cudaError_t LayerNorm(const T* input, const T* weight, const T* bias, T* output,
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, output, weight, bias);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -1178,7 +1187,7 @@ cudaError_t LayerNormQuant(const T* input, const T* weight, const T* bias, void*
     // LayerNorm also requires its T output aligned, which the freshly allocated
     // output of the unfused pair always is.
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input);
+                   (hidden_size % VecSize == 0) && allAligned<T, VecSize>(input, weight, bias);
 
     const QuantOutParams quant{out_q, out_scale, qeps, fp8};
     const int hidden = static_cast<int>(hidden_size);
@@ -1225,8 +1234,8 @@ cudaError_t RMSNorm(const T* input, const T* weight, const T* bias, T* output,
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, output, weight, bias);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -1253,7 +1262,7 @@ cudaError_t BatchNorm1D(const T* input, const T* weight, const T* bias, const T*
     int block_size = 256;
 
     bool use_vec = (channels >= static_cast<unsigned int>(VecSize)) && (channels % VecSize == 0) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+                   allAligned<T, VecSize>(input, output, weight, bias, running_mean, running_var);
 
     if (use_vec) {
         int grid_size = (total_elements / VecSize + block_size - 1) / block_size;
@@ -1277,9 +1286,28 @@ cudaError_t GroupNorm(const T* input, const T* weight, const T* bias, T* output,
                       unsigned int num_groups, float eps, cudaStream_t stream) {
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
+    // 1 <= num_groups <= 1024 dividing channels (the launcher checks it).
     int channels_per_group = static_cast<int>(channels / num_groups);
-    int num_blocks = static_cast<int>(batch_size * seq_len);
-    int block_size = alignedBlockSize(static_cast<int>(channels));
+    const int64_t num_blocks = static_cast<int64_t>(batch_size) * seq_len;
+    if (num_blocks == 0) {
+        return cudaSuccess;  // a zero-block grid is a launch error, not a no-op
+    }
+    // Each group takes the largest power of two of the row's threads that fits,
+    // and the block is rounded up to whole warps for the full-mask shuffles.
+    // The threads per group used to be `block / num_groups`, which is neither
+    // for a count that does not divide the block: 5 groups of 16 channels got
+    // 19 threads each, so the shuffles summed across groups, and the 96th
+    // thread reduced a sixth group from the next row into group 0's statistics.
+    // Wherever that division was exact and a power of two, this picks the same
+    // geometry, so those results are unchanged.
+    const int row_threads = alignedBlockSize(static_cast<int>(channels));
+    int threads_per_group = 1;
+    while (threads_per_group * 2 * static_cast<int>(num_groups) <= row_threads) {
+        threads_per_group *= 2;
+    }
+    const int block_size =
+        (threads_per_group * static_cast<int>(num_groups) + oasr::WARP_SIZE - 1) /
+        oasr::WARP_SIZE * oasr::WARP_SIZE;
     int num_warps = block_size / oasr::WARP_SIZE;
     size_t smem_bytes = sizeof(float) * (2 * num_groups + 2 * static_cast<unsigned int>(num_warps));
 
@@ -1288,14 +1316,15 @@ cudaError_t GroupNorm(const T* input, const T* weight, const T* bias, T* output,
                    isAligned<T, VecSize>(output) && isAligned<T, VecSize>(weight) &&
                    isAligned<T, VecSize>(bias);
 
+    const auto grid = static_cast<unsigned int>(num_blocks);
     if (use_vec) {
-        groupNormKernel<T, VecSize><<<num_blocks, block_size, smem_bytes, stream>>>(
-            input, output, weight, bias, static_cast<int>(batch_size), static_cast<int>(seq_len),
-            static_cast<int>(channels), static_cast<int>(num_groups), eps);
+        groupNormKernel<T, VecSize><<<grid, block_size, smem_bytes, stream>>>(
+            input, output, weight, bias, static_cast<int>(channels), static_cast<int>(num_groups),
+            threads_per_group, eps);
     } else {
-        groupNormKernel<T, 1><<<num_blocks, block_size, smem_bytes, stream>>>(
-            input, output, weight, bias, static_cast<int>(batch_size), static_cast<int>(seq_len),
-            static_cast<int>(channels), static_cast<int>(num_groups), eps);
+        groupNormKernel<T, 1><<<grid, block_size, smem_bytes, stream>>>(
+            input, output, weight, bias, static_cast<int>(channels), static_cast<int>(num_groups),
+            threads_per_group, eps);
     }
     return cudaGetLastError();
 }
@@ -1309,8 +1338,8 @@ cudaError_t AddLayerNorm(const T* input, const T* residual, const T* weight, con
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, residual, output, weight, bias);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -1334,9 +1363,8 @@ cudaError_t AddLayerNormResidual(const T* input, const T* residual, const T* wei
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(output) &&
-                   isAligned<T, VecSize>(residual_out);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, residual, output, residual_out, weight, bias);
 
     if (use_vec) {
         int block_size = alignedBlockSize(static_cast<int>(hidden_size) / VecSize);
@@ -1370,8 +1398,8 @@ cudaError_t AddLayerNormResidualQuant(const T* input, const T* residual, const T
     // AddLayerNormResidual's vector choice, less its (always aligned, freshly
     // allocated) T output -- see LayerNormQuant.
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(residual) && isAligned<T, VecSize>(residual_out);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, residual, residual_out, weight, bias);
 
     const QuantOutParams quant{out_q, out_scale, qeps, fp8};
     const int hidden = static_cast<int>(hidden_size);
@@ -1455,8 +1483,8 @@ cudaError_t LayerNormActivation(const T* input, const T* weight, const T* bias, 
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, output, weight, bias);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {
@@ -1484,8 +1512,8 @@ cudaError_t RMSNormActivation(const T* input, const T* weight, const T* bias, T*
     constexpr int VecSize = oasr::VecTypeTrait<T>::VecSize;
 
     bool use_vec = (hidden_size >= static_cast<unsigned int>(VecSize)) &&
-                   (hidden_size % VecSize == 0) && isAligned<T, VecSize>(input) &&
-                   isAligned<T, VecSize>(output);
+                   (hidden_size % VecSize == 0) &&
+                   allAligned<T, VecSize>(input, output, weight, bias);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {
@@ -1544,7 +1572,7 @@ cudaError_t BatchNormActivation(const T* input, const T* weight, const T* bias,
     int block_size = 256;
 
     bool use_vec = (channels >= static_cast<unsigned int>(VecSize)) && (channels % VecSize == 0) &&
-                   isAligned<T, VecSize>(input) && isAligned<T, VecSize>(output);
+                   allAligned<T, VecSize>(input, output, weight, bias, running_mean, running_var);
 
     cudaError_t err = cudaSuccess;
     dispatchActivation(activation, [&](auto act) {

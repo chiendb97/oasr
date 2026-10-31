@@ -9,10 +9,11 @@ and the **layout** the wrapper is handed -- not the batch or sequence extents.
 So one parametrization walks the ops and each test covers both alignments in
 its body, rather than multiplying the node count by shapes that share a branch.
 
-Two groups, because they do not accept the same inputs. The generic ops take
-any rank and any layout; ``swoosh_l`` / ``swoosh_r`` want rank >= 2 and have no
-unaligned-pointer path, so they get their own tests instead of being folded
-into a grid that would assert a surface they never claimed.
+The generic ops take any rank and any layout. ``swoosh_l`` / ``swoosh_r`` run on
+the same launcher (they used to have kernels of their own, with a 32-bit
+element count and no unaligned-pointer path) but keep their own tests, since
+their references are not torch functions. ``glu`` halves the last dimension, so
+it does not share the signature either.
 
 ``oasr.gelu`` is the exact-erf one. The *fused* GELU epilogues elsewhere are
 the tanh approximation, and :class:`TestGeluIsExactErf` is what keeps the two
@@ -49,7 +50,7 @@ OPS = {
 }
 NAMES = list(OPS)
 #: The subset whose wrapper has the awkward-layout branches.
-LAYOUT_OPS = ["gelu", "sigmoid", "tanh", "relu"]
+LAYOUT_OPS = ["gelu", "sigmoid", "tanh", "relu", "swish"]
 SWOOSH = {"swoosh_l": (oasr.swoosh_l, _ref_swoosh_l), "swoosh_r": (oasr.swoosh_r, _ref_swoosh_r)}
 
 #: One shape whose last dim is vec4-aligned and one whose is not: the two
@@ -122,7 +123,7 @@ def test_saturation_is_stable_over_a_wide_range():
     torch.testing.assert_close(oasr.tanh(x), torch.tanh(x), rtol=1e-5, atol=2e-6)
 
 
-@pytest.mark.parametrize("name", ["sigmoid", "tanh", "relu"])
+@pytest.mark.parametrize("name", ["sigmoid", "tanh", "relu", "swish"])
 def test_empty_input_is_a_shape_preserving_noop(name):
     """Only the unary table claims a zero-element input; the others are not asked."""
     x = torch.empty(0, 8, device="cuda", dtype=torch.float16)
@@ -146,7 +147,7 @@ class TestGeluIsExactErf:
 
 
 class TestSwoosh:
-    """Zipformer's two softplus activations. Rank >= 2, no unaligned path."""
+    """Zipformer's two softplus activations, on the generic elementwise launcher."""
 
     @pytest.mark.parametrize("name", list(SWOOSH))
     @pytest.mark.parametrize(
@@ -185,6 +186,28 @@ class TestSwoosh:
         x = torch.randn(2, 128, 256, device="cuda", dtype=torch.float32)
         assert_dest_passing(oasr.swoosh_r, x, out=torch.empty_like(x), expected=_ref_swoosh_r(x))
 
+    @pytest.mark.parametrize("name", list(SWOOSH))
+    def test_an_unaligned_pointer_takes_the_scalar_path(self, name):
+        """The old kernels took the vector path on ``n % 8`` alone, so any
+        ``x[1:]`` of half-precision audio faulted with ``misaligned address``."""
+        fn, ref = SWOOSH[name]
+        x = torch.randn(4097, device="cuda", dtype=torch.float16)[1:]
+        assert x.is_contiguous() and x.data_ptr() % 16 != 0
+        torch.testing.assert_close(fn(x), ref(x), rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("name", list(SWOOSH))
+    def test_a_row_strided_chunk_is_read_in_place(self, name):
+        fn, ref = SWOOSH[name]
+        x = torch.randn(17, 3, 192, device="cuda", dtype=torch.float32).chunk(3, dim=-1)[1]
+        assert not x.is_contiguous()
+        torch.testing.assert_close(fn(x), ref(x), rtol=1e-5, atol=1e-5)
+
+    def test_a_non_contiguous_destination_is_refused(self):
+        x = torch.randn(4, 8, device="cuda", dtype=torch.float16)
+        out = torch.empty(8, 4, device="cuda", dtype=torch.float16).t()
+        with pytest.raises(RuntimeError, match="contiguous"):
+            oasr.swoosh_l(x, out=out)
+
 
 class TestGlu:
     """``oasr.glu`` halves the last dim, so it does not share the OPS signature."""
@@ -198,6 +221,34 @@ class TestGlu:
         x = torch.randn(2, 128, 512, device="cuda", dtype=torch.float16)
         out = torch.empty(2, 128, 256, device="cuda", dtype=torch.float16)
         assert_dest_passing(oasr.glu, x, out=out, expected=F.glu(x, dim=-1))
+
+    def test_a_padded_row_stride_is_read_at_its_own_rows(self):
+        """The launcher checked only the last stride, so a slice of a wider
+        buffer was read as if its rows were packed (~3.6 off in fp16)."""
+        x = torch.randn(2, 6, 256, device="cuda", dtype=torch.float16)[..., :128]
+        assert x.stride(-1) == 1 and not x.is_contiguous()
+        torch.testing.assert_close(oasr.glu(x), F.glu(x, dim=-1), rtol=1e-2, atol=1e-2)
+
+    @pytest.mark.parametrize("shape", [(6, 256), (3, 2, 5, 64), (130,)])
+    def test_any_rank(self, shape):
+        """It read ``size(0..2)`` regardless of rank: a 2-D input raised."""
+        x = torch.randn(*shape, device="cuda", dtype=torch.float16)
+        torch.testing.assert_close(oasr.glu(x), F.glu(x, dim=-1), rtol=1e-2, atol=1e-2)
+
+    def test_an_unaligned_pointer_takes_the_scalar_path(self):
+        x = torch.randn(2 * 6 * 128 + 1, device="cuda", dtype=torch.float16)[1:].view(2, 6, 128)
+        assert x.data_ptr() % 16 != 0
+        torch.testing.assert_close(oasr.glu(x), F.glu(x, dim=-1), rtol=1e-2, atol=1e-2)
+
+    def test_an_odd_last_dimension_is_refused(self):
+        """It halved 9 to 4 and gated the first four with the next four."""
+        with pytest.raises(RuntimeError, match="must be even"):
+            oasr.glu(torch.randn(2, 3, 9, device="cuda", dtype=torch.float16))
+
+    def test_a_mis_shaped_destination_is_refused(self):
+        x = torch.randn(2, 6, 64, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="last dimension halved"):
+            oasr.glu(x, out=torch.empty(2, 6, 64, device="cuda", dtype=torch.float16))
 
 
 if __name__ == "__main__":

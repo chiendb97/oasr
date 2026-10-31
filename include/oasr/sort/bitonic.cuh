@@ -45,6 +45,20 @@ __device__ __forceinline__ void compare_and_swap(float& a, float& b) {
     }
 }
 
+// An integer key: a packed (key, payload) word sorts by one compare.
+template <bool Ascending>
+__device__ __forceinline__ void compare_and_swap(uint64_t& a, uint64_t& b) {
+    uint64_t lo = a < b ? a : b;
+    uint64_t hi = a < b ? b : a;
+    if constexpr (Ascending) {
+        a = lo;
+        b = hi;
+    } else {
+        a = hi;
+        b = lo;
+    }
+}
+
 template <bool Ascending, typename Aux>
 __device__ __forceinline__ void compare_and_swap(float& a, float& b, Aux& xa, Aux& xb) {
     if constexpr (Ascending) {
@@ -67,8 +81,8 @@ __device__ __forceinline__ void compare_and_swap(float& a, float& b, Aux& xa, Au
 // Merge a bitonic sequence of length N into a sorted sequence of length N.
 // Implemented recursively: compare arr[i] with arr[i + N/2] for i in [0, N/2),
 // then merge each half. Fully unrolls when N is a compile-time constant.
-template <int N, bool Ascending>
-__device__ __forceinline__ void bitonic_merge(float* arr) {
+template <int N, bool Ascending, typename Key>
+__device__ __forceinline__ void bitonic_merge(Key* arr) {
     if constexpr (N > 1) {
         constexpr int kHalf = N / 2;
 #pragma unroll
@@ -99,8 +113,8 @@ __device__ __forceinline__ void bitonic_merge(float* arr, Aux* aux) {
 //
 // Sort N elements (N must be a power of two) using a bitonic sort network.
 // Sorts the first half ascending, the second half descending, then merges.
-template <int N, bool Ascending>
-__device__ __forceinline__ void bitonic_sort(float* arr) {
+template <int N, bool Ascending, typename Key>
+__device__ __forceinline__ void bitonic_sort(Key* arr) {
     static_assert((N & (N - 1)) == 0, "N must be a power of two");
     if constexpr (N > 1) {
         constexpr int kHalf = N / 2;
@@ -131,11 +145,11 @@ __device__ __forceinline__ void bitonic_sort(float* arr, Aux* aux) {
 //
 // Trick: pair arr0[i] with arr1[K-1-i] and keep the better one in arr0. The
 // resulting arr0 is bitonic, so a single bitonic_merge re-sorts it.
-template <int K, bool Ascending>
-__device__ __forceinline__ void bitonic_topk_merge(float* arr0, const float* arr1) {
+template <int K, bool Ascending, typename Key>
+__device__ __forceinline__ void bitonic_topk_merge(Key* arr0, const Key* arr1) {
 #pragma unroll
     for (int i = 0; i < K; ++i) {
-        float other = arr1[K - 1 - i];
+        Key other = arr1[K - 1 - i];
         bool other_wins = Ascending ? (other < arr0[i]) : (other > arr0[i]);
         if (other_wins) {
             arr0[i] = other;

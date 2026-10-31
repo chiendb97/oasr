@@ -9,17 +9,45 @@
 
 using namespace oasr;
 
-void softmax(TensorView output, TensorView input) {
+namespace {
+
+bool same_dtype(const TensorView& a, const TensorView& b) {
+    return a.dtype().code == b.dtype().code && a.dtype().bits == b.dtype().bits &&
+           a.dtype().lanes == b.dtype().lanes;
+}
+
+// The row-wise softmaxes walk `base + row * num_cols` in memory order.  A
+// contiguous last dimension is not enough: a slice of a wider buffer has one
+// and a padded row stride, and its rows were read and written at the wrong
+// offsets.  The rows must tile memory and the output must share the input's
+// layout (an in-place call does).  Returns false for an empty input.
+bool check_softmax_rows(TensorView output, TensorView input) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-
-    unsigned int num_rows = 1;
-    for (int i = 0; i < input.ndim() - 1; ++i) {
-        num_rows *= input.size(i);
+    CHECK_DEVICE(input, output);
+    TVM_FFI_ICHECK(input.ndim() >= 1) << "softmax input must have at least one dimension";
+    TVM_FFI_ICHECK(same_dtype(input, output)) << "softmax input and output dtypes must match";
+    if (input.numel() > 0) {
+        CHECK_ROW_DENSE_INPUT(input);  // before the layout: `empty_like` of a padded view is dense
     }
-    unsigned int num_cols = input.size(input.ndim() - 1);
+    CHECK_SAME_LAYOUT(input, output);
+    if (input.numel() == 0) {
+        return false;
+    }
+    TVM_FFI_ICHECK(FLATTENED_ROWS(input) <= 0x7fffffff)
+        << "softmax launches one block per row and cannot address " << FLATTENED_ROWS(input)
+        << " rows";
+    return true;
+}
+
+}  // namespace
+
+void softmax(TensorView output, TensorView input) {
+    if (!check_softmax_rows(output, input)) {
+        return;
+    }
+    const auto num_rows = static_cast<unsigned int>(FLATTENED_ROWS(input));
+    const auto num_cols = static_cast<unsigned int>(input.size(input.ndim() - 1));
 
     cudaStream_t stream = get_stream(input.device());
 
@@ -37,16 +65,11 @@ void softmax(TensorView output, TensorView input) {
 // (output == input): the online kernel reads each element once per pass and
 // writes each element exactly once in the final pass.
 void log_softmax(TensorView output, TensorView input) {
-    CHECK_INPUT(input);
-    CHECK_INPUT(output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-
-    unsigned int num_rows = 1;
-    for (int i = 0; i < input.ndim() - 1; ++i) {
-        num_rows *= input.size(i);
+    if (!check_softmax_rows(output, input)) {
+        return;
     }
-    unsigned int num_cols = input.size(input.ndim() - 1);
+    const auto num_rows = static_cast<unsigned int>(FLATTENED_ROWS(input));
+    const auto num_cols = static_cast<unsigned int>(input.size(input.ndim() - 1));
 
     cudaStream_t stream = get_stream(input.device());
 
@@ -75,11 +98,6 @@ using oasr::softmax::BroadcastView;
 
 //! Leading axes the broadcast operands can be addressed on -- one per grid axis.
 constexpr int kMaxLeadDims = 3;
-
-bool same_dtype(const TensorView& a, const TensorView& b) {
-    return a.dtype().code == b.dtype().code && a.dtype().bits == b.dtype().bits &&
-           a.dtype().lanes == b.dtype().lanes;
-}
 
 /// Layout of an operand broadcast against the score tensor, stated per *grid*
 /// axis (innermost leading axis on x) and dtype-erased so it can be built once

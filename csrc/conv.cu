@@ -175,18 +175,82 @@ void depthwise_conv1d_silu(TensorView output, TensorView input, TensorView weigh
 // Causal Conv1D launcher
 // =============================================================================
 
+namespace {
+
+// Whether two tensors' storage overlaps, by byte range.  Enough for the dense
+// tensors the causal convolution takes.
+bool overlaps(const TensorView& a, const TensorView& b) {
+    const auto begin_a = reinterpret_cast<uintptr_t>(a.data_ptr());
+    const auto begin_b = reinterpret_cast<uintptr_t>(b.data_ptr());
+    const auto end_a = begin_a + static_cast<uintptr_t>(a.numel()) * get_element_size(a.dtype());
+    const auto end_b = begin_b + static_cast<uintptr_t>(b.numel()) * get_element_size(b.dtype());
+    return a.numel() > 0 && b.numel() > 0 && begin_a < end_b && begin_b < end_a;
+}
+
+}  // namespace
+
+// Streaming causal convolution over one chunk: `output` from [state | input],
+// then `state` <- its last kernel_size - 1 positions, in place.
 void causal_conv1d(TensorView output, TensorView input, TensorView state, TensorView weight,
                    Optional bias_opt) {
     CHECK_INPUT(input);
     CHECK_INPUT(output);
     CHECK_INPUT(state);
     CHECK_INPUT(weight);
+    CHECK_DEVICE(input, output);
+    CHECK_DEVICE(input, state);
+    CHECK_DEVICE(input, weight);
     CHECK_DIM(3, input);
+    CHECK_DIM(3, output);
+    CHECK_DIM(3, state);
+    CHECK_DIM(3, weight);
+    // Every operand is indexed as a dense row-major array.  An empty one (a
+    // kernel_size-1 state, an empty chunk) is never read, and TVM does not call
+    // a tensor with a zero extent contiguous.
+    for (const TensorView* operand : {&input, &output, &state, &weight}) {
+        if (operand->numel() > 0) {
+            CHECK_CONTIGUOUS_INPUT(*operand);
+        }
+    }
 
-    int batch_size = input.size(0);
-    int chunk_len = input.size(1);
-    int channels = input.size(2);
-    int kernel_size = weight.size(2);
+    const int64_t batch_size = input.size(0);
+    const int64_t chunk_len = input.size(1);
+    const int64_t channels = input.size(2);
+    const int64_t kernel_size = weight.size(2);
+
+    TVM_FFI_ICHECK(kernel_size >= 1) << "CausalConv1D kernel_size must be at least 1";
+    TVM_FFI_ICHECK(weight.size(0) == channels && weight.size(1) == 1)
+        << "CausalConv1D weight must be [C, 1, K] with C=" << channels << ", got ["
+        << weight.size(0) << ", " << weight.size(1) << ", " << kernel_size << "]";
+    TVM_FFI_ICHECK(state.size(0) == batch_size && state.size(1) == kernel_size - 1 &&
+                   state.size(2) == channels)
+        << "CausalConv1D state must be [B, K - 1, C] = [" << batch_size << ", " << kernel_size - 1
+        << ", " << channels << "], got [" << state.size(0) << ", " << state.size(1) << ", "
+        << state.size(2) << "]";
+    TVM_FFI_ICHECK(output.size(0) == batch_size && output.size(1) == chunk_len &&
+                   output.size(2) == channels)
+        << "CausalConv1D output must be shaped like the input";
+    TVM_FFI_ICHECK(same_dtype(input, output) && same_dtype(input, state) &&
+                   same_dtype(input, weight))
+        << "CausalConv1D input, state, weight, and output dtypes must match";
+    // The convolution reads the state and the input while it writes the output,
+    // and the state update then reads the input again.
+    TVM_FFI_ICHECK(!overlaps(output, input) && !overlaps(output, state) && !overlaps(state, input))
+        << "CausalConv1D output, input and state must not share memory";
+    // Extents travel as int, and the weight is indexed in 32 bits.
+    TVM_FFI_ICHECK(batch_size <= 0x7fffffff && chunk_len <= 0x7fffffff &&
+                   channels * kernel_size <= 0x7fffffff)
+        << "CausalConv1D extents are past the kernels' 32-bit sizes";
+
+    if (bias_opt.has_value()) {
+        TensorView bias = bias_opt.value();
+        CHECK_INPUT(bias);
+        CHECK_DIM(1, bias);
+        CHECK_CONTIGUOUS_INPUT(bias);
+        CHECK_DEVICE(input, bias);
+        TVM_FFI_ICHECK(bias.size(0) == channels) << "CausalConv1D bias shape mismatch";
+        TVM_FFI_ICHECK(same_dtype(input, bias)) << "CausalConv1D bias dtype mismatch";
+    }
 
     cudaStream_t stream = get_stream(input.device());
 
@@ -198,7 +262,8 @@ void causal_conv1d(TensorView output, TensorView input, TensorView state, Tensor
         cudaError_t status = conv::CausalConv1D<c_type>(
             static_cast<const c_type*>(input.data_ptr()), static_cast<c_type*>(state.data_ptr()),
             static_cast<const c_type*>(weight.data_ptr()), bias_ptr,
-            static_cast<c_type*>(output.data_ptr()), batch_size, chunk_len, channels, kernel_size,
+            static_cast<c_type*>(output.data_ptr()), static_cast<int>(batch_size),
+            static_cast<int>(chunk_len), static_cast<int>(channels), static_cast<int>(kernel_size),
             stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "CausalConv1D kernel failed: " << cudaGetErrorString(status);
