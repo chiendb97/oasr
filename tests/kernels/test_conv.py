@@ -299,6 +299,102 @@ class TestDepthwiseConv1D:
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
 
+class TestCausalConv1D:
+    """``oasr.causal_conv1d``: one streaming chunk, with its state carried in place.
+
+    The oracle is the whole utterance at once: chunks of any length, fed in
+    order, must give the full causal convolution and leave the state holding the
+    last ``K - 1`` inputs.  The state is a copy, so it is compared exactly.
+    """
+
+    @staticmethod
+    def _whole(x, w, b):
+        K, C = w.shape[-1], x.shape[-1]
+        y = F.conv1d(
+            F.pad(x.transpose(1, 2).float(), (K - 1, 0)),
+            w.float(),
+            None if b is None else b.float(),
+            groups=C,
+        )
+        return y.transpose(1, 2)
+
+    @staticmethod
+    def _tail(state0, x):
+        return torch.cat([state0, x], dim=1)[:, -state0.shape[1] :]
+
+    #: Chunks shorter than the state (a shift), as long, and longer.
+    @pytest.mark.parametrize("chunks", [(1, 1, 3, 2, 1), (14, 14), (3, 20, 7)])
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_chunks_reproduce_the_whole_utterance(self, chunks, dtype):
+        torch.manual_seed(sum(chunks))
+        B, C, K = 3, 96, 15
+        x = torch.randn(B, sum(chunks), C, device="cuda", dtype=dtype)
+        w = torch.randn(C, 1, K, device="cuda", dtype=dtype) / K
+        b = torch.randn(C, device="cuda", dtype=dtype)
+        state = torch.zeros(B, K - 1, C, device="cuda", dtype=dtype)
+        state0 = state.clone()
+
+        outs, t = [], 0
+        for n in chunks:
+            outs.append(oasr.causal_conv1d(x[:, t : t + n], state, w, b))
+            t += n
+
+        torch.testing.assert_close(
+            torch.cat(outs, dim=1).float(), self._whole(x, w, b), rtol=2e-2, atol=2e-2
+        )
+        assert torch.equal(state, self._tail(state0, x))
+
+    def test_the_state_shift_is_exact_under_co_tenant_load(self):
+        """A chunk shorter than the state shifts it down: position ``s`` takes
+        ``s + L``.  Every position had a thread of its own, so whether a thread
+        read its source before another overwrote it was the scheduler's choice;
+        with a GEMM on another stream the state came back wrong in ~60% of calls
+        (2 in 20 alone).  One thread per channel column now shifts in order."""
+        torch.manual_seed(0)
+        B, C, K, L = 64, 2048, 31, 1
+        x = torch.randn(B, L, C, device="cuda", dtype=torch.float16)
+        w = torch.randn(C, 1, K, device="cuda", dtype=torch.float16)
+        state0 = torch.randn(B, K - 1, C, device="cuda", dtype=torch.float16)
+        want = self._tail(state0, x)
+        hog = torch.randn(8192, 8192, device="cuda", dtype=torch.float16)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+
+        wrong = 0
+        for _ in range(20):
+            with torch.cuda.stream(side):
+                hog @ hog
+            state = state0.clone()
+            oasr.causal_conv1d(x, state, w)
+            torch.cuda.synchronize()
+            wrong += int(not torch.equal(state, want))
+        assert wrong == 0, f"the state came back wrong in {wrong} of 20 calls"
+
+    def test_kernel_size_one_has_no_state(self):
+        """An empty state used to be a zero-block launch, which CUDA refuses."""
+        x = torch.randn(2, 5, 64, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 1, 1, device="cuda", dtype=torch.float16)
+        state = torch.empty(2, 0, 64, device="cuda", dtype=torch.float16)
+        y = oasr.causal_conv1d(x, state, w)
+        torch.testing.assert_close(y, x * w[:, 0, 0], rtol=1e-3, atol=1e-3)
+
+    def test_a_state_of_the_wrong_shape_is_refused(self):
+        """It was read and written as [B, K - 1, C] whatever its shape."""
+        x = torch.randn(2, 4, 64, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 1, 15, device="cuda", dtype=torch.float16)
+        state = torch.zeros(2, 2, 64, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match=r"state must be \[B, K - 1, C\]"):
+            oasr.causal_conv1d(x, state, w)
+
+    def test_an_output_sharing_the_input_is_refused(self):
+        """The state update reads the input after the convolution wrote ``out``."""
+        x = torch.randn(2, 4, 64, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, 1, 15, device="cuda", dtype=torch.float16)
+        state = torch.zeros(2, 14, 64, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="must not share memory"):
+            oasr.causal_conv1d(x, state, w, out=x)
+
+
 class TestPointwiseConv1dLayer:
     """Tests for oasr.layers.PointwiseConv1d (delegates to oasr.gemm)."""
 

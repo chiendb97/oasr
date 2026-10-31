@@ -44,12 +44,14 @@ def glu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor
     Computes: output = input[..., :channels] * sigmoid(input[..., channels:])
 
     Args:
-        input: Input tensor [..., 2 * channels].
-        out: Optional pre-allocated output tensor [..., channels].
+        input: Input tensor [..., 2 * channels]. A non-contiguous one is
+            materialized once.
+        out: Optional pre-allocated contiguous output tensor [..., channels].
 
     Returns:
         Output tensor [..., channels].
     """
+    input = input.contiguous()
     if out is None:
         out = torch.empty(
             input.shape[:-1] + (input.shape[-1] // 2,),
@@ -64,15 +66,17 @@ def glu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor
 def swish(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Swish (SiLU) activation: x * sigmoid(x).
 
+    Contiguous rows with a regular padded stride are consumed directly; other
+    non-contiguous inputs are materialized once.
+
     Args:
         input: Input tensor.
-        out: Optional pre-allocated output tensor.
+        out: Optional pre-allocated contiguous output tensor.
 
     Returns:
         Output tensor with same shape as input.
     """
-    if out is None:
-        out = torch.empty_like(input)
+    input, out = _prepare_elementwise(input, out)
     _get_activation_module().swish(out, input)
     return out
 
@@ -148,19 +152,18 @@ def relu(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tenso
 def swoosh_l(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Zipformer Swoosh-L activation: ``log(1 + exp(x - 4)) - 0.08 x - 0.035``.
 
-    Elementwise over a flat contiguous buffer (shape-agnostic). A non-contiguous
-    input is made contiguous first.
+    Elementwise and shape-agnostic. Contiguous rows with a regular padded
+    stride are consumed directly; other non-contiguous inputs are materialized
+    once.
 
     Args:
         input: Input tensor.
-        out: Optional pre-allocated output tensor.
+        out: Optional pre-allocated contiguous output tensor.
 
     Returns:
         Output tensor with same shape as input.
     """
-    input = input.contiguous()
-    if out is None:
-        out = torch.empty_like(input)
+    input, out = _prepare_elementwise(input, out)
     _get_activation_module().swoosh_l(out, input)
     return out
 
@@ -169,18 +172,17 @@ def swoosh_l(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.T
 def swoosh_r(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Zipformer Swoosh-R activation: ``log(1 + exp(x - 1)) - 0.08 x - 0.313261687``.
 
-    Elementwise over a flat contiguous buffer (shape-agnostic). A non-contiguous
-    input is made contiguous first.
+    Elementwise and shape-agnostic. Contiguous rows with a regular padded
+    stride are consumed directly; other non-contiguous inputs are materialized
+    once.
 
     Args:
         input: Input tensor.
-        out: Optional pre-allocated output tensor.
+        out: Optional pre-allocated contiguous output tensor.
 
     Returns:
         Output tensor with same shape as input.
     """
-    input = input.contiguous()
-    if out is None:
-        out = torch.empty_like(input)
+    input, out = _prepare_elementwise(input, out)
     _get_activation_module().swoosh_r(out, input)
     return out

@@ -109,4 +109,12 @@ struct SwishActivation {
     __device__ __forceinline__ float operator()(float x) const { return swish(x); }
 };
 
+struct SwooshLActivation {
+    __device__ __forceinline__ float operator()(float x) const { return swoosh_l(x); }
+};
+
+struct SwooshRActivation {
+    __device__ __forceinline__ float operator()(float x) const { return swoosh_r(x); }
+};
+
 }  // namespace oasr

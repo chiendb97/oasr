@@ -62,6 +62,57 @@ class TestSoftmax:
             oasr.softmax(x)
 
 
+class TestRowLayout:
+    """What the row-wise softmaxes require of a layout: rows that tile memory.
+
+    Their launchers checked only ``stride(-1) == 1``, which a slice of a wider
+    buffer passes with a padded row stride; its rows were then read at the
+    wrong offsets and the result was plausibly wrong (log_softmax off by ~5).
+    A permuted dense view is fine: rows are independent and ``empty_like``
+    keeps the layout.
+    """
+
+    OPS = {
+        "softmax": (oasr.softmax, torch.softmax),
+        "log_softmax": (oasr.log_softmax, torch.log_softmax),
+    }
+
+    @pytest.mark.parametrize("op", list(OPS))
+    def test_a_padded_row_stride_is_refused(self, op):
+        x = torch.randn(6, 256, device="cuda", dtype=torch.float16)[:, :128]
+        assert x.stride(-1) == 1, "premise: the old check passed this"
+        with pytest.raises(RuntimeError, match="tile memory exactly"):
+            self.OPS[op][0](x)
+
+    @pytest.mark.parametrize("op", list(OPS))
+    def test_a_permuted_dense_view_matches_torch(self, op):
+        fn, ref = self.OPS[op]
+        x = torch.randn(2, 96, 64, device="cuda", dtype=torch.float16).transpose(0, 1)
+        got = fn(x)
+        assert got.stride() == x.stride()
+        torch.testing.assert_close(got, ref(x.float(), -1).half(), **tol(torch.float16))
+
+    def test_the_layer_routes_a_padded_view_to_torch(self):
+        from oasr.layers import Softmax
+        from oasr.layers._backend import policy_hits
+
+        before = policy_hits().get("softmax-rows-not-dense", 0)
+        x = torch.randn(6, 256, device="cuda", dtype=torch.float16)[:, :128]
+        torch.testing.assert_close(Softmax()(x), torch.softmax(x, -1))
+        assert policy_hits().get("softmax-rows-not-dense", 0) == before + 1
+
+    def test_in_place_log_softmax(self):
+        """The CTC head normalizes its GEMM output in place through this launcher."""
+        x = torch.randn(4, 300, device="cuda", dtype=torch.float16)
+        want = torch.log_softmax(x.float(), -1).half()
+        assert oasr.log_softmax(x, out=x).data_ptr() == x.data_ptr()
+        torch.testing.assert_close(x, want, **tol(torch.float16))
+
+    def test_no_rows(self):
+        x = torch.empty(0, 64, device="cuda", dtype=torch.float16)
+        assert oasr.softmax(x).shape == x.shape
+
+
 def _prepared(scores, bias=None, mask=None, mask2=None, mask_value=-1000.0):
     """The op sequence ``oasr.masked_softmax`` fuses, up to (not including) the softmax."""
     out = scores

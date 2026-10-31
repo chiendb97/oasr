@@ -409,3 +409,142 @@ class TestRowLayoutPrecondition:
         }
         for name, (t, expected) in cases.items():
             assert is_row_dense(t) is expected, name
+
+
+def _unaligned_copy(t: torch.Tensor) -> torch.Tensor:
+    """``t``'s values at an address two bytes past a vector boundary."""
+    buf = torch.empty(t.numel() + 1, device=t.device, dtype=t.dtype)
+    out = buf[1:].view(t.shape)
+    out.copy_(t)
+    assert out.is_contiguous() and out.data_ptr() % 16 != 0
+    return out
+
+
+class TestUnalignedParameters:
+    """The vector path loads the per-channel parameters as vectors, too.
+
+    The launchers chose it on the rows' alignment alone, so a weight, bias or
+    running statistic that is a slice of a larger buffer faulted with
+    ``misaligned address`` -- which also poisons the CUDA context for the rest
+    of the process.  Such a parameter now takes the scalar path, as an unaligned
+    row already did, and agrees with the same call on aligned parameters.
+    """
+
+    H = 512
+
+    def _operands(self, dtype=torch.float16):
+        torch.manual_seed(5)
+        H = self.H
+        x = torch.randn(8, H, device="cuda", dtype=dtype)
+        r = torch.randn(8, H, device="cuda", dtype=dtype)
+        w = torch.randn(H, device="cuda", dtype=dtype)
+        b = torch.randn(H, device="cuda", dtype=dtype)
+        return x, r, w, b
+
+    #: Every launcher whose vector path reads a weight; each takes (x, r, w, b).
+    ROW_NORMS = {
+        "layer_norm": lambda x, r, w, b: oasr.layer_norm(x, w, b),
+        "rms_norm": lambda x, r, w, b: oasr.rms_norm(x, w, b),
+        "layer_norm_activation": lambda x, r, w, b: oasr.layer_norm_activation(x, w, b),
+        "rms_norm_activation": lambda x, r, w, b: oasr.rms_norm_activation(x, w, b),
+        "add_layer_norm": lambda x, r, w, b: oasr.add_layer_norm(x, r, w, b),
+        "add_layer_norm_residual": lambda x, r, w, b: oasr.add_layer_norm_residual(x, r, w, b)[0],
+        "add_rms_norm": lambda x, r, w, b: oasr.add_rms_norm(x, r, w, b),
+    }
+
+    @pytest.mark.parametrize("op", list(ROW_NORMS))
+    @pytest.mark.parametrize("which", ["weight", "bias"])
+    def test_an_unaligned_parameter_takes_the_scalar_path(self, op, which):
+        fn = self.ROW_NORMS[op]
+        x, r, w, b = self._operands()
+        want = fn(x, r, w, b)
+        if which == "weight":
+            w = _unaligned_copy(w)
+        else:
+            b = _unaligned_copy(b)
+        torch.testing.assert_close(fn(x, r, w, b), want, **tol(torch.float16))
+
+    @pytest.mark.parametrize("which", ["weight", "bias", "running_mean", "running_var"])
+    def test_batch_norm_statistics(self, which):
+        x, _, w, b = self._operands()
+        params = {
+            "weight": w,
+            "bias": b,
+            "running_mean": torch.randn_like(w),
+            "running_var": torch.rand_like(w) + 0.5,
+        }
+        want = oasr.batch_norm_1d(x.view(2, 4, self.H), **params)
+        params[which] = _unaligned_copy(params[which])
+        got = oasr.batch_norm_1d(x.view(2, 4, self.H), **params)
+        torch.testing.assert_close(got, want, **tol(torch.float16))
+
+
+class TestAddNormOperandLayout:
+    """``add_layer_norm`` reads ``residual`` row by row alongside the input.
+
+    Its launcher checked the input and output but not the residual, so a
+    residual with a padded row stride was read at the wrong offsets and the sum
+    came back plausibly wrong.  It is refused now, as ``add_rms_norm`` and the
+    ``_residual`` variants already refused it.
+    """
+
+    @pytest.mark.parametrize("op", ["add_layer_norm", "add_layer_norm_residual"])
+    def test_a_residual_in_another_layout_is_refused(self, op):
+        H = 128
+        x = torch.randn(8, H, device="cuda", dtype=torch.float16)
+        r = torch.randn(16, H, device="cuda", dtype=torch.float16)[::2]
+        w = torch.randn(H, device="cuda", dtype=torch.float16)
+        b = torch.randn(H, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="identical shape and strides"):
+            getattr(oasr, op)(x, r, w, b)
+
+    def test_a_weight_of_the_wrong_length_is_refused(self):
+        x = torch.randn(8, 128, device="cuda", dtype=torch.float16)
+        w = torch.randn(64, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="weight must be 1-D"):
+            oasr.layer_norm(x, w, None)
+
+
+class TestGroupNormGeometry:
+    """Group counts that do not divide the block.
+
+    Each group's threads reduce with xor shuffles, so they must be a power of
+    two and whole warps must be present.  The launcher took ``block / groups``
+    threads per group: for 5 groups of 16 channels, 19 threads each, so the
+    shuffles summed across groups and the last thread reduced a sixth group,
+    read from the next row, into group 0's statistics.
+    """
+
+    @staticmethod
+    def _reference(x, w, b, groups, eps=1e-5):
+        B, T, C = x.shape
+        return torch.nn.functional.group_norm(
+            x.float().reshape(B * T, C), groups, w.float(), b.float(), eps
+        ).reshape(B, T, C)
+
+    @pytest.mark.parametrize(
+        "channels,groups",
+        [
+            (80, 5),  # 96 threads / 5: 19 a group
+            (48, 3),  # 64 / 3: 21
+            (120, 5),  # 128 / 5: 25
+            (1000, 10),  # 1024 / 10: 102, past a warp
+            (96, 3),  # 96 / 3 = 32: always right, and must stay so
+            (128, 8),  # a power of two: the geometry in-tree callers use
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_matches_torch(self, channels, groups, dtype):
+        torch.manual_seed(channels + groups)
+        x = torch.randn(2, 6, channels, device="cuda", dtype=dtype) * 2 + 0.5
+        w = torch.randn(channels, device="cuda", dtype=dtype)
+        b = torch.randn(channels, device="cuda", dtype=dtype)
+        got = oasr.group_norm(x, w, b, groups)
+        torch.testing.assert_close(got.float(), self._reference(x, w, b, groups), **tol(dtype))
+
+    @pytest.mark.parametrize("channels,groups", [(100, 3), (2048, 2048)])
+    def test_an_unservable_group_count_is_refused(self, channels, groups):
+        x = torch.randn(1, 2, channels, device="cuda", dtype=torch.float16)
+        w = torch.ones(channels, device="cuda", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="num_groups"):
+            oasr.group_norm(x, w, torch.zeros_like(w), groups)

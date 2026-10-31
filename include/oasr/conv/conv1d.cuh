@@ -196,22 +196,22 @@ __global__ void depthwiseConv1DSiluKernel(
 
 template <typename T>
 __global__ void causalConv1DKernel(const T* __restrict__ input,  // [batch, chunk_len, channels]
-                                   T* __restrict__ state,        // [batch, kernel_size-1, channels]
+                                   const T* __restrict__ state,  // [batch, kernel_size-1, channels]
                                    const T* __restrict__ weight,  // [channels, 1, kernel_size]
                                    const T* __restrict__ bias,    // [channels] or nullptr
                                    T* __restrict__ output,        // [batch, chunk_len, channels]
                                    int batch_size, int chunk_len, int channels, int kernel_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * chunk_len * channels;
+    const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total_elements = static_cast<int64_t>(batch_size) * chunk_len * channels;
 
     if (idx >= total_elements)
         return;
 
-    int c = idx % channels;
-    int t = (idx / channels) % chunk_len;
-    int b = idx / (channels * chunk_len);
+    const int c = static_cast<int>(idx % channels);
+    const int t = static_cast<int>((idx / channels) % chunk_len);
+    const int64_t b = idx / (static_cast<int64_t>(channels) * chunk_len);
 
-    int state_len = kernel_size - 1;
+    const int state_len = kernel_size - 1;
 
     float sum = 0.0f;
 
@@ -221,10 +221,10 @@ __global__ void causalConv1DKernel(const T* __restrict__ input,  // [batch, chun
 
         if (input_pos < 0) {
             int state_pos = state_len + input_pos;  // Maps -state_len to 0, etc.
-            int state_idx = b * state_len * channels + state_pos * channels + c;
+            const int64_t state_idx = (b * state_len + state_pos) * channels + c;
             val = static_cast<float>(state[state_idx]);
         } else {
-            int input_idx = b * chunk_len * channels + input_pos * channels + c;
+            const int64_t input_idx = (b * chunk_len + input_pos) * channels + c;
             val = static_cast<float>(input[input_idx]);
         }
 
@@ -239,42 +239,36 @@ __global__ void causalConv1DKernel(const T* __restrict__ input,  // [batch, chun
     output[idx] = static_cast<T>(sum);
 }
 
+// The new state is the last `state_len` positions of [old state | chunk].
+// One thread owns one (batch, channel) column and rewrites it in ascending
+// position order.  A short chunk shifts the old state down -- position `s`
+// takes position `s + chunk_len` -- and when every position had a thread of its
+// own, whether a source was read before another thread overwrote it was up to
+// the scheduler: under load, later positions came back copied into earlier
+// ones.  In one thread, ascending order reads each source before anything
+// writes over it.
 template <typename T>
 __global__ void updateConvStateKernel(const T* __restrict__ input,  // [batch, chunk_len, channels]
                                       T* __restrict__ state,        // [batch, state_len, channels]
                                       int batch_size, int chunk_len, int channels, int state_len) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch_size * state_len * channels;
-
-    if (idx >= total_elements)
+    const int64_t column = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column >= static_cast<int64_t>(batch_size) * channels)
         return;
 
-    int c = idx % channels;
-    int s = (idx / channels) % state_len;
-    int b = idx / (channels * state_len);
+    const int64_t b = column / channels;
+    const int64_t c = column % channels;
+    T* state_column = state + b * state_len * channels + c;
+    const T* input_column = input + b * chunk_len * channels + c;
 
-    // New state comes from:
-    // - Old state shifted left (if chunk_len < state_len)
-    // - Or entirely from new input (if chunk_len >= state_len)
-    int source_pos;
-    if (chunk_len >= state_len) {
-        // Take from input: last state_len positions
-        source_pos = chunk_len - state_len + s;
-        int input_idx = b * chunk_len * channels + source_pos * channels + c;
-        state[idx] = input[input_idx];
-    } else {
-        // Mix: shift old state and add new input
-        int shift = state_len - chunk_len;
-        if (s < shift) {
-            // From old state
-            int old_state_idx = b * state_len * channels + (s + chunk_len) * channels + c;
-            state[idx] = state[old_state_idx];
-        } else {
-            // From new input
-            source_pos = s - shift;
-            int input_idx = b * chunk_len * channels + source_pos * channels + c;
-            state[idx] = input[input_idx];
-        }
+    // Positions [0, kept) come from the old state, the rest from the chunk.
+    const int kept = state_len > chunk_len ? state_len - chunk_len : 0;
+    for (int s = 0; s < kept; ++s) {
+        state_column[static_cast<int64_t>(s) * channels] =
+            state_column[static_cast<int64_t>(s + chunk_len) * channels];
+    }
+    for (int s = kept; s < state_len; ++s) {
+        state_column[static_cast<int64_t>(s) * channels] =
+            input_column[static_cast<int64_t>(chunk_len - state_len + s) * channels];
     }
 }
 
@@ -461,23 +455,29 @@ template <typename T>
 cudaError_t CausalConv1D(const T* input, T* state, const T* weight, const T* bias, T* output,
                          int batch_size, int chunk_len, int channels, int kernel_size,
                          cudaStream_t stream) {
-    int total_elements = batch_size * chunk_len * channels;
-    int block_size = 256;
-    int grid_size = (total_elements + block_size - 1) / block_size;
-    int state_len = kernel_size - 1;
+    constexpr int block_size = 256;
+    const int state_len = kernel_size - 1;
 
-    causalConv1DKernel<T><<<grid_size, block_size, 0, stream>>>(
-        input, state, weight, bias, output, batch_size, chunk_len, channels, kernel_size);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        return err;
+    // A zero-block grid is a launch error, so an empty chunk or an empty state
+    // (kernel_size 1) skips its launch rather than failing it.
+    const int64_t total_elements = static_cast<int64_t>(batch_size) * chunk_len * channels;
+    if (total_elements > 0) {
+        const int64_t grid_size = (total_elements + block_size - 1) / block_size;
+        causalConv1DKernel<T><<<static_cast<unsigned int>(grid_size), block_size, 0, stream>>>(
+            input, state, weight, bias, output, batch_size, chunk_len, channels, kernel_size);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            return err;
+        }
     }
 
-    int state_elements = batch_size * state_len * channels;
-    int state_grid = (state_elements + block_size - 1) / block_size;
-    updateConvStateKernel<T><<<state_grid, block_size, 0, stream>>>(input, state, batch_size,
-                                                                    chunk_len, channels, state_len);
+    // After the convolution, which reads the old state (same stream, so ordered).
+    const int64_t columns = static_cast<int64_t>(batch_size) * channels;
+    if (columns > 0 && state_len > 0 && chunk_len > 0) {
+        const int64_t state_grid = (columns + block_size - 1) / block_size;
+        updateConvStateKernel<T><<<static_cast<unsigned int>(state_grid), block_size, 0, stream>>>(
+            input, state, batch_size, chunk_len, channels, state_len);
+    }
 
     return cudaGetLastError();
 }

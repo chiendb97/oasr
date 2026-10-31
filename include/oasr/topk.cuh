@@ -10,17 +10,38 @@
 #include <cuda_runtime.h>
 
 #include <cub/block/block_radix_sort.cuh>
-#include <cuda/std/limits>
 #include <oasr/common/utils.h>
 #include <oasr/sort/bitonic.cuh>
 
 namespace oasr {
 namespace topk {
 
+// Every kernel below selects on an order-preserving unsigned key, not on the
+// value.  A row is padded out to the block's width, and the iterative kernel
+// retires each element it picks; with float keys both used -FLT_MAX, which
+// outranks every -inf in the row, so once a row's finite entries ran out a pad
+// won: index -1 from the bitonic kernel, an index past the row from the sort
+// and a repeat of index 0 from the iterative kernel.  No float lies below -inf,
+// but key 0 lies below -inf's key (0x007FFFFF), so it marks a slot holding no
+// element.  NaN takes the top key, which is where torch.topk ranks it.
+constexpr uint32_t kNoElement = 0;
+
+// Branch-free, so the loads it follows still issue back to back.
+__device__ __forceinline__ uint32_t orderedKey(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t key = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    return (bits & 0x7FFFFFFFu) > 0x7F800000u ? 0xFFFFFFFFu : key;  // NaN
+}
+
+// The inverse of orderedKey (NaN comes back as a NaN, not its payload).
+__device__ __forceinline__ float keyValue(uint32_t key) {
+    return __uint_as_float((key & 0x80000000u) ? (key & 0x7FFFFFFFu) : ~key);
+}
+
 /*!
  * \brief One-block-per-row top-k extraction kernel.
  *
- * Each thread loads a strided slice of the row into PER_THREAD float registers.
+ * Each thread loads the keys of a strided slice of the row into PER_THREAD registers.
  * For each of the k iterations, we:
  *   1. Find the local argmax over each thread's registers.
  *   2. Reduce across the warp via shuffle.
@@ -40,7 +61,7 @@ __global__ void topkKernel(const T* __restrict__ input, T* __restrict__ values,
                            int32_t* __restrict__ indices, int num_cols, int k) {
     static constexpr int NWARP = BLOCK_SIZE / WARP_SIZE;
 
-    __shared__ float warp_vals[NWARP];
+    __shared__ uint32_t warp_vals[NWARP];
     __shared__ int32_t warp_idxs[NWARP];
     __shared__ int32_t global_idx_smem;
 
@@ -52,20 +73,18 @@ __global__ void topkKernel(const T* __restrict__ input, T* __restrict__ values,
     T* row_out = values + (int64_t)row * k;
     int32_t* idx_out = indices + (int64_t)row * k;
 
-    const float neg_inf = cuda::std::numeric_limits<float>::lowest();
-
-    // Load row into registers (cast to float for comparison). Out-of-range
-    // slots are set to -inf so they never win the argmax.
-    float regs[PER_THREAD];
+    // Load the row's keys into registers. Out-of-range slots hold no element, so
+    // they never win the argmax; k <= num_cols leaves a real one every round.
+    uint32_t regs[PER_THREAD];
 #pragma unroll
     for (int j = 0; j < PER_THREAD; j++) {
         int i = threadIdx.x + j * BLOCK_SIZE;
-        regs[j] = (i < num_cols) ? static_cast<float>(row_in[i]) : neg_inf;
+        regs[j] = (i < num_cols) ? orderedKey(static_cast<float>(row_in[i])) : kNoElement;
     }
 
     for (int iter = 0; iter < k; iter++) {
         // Each thread finds its argmax over its register strip.
-        float local_val = neg_inf;
+        uint32_t local_val = kNoElement;
         int local_idx = 0;
 #pragma unroll
         for (int j = 0; j < PER_THREAD; j++) {
@@ -79,7 +98,7 @@ __global__ void topkKernel(const T* __restrict__ input, T* __restrict__ values,
 // Warp-level argmax reduce via shuffle.
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            float other_val = __shfl_xor_sync(0xffffffff, local_val, offset);
+            uint32_t other_val = __shfl_xor_sync(0xffffffff, local_val, offset);
             int other_idx = __shfl_xor_sync(0xffffffff, local_idx, offset);
             if (other_val > local_val) {
                 local_val = other_val;
@@ -97,12 +116,12 @@ __global__ void topkKernel(const T* __restrict__ input, T* __restrict__ values,
         // First warp does the cross-warp reduction in parallel (replaces the
         // thread-0 serial sweep — big win at NWARP=32).
         if (wid == 0) {
-            float v = (lane < NWARP) ? warp_vals[lane] : neg_inf;
+            uint32_t v = (lane < NWARP) ? warp_vals[lane] : kNoElement;
             int32_t i = (lane < NWARP) ? warp_idxs[lane] : 0;
 
 #pragma unroll
             for (int offset = NWARP / 2; offset > 0; offset >>= 1) {
-                float ov = __shfl_xor_sync(0xffffffff, v, offset);
+                uint32_t ov = __shfl_xor_sync(0xffffffff, v, offset);
                 int32_t oi = __shfl_xor_sync(0xffffffff, i, offset);
                 if (ov > v) {
                     v = ov;
@@ -125,7 +144,7 @@ __global__ void topkKernel(const T* __restrict__ input, T* __restrict__ values,
         for (int j = 0; j < PER_THREAD; j++) {
             int i = threadIdx.x + j * BLOCK_SIZE;
             if (i == gidx) {
-                regs[j] = neg_inf;
+                regs[j] = kNoElement;
             }
         }
     }
@@ -145,7 +164,7 @@ __global__ void topkKernel(const T* __restrict__ input, T* __restrict__ values,
 template <typename T, int BLOCK_SIZE, int PER_THREAD>
 __global__ void topkSortKernel(const T* __restrict__ input, T* __restrict__ values,
                                int32_t* __restrict__ indices, int num_cols, int k) {
-    using BlockRadixSort = cub::BlockRadixSort<float, BLOCK_SIZE, PER_THREAD, int32_t>;
+    using BlockRadixSort = cub::BlockRadixSort<uint32_t, BLOCK_SIZE, PER_THREAD, int32_t>;
     __shared__ typename BlockRadixSort::TempStorage temp_storage;
 
     const int row = blockIdx.x;
@@ -154,28 +173,26 @@ __global__ void topkSortKernel(const T* __restrict__ input, T* __restrict__ valu
     T* row_out = values + (int64_t)row * k;
     int32_t* idx_out = indices + (int64_t)row * k;
 
-    const float neg_inf = cuda::std::numeric_limits<float>::lowest();
-
-    float keys[PER_THREAD];
+    uint32_t keys[PER_THREAD];
     int32_t idx[PER_THREAD];
 
 #pragma unroll
     for (int j = 0; j < PER_THREAD; j++) {
         int i = threadIdx.x + j * BLOCK_SIZE;
-        keys[j] = (i < num_cols) ? static_cast<float>(row_in[i]) : neg_inf;
+        keys[j] = (i < num_cols) ? orderedKey(static_cast<float>(row_in[i])) : kNoElement;
         idx[j] = i;
     }
 
     BlockRadixSort(temp_storage).SortDescendingBlockedToStriped(keys, idx);
 
     // Striped output: rank (j*BS + tx) lives in register j of thread tx.
-    // half/bf16/float survive a float roundtrip exactly when the source was
-    // already that type, so we can write keys[j] directly without a gather.
+    // half/bf16/float survive a float and key roundtrip exactly when the source
+    // was already that type, so we can write the key's value without a gather.
 #pragma unroll
     for (int j = 0; j < PER_THREAD; j++) {
         int rank = j * BLOCK_SIZE + threadIdx.x;
         if (rank < k) {
-            row_out[rank] = static_cast<T>(keys[j]);
+            row_out[rank] = static_cast<T>(keyValue(keys[j]));
             idx_out[rank] = idx[j];
         }
     }
@@ -192,6 +209,19 @@ __global__ void topkSortKernel(const T* __restrict__ input, T* __restrict__ valu
  * \tparam PER_THREAD Elements held per thread; must be a multiple of K.
  * \tparam K          Top-k width (power of two). k_actual ≤ K is the runtime k.
  */
+// The bitonic kernel sorts one 64-bit word per element: the value's key above
+// its inverted column, so a single compare orders by value and breaks a tie
+// toward the lower column, and a pad (key 0) sorts below every element.  A
+// (key, column) register pair sorts the same, but nvcc spent many times longer
+// compiling its 128-wide networks than these plain min/max ones.
+__device__ __forceinline__ uint64_t packKey(uint32_t key, int column) {
+    return (static_cast<uint64_t>(key) << 32) | static_cast<uint32_t>(~column);
+}
+
+__device__ __forceinline__ int32_t packedColumn(uint64_t packed) {
+    return static_cast<int32_t>(~static_cast<uint32_t>(packed));
+}
+
 template <typename T, int BLOCK_SIZE, int PER_THREAD, int K>
 __global__ void topkBitonicKernel(const T* __restrict__ input, T* __restrict__ values,
                                   int32_t* __restrict__ indices, int num_cols, int k_actual) {
@@ -204,8 +234,7 @@ __global__ void topkBitonicKernel(const T* __restrict__ input, T* __restrict__ v
     constexpr int kNumWarps = BLOCK_SIZE / WARP_SIZE;
     constexpr int kNumChunks = PER_THREAD / K;
 
-    __shared__ float warp_topk_smem[kNumWarps * K];
-    __shared__ int32_t warp_idx_smem[kNumWarps * K];
+    __shared__ uint64_t warp_topk_smem[kNumWarps * K];
 
     const int row = blockIdx.x;
     const int tx = threadIdx.x;
@@ -216,59 +245,42 @@ __global__ void topkBitonicKernel(const T* __restrict__ input, T* __restrict__ v
     T* row_out = values + (int64_t)row * k_actual;
     int32_t* idx_out = indices + (int64_t)row * k_actual;
 
-    const float neg_inf = cuda::std::numeric_limits<float>::lowest();
-
     // Per-thread register strip: striped layout for coalesced loads.
-    float regs[PER_THREAD];
-    int32_t regs_idx[PER_THREAD];
+    uint64_t regs[PER_THREAD];
 #pragma unroll
     for (int j = 0; j < PER_THREAD; ++j) {
         int i = tx + j * BLOCK_SIZE;
-        if (i < num_cols) {
-            regs[j] = static_cast<float>(row_in[i]);
-            regs_idx[j] = i;
-        } else {
-            regs[j] = neg_inf;
-            regs_idx[j] = -1;
-        }
+        regs[j] = packKey(i < num_cols ? orderedKey(static_cast<float>(row_in[i])) : kNoElement, i);
     }
 
     // Per-thread top-K: sort the first chunk, then merge subsequent chunks.
-    float topk_vals[K];
-    int32_t topk_idx[K];
+    uint64_t topk[K];
 #pragma unroll
     for (int j = 0; j < K; ++j) {
-        topk_vals[j] = regs[j];
-        topk_idx[j] = regs_idx[j];
+        topk[j] = regs[j];
     }
-    sort::bitonic_sort<K, /*Ascending=*/false>(topk_vals, topk_idx);
+    sort::bitonic_sort<K, /*Ascending=*/false>(topk);
 
 #pragma unroll
     for (int chunk = 1; chunk < kNumChunks; ++chunk) {
-        float other_vals[K];
-        int32_t other_idx[K];
+        uint64_t other[K];
 #pragma unroll
         for (int j = 0; j < K; ++j) {
-            other_vals[j] = regs[chunk * K + j];
-            other_idx[j] = regs_idx[chunk * K + j];
+            other[j] = regs[chunk * K + j];
         }
-        sort::bitonic_sort<K, /*Ascending=*/false>(other_vals, other_idx);
-        sort::bitonic_topk_merge<K, /*Ascending=*/false>(topk_vals, topk_idx, other_vals,
-                                                        other_idx);
+        sort::bitonic_sort<K, /*Ascending=*/false>(other);
+        sort::bitonic_topk_merge<K, /*Ascending=*/false>(topk, other);
     }
 
     // Warp-level top-k merge: log2(WARP_SIZE) butterfly shuffles.
 #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
-        float other_vals[K];
-        int32_t other_idx[K];
+        uint64_t other[K];
 #pragma unroll
         for (int j = 0; j < K; ++j) {
-            other_vals[j] = __shfl_xor_sync(0xffffffff, topk_vals[j], offset);
-            other_idx[j] = __shfl_xor_sync(0xffffffff, topk_idx[j], offset);
+            other[j] = __shfl_xor_sync(0xffffffff, topk[j], offset);
         }
-        sort::bitonic_topk_merge<K, /*Ascending=*/false>(topk_vals, topk_idx, other_vals,
-                                                        other_idx);
+        sort::bitonic_topk_merge<K, /*Ascending=*/false>(topk, other);
     }
 
     // Cross-warp top-k merge via shared memory.
@@ -276,37 +288,27 @@ __global__ void topkBitonicKernel(const T* __restrict__ input, T* __restrict__ v
         if (lane == 0) {
 #pragma unroll
             for (int j = 0; j < K; ++j) {
-                warp_topk_smem[wid * K + j] = topk_vals[j];
-                warp_idx_smem[wid * K + j] = topk_idx[j];
+                warp_topk_smem[wid * K + j] = topk[j];
             }
         }
         __syncthreads();
 
         if (wid == 0) {
-            // Lane l reads warp l's top-K. Lanes ≥ kNumWarps load -inf so
-            // the butterfly merges below treat them as no-ops.
+            // Lane l reads warp l's top-K. Lanes ≥ kNumWarps hold nothing (0
+            // sorts below every element), so the merges below pass them over.
 #pragma unroll
             for (int j = 0; j < K; ++j) {
-                if (lane < kNumWarps) {
-                    topk_vals[j] = warp_topk_smem[lane * K + j];
-                    topk_idx[j] = warp_idx_smem[lane * K + j];
-                } else {
-                    topk_vals[j] = neg_inf;
-                    topk_idx[j] = -1;
-                }
+                topk[j] = lane < kNumWarps ? warp_topk_smem[lane * K + j] : 0;
             }
 
 #pragma unroll
             for (int offset = 1; offset < kNumWarps; offset <<= 1) {
-                float other_vals[K];
-                int32_t other_idx[K];
+                uint64_t other[K];
 #pragma unroll
                 for (int j = 0; j < K; ++j) {
-                    other_vals[j] = __shfl_xor_sync(0xffffffff, topk_vals[j], offset);
-                    other_idx[j] = __shfl_xor_sync(0xffffffff, topk_idx[j], offset);
+                    other[j] = __shfl_xor_sync(0xffffffff, topk[j], offset);
                 }
-                sort::bitonic_topk_merge<K, /*Ascending=*/false>(topk_vals, topk_idx, other_vals,
-                                                                other_idx);
+                sort::bitonic_topk_merge<K, /*Ascending=*/false>(topk, other);
             }
         }
     }
@@ -318,8 +320,8 @@ __global__ void topkBitonicKernel(const T* __restrict__ input, T* __restrict__ v
 #pragma unroll
         for (int j = 0; j < K; ++j) {
             if (j < k_actual) {
-                row_out[j] = static_cast<T>(topk_vals[j]);
-                idx_out[j] = topk_idx[j];
+                row_out[j] = static_cast<T>(keyValue(static_cast<uint32_t>(topk[j] >> 32)));
+                idx_out[j] = packedColumn(topk[j]);
             }
         }
     }
@@ -393,7 +395,7 @@ template <typename T, int BLOCK_SIZE, int PER_THREAD>
 inline void LaunchTopK(const T* input, T* values, int32_t* indices, unsigned int num_rows,
                        int num_cols, int k, bool use_sort, cudaStream_t stream) {
     constexpr bool kSortFitsShmem =
-        BLOCK_SIZE * PER_THREAD * static_cast<int>(sizeof(float)) <= 48 * 1024;
+        BLOCK_SIZE * PER_THREAD * static_cast<int>(sizeof(uint32_t)) <= 48 * 1024;
     constexpr bool kSortAmortizes = PER_THREAD >= 4;
     if constexpr (kSortFitsShmem && kSortAmortizes) {
         if (use_sort) {
@@ -421,6 +423,9 @@ inline void LaunchTopK(const T* input, T* values, int32_t* indices, unsigned int
 template <typename T>
 cudaError_t TopK(const T* input, T* values, int32_t* indices, unsigned int num_rows,
                  unsigned int num_cols, int k, cudaStream_t stream = nullptr) {
+    if (num_rows == 0) {
+        return cudaSuccess;  // a zero-block grid is a launch error, not a no-op
+    }
     // Pick (BLOCK_SIZE, PER_THREAD) such that BLOCK_SIZE * PER_THREAD ≥ num_cols.
     int block_size, per_thread;
     if (num_cols <= 32) {

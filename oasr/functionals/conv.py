@@ -712,7 +712,21 @@ def causal_conv1d(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Causal 1D convolution with state management (streaming)."""
+    """Causal 1D convolution with state management (streaming).
+
+    Args:
+        input: The chunk, ``[B, L, C]``. A non-contiguous one is materialized once.
+        state: The previous ``K - 1`` positions, ``[B, K - 1, C]``, contiguous.
+            Updated in place to the last ``K - 1`` positions of ``[state | input]``.
+        weight: Depthwise weight ``[C, 1, K]``.
+        bias: Optional ``[C]``.
+        out: Optional contiguous ``[B, L, C]`` output; must not share memory
+            with ``input`` or ``state``.
+
+    Returns:
+        The convolution of ``[state | input]``, one output per input position.
+    """
+    input = input.contiguous()
     if out is None:
         out = torch.empty_like(input)
     _get_conv_module().causal_conv1d(out, input, state, weight, bias)
