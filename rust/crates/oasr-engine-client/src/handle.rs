@@ -8,37 +8,41 @@
 //! dispatcher — there's no intermediate forwarder task.  Dropping the
 //! handle without an explicit `finish` emits a `Cmd::Cancel`.
 //!
-//! [`OfflineHandle`] is a oneshot future that resolves with the Final or
-//! Error event.  All three handles arm [`CancelOnDrop`]: a client that goes
-//! away is the normal case, and the engine has to hear about it or the request
-//! keeps computing on a slot nobody is waiting for.
+//! [`OfflineHandle`] resolves with the Final or Error event.  All three
+//! handles arm [`CancelOnDrop`]: a client that goes away is the normal case,
+//! and the engine has to hear about it or the request keeps computing on a
+//! slot nobody is waiting for.  Each also owns the request's router
+//! [`Registration`], so the entry goes when the handle does, however the
+//! handler that held it returned.
 
 use bytes::Bytes;
 use oasr_wire::{Cmd, Event};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
 use crate::dispatcher::CmdEnvelope;
-use crate::router::RouterActor;
-use crate::EventStream;
+use crate::router::Registration;
+use crate::{EngineClientError, EventStream};
 
 /// Carrier of a cancellation tail when the WS / gRPC stream drops early.
+///
+/// Disarming stops the cancel, not the cleanup: the registration is dropped
+/// with the guard either way.  A streaming handle disarms at `flush_last`,
+/// before its final arrives, and a handler that returned in that window used to
+/// leave its entry until the engine got round to the terminal event.
 struct CancelOnDrop {
-    request_id: String,
+    registration: Registration,
     cmd_tx: mpsc::Sender<CmdEnvelope>,
-    router: RouterActor,
     finished: bool,
 }
 
 impl CancelOnDrop {
-    fn arm(request_id: String, cmd_tx: mpsc::Sender<CmdEnvelope>, router: RouterActor) -> Self {
+    fn arm(registration: Registration, cmd_tx: mpsc::Sender<CmdEnvelope>) -> Self {
         Self {
-            request_id,
+            registration,
             cmd_tx,
-            router,
             finished: false,
         }
     }
@@ -53,8 +57,9 @@ impl Drop for CancelOnDrop {
         if self.finished {
             return;
         }
+        let request_id = self.registration.request_id();
         let cancel = Cmd::Cancel {
-            request_id: self.request_id.clone(),
+            request_id: request_id.to_owned(),
         };
         let envelope = CmdEnvelope::new(cancel, None);
         match self.cmd_tx.try_send(envelope) {
@@ -65,15 +70,16 @@ impl Drop for CancelOnDrop {
             // logged left the request holding its slot and its KV blocks for
             // the life of the process.  So it waits for room instead.
             Err(TrySendError::Full(envelope)) => {
-                debug!(rid = %self.request_id, "dispatcher channel full; deferring cancel");
+                debug!(rid = %request_id, "dispatcher channel full; deferring cancel");
                 send_when_room(self.cmd_tx.clone(), envelope);
             }
             // The dispatcher is gone, and the engine with it.
             Err(TrySendError::Closed(_)) => {
-                trace!(rid = %self.request_id, "dispatcher closed; cancel dropped");
+                trace!(rid = %request_id, "dispatcher closed; cancel dropped");
             }
         }
-        self.router.remove(&self.request_id);
+        // The registration is a field, so it is removed after the cancel is
+        // queued, whether or not the guard was armed.
     }
 }
 
@@ -107,18 +113,16 @@ pub struct StreamingHandle {
 
 impl StreamingHandle {
     pub(crate) fn new(
-        request_id: String,
+        registration: Registration,
         events: EventStream,
         cmd_tx: mpsc::Sender<CmdEnvelope>,
-        router: RouterActor,
     ) -> Self {
         Self {
+            request_id: registration.request_id().to_owned(),
             _cancel: Arc::new(parking_lot::Mutex::new(CancelOnDrop::arm(
-                request_id.clone(),
+                registration,
                 cmd_tx.clone(),
-                router,
             ))),
-            request_id,
             cmd_tx,
             events,
         }
@@ -181,18 +185,16 @@ pub struct OfflineStreamHandle {
 
 impl OfflineStreamHandle {
     pub(crate) fn new(
-        request_id: String,
+        registration: Registration,
         events: EventStream,
         cmd_tx: mpsc::Sender<CmdEnvelope>,
-        router: RouterActor,
     ) -> Self {
         Self {
+            request_id: registration.request_id().to_owned(),
             _cancel: Arc::new(parking_lot::Mutex::new(CancelOnDrop::arm(
-                request_id.clone(),
+                registration,
                 cmd_tx,
-                router,
             ))),
-            request_id,
             events,
         }
     }
@@ -212,43 +214,67 @@ impl OfflineStreamHandle {
 /// disconnects.  Without the guard the request kept computing and kept holding
 /// its `--max-concurrent-requests` slot — for an autoregressive family, the
 /// whole `max_new_tokens` generation, burned on nobody.
+///
+/// The handle reads its own events rather than leaving them to a forwarding
+/// task: a task spawned per request is one more thing that outlives the request
+/// when it ends early, and this one did, waiting forever on a registration no
+/// terminal event would ever remove.
 pub struct OfflineHandle {
     pub request_id: String,
-    rx: oneshot::Receiver<Event>,
+    events: mpsc::Receiver<Event>,
     cancel: CancelOnDrop,
 }
 
 impl OfflineHandle {
     pub(crate) fn new(
-        request_id: String,
-        rx: oneshot::Receiver<Event>,
+        registration: Registration,
+        events: mpsc::Receiver<Event>,
         cmd_tx: mpsc::Sender<CmdEnvelope>,
-        router: RouterActor,
     ) -> Self {
         Self {
-            cancel: CancelOnDrop::arm(request_id.clone(), cmd_tx, router),
-            request_id,
-            rx,
+            request_id: registration.request_id().to_owned(),
+            cancel: CancelOnDrop::arm(registration, cmd_tx),
+            events,
         }
     }
 
-    /// Await the final result event.
+    /// Await the final result event, skipping the non-terminal ones.
     ///
-    /// The guard is disarmed only once the terminal event is in hand.  Dropping
+    /// The guard is disarmed only once the event stream has ended.  Dropping
     /// this future before then — which is what a client disconnect does — leaves
     /// it armed and cancels the request.
-    pub async fn finish(self) -> Result<Event, oneshot::error::RecvError> {
-        let Self { rx, mut cancel, .. } = self;
-        let ev = rx.await;
+    pub async fn finish(self) -> Result<Event, EngineClientError> {
+        let Self {
+            mut events,
+            mut cancel,
+            ..
+        } = self;
+        let terminal = loop {
+            match events.recv().await {
+                Some(ev) if ev.is_terminal() => break Some(ev),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
         cancel.disarm();
-        ev
+        terminal.ok_or_else(|| {
+            EngineClientError::Other("event stream closed before a terminal event".into())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::RouterActor;
     use std::time::Duration;
+
+    /// A guard for `rid` on its own router, which the caller keeps to inspect.
+    fn armed(rid: &str, cmd_tx: mpsc::Sender<CmdEnvelope>) -> (CancelOnDrop, RouterActor) {
+        let router = RouterActor::default();
+        let (registration, _events) = router.register(rid.into(), 1);
+        (CancelOnDrop::arm(registration, cmd_tx), router)
+    }
 
     fn cancel_for(rid: &str) -> CmdEnvelope {
         CmdEnvelope::new(
@@ -280,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_dropped_into_a_full_channel_still_arrives() {
         let (tx, mut rx) = full_channel();
-        drop(CancelOnDrop::arm("gone".into(), tx, RouterActor::default()));
+        drop(armed("gone", tx).0);
         assert_eq!(next_cancelled(&mut rx).await, "queued-ahead");
         assert_eq!(next_cancelled(&mut rx).await, "gone");
     }
@@ -288,11 +314,9 @@ mod tests {
     #[tokio::test]
     async fn a_handle_dropped_off_the_runtime_still_cancels() {
         let (tx, mut rx) = full_channel();
-        std::thread::spawn(move || {
-            drop(CancelOnDrop::arm("gone".into(), tx, RouterActor::default()))
-        })
-        .join()
-        .unwrap();
+        std::thread::spawn(move || drop(armed("gone", tx).0))
+            .join()
+            .unwrap();
         assert_eq!(next_cancelled(&mut rx).await, "queued-ahead");
         assert_eq!(next_cancelled(&mut rx).await, "gone");
     }
@@ -300,12 +324,61 @@ mod tests {
     #[tokio::test]
     async fn a_disarmed_guard_sends_nothing() {
         let (tx, mut rx) = mpsc::channel(1);
-        let mut guard = CancelOnDrop::arm("done".into(), tx, RouterActor::default());
+        let (mut guard, _router) = armed("done", tx);
         guard.disarm();
         drop(guard);
         assert!(
             rx.recv().await.is_none(),
             "a finished request must not be cancelled"
+        );
+    }
+
+    /// Disarming is about the cancel.  A streaming handle disarms at
+    /// `flush_last`, before its final arrives, and its router entry used to
+    /// stay until that final was routed -- or for good, if it never was.
+    #[tokio::test]
+    async fn a_disarmed_guard_still_takes_its_router_entry() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (mut guard, router) = armed("done", tx);
+        assert_eq!(router.len(), 1);
+        guard.disarm();
+        drop(guard);
+        assert!(router.is_empty(), "the entry outlived its handle");
+    }
+
+    #[tokio::test]
+    async fn an_armed_guard_takes_its_router_entry_too() {
+        let (tx, _rx) = mpsc::channel(1);
+        let (guard, router) = armed("gone", tx);
+        drop(guard);
+        assert!(router.is_empty(), "the entry outlived its handle");
+    }
+
+    /// The unary handle reads past `Accepted` and partials to the terminal.
+    #[tokio::test]
+    async fn an_offline_handle_resolves_with_the_terminal_event() {
+        let router = RouterActor::default();
+        let (registration, events) = router.register("r".into(), 8);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(1);
+        let handle = OfflineHandle::new(registration, events, cmd_tx);
+        router
+            .route(Event::Accepted {
+                request_id: "r".into(),
+            })
+            .await;
+        router
+            .route(Event::Error {
+                request_id: "r".into(),
+                code: oasr_wire::ErrorCode::Busy,
+                message: "full".into(),
+            })
+            .await;
+        let ev = handle.finish().await.expect("no terminal event");
+        assert!(matches!(ev, Event::Error { .. }), "{ev:?}");
+        assert!(router.is_empty());
+        assert!(
+            cmd_rx.recv().await.is_none(),
+            "a request that finished must not be cancelled"
         );
     }
 }

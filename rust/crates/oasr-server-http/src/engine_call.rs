@@ -77,8 +77,9 @@ pub fn error_from_event_code(code: ErrorCode) -> (StatusCode, &'static str) {
 
 /// Submit one fully-buffered utterance and await its terminal event.
 ///
-/// `audio` is f32-LE mono at the engine rate. Releases the pool slot on every
-/// path; `metrics` identifies the calling API surface.
+/// `audio` is f32-LE mono at the engine rate. The handle releases the request
+/// on every path, a dropped future included; `metrics` identifies the calling
+/// API surface.
 pub async fn submit_offline_and_wait(
     state: &AppState,
     audio: Bytes,
@@ -124,7 +125,6 @@ pub async fn submit_offline_and_wait(
             ));
         }
     };
-    state.pool.release(&rid);
 
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_millis() as u64;

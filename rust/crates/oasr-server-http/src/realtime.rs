@@ -55,11 +55,19 @@
 //! rather than at the handshake, and `--stream-idle-timeout-secs` on every wait
 //! — for a client message before commit, for an engine event after.  Without
 //! them a socket that configured and went quiet held an engine slot forever.
+//!
+//! ## Shutdown
+//!
+//! An upgraded socket leaves the HTTP server's connection accounting at the
+//! upgrade, so the listener's graceful shutdown cannot wait for it.  Each
+//! session is counted in a [`SessionTracker`] instead: the server waits for
+//! them up to its grace period, refuses new ones meanwhile, and ends whatever
+//! is left with an `error` event and a `1001 going away` close.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{close_code, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -74,6 +82,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::http_metrics::realtime_streaming;
@@ -86,6 +96,56 @@ pub struct SessionLimits {
     pub permits: Option<Arc<Semaphore>>,
     /// End a session idle this long.  `None` disables.
     pub idle: Option<Duration>,
+    /// Where the session is counted for the shutdown drain.
+    pub sessions: SessionTracker,
+}
+
+/// The realtime sessions in flight, for the server's shutdown drain.
+///
+/// The listener's graceful shutdown waited only for HTTP requests, and a
+/// WebSocket stops being one at the upgrade: the server stopped accepting,
+/// found nothing left to wait for, and exited under every open session,
+/// mid-utterance.  Cheap to clone; every clone is the same set.
+#[derive(Clone, Debug, Default)]
+pub struct SessionTracker {
+    tasks: TaskTracker,
+    /// Cancelled once the drain begins: new sessions are refused.
+    draining: CancellationToken,
+    /// Cancelled when the drain's deadline passes: sessions still open end.
+    cut: CancellationToken,
+}
+
+impl SessionTracker {
+    /// Begin the drain: refuse new sessions, and let [`Self::wait`] resolve
+    /// once the open ones have ended.
+    pub fn drain(&self) {
+        self.draining.cancel();
+        self.tasks.close();
+    }
+
+    /// End every session still open, telling each client why.
+    pub fn cut(&self) {
+        self.cut.cancel();
+    }
+
+    /// Resolves once [`Self::drain`] has been called and every session has
+    /// ended.
+    pub async fn wait(&self) {
+        self.tasks.wait().await
+    }
+
+    /// Sessions currently open.
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.is_cancelled()
+    }
 }
 
 /// `GET /v1/realtime` — upgrade and run one transcription session.
@@ -94,6 +154,14 @@ pub async fn handle_realtime(
     Extension(limits): Extension<SessionLimits>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    if limits.sessions.is_draining() {
+        return crate::openai::api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            None,
+            "the server is shutting down",
+        );
+    }
     // Refused rather than queued: a WebSocket client handles a 503 on connect,
     // and an upgrade parked for a permit would sit outside every timeout.
     let permit = match &limits.permits {
@@ -110,12 +178,41 @@ pub async fn handle_realtime(
         },
         None => None,
     };
+    // Counted from here, not from the upgrade: between this handler returning
+    // and the upgrade completing, the connection is in neither the listener's
+    // accounting nor the tracker's.
+    let counted = limits.sessions.tasks.token();
     ws.on_upgrade(move |socket| async move {
         let _permit = permit;
-        if let Err(e) = run_session(s, socket, limits.idle).await {
-            debug!(reason = %e, "realtime session ended");
-        }
+        let _counted = counted;
+        supervise(s, socket, limits).await;
     })
+}
+
+/// Run one session until it ends or the shutdown drain's deadline cuts it.
+///
+/// A cut drops the session — its engine handle cancels the request — and then
+/// tells the client, on the socket the session was borrowing, why it ended:
+/// `1001 going away` is the close a client takes as "reconnect elsewhere".
+async fn supervise(s: AppState, mut socket: WebSocket, limits: SessionLimits) {
+    let ended = tokio::select! {
+        ended = run_session(s, &mut socket, limits.idle) => ended,
+        _ = limits.sessions.cut.cancelled() => {
+            let message = "the server is shutting down";
+            info!("realtime session cut at the shutdown deadline");
+            let _ = send_json(&mut socket, error_event(message, "server_error")).await;
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::AWAY,
+                    reason: message.into(),
+                })))
+                .await;
+            Err(message.into())
+        }
+    };
+    if let Err(e) = ended {
+        debug!(reason = %e, "realtime session ended");
+    }
 }
 
 /// Per-session configuration, from `session.update`.
@@ -378,7 +475,7 @@ type SessionEnd = String;
 
 async fn run_session(
     s: AppState,
-    mut socket: WebSocket,
+    socket: &mut WebSocket,
     idle: Option<Duration>,
 ) -> Result<(), SessionEnd> {
     // Configuration is optional: a client that opens the socket and starts
@@ -389,7 +486,7 @@ async fn run_session(
     let mut pending_audio: Option<Bytes> = None;
     let mut committed = false;
     loop {
-        match next_message_within(&mut socket, idle).await? {
+        match next_message_within(socket, idle).await? {
             ClientMessage::Configure(u) => {
                 update = u;
                 break;
@@ -410,7 +507,7 @@ async fn run_session(
         Ok(sess) => sess,
         Err(e) => {
             let _ = send_json(
-                &mut socket,
+                socket,
                 json!({
                     "type": "error",
                     "error": {
@@ -425,7 +522,7 @@ async fn run_session(
         }
     };
     send_json(
-        &mut socket,
+        socket,
         json!({
             "type": "transcription_session.created",
             "session": {
@@ -616,7 +713,7 @@ fn error_event(message: &str, kind: &str) -> Value {
 /// Streaming engine: feed chunks as they arrive, forward events as they come.
 async fn chunked_session(
     s: AppState,
-    mut socket: WebSocket,
+    socket: &mut WebSocket,
     mut session: Session,
     mut pending_audio: Option<Bytes>,
     mut already_committed: bool,
@@ -626,7 +723,7 @@ async fn chunked_session(
     // client that configured and went quiet used to hold an engine slot for as
     // long as it kept the socket, and enough of them held every slot.
     while pending_audio.is_none() && !already_committed {
-        match next_message_within(&mut socket, idle).await? {
+        match next_message_within(socket, idle).await? {
             ClientMessage::Audio(bytes) => pending_audio = Some(bytes),
             ClientMessage::Commit => already_committed = true,
             ClientMessage::Configure(_) => {
@@ -643,7 +740,7 @@ async fn chunked_session(
         Ok(handle) => handle,
         Err(e) => {
             warn!(%e, "realtime open rejected");
-            return Err(refuse(&mut socket, format!("submit failed: {e}")).await);
+            return Err(refuse(socket, format!("submit failed: {e}")).await);
         }
     };
     let rid = handle.request_id.clone();
@@ -669,18 +766,18 @@ async fn chunked_session(
                     // transcript, not whether this client asked to see it.
                     metrics.partial();
                     for ev in speech_activity_events(speech_events) {
-                        send_json(&mut socket, ev).await?;
+                        send_json(socket, ev).await?;
                     }
                     if session.interim_results {
                         if let Some(ev) = emitted.event(&text) {
-                            send_json(&mut socket, ev).await?;
+                            send_json(socket, ev).await?;
                         }
                     }
                 }
                 Some(Event::Final { text, speech_events, endpoint_reason, .. }) => {
                     handle.finish();
                     for ev in speech_activity_events(speech_events) {
-                        send_json(&mut socket, ev).await?;
+                        send_json(socket, ev).await?;
                     }
                     // A turn the endpointer closed is *committed* — the buffer
                     // became a conversation item without the client asking.
@@ -688,10 +785,10 @@ async fn chunked_session(
                     // client's own `input_audio_buffer.commit`, so re-announcing
                     // it would double-count the item.
                     if endpoint_reason.is_some() {
-                        send_json(&mut socket, json!({"type": "input_audio_buffer.committed"}))
+                        send_json(socket, json!({"type": "input_audio_buffer.committed"}))
                             .await?;
                     }
-                    send_json(&mut socket, completed_event(&text)).await?;
+                    send_json(socket, completed_event(&text)).await?;
                     info!(
                         rid = %rid,
                         transcript = %text,
@@ -702,16 +799,16 @@ async fn chunked_session(
                 }
                 Some(Event::Error { code, message, .. }) => {
                     handle.finish();
-                    let _ = send_json(&mut socket, error_event(&message, &format!("{code:?}"))).await;
+                    let _ = send_json(socket, error_event(&message, &format!("{code:?}"))).await;
                     break Err(message);
                 }
                 Some(_) => {}
                 None => {
-                    let _ = send_json(&mut socket, error_event("event stream closed", "server_error")).await;
+                    let _ = send_json(socket, error_event("event stream closed", "server_error")).await;
                     break Err("event stream closed".into());
                 }
             },
-            msg = next_client_message(&mut socket), if !inbound_done => match msg {
+            msg = next_client_message(socket), if !inbound_done => match msg {
                 Ok(ClientMessage::Audio(bytes)) => {
                     feed(&mut session, &handle, &bytes, &mut metrics, s.sample_rate).await?
                 }
@@ -738,12 +835,11 @@ async fn chunked_session(
             // engine event -- counts as activity.
             _ = sleep_opt(idle) => {
                 let limit = idle.expect("an idle arm fires only with a bound");
-                break Err(end_idle(&mut socket, limit, inbound_done).await);
+                break Err(end_idle(socket, limit, inbound_done).await);
             }
         }
     };
     metrics.finished(outcome_of(&result));
-    s.pool.release(&rid);
     let _ = socket.send(Message::Close(None)).await;
     result
 }
@@ -824,7 +920,7 @@ async fn feed(
 /// expects.  Identical to what the gRPC surface does for the same reason.
 async fn buffered_session(
     s: AppState,
-    mut socket: WebSocket,
+    socket: &mut WebSocket,
     mut session: Session,
     pending_audio: Option<Bytes>,
     already_committed: bool,
@@ -842,7 +938,7 @@ async fn buffered_session(
     }
     let mut committed = already_committed;
     while !committed {
-        match next_message_within(&mut socket, idle).await? {
+        match next_message_within(socket, idle).await? {
             ClientMessage::Audio(chunk) => {
                 let decoded = session
                     .pcm
@@ -853,8 +949,7 @@ async fn buffered_session(
                 if let Some(cap) = s.max_audio_samples {
                     if buffered.len() / 4 > cap {
                         let msg = format!("audio exceeds the {cap}-sample limit");
-                        let _ = send_json(&mut socket, error_event(&msg, "invalid_request_error"))
-                            .await;
+                        let _ = send_json(socket, error_event(&msg, "invalid_request_error")).await;
                         return Err(msg);
                     }
                 }
@@ -872,7 +967,7 @@ async fn buffered_session(
     }
     if buffered.is_empty() {
         let msg = "no audio received before input_audio_buffer.commit";
-        let _ = send_json(&mut socket, error_event(msg, "invalid_request_error")).await;
+        let _ = send_json(socket, error_event(msg, "invalid_request_error")).await;
         return Err(msg.into());
     }
 
@@ -889,7 +984,7 @@ async fn buffered_session(
         Ok(handle) => handle,
         Err(e) => {
             warn!(%e, "realtime (offline) submit rejected");
-            return Err(refuse(&mut socket, format!("submit failed: {e}")).await);
+            return Err(refuse(socket, format!("submit failed: {e}")).await);
         }
     };
     let rid = handle.request_id.clone();
@@ -902,7 +997,7 @@ async fn buffered_session(
             None => handle.events.next().await,
             Some(limit) => match tokio::time::timeout(limit, handle.events.next()).await {
                 Ok(ev) => ev,
-                Err(_) => break Err(end_idle(&mut socket, limit, true).await),
+                Err(_) => break Err(end_idle(socket, limit, true).await),
             },
         };
         match next {
@@ -910,19 +1005,19 @@ async fn buffered_session(
                 metrics.partial();
                 if session.interim_results {
                     if let Some(ev) = emitted.event(&text) {
-                        send_json(&mut socket, ev).await?;
+                        send_json(socket, ev).await?;
                     }
                 }
             }
             Some(Event::Final { text, .. }) => {
                 handle.finish();
-                send_json(&mut socket, completed_event(&text)).await?;
+                send_json(socket, completed_event(&text)).await?;
                 info!(rid = %rid, transcript = %text, "realtime final");
                 break Ok(());
             }
             Some(Event::Error { code, message, .. }) => {
                 handle.finish();
-                let _ = send_json(&mut socket, error_event(&message, &format!("{code:?}"))).await;
+                let _ = send_json(socket, error_event(&message, &format!("{code:?}"))).await;
                 break Err(message);
             }
             Some(_) => {}
@@ -930,7 +1025,6 @@ async fn buffered_session(
         }
     };
     metrics.finished(outcome_of(&result));
-    s.pool.release(&rid);
     let _ = socket.send(Message::Close(None)).await;
     result
 }

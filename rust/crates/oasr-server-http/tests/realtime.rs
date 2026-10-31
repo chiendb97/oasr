@@ -17,9 +17,10 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use oasr_asr::DecodePool;
 use oasr_engine_client::EnginePool;
-use oasr_server_http::{build_router, RouterLimits, ServerState, ServiceMode};
+use oasr_server_http::{build_router, RouterLimits, ServerState, ServiceMode, SessionTracker};
 use serde_json::Value;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -154,7 +155,7 @@ async fn a_session_holds_an_inflight_permit_for_its_life() {
     let addr = serve(
         ServiceMode::Streaming,
         RouterLimits {
-            max_inflight: Some(1),
+            inflight_permits: Some(Arc::new(Semaphore::new(1))),
             ..Default::default()
         },
     )
@@ -180,4 +181,96 @@ async fn a_session_holds_an_inflight_permit_for_its_life() {
             Err(e) => panic!("the permit was never returned: {e:?}"),
         }
     }
+}
+
+/// Limits whose session tracker the test keeps, to drive a shutdown drain.
+fn tracked() -> (RouterLimits, SessionTracker) {
+    let sessions = SessionTracker::default();
+    let limits = RouterLimits {
+        sessions: sessions.clone(),
+        ..Default::default()
+    };
+    (limits, sessions)
+}
+
+/// The close frame that ends the session, skipping any events before it.
+async fn close_code(ws: &mut Client) -> Option<u16> {
+    loop {
+        match tokio::time::timeout(REPLY, ws.next()).await {
+            Err(_) => panic!("the server neither closed nor hung up within {REPLY:?}"),
+            Ok(Some(Ok(Message::Close(frame)))) => return frame.map(|f| f.code.into()),
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => return None,
+        }
+    }
+}
+
+/// An upgraded socket is not an HTTP request any more, so the listener's
+/// graceful shutdown never waited for one: the process exited under every open
+/// session, mid-utterance.  The drain waits for it, and lets it finish.
+#[tokio::test]
+async fn a_drain_waits_for_an_open_session_and_refuses_new_ones() {
+    let (limits, sessions) = tracked();
+    let addr = serve(ServiceMode::Offline, limits).await;
+    let mut ws = configured(addr).await;
+    ws.send(Message::binary(vec![0u8; 3200])).await.unwrap();
+    assert_quiet(&mut ws, Duration::from_millis(100)).await;
+    assert_eq!(sessions.len(), 1);
+
+    sessions.drain();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), sessions.wait())
+            .await
+            .is_err(),
+        "the drain finished with a session still open"
+    );
+    match connect(addr).await.map_err(|e| *e) {
+        Err(tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 503),
+        other => panic!("a new session was opened during the drain: {other:?}"),
+    }
+
+    // The open session runs to its own end: more audio, then the commit,
+    // which a pool with no workers refuses.
+    ws.send(Message::binary(vec![0u8; 3200])).await.unwrap();
+    ws.send(Message::text(r#"{"type":"input_audio_buffer.commit"}"#))
+        .await
+        .unwrap();
+    let err = next_event(&mut ws).await.expect("no reply to the commit");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("submit failed"),
+        "{err}"
+    );
+    tokio::time::timeout(REPLY, sessions.wait())
+        .await
+        .expect("the drain never finished after the session ended");
+}
+
+/// At the drain's deadline what is left is ended, and the client is told:
+/// `1001 going away` is the close a client takes as "reconnect elsewhere".
+#[tokio::test]
+async fn a_cut_session_is_told_the_server_is_going_away() {
+    let (limits, sessions) = tracked();
+    let addr = serve(ServiceMode::Offline, limits).await;
+    let mut ws = configured(addr).await;
+    ws.send(Message::binary(vec![0u8; 3200])).await.unwrap();
+    assert_quiet(&mut ws, Duration::from_millis(100)).await;
+
+    sessions.drain();
+    sessions.cut();
+    let err = next_event(&mut ws).await.expect("cut without saying why");
+    assert_eq!(err["type"], "error", "{err}");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shutting down"),
+        "{err}"
+    );
+    assert_eq!(close_code(&mut ws).await, Some(1001));
+    tokio::time::timeout(REPLY, sessions.wait())
+        .await
+        .expect("the cut session never ended");
 }

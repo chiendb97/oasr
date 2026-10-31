@@ -23,21 +23,35 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use futures::future::{FusedFuture, FutureExt};
 use oasr_engine_client::{
     client::EngineClientConfig, dispatcher::DispatcherConfig, EngineClient, EnginePool, PyEngine,
 };
 use oasr_server_grpc::pb::speech_server::SpeechServer;
 use oasr_server_grpc::{ServiceMode as GrpcServiceMode, SpeechService, SPEECH_SERVICE_NAME};
 use oasr_server_http::{
-    build_router, RouterLimits, ServerState, ServiceMode as HttpServiceMode, READY_STALE_AFTER,
+    build_router, RouterLimits, ServerState, ServiceMode as HttpServiceMode, SessionTracker,
+    READY_STALE_AFTER,
 };
 use tokio::signal;
+use tokio::sync::Semaphore;
 use tonic_health::ServingStatus;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// How often the health watcher re-evaluates engine readiness.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// After the drain deadline, how long a cut realtime session gets to tell its
+/// client why, and how long the listeners get to send the `SHUTDOWN` errors the
+/// engine stop produces.
+const CUT_GRACE: Duration = Duration::from_secs(2);
+
+/// How long each dispatcher gets to finish its tick, fail what it still holds
+/// and run the engine's `shutdown()`.  Separate from `--shutdown-grace-secs`,
+/// which is spent by then: a stop that is not waited for is cut by the process
+/// exiting, which is the failure this bound exists to avoid.
+const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run the server to completion: build the engine, start the HTTP + gRPC
 /// listeners, and block until a shutdown signal arrives.
@@ -251,6 +265,9 @@ async fn serve(cli: Cli) -> Result<()> {
         .clone()
         .unwrap_or_else(|| cli.engine_label.clone());
     let max_audio_samples = cli.max_audio_samples(engine_sample_rate);
+    // One in-flight budget for the process, drawn on by both listeners.
+    let inflight_permits = cli.inflight_limit().map(|n| Arc::new(Semaphore::new(n)));
+    let sessions = SessionTracker::default();
     let state = Arc::new(ServerState {
         pool: Arc::clone(&pool),
         prometheus,
@@ -273,7 +290,8 @@ async fn serve(cli: Cli) -> Result<()> {
         Arc::clone(&state),
         RouterLimits {
             request_timeout: cli.request_timeout(),
-            max_inflight: cli.inflight_limit(),
+            inflight_permits: inflight_permits.clone(),
+            sessions: sessions.clone(),
             stream_idle_timeout: cli.stream_idle_timeout(),
             cors_allow_origins: cli.cors_allow_origin.clone(),
         },
@@ -297,8 +315,9 @@ async fn serve(cli: Cli) -> Result<()> {
     let grpc_backlog = cli.listen_backlog;
     let grpc_pool = Arc::clone(&pool);
     let grpc_idle = cli.stream_idle_timeout();
+    let grpc_request_timeout = cli.request_timeout();
     let grpc_max_message = cli.max_audio_bytes();
-    let grpc_conn_limit = cli.inflight_limit();
+    let grpc_permits = inflight_permits;
     let grpc_max_audio_samples = max_audio_samples;
     let grpc_decode_pool = decode_pool;
 
@@ -354,6 +373,8 @@ async fn serve(cli: Cli) -> Result<()> {
     let grpc_handle = tokio::spawn(async move {
         let svc = SpeechService::new(grpc_pool, grpc_mode, engine_sample_rate)
             .with_stream_idle_timeout(grpc_idle)
+            .with_request_timeout(grpc_request_timeout)
+            .with_inflight_permits(grpc_permits)
             .with_max_audio_samples(grpc_max_audio_samples)
             .with_decode_pool(grpc_decode_pool);
         info!("gRPC listening on {grpc_bind}");
@@ -365,10 +386,12 @@ async fn serve(cli: Cli) -> Result<()> {
         let speech = SpeechServer::new(svc)
             .max_decoding_message_size(grpc_max_message)
             .max_encoding_message_size(grpc_max_message);
+        // The in-flight budget is applied in the Speech handlers, from the
+        // semaphore the HTTP listener shares, not as tonic's
+        // `concurrency_limit_per_connection`: that gives each connection its own
+        // budget, so more connections meant more budget, and it would also have
+        // queued the health checks behind a saturated server.
         let mut builder = tonic::transport::Server::builder();
-        if let Some(n) = grpc_conn_limit {
-            builder = builder.concurrency_limit_per_connection(n);
-        }
         // An incoming stream drops the builder's TCP options, so they are
         // restated: `Server::builder()` sets nodelay and no keepalive.
         let incoming = bind_listener(grpc_bind, grpc_backlog)
@@ -407,21 +430,55 @@ async fn serve(cli: Cli) -> Result<()> {
     // Tell every listener to stop accepting.  Both then finish their in-flight
     // requests; the health watcher flips to NOT_SERVING on the same signal, so
     // a load balancer sees the transition while the drain is still running.
+    // Realtime sessions are not HTTP requests any more once upgraded, so the
+    // HTTP listener cannot wait for them; the tracker does.
     let _ = shutdown_tx.send(());
+    sessions.drain();
 
-    // Wait for the drain, bounded.  The previous code called `abort()` on both
-    // tasks — hard-cancelling every in-flight request — and *then* slept 500 ms,
-    // which helped nothing because there was no longer anything to wait for.
+    // Wait for the drain, bounded.  Fused so the listeners can be waited on
+    // again below after the deadline has dropped this wait.
+    let mut listeners = Box::pin(
+        async move {
+            let _ = tokio::join!(http_handle, grpc_handle, health_handle);
+        }
+        .fuse(),
+    );
     let drained = tokio::time::timeout(grace, async {
-        let _ = tokio::join!(http_handle, grpc_handle, health_handle);
+        tokio::join!(&mut listeners, sessions.wait());
     })
-    .await;
-    match drained {
-        Ok(()) => info!("listeners drained cleanly"),
-        Err(_) => warn!(
+    .await
+    .is_ok();
+    if drained {
+        info!("listeners and realtime sessions drained cleanly");
+    } else {
+        warn!(
             grace_secs = cli.shutdown_grace_secs,
-            "drain deadline elapsed with requests still in flight; exiting anyway"
-        ),
+            realtime_sessions = sessions.len(),
+            "drain deadline elapsed with work still in flight; cutting it"
+        );
+        sessions.cut();
+        let _ = tokio::time::timeout(CUT_GRACE, sessions.wait()).await;
+    }
+
+    // Stop the engines last: everything above needs them running.  Each
+    // dispatcher fails what it still holds with SHUTDOWN, aborts it, releases
+    // its engine and exits, and is joined here -- before the runtime it waits
+    // on is dropped.  Neither happened before: the threads were never joined,
+    // and `ASREngine.shutdown()` was never called by the server.
+    if pool.shutdown(ENGINE_STOP_TIMEOUT).await {
+        info!("engine dispatchers stopped");
+    } else {
+        warn!(
+            timeout_secs = ENGINE_STOP_TIMEOUT.as_secs(),
+            "an engine dispatcher did not stop in time; exiting anyway"
+        );
+    }
+    if !listeners.is_terminated() {
+        // The requests still in flight have just been answered SHUTDOWN; give
+        // the listeners a moment to send those answers.  Checked first: a
+        // finished `Fuse` stays pending, so waiting on listeners that drained
+        // before the deadline would sit out the whole bound.
+        let _ = tokio::time::timeout(CUT_GRACE, &mut listeners).await;
     }
 
     info!("bye");

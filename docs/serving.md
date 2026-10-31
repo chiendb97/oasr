@@ -314,7 +314,8 @@ the gRPC surface does and for the same reason.
 
 A session outlives the HTTP request that opened it, so it carries its own
 bounds rather than the route's: it holds one `--max-inflight-connections`
-permit for its whole life (`503` on connect when none is free), the engine
+permit for its whole life (`503` on connect when none is free, the same budget
+gRPC draws on), it is counted for the shutdown drain, the engine
 stream opens at the first audio rather than at the handshake, and
 `--stream-idle-timeout-secs` ends a session that sends nothing before commit,
 or gets no transcription event after it, with an `error` event. An offline
@@ -703,7 +704,10 @@ CUDA_VISIBLE_DEVICES=1 oasr-server \
 ```
 
 Put any L4/L7 load balancer (nginx, envoy, …) in front — sticky routing is
-not required since one process serves a request end-to-end.
+not required since one process serves a request end-to-end.  Inside a process
+with several `--engine-workers`, a request goes to the least-loaded worker and
+stays there because its handle carries that worker's command sender; there is
+no routing table to keep in step.
 
 ### Processes per GPU is mode-dependent
 
@@ -1117,10 +1121,10 @@ the defaults that bit hardest were the ones nobody had written down.
 | `--max-concurrent-decodes` | the CPU count | Unary requests decoding and resampling their audio at once, shared by both listeners; the rest wait for a slot. Decodes run on tokio's blocking pool rather than the async workers, so the bound is on CPU and on resident waveforms -- each decode holds its audio at the source and the model rate until it finishes. Short raw PCM at the model's rate bypasses the pool (see above). A decoder that panics on some input fails that request with `500` / `INTERNAL`. Minimum `1`. |
 | `--served-model-name` | *(unset)* | Names the OpenAI surface's `model` field must match. Unset accepts any name — what makes a client hardcoded to `whisper-1` work after a base-URL change. Set, an unknown name is `404`. Repeatable. |
 | `--cors-allow-origin` | *(unset)* | Origins allowed to call the HTTP API from a browser; `*` allows any. No CORS layer is installed when unset. Repeatable. |
-| `--request-timeout-secs` | `300` | Deadline for one **unary** request (HTTP `speech:recognize`, gRPC `Recognize`), covering time queued behind the concurrency limit. `0` disables. |
-| `--stream-idle-timeout-secs` | `300` | Aborts a streaming RPC or `/v1/realtime` session that goes this long with no inbound message (before half-close / commit) or no decode event (after). `0` disables. Deliberately *not* a blanket gRPC deadline — that would cut off healthy long-lived streams; a live stream can only be bounded by inactivity. |
-| `--max-inflight-connections` | `4 x --max-concurrent-requests` | Requests either listener processes at once; the rest queue (and are eventually cut off by the timeout). Bounds how many multi-MiB bodies are resident. A `/v1/realtime` session holds one for its whole life and is refused with `503` on connect when none is free. `/healthz`, `/readyz` and `/metrics` are **exempt** — a saturated server must still answer its own probes. `0` disables. |
-| `--shutdown-grace-secs` | `10` | How long in-flight requests get to finish after SIGTERM/SIGINT before the listeners are dropped. |
+| `--request-timeout-secs` | `300` | Deadline for one **unary** request (HTTP `speech:recognize` and the OpenAI upload routes, gRPC `Recognize`), covering time queued for an in-flight permit. HTTP answers `408`, gRPC `DEADLINE_EXCEEDED`; a client's shorter `grpc-timeout` wins. `0` disables. |
+| `--stream-idle-timeout-secs` | `300` | Aborts a streaming RPC or `/v1/realtime` session that goes this long with no inbound message (the config, audio before half-close / commit) or no decode event (after). `0` disables. Deliberately *not* a blanket deadline — that would cut off healthy long-lived streams; a live stream can only be bounded by inactivity. |
+| `--max-inflight-connections` | `4 x --max-concurrent-requests` | Requests the **process** handles at once, one budget for both listeners; the rest queue (and are eventually cut off by the timeout). A unary request takes a permit for its life; a `/v1/realtime` session or a gRPC `StreamingRecognize` holds one for its whole life and is refused when none is free (`503` / `RESOURCE_EXHAUSTED`), because a stream parked for a permit would sit outside every other bound. On HTTP the permit is taken before the body is read, so it also bounds resident bodies; on gRPC tonic has already read the message (`--max-audio-mib`) when the handler takes it. `/healthz`, `/readyz`, `/metrics` and the gRPC health service are **exempt** — a saturated server must still answer its own probes. `0` disables. |
+| `--shutdown-grace-secs` | `10` | How long in-flight work — requests, RPCs and realtime sessions — gets to finish after SIGTERM/SIGINT before what is left is cut. |
 | `--listen-backlog` | `4096` | Accept-queue depth of both listeners (`listen(2)`; the kernel caps it at `net.core.somaxconn`). tokio's and std's `bind` use 128, and past it the kernel drops a new connection's SYN, which the client resends only after Linux's 1 s initial retransmission timeout — so a burst of reconnecting clients bigger than the queue turned into a second of latency for whichever requests did not fit. |
 
 The dispatcher's command channel is derived from `--max-concurrent-requests`
@@ -1128,14 +1132,30 @@ The dispatcher's command channel is derived from `--max-concurrent-requests`
 holds its full audio payload: the two bounds have to be related or the channel
 buffers several times the admissible work, each up to `--max-audio-mib`.
 
-**Shutdown is graceful.**  SIGTERM flips the gRPC health check and `/readyz` to
-not-serving, stops both listeners accepting, and waits up to the grace period for
-in-flight requests to complete — none are dropped.
+**Shutdown is graceful, and the server owns everything it started.**  In order:
+
+1. SIGTERM flips the gRPC health check and `/readyz` to not-serving and stops
+   both listeners accepting.  New `/v1/realtime` upgrades are refused with `503`.
+2. In-flight requests, RPCs and realtime sessions get up to `--shutdown-grace-secs`
+   to finish, with the engines still running.  A realtime session is waited for
+   separately: once upgraded, a WebSocket is no longer a request the HTTP
+   listener's graceful shutdown can see, which is how sessions used to be cut
+   mid-utterance at the signal.
+3. At the deadline, each realtime session still open gets an `error` event and a
+   `1001 going away` close (the code a client takes as "reconnect elsewhere"),
+   and its engine request is cancelled.
+4. Each engine dispatcher is stopped and joined: it fails whatever it still holds
+   with `SHUTDOWN` (`503` / `UNAVAILABLE`), aborts it, and calls
+   `ASREngine.shutdown()`, which returns the CUDA-graph pools, the pinned
+   staging buffers and any parked decoder KV.  The process exits after that,
+   not under it.
 
 **Client disconnects cancel.**  All three request handles — streaming, offline
 streaming, and the unary one behind HTTP `speech:recognize` / gRPC `Recognize` —
 cancel their engine request when the handler future is dropped.  Watch
-`oasr_requests_cancelled_total`.
+`oasr_requests_cancelled_total`.  Each handle also owns its request's entry in
+the dispatcher's router from the moment it is registered, so a submit that fails,
+or is abandoned while the command channel is full, leaves nothing behind either.
 
 ## Operational tips
 

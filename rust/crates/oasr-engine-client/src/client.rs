@@ -13,13 +13,14 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use oasr_wire::{Cmd, DecodingParams, Event};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::trace;
+use tracing::{trace, warn};
 use uuid::Uuid;
 
 use crate::dispatcher::{
@@ -84,12 +85,17 @@ impl EngineClientConfig {
     }
 }
 
+/// How often [`EngineClient::shutdown`] looks for the dispatcher thread's exit.
+const JOIN_POLL: Duration = Duration::from_millis(10);
+
 /// One in-process engine, cheap to clone (internal `Arc`s).
 #[derive(Clone)]
 pub struct EngineClient {
     cfg: Arc<EngineClientConfig>,
     cmd_tx: mpsc::Sender<CmdEnvelope>,
     shared: Arc<DispatcherShared>,
+    /// The dispatcher thread, until [`Self::shutdown`] has joined it.
+    thread: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
     /// Anchor for `last_pong_at` computation — `last_event_at_ms` is the
     /// number of millis since this instant.
     epoch: Instant,
@@ -99,7 +105,7 @@ impl EngineClient {
     /// Start a dispatcher thread for `engine` and return the async-facing client.
     pub fn start(engine: PyEngine, cfg: EngineClientConfig) -> Self {
         let cfg = Arc::new(cfg);
-        let (shared, cmd_tx) = spawn_dispatcher(
+        let (shared, cmd_tx, thread) = spawn_dispatcher(
             engine,
             cfg.label.clone(),
             cfg.dispatcher.clone(),
@@ -109,7 +115,58 @@ impl EngineClient {
             cfg,
             cmd_tx,
             shared,
+            thread: Arc::new(parking_lot::Mutex::new(Some(thread))),
             epoch: Instant::now(),
+        }
+    }
+
+    /// Ask the dispatcher to exit after its current tick.  Returns at once;
+    /// [`Self::shutdown`] waits for it.
+    pub fn stop(&self) {
+        self.shared.stop.store(true, Ordering::Release);
+        // Wakes a dispatcher blocked on an idle receive, which would otherwise
+        // notice the flag only when that wait times out.  A full channel means
+        // it is not idle, and it will see the flag on its next iteration.
+        let _ = self
+            .cmd_tx
+            .try_send(CmdEnvelope::new(Cmd::Ping { seq: 0 }, None));
+    }
+
+    /// Stop the dispatcher and wait up to `timeout` for its thread to exit.
+    ///
+    /// On the way out the thread fails every request still in flight with
+    /// `SHUTDOWN`, aborts them and calls the engine's `shutdown()`.  Returns
+    /// whether the thread exited; a later call keeps waiting for it.
+    ///
+    /// The thread has to be gone before the tokio runtime is: it waits on the
+    /// runtime's timers, and a process that exited under it cut whatever tick
+    /// it was in.
+    pub async fn shutdown(&self, timeout: Duration) -> bool {
+        self.stop();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let finished = match self.thread.lock().as_ref() {
+                None => return true,
+                Some(t) => t.is_finished(),
+            };
+            if finished {
+                if let Some(t) = self.thread.lock().take() {
+                    // Already finished, so this returns at once.
+                    if t.join().is_err() {
+                        warn!(label = %self.cfg.label, "dispatcher thread panicked on its way out");
+                    }
+                }
+                return true;
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    label = %self.cfg.label,
+                    timeout_secs = timeout.as_secs_f64(),
+                    "dispatcher thread did not exit in time"
+                );
+                return false;
+            }
+            tokio::time::sleep(JOIN_POLL).await;
         }
     }
 
@@ -182,16 +239,7 @@ impl EngineClient {
         decoding: Option<DecodingParams>,
     ) -> Result<OfflineHandle, EngineClientError> {
         let request_id = Uuid::new_v4().simple().to_string();
-        let (tx, rx) = oneshot::channel::<Event>();
-        let mut event_rx = self.shared.router.register(request_id.clone(), 8);
-        tokio::spawn(async move {
-            while let Some(ev) = event_rx.recv().await {
-                if matches!(ev, Event::Final { .. } | Event::Error { .. }) {
-                    let _ = tx.send(ev);
-                    break;
-                }
-            }
-        });
+        let (registration, events) = self.shared.router.register(request_id.clone(), 8);
         let envelope = CmdEnvelope::new(
             Cmd::CreateOffline {
                 request_id: request_id.clone(),
@@ -201,12 +249,13 @@ impl EngineClient {
             },
             Some(audio),
         );
+        // A send that fails, or whose future is dropped while the channel is
+        // full, drops `registration` here and takes the router entry with it.
         self.send_envelope(envelope).await?;
         Ok(OfflineHandle::new(
-            request_id,
-            rx,
+            registration,
+            events,
             self.cmd_tx.clone(),
-            self.shared.router.clone(),
         ))
     }
 
@@ -236,7 +285,7 @@ impl EngineClient {
     ) -> Result<OfflineStreamHandle, EngineClientError> {
         // Full ``event_channel_cap`` rather than the unary path's 8: an AR request
         // emits {Accepted, Partial x N, Final}, and N is the token count.
-        let event_rx = self
+        let (registration, event_rx) = self
             .shared
             .router
             .register(request_id.clone(), self.cfg.event_channel_cap);
@@ -252,10 +301,9 @@ impl EngineClient {
         );
         self.send_envelope(envelope).await?;
         Ok(OfflineStreamHandle::new(
-            request_id,
+            registration,
             stream,
             self.cmd_tx.clone(),
-            self.shared.router.clone(),
         ))
     }
 
@@ -277,7 +325,7 @@ impl EngineClient {
         priority: i32,
         decoding: Option<DecodingParams>,
     ) -> Result<StreamingHandle, EngineClientError> {
-        let event_rx = self
+        let (registration, event_rx) = self
             .shared
             .router
             .register(request_id.clone(), self.cfg.event_channel_cap);
@@ -300,10 +348,9 @@ impl EngineClient {
         // is dropped before an `is_last=true` flush, `CancelOnDrop` emits
         // `Cmd::Cancel` via the same `cmd_tx`.
         Ok(StreamingHandle::new(
-            request_id,
+            registration,
             stream,
             self.cmd_tx.clone(),
-            self.shared.router.clone(),
         ))
     }
 
@@ -333,6 +380,115 @@ impl EngineClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client whose "dispatcher" is the returned receiver, so a test can
+    /// fill, drain or drop the command channel itself.
+    fn detached(cap: usize) -> (EngineClient, mpsc::Receiver<CmdEnvelope>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(cap);
+        let client = EngineClient {
+            cfg: Arc::new(EngineClientConfig::new("t")),
+            cmd_tx,
+            shared: Arc::new(DispatcherShared::new("t".into(), None)),
+            thread: Arc::new(parking_lot::Mutex::new(None)),
+            epoch: Instant::now(),
+        };
+        (client, cmd_rx)
+    }
+
+    fn audio() -> Bytes {
+        Bytes::from_static(&[0u8; 16])
+    }
+
+    /// The submit registered its event channel, then failed to send.  No
+    /// handle was ever built to remove it, and the unary path's forwarding
+    /// task waited on it for the life of the process.
+    #[tokio::test]
+    async fn a_submit_the_engine_never_receives_leaves_no_entry() {
+        let (client, cmd_rx) = detached(4);
+        drop(cmd_rx);
+        assert!(client
+            .submit_offline(audio(), 16_000, 0, None)
+            .await
+            .is_err());
+        assert!(client
+            .submit_offline_streaming(audio(), 16_000, 0, None)
+            .await
+            .is_err());
+        assert!(client.open_streaming(16_000, 0, None).await.is_err());
+        assert!(
+            client.router().is_empty(),
+            "{} entries outlived their submits",
+            client.router().len()
+        );
+    }
+
+    /// A handler dropped while its submit waits for room -- a client
+    /// disconnect, or a deadline, against a backed-up dispatcher.  The command
+    /// was never sent, so nothing would ever route a terminal event for it.
+    #[tokio::test]
+    async fn a_submit_abandoned_on_a_full_channel_leaves_no_entry() {
+        let (client, _cmd_rx) = detached(1);
+        client
+            .cmd_tx
+            .try_send(CmdEnvelope::new(Cmd::Ping { seq: 0 }, None))
+            .unwrap();
+        let wait = Duration::from_millis(50);
+        assert!(
+            tokio::time::timeout(wait, client.submit_offline(audio(), 16_000, 0, None))
+                .await
+                .is_err(),
+            "the full channel should have held the submit"
+        );
+        assert!(
+            tokio::time::timeout(wait, client.open_streaming(16_000, 0, None))
+                .await
+                .is_err()
+        );
+        assert!(
+            client.router().is_empty(),
+            "{} entries outlived their submits",
+            client.router().len()
+        );
+    }
+
+    /// A stream that sent its last chunk is disarmed, and its handler can still
+    /// return before the final arrives -- on a failed send to its client, say.
+    #[tokio::test]
+    async fn a_stream_dropped_after_its_last_chunk_leaves_no_entry() {
+        let (client, mut cmd_rx) = detached(4);
+        let handle = client.open_streaming(16_000, 0, None).await.unwrap();
+        handle.flush_last(Bytes::new()).await.unwrap();
+        assert_eq!(client.router().len(), 1);
+        drop(handle);
+        assert!(client.router().is_empty(), "the entry outlived its handle");
+        // Created, then the last chunk; no cancel for a finished stream.
+        for _ in 0..2 {
+            let env = cmd_rx.recv().await.unwrap();
+            assert!(!matches!(env.cmd, Cmd::Cancel { .. }), "{:?}", env.cmd);
+        }
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// An unfinished request dropped by its handler is cancelled and removed.
+    #[tokio::test]
+    async fn a_request_dropped_mid_flight_is_cancelled_and_removed() {
+        let (client, mut cmd_rx) = detached(4);
+        let handle = client
+            .submit_offline(audio(), 16_000, 0, None)
+            .await
+            .unwrap();
+        let rid = handle.request_id.clone();
+        drop(handle);
+        assert!(client.router().is_empty(), "the entry outlived its handle");
+        assert!(matches!(
+            cmd_rx.recv().await.unwrap().cmd,
+            Cmd::CreateOffline { .. }
+        ));
+        match cmd_rx.recv().await.unwrap().cmd {
+            Cmd::Cancel { request_id } => assert_eq!(request_id, rid),
+            other => panic!("expected a cancel, got {other:?}"),
+        }
+    }
 
     /// The two bounds must stay related.  A fixed 1024-deep command channel
     /// against a default admission cap of 256 meant up to 4x the admissible
