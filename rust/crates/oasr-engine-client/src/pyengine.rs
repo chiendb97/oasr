@@ -375,6 +375,24 @@ impl PyEngine {
         Ok(())
     }
 
+    /// `ASREngine.shutdown()`: return the CUDA-graph pools, the pinned staging
+    /// buffers and any parked decoder KV.  An engine object without the method
+    /// (one predating it, or a test double) has nothing to release, which is
+    /// not an error.
+    pub fn shutdown_locked(bound: &Bound<'_, PyAny>) -> Result<(), PyEngineError> {
+        if bound.hasattr("shutdown")? {
+            bound.call_method0("shutdown")?;
+        }
+        Ok(())
+    }
+
+    /// Wrap an already-built engine object.  For tests that drive a dispatcher
+    /// with a stand-in engine; servers build theirs with [`Self::new`].
+    #[doc(hidden)]
+    pub fn from_object(engine: Py<PyAny>, model_info: ModelInfo) -> Self {
+        Self { engine, model_info }
+    }
+
     /// Run one engine step and return any `RequestOutput`s as native events.
     pub fn step(&self) -> Result<Vec<Event>, PyEngineError> {
         Python::with_gil(|py| {

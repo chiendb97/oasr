@@ -19,7 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::realtime::SessionLimits;
+use crate::realtime::{SessionLimits, SessionTracker};
 use crate::ServerState;
 
 pub type AppState = Arc<ServerState>;
@@ -55,10 +55,16 @@ impl std::str::FromStr for ServiceMode {
 pub struct RouterLimits {
     /// Deadline for one request, end to end.
     pub request_timeout: Option<Duration>,
-    /// Max requests processed concurrently; the rest queue.  A realtime
-    /// session counts as one for its whole life, and is refused with `503`
-    /// rather than queued when none is free.
-    pub max_inflight: Option<usize>,
+    /// The in-flight budget: one permit per request being processed; the rest
+    /// queue.  A realtime session holds one for its whole life, and is refused
+    /// with `503` rather than queued when none is free.
+    ///
+    /// A semaphore rather than a count so the server can hand the gRPC
+    /// listener the same one: the budget is the process's, and two listeners
+    /// with one each admitted twice it.
+    pub inflight_permits: Option<Arc<Semaphore>>,
+    /// The realtime sessions in flight, which the server drains at shutdown.
+    pub sessions: SessionTracker,
     /// End a realtime session that goes this long without a client message
     /// (before commit) or an engine event (after).  The other bounds stop at
     /// the WebSocket upgrade; this is the one that covers the socket.
@@ -97,7 +103,7 @@ pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
         // below `--max-audio-mib`, and it would reject uploads the raw-body
         // route on the same server accepts.
         .layer(DefaultBodyLimit::max(body_limit));
-    let permits = limits.max_inflight.map(|n| Arc::new(Semaphore::new(n)));
+    let permits = limits.inflight_permits.clone();
     if let Some(permits) = &permits {
         // Bounds how many multi-MiB bodies can be resident at once; excess
         // requests wait for a permit rather than each parking a buffer.
@@ -126,6 +132,7 @@ pub fn build_router(state: AppState, limits: RouterLimits) -> Router {
             get(crate::realtime::handle_realtime).layer(Extension(SessionLimits {
                 permits,
                 idle: limits.stream_idle_timeout,
+                sessions: limits.sessions.clone(),
             })),
         )
         // Models.

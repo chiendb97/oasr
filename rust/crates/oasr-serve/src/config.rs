@@ -399,8 +399,9 @@ pub struct Cli {
     #[arg(long)]
     pub cors_allow_origin: Vec<String>,
     /// Deadline for a single **unary** request (HTTP `speech:recognize`,
-    /// gRPC `Recognize`), in seconds.  0 disables.  Streaming RPCs are bounded
-    /// by `--stream-idle-timeout-secs` instead: a blanket deadline would kill
+    /// gRPC `Recognize`), in seconds, time queued for an in-flight permit
+    /// included.  0 disables.  Streaming RPCs are bounded by
+    /// `--stream-idle-timeout-secs` instead: a blanket deadline would kill
     /// healthy long-lived streams.
     #[arg(long, default_value_t = 300)]
     pub request_timeout_secs: u64,
@@ -411,16 +412,19 @@ pub struct Cli {
     /// slot indefinitely.
     #[arg(long, default_value_t = 300)]
     pub stream_idle_timeout_secs: u64,
-    /// Max requests either listener will process concurrently; excess ones
-    /// queue (and are eventually cut off by the timeouts above) rather than
-    /// each parking a multi-MiB body.  A realtime WebSocket session holds one
-    /// for its whole life and is refused with 503 when none is free.  0
-    /// disables.  Defaults to 4x `--max-concurrent-requests`, i.e. deep enough
-    /// that the engine's own admission cap is what clients actually see.
+    /// Max requests the process handles concurrently, one budget shared by
+    /// both listeners; excess unary ones queue (and are eventually cut off by
+    /// the timeouts above) rather than each parking a multi-MiB body.  A
+    /// realtime WebSocket session or a gRPC `StreamingRecognize` holds one for
+    /// its whole life and is refused (503 / RESOURCE_EXHAUSTED) when none is
+    /// free.  0 disables.  Defaults to 4x `--max-concurrent-requests`, i.e.
+    /// deep enough that the engine's own admission cap is what clients
+    /// actually see.
     #[arg(long)]
     pub max_inflight_connections: Option<usize>,
-    /// How long to let in-flight requests finish after a shutdown signal
-    /// before the listeners are dropped, in seconds.
+    /// How long to let in-flight requests, streams and realtime sessions
+    /// finish after a shutdown signal before what is left is cut, in seconds.
+    /// The engines are stopped and joined after that.
     #[arg(long, default_value_t = 10)]
     pub shutdown_grace_secs: u64,
     /// Dispatcher admission coalescing window in milliseconds.  After the
@@ -470,7 +474,7 @@ impl Cli {
         }
     }
 
-    /// Concurrency limit for each listener, defaulted from the admission cap.
+    /// The process's in-flight budget, defaulted from the admission cap.
     pub fn inflight_limit(&self) -> Option<usize> {
         let n = self
             .max_inflight_connections

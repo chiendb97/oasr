@@ -26,3 +26,8 @@ tracing = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+
+[dev-dependencies]
+# A request body that never yields, to drive `StreamingRecognize` without a
+# socket.  Already in the build: hyper 1 and tonic are built on it.
+http-body = "1"

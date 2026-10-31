@@ -1,15 +1,20 @@
 // Copyright 2024 OASR Authors
 // SPDX-License-Identifier: Apache-2.0
-//! Multi-worker pool with sticky-by-rid streaming routing.
+//! Multi-worker pool: least-loaded admission, and a request stays where it was
+//! admitted.
+//!
+//! "Stays" needs no table.  A handle carries the command sender of the worker
+//! that admitted it, and that worker's router holds its event channel.  The
+//! pool used to keep a `request_id -> worker` map besides, which nothing read:
+//! entries went in on every streaming open and came out only when a front-end
+//! reached its normal-completion `release` call, so every error, timeout and
+//! disconnect left one behind for the life of the process.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use dashmap::DashMap;
-use oasr_wire::{DecodingParams, Event};
-use tracing::warn;
-use uuid::Uuid;
+use oasr_wire::DecodingParams;
 
 use crate::client::EngineClient;
 use crate::handle::{OfflineHandle, OfflineStreamHandle, StreamingHandle};
@@ -18,16 +23,11 @@ use crate::EngineClientError;
 /// Owned by `oasr-server`; shared across HTTP and gRPC stacks via `Arc<_>`.
 pub struct EnginePool {
     workers: Vec<Arc<EngineClient>>,
-    /// Streaming `request_id` → worker index.
-    sticky: DashMap<String, usize>,
 }
 
 impl EnginePool {
     pub fn new(workers: Vec<Arc<EngineClient>>) -> Self {
-        Self {
-            workers,
-            sticky: DashMap::new(),
-        }
+        Self { workers }
     }
 
     pub fn workers(&self) -> &[Arc<EngineClient>] {
@@ -83,10 +83,9 @@ impl EnginePool {
             .await
     }
 
-    /// Submit an offline request whose *events* stream back incrementally.
-    ///
-    /// Sticky like `open_streaming`, because the caller keeps pulling events from
-    /// the worker it was admitted to.
+    /// Submit an offline request whose *events* stream back incrementally, to
+    /// the least-loaded worker.  The caller keeps pulling events from that
+    /// worker through the handle.
     pub async fn submit_offline_streaming(
         &self,
         audio: Bytes,
@@ -97,15 +96,13 @@ impl EnginePool {
         let k = self
             .pick_least_loaded()
             .ok_or_else(|| EngineClientError::WorkerDown("no healthy workers".into()))?;
-        let rid = Uuid::new_v4().simple().to_string();
-        self.sticky.insert(rid.clone(), k);
         self.workers[k]
-            .submit_offline_streaming_with_id(rid, audio, sample_rate, priority, decoding)
+            .submit_offline_streaming(audio, sample_rate, priority, decoding)
             .await
     }
 
-    /// Open a streaming request, sticky to the chosen worker for subsequent
-    /// chunks.  The returned handle wraps the worker's `StreamingHandle`.
+    /// Open a streaming request on the least-loaded worker.  Its chunks follow
+    /// through the handle, which sends them to the worker that admitted it.
     pub async fn open_streaming(
         &self,
         sample_rate: u32,
@@ -115,47 +112,23 @@ impl EnginePool {
         let k = self
             .pick_least_loaded()
             .ok_or_else(|| EngineClientError::WorkerDown("no healthy workers".into()))?;
-        let rid = Uuid::new_v4().simple().to_string();
-        self.sticky.insert(rid.clone(), k);
-        let handle = self.workers[k]
-            .open_streaming_with_id(rid.clone(), sample_rate, priority, decoding)
-            .await?;
-        Ok(handle)
+        self.workers[k]
+            .open_streaming(sample_rate, priority, decoding)
+            .await
     }
 
-    /// Remove the sticky entry for `rid` (typically after Final/Error).
-    pub fn release(&self, rid: &str) {
-        self.sticky.remove(rid);
-    }
-
-    /// On worker death, mark all rids belonging to it as failed and emit a
-    /// synthetic [`Event::Error{code: WorkerLost}`] into their channels.
-    pub async fn fail_worker(&self, worker_index: usize, reason: &str) {
-        let to_kill: Vec<String> = self
-            .sticky
-            .iter()
-            .filter(|kv| *kv.value() == worker_index)
-            .map(|kv| kv.key().clone())
-            .collect();
-        if to_kill.is_empty() {
-            return;
+    /// Stop every worker's dispatcher and wait, up to `timeout` in all, for
+    /// their threads to exit.  Returns whether every one did.
+    ///
+    /// Each fails what it still has in flight with `SHUTDOWN` and releases its
+    /// engine before exiting, so call this once the listeners have drained.
+    pub async fn shutdown(&self, timeout: Duration) -> bool {
+        for w in &self.workers {
+            w.stop();
         }
-        warn!(
-            worker = worker_index,
-            n = to_kill.len(),
-            "fanning WORKER_LOST to in-flight streams: {reason}"
-        );
-        let router = self.workers[worker_index].router().clone();
-        for rid in to_kill {
-            router
-                .route(Event::Error {
-                    request_id: rid.clone(),
-                    code: oasr_wire::ErrorCode::WorkerLost,
-                    message: reason.to_owned(),
-                })
-                .await;
-            self.sticky.remove(&rid);
-        }
+        let joined =
+            futures::future::join_all(self.workers.iter().map(|w| w.shutdown(timeout))).await;
+        joined.into_iter().all(|ok| ok)
     }
 
     pub fn worker(&self, i: usize) -> Option<&Arc<EngineClient>> {

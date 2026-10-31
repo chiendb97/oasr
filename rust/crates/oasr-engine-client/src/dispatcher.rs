@@ -12,8 +12,14 @@
 //! When the engine is fully idle and the inbound channel is empty, the
 //! thread blocks on `cmd_rx.blocking_recv()` instead of polling — this
 //! removes the historical ~1 ms idle-sleep floor on latency-to-first-byte.
+//!
+//! The thread runs until it is stopped ([`crate::EngineClient::stop`]) or its
+//! command channel closes, and however it ends — a panic included — it fails
+//! every request still registered, aborts them, and calls the engine's
+//! `shutdown()` before it exits, so the server can join it.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -88,6 +94,10 @@ impl CmdEnvelope {
 /// async client facade.
 pub(crate) struct DispatcherShared {
     pub(crate) load: AtomicU32,
+    /// Set to make the thread exit at the top of its next iteration.  The
+    /// channel closing does the same, but a server cannot drop every sender:
+    /// each live handle holds one.
+    pub(crate) stop: AtomicBool,
     pub(crate) last_event_at_ms: AtomicU64,
     pub(crate) model_info: Mutex<Option<ModelInfo>>,
     pub(crate) router: RouterActor,
@@ -101,6 +111,7 @@ impl DispatcherShared {
         let metric_labels = EngineLabels::new(&label, model);
         Self {
             load: AtomicU32::new(0),
+            stop: AtomicBool::new(false),
             last_event_at_ms: AtomicU64::new(0),
             model_info: Mutex::new(model.cloned()),
             router: RouterActor::new(metric_labels.clone()),
@@ -226,18 +237,23 @@ impl DispatchTrace {
     }
 }
 
-/// Spawn the dispatcher thread.  Returns the shared state + the command tx
-/// for the client facade to clone and use.
+/// Spawn the dispatcher thread.  Returns the shared state, the command tx
+/// for the client facade to clone and use, and the thread to join.
 ///
 /// Must be called from within a tokio runtime — the dispatcher uses the
 /// captured `Handle` to bound its idle waits with `tokio::time::timeout`
 /// (so the heartbeat keeps refreshing even when no traffic is arriving).
+/// That is also why the thread has to be joined before the runtime is dropped.
 pub(crate) fn spawn(
     engine: PyEngine,
     label: String,
     cfg: DispatcherConfig,
     cmd_channel_cap: usize,
-) -> (Arc<DispatcherShared>, mpsc::Sender<CmdEnvelope>) {
+) -> (
+    Arc<DispatcherShared>,
+    mpsc::Sender<CmdEnvelope>,
+    thread::JoinHandle<()>,
+) {
     // The model has to be known *before* the shared state is built: it
     // supplies two of the three engine-scope label values, and a handle
     // resolved without them would publish into a different series than every
@@ -248,14 +264,14 @@ pub(crate) fn spawn(
     let rt_handle = Handle::current();
 
     let shared_for_thread = Arc::clone(&shared);
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name(format!("oasr-dispatcher[{label}]"))
         .spawn(move || {
             run_dispatcher(engine, shared_for_thread, cfg, cmd_rx, rt_handle);
         })
         .expect("spawn dispatcher thread");
 
-    (shared, cmd_tx)
+    (shared, cmd_tx, thread)
 }
 
 fn run_dispatcher(
@@ -272,6 +288,69 @@ fn run_dispatcher(
     // held for the lifetime of the thread.
     let _rt_guard = rt_handle.enter();
 
+    let ended = panic::catch_unwind(AssertUnwindSafe(|| {
+        dispatch_loop(&engine, &shared, &cfg, &mut cmd_rx, &rt_handle)
+    }));
+    // Nothing is admitted past this point: the receiver goes with the thread,
+    // so a later send fails at once instead of parking in the channel.
+    drop(cmd_rx);
+    let (code, reason) = match ended {
+        Ok(()) => (ErrorCode::Shutdown, "the engine is shutting down"),
+        Err(_) => {
+            error!(label = %shared.label, "dispatcher loop panicked; failing its requests");
+            (ErrorCode::WorkerLost, "the engine dispatcher failed")
+        }
+    };
+    wind_down(engine, &shared, code, reason);
+}
+
+/// Leave nothing behind: tell every request still registered that it is over,
+/// abort it in the engine, and let the engine release what it holds.
+///
+/// Before this the thread simply returned (or was cut off by the process
+/// exiting): a handler still waiting on a request heard nothing, and
+/// `ASREngine.shutdown()` — which returns the CUDA-graph pools, the pinned
+/// staging buffers and any parked decoder KV — was never called by the server
+/// at all.  That matters wherever the interpreter outlives the server, as it
+/// does under `oasr._core`.
+fn wind_down(engine: PyEngine, shared: &DispatcherShared, code: ErrorCode, reason: &str) {
+    let rids = shared.router.all_request_ids();
+    let shut = Python::with_gil(|py| {
+        let bound = engine.bind_engine(py);
+        for rid in &rids {
+            if let Err(e) = PyEngine::abort_locked(&bound, rid) {
+                debug!(label = %shared.label, rid = %rid, "abort at shutdown failed: {e}");
+            }
+        }
+        PyEngine::shutdown_locked(&bound)
+    });
+    // Routed with the GIL released, and before the engine object goes: a
+    // handler waiting on one of these can answer its client now.
+    let n_failed = rids.len();
+    for rid in rids {
+        shared.router.route_blocking(Event::Error {
+            request_id: rid,
+            code,
+            message: reason.to_owned(),
+        });
+    }
+    shared.load.store(0, Ordering::Relaxed);
+    if let Err(e) = shut {
+        warn!(label = %shared.label, "engine shutdown failed: {e}");
+    }
+    // Under the GIL, so the engine is released here rather than whenever
+    // something next takes the GIL in this process.
+    Python::with_gil(|_py| drop(engine));
+    info!(label = %shared.label, n_failed, "dispatcher stopped");
+}
+
+fn dispatch_loop(
+    engine: &PyEngine,
+    shared: &DispatcherShared,
+    cfg: &DispatcherConfig,
+    cmd_rx: &mut mpsc::Receiver<CmdEnvelope>,
+    rt_handle: &Handle,
+) {
     let epoch = Instant::now();
     let mut last_overload_emit: Option<Instant> = None;
 
@@ -295,6 +374,10 @@ fn run_dispatcher(
     let mut next_drain = Instant::now();
 
     loop {
+        if shared.stop.load(Ordering::Acquire) {
+            info!(label = %shared.label, "stop requested; dispatcher exit");
+            return;
+        }
         // ---- Drain inbound commands (non-blocking up to per-tick budget) ----
         let intake_t0 = Instant::now();
         while envs.len() < cfg.max_inbound_per_tick {
@@ -310,7 +393,7 @@ fn run_dispatcher(
 
         // Briefly wait for sibling admissions when below threshold and lightly
         // loaded. Never coalesce other commands because their latency takes priority.
-        if should_coalesce(&envs, &cfg, shared.load.load(Ordering::Relaxed)) {
+        if should_coalesce(&envs, cfg, shared.load.load(Ordering::Relaxed)) {
             let deadline = Instant::now() + cfg.admit_window;
             while envs.len() < cfg.admit_threshold {
                 let remaining = match deadline.checked_duration_since(Instant::now()) {
@@ -389,7 +472,7 @@ fn run_dispatcher(
                         enqueue_admit_locked(
                             env,
                             cfg.max_concurrent_requests,
-                            &shared,
+                            shared,
                             &mut admit_batch,
                             &mut tick_events,
                         );
@@ -399,15 +482,15 @@ fn run_dispatcher(
                             py,
                             &bound,
                             &mut admit_batch,
-                            &shared,
+                            shared,
                             &mut tick_events,
                         );
-                        handle_nonadmit_cmd_locked(py, &bound, env, &shared, &mut tick_events);
+                        handle_nonadmit_cmd_locked(py, &bound, env, shared, &mut tick_events);
                     }
                 }
             }
             // Drain any remaining admits before stepping.
-            flush_admit_batch_locked(py, &bound, &mut admit_batch, &shared, &mut tick_events);
+            flush_admit_batch_locked(py, &bound, &mut admit_batch, shared, &mut tick_events);
             let t_admit = admit_t0.elapsed();
 
             // Decide whether to step.  `engine.step()` is fast when there's
@@ -506,14 +589,7 @@ fn run_dispatcher(
 
         // ---- Route events outside the GIL ----
         let route_t0 = Instant::now();
-        for evt in tick_events.drain(..) {
-            let terminal = evt.is_terminal();
-            let rid_present = evt.request_id().is_some();
-            shared.router.route_blocking(evt);
-            if terminal && rid_present {
-                shared.load.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+        route_tick_events(shared, &mut tick_events);
         let t_route = route_t0.elapsed();
 
         // ---- Metrics ----
@@ -633,6 +709,22 @@ fn run_dispatcher(
             // Loop back — the next iteration's try_recv drain will top up
             // `envs` with any siblings already in the channel.
         }
+    }
+}
+
+/// Hand this tick's events to their requests.
+///
+/// The load is left alone.  It used to drop by one per terminal event, but
+/// not every terminal is for an admitted request: a `BUSY` refusal, an empty
+/// payload, a rejected option and the step-failure fan-out (which reaches
+/// requests still queued in the channel) were never counted in, so from a
+/// low count the decrement wrapped to `u32::MAX`, and
+/// [`crate::EnginePool::pick_least_loaded`] saw the most loaded worker in the
+/// pool.  The engine's own `running + waiting`, stored at the end of every
+/// tick, is the count.
+fn route_tick_events(shared: &DispatcherShared, events: &mut Vec<Event>) {
+    for evt in events.drain(..) {
+        shared.router.route_blocking(evt);
     }
 }
 
@@ -951,6 +1043,29 @@ mod tests {
 
     fn cfg() -> DispatcherConfig {
         DispatcherConfig::default()
+    }
+
+    /// A refusal is terminal but was never counted in.  Taking one off a low
+    /// count wrapped it to `u32::MAX`, so the least-loaded pick saw this
+    /// worker as the most loaded in the pool until the end of the tick.
+    #[tokio::test]
+    async fn routing_a_refusal_leaves_the_load_alone() {
+        let shared = DispatcherShared::new("t".into(), None);
+        let mut events = vec![
+            Event::Error {
+                request_id: "never-admitted".into(),
+                code: ErrorCode::Busy,
+                message: "full".into(),
+            },
+            Event::Error {
+                request_id: "empty-payload".into(),
+                code: ErrorCode::InvalidCmd,
+                message: "CreateOffline requires audio payload".into(),
+            },
+        ];
+        route_tick_events(&shared, &mut events);
+        assert!(events.is_empty());
+        assert_eq!(shared.load.load(Ordering::Relaxed), 0);
     }
 
     #[test]

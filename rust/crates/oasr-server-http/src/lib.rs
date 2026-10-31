@@ -28,6 +28,7 @@ pub mod realtime;
 pub mod recognize;
 pub mod router;
 
+pub use realtime::SessionTracker;
 pub use router::{build_router, AppState, RouterLimits, ServiceMode, READY_STALE_AFTER};
 
 use std::sync::Arc;

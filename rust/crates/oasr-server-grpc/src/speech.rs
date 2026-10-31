@@ -15,7 +15,7 @@ use oasr_engine_client::EnginePool;
 use oasr_wire::{
     normalize_language, score_posteriors, DecodingParams, ErrorCode, Event, WordTiming,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tonic::{Code, Request, Response, Status, Streaming};
@@ -62,6 +62,12 @@ pub struct SpeechService {
     max_audio_samples: Option<usize>,
     /// Abort a streaming RPC idle this long.  `None` disables.
     stream_idle_timeout: Option<Duration>,
+    /// Deadline for one `Recognize`, queueing for a permit included.  `None`
+    /// disables.
+    request_timeout: Option<Duration>,
+    /// The process's in-flight budget, shared with the HTTP listener.  `None`
+    /// disables.
+    permits: Option<Arc<Semaphore>>,
     /// Where `Recognize` decodes its audio: off the async workers, a bounded
     /// number at a time.
     decode_pool: DecodePool,
@@ -75,6 +81,8 @@ impl SpeechService {
             sample_rate,
             max_audio_samples: None,
             stream_idle_timeout: None,
+            request_timeout: None,
+            permits: None,
             decode_pool: DecodePool::default(),
         }
     }
@@ -92,16 +100,77 @@ impl SpeechService {
         self
     }
 
-    /// Abort a streaming RPC that goes `d` without an inbound audio message
-    /// (before half-close) or a decode event (after).
-    ///
-    /// This is deliberately *not* a `tonic::transport::Server::timeout`: that
-    /// applies to every request including `StreamingRecognize`, so it would cut
-    /// off healthy long-lived streams.  A live stream cannot be bounded by
-    /// total duration, only by inactivity.
+    /// Abort a streaming RPC that goes `d` without an inbound message (the
+    /// config, audio before half-close) or a decode event (after).  A live
+    /// stream cannot be bounded by total duration, only by inactivity.
     pub fn with_stream_idle_timeout(mut self, d: Option<Duration>) -> Self {
         self.stream_idle_timeout = d;
         self
+    }
+
+    /// Bound one unary `Recognize` at `d`, end to end, as the HTTP surface's
+    /// `TimeoutLayer` bounds `speech:recognize` (`--request-timeout-secs`).
+    ///
+    /// The flag always said it covered `Recognize`, and nothing applied it: a
+    /// request whose engine never answered held its connection, its decoded
+    /// waveform and its slot for as long as the client waited.  Applied in the
+    /// handler rather than as `Server::timeout` so the RPC still records its
+    /// own `DEADLINE_EXCEEDED`; a client's shorter `grpc-timeout` is honoured
+    /// by tonic on top.
+    pub fn with_request_timeout(mut self, d: Option<Duration>) -> Self {
+        self.request_timeout = d;
+        self
+    }
+
+    /// Draw on the process-wide in-flight budget, the one the HTTP listener
+    /// uses (`--max-inflight-connections`).
+    ///
+    /// The listener used to apply tonic's `concurrency_limit_per_connection`,
+    /// which hands every connection its own budget, so a client with N
+    /// connections had N times the limit.  A `Recognize` queues for a permit
+    /// inside its deadline; a `StreamingRecognize` holds one for its whole life
+    /// and is refused when none is free, as a realtime session is.
+    pub fn with_inflight_permits(mut self, permits: Option<Arc<Semaphore>>) -> Self {
+        self.permits = permits;
+        self
+    }
+
+    /// The permit a stream holds for its life, or `RESOURCE_EXHAUSTED`.
+    ///
+    /// Refused rather than queued: the stream's own bounds start once it is
+    /// open, so a stream parked for a permit would sit outside all of them.
+    fn stream_permit(&self) -> Result<Option<OwnedSemaphorePermit>, Status> {
+        match &self.permits {
+            None => Ok(None),
+            Some(permits) => Arc::clone(permits)
+                .try_acquire_owned()
+                .map(Some)
+                .map_err(|_| log_reject(Status::resource_exhausted("too many requests in flight"))),
+        }
+    }
+}
+
+/// Await `fut` within the unary deadline, mapping an elapse to
+/// `DEADLINE_EXCEEDED`.  `None` waits forever.
+async fn within_deadline<F, T>(deadline: Option<Duration>, fut: F) -> Result<T, Status>
+where
+    F: std::future::Future<Output = Result<T, Status>>,
+{
+    match deadline {
+        None => fut.await,
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    deadline_secs = d.as_secs_f64(),
+                    "recognize exceeded its deadline"
+                );
+                Err(Status::deadline_exceeded(format!(
+                    "request exceeded the {}s deadline",
+                    d.as_secs()
+                )))
+            }
+        },
     }
 }
 
@@ -445,6 +514,8 @@ struct StreamOverOfflineCfg {
     idle_timeout: Option<Duration>,
     /// Ceiling on the buffered waveform, in samples at the model's rate.
     max_samples: Option<usize>,
+    /// This stream's share of the in-flight budget, held until it ends.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl SpeechService {
@@ -480,6 +551,7 @@ impl SpeechService {
         tokio::spawn(
             async move {
                 let start = Instant::now();
+                let _permit = cfg.permit.take();
 
                 // ---- 1. drain the inbound audio -------------------------------
                 let mut buffered: Vec<u8> = Vec::new();
@@ -700,7 +772,6 @@ impl SpeechService {
                         _ => {}
                     }
                 }
-                pool.release(&rid);
             }
             .instrument(span),
         );
@@ -719,7 +790,8 @@ impl pb::speech_server::Speech for SpeechService {
         // request so all downstream events carry it.
         let span = info_span!("grpc.recognize", rid = field::Empty);
         let rpc_start = Instant::now();
-        let result = async move {
+        let permits = self.permits.clone();
+        let result = within_deadline(self.request_timeout, async move {
             let start = Instant::now();
 
             if self.mode != ServiceMode::Offline {
@@ -748,6 +820,18 @@ impl pb::speech_server::Speech for SpeechService {
                 cfg.sample_rate_hertz
             };
             let (source_enc, ct_hint) = map_encoding(cfg.encoding).map_err(log_reject)?;
+            // Queued for inside the deadline, as on the HTTP surface, where the
+            // timeout layer sits outside the concurrency limit; after the
+            // checks above, so a malformed request is refused without waiting.
+            let _permit = match permits {
+                Some(permits) => Some(
+                    permits
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Status::unavailable("server is shutting down"))?,
+                ),
+                None => None,
+            };
             // Convert to the engine's rate before submitting: the engine derives
             // every frame count from its own feature config and ignores the
             // request's rate, so unconverted 8 kHz / 44.1 kHz audio decoded to a
@@ -801,7 +885,6 @@ impl pb::speech_server::Speech for SpeechService {
                 error!(rid = %rid, "engine channel closed");
                 Status::internal("engine channel closed")
             })?;
-            self.pool.release(&rid);
 
             let elapsed_ms = start.elapsed().as_millis() as u64;
             match ev {
@@ -854,7 +937,7 @@ impl pb::speech_server::Speech for SpeechService {
                 }
             }
         }
-        .instrument(span)
+        .instrument(span))
         .await;
 
         // Recorded here rather than in a tower layer: this is where the RPC's
@@ -873,13 +956,16 @@ impl pb::speech_server::Speech for SpeechService {
         &self,
         req: Request<Streaming<pb::StreamingRecognizeRequest>>,
     ) -> Result<Response<Self::StreamingRecognizeStream>, Status> {
+        let permit = self.stream_permit()?;
         let mut inbound = req.into_inner();
         let (out_tx, out_rx) = mpsc::channel::<Result<pb::StreamingRecognizeResponse, Status>>(64);
 
-        // First inbound MUST carry streaming_config.
-        let first = inbound
-            .next()
+        // First inbound MUST carry streaming_config.  Bounded like every later
+        // message: a stream opened and never written to held its permit and
+        // its handler for good.
+        let first = with_idle(self.stream_idle_timeout, inbound.next())
             .await
+            .map_err(log_reject)?
             .ok_or_else(|| {
                 log_reject(Status::invalid_argument(
                     "missing streaming_config first message",
@@ -946,6 +1032,7 @@ impl pb::speech_server::Speech for SpeechService {
                         max_alts,
                         idle_timeout: self.stream_idle_timeout,
                         max_samples: self.max_audio_samples,
+                        permit,
                     },
                 )
                 .await;
@@ -962,7 +1049,6 @@ impl pb::speech_server::Speech for SpeechService {
                 Status::resource_exhausted(format!("submit failed: {e}"))
             })?;
 
-        let pool = Arc::clone(&self.pool);
         let rid = handle.request_id.clone();
 
         // Per-request span carrying `rid`; the streaming work runs in the
@@ -981,6 +1067,7 @@ impl pb::speech_server::Speech for SpeechService {
         let idle_timeout = self.stream_idle_timeout;
         let engine_rate = self.sample_rate;
         tokio::spawn(async move {
+            let _permit = permit;
             let start = Instant::now();
             let mut n_partials: u64 = 0;
             // Time to first partial is clocked from the first inbound audio,
@@ -1017,8 +1104,8 @@ impl pb::speech_server::Speech for SpeechService {
                         );
                         let _ = out_tx.send(Err(Status::deadline_exceeded("stream idle"))).await;
                         rpc_code = Code::DeadlineExceeded;
-                        // Fall through to `pool.release`; dropping `handle`
-                        // un-disarmed cancels the request engine-side.
+                        // Dropping `handle` un-disarmed cancels the request
+                        // engine-side.
                         break;
                     }
                     ev = handle.events.next() => {
@@ -1163,7 +1250,6 @@ impl pb::speech_server::Speech for SpeechService {
                     }
                 }
             }
-            pool.release(&rid);
             let elapsed = start.elapsed();
             record_rpc(method::STREAMING_RECOGNIZE, rpc_code, elapsed);
             grpc_streaming().audio_duration(audio_seconds);
@@ -1376,6 +1462,7 @@ mod tests {
             max_alts: 1,
             idle_timeout: None,
             max_samples,
+            permit: None,
         };
         let mut out = svc
             .streaming_over_offline(inbound, out_tx, out_rx, cfg)
@@ -1398,6 +1485,157 @@ mod tests {
             status.message().contains("16000-sample limit"),
             "{status:?}"
         );
+    }
+
+    fn offline_service() -> SpeechService {
+        SpeechService::new(
+            Arc::new(EnginePool::new(Vec::new())),
+            ServiceMode::Offline,
+            16_000,
+        )
+    }
+
+    /// A request body that never yields a frame: a client that opened the
+    /// stream and then said nothing.
+    struct Silent;
+
+    impl http_body::Body for Silent {
+        type Data = Bytes;
+        type Error = Status;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Status>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn silent_stream() -> Request<Streaming<pb::StreamingRecognizeRequest>> {
+        use tonic::codec::{Codec, ProstCodec};
+        let mut codec =
+            ProstCodec::<pb::StreamingRecognizeResponse, pb::StreamingRecognizeRequest>::default();
+        Request::new(Streaming::new_request(codec.decoder(), Silent, None, None))
+    }
+
+    fn recognize_request() -> Request<pb::RecognizeRequest> {
+        Request::new(pb::RecognizeRequest {
+            config: Some(pb::RecognitionConfig {
+                encoding: pb::recognition_config::AudioEncoding::Linear16 as i32,
+                sample_rate_hertz: 16_000,
+                ..Default::default()
+            }),
+            audio: Some(pb::RecognitionAudio {
+                audio_source: Some(pb::recognition_audio::AudioSource::Content(vec![0u8; 3200])),
+            }),
+        })
+    }
+
+    /// The flag always said `--request-timeout-secs` bounded `Recognize`, and
+    /// nothing applied it.  The deadline covers the wait for a permit, as the
+    /// HTTP surface's does.
+    #[tokio::test]
+    async fn a_recognize_queued_for_the_budget_is_cut_at_its_deadline() {
+        use pb::speech_server::Speech;
+        let permits = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let svc = offline_service()
+            .with_request_timeout(Some(Duration::from_millis(200)))
+            .with_inflight_permits(Some(Arc::clone(&permits)));
+        let status =
+            tokio::time::timeout(Duration::from_secs(5), svc.recognize(recognize_request()))
+                .await
+                .expect("the deadline never fired")
+                .unwrap_err();
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+
+        // With the budget free the request reaches the submit, which a pool
+        // with no workers refuses, and it gives its permit back.
+        drop(held);
+        let status = svc.recognize(recognize_request()).await.unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    /// One budget for the process: a stream finding it spent is refused at
+    /// once rather than parked outside every bound.  The listener used to give
+    /// each connection a budget of its own.
+    #[tokio::test]
+    async fn a_stream_is_refused_when_the_budget_is_spent() {
+        use pb::speech_server::Speech;
+        let svc = offline_service().with_inflight_permits(Some(Arc::new(Semaphore::new(0))));
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            svc.streaming_recognize(silent_stream()),
+        )
+        .await
+        .expect("the stream was parked instead of refused");
+        match ended {
+            Err(status) => assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}"),
+            Ok(_) => panic!("a stream got past a spent budget"),
+        }
+    }
+
+    /// The idle bound covered every message but the first, so a stream that
+    /// was opened and never written to held its handler for good.
+    #[tokio::test]
+    async fn a_stream_that_never_sends_its_config_is_ended() {
+        use pb::speech_server::Speech;
+        let svc = offline_service().with_stream_idle_timeout(Some(Duration::from_millis(200)));
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            svc.streaming_recognize(silent_stream()),
+        )
+        .await
+        .expect("the stream was never ended");
+        match ended {
+            Err(status) => assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}"),
+            Ok(_) => panic!("a stream with no config was opened"),
+        }
+    }
+
+    /// A stream's permit is held by its task, not by the handler that spawned
+    /// it and returned at once.
+    #[tokio::test]
+    async fn a_stream_holds_its_permit_until_it_ends() {
+        let permits = Arc::new(Semaphore::new(1));
+        let cfg = StreamOverOfflineCfg {
+            pcm: PcmStream::new(oasr_asr::PcmEncoding::F32Le, 16_000, 16_000).unwrap(),
+            priority: 0,
+            decoding: None,
+            want_partials: false,
+            max_alts: 1,
+            idle_timeout: Some(Duration::from_millis(200)),
+            max_samples: None,
+            permit: Some(Arc::clone(&permits).try_acquire_owned().unwrap()),
+        };
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let inbound = futures::stream::pending::<Result<pb::StreamingRecognizeRequest, Status>>();
+        let mut out = offline_service()
+            .streaming_over_offline(inbound, out_tx, out_rx, cfg)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "an open stream holds its permit"
+        );
+        let status = out
+            .next()
+            .await
+            .expect("the RPC ended without a status")
+            .expect_err("a silent stream cannot succeed");
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+        // Returned as the task ends, just after it sends that status.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while permits.available_permits() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the permit was never returned"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// Under the bound the stream reaches the submit, which a pool with no

@@ -7,8 +7,10 @@
 //!   handlers push commands across a tokio mpsc channel; the dispatcher
 //!   thread runs them in order, then routes the resulting events back via
 //!   per-request channels.
-//! - [`EnginePool`] groups N clients (one per GPU) with sticky-by-rid
-//!   routing for streaming and least-loaded routing for offline.
+//! - [`EnginePool`] groups N clients (one per GPU), admits each request to
+//!   the least-loaded one, and stops them all at shutdown.  A request stays on
+//!   the worker that admitted it because its handle carries that worker's
+//!   command sender.
 //!
 //! The previous ZMQ + msgpack hop is gone: there is no separate Python
 //! worker process, no DEALER socket, no wire codec.  Events are

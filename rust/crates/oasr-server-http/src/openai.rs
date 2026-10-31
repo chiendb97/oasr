@@ -820,7 +820,6 @@ async fn stream_transcription(
                 _ => {}
             }
         }
-        s.pool.release(&handle.request_id);
         // OpenAI's clients stop on this sentinel; without it they wait for
         // the connection to close.
         yield Ok::<SseEvent, std::convert::Infallible>(SseEvent::default().data("[DONE]"));

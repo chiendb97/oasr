@@ -14,6 +14,33 @@ use tracing::{debug, warn};
 
 use crate::engine_metrics::EngineLabels;
 
+/// One request's entry in a [`RouterActor`], removed when this is dropped.
+///
+/// The entry used to be removed only by a terminal event or a cancel, so every
+/// other way a request ends left it behind: a submit whose send failed, or
+/// whose future was dropped while the command channel was full, never got a
+/// handle to cancel it, and its entry (with the forwarding task waiting on it)
+/// stayed for the life of the process.  Every handle owns one of these from
+/// the moment the request is registered, so no exit path can skip it.
+pub struct Registration {
+    router: RouterActor,
+    request_id: String,
+}
+
+impl Registration {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // Request ids are fresh UUIDs, so nothing else can have registered
+        // the same one in the meantime.
+        self.router.remove(&self.request_id);
+    }
+}
+
 /// Owned per-worker; thread-safe via `Arc<...>` clones.
 ///
 /// The two channel-pressure counters are resolved to handles at construction
@@ -43,11 +70,23 @@ impl RouterActor {
         }
     }
 
-    /// Register a per-request channel; returns the matching receiver.
-    pub fn register(&self, request_id: String, buffer: usize) -> mpsc::Receiver<Event> {
+    /// Register a per-request channel; returns the entry's guard and the
+    /// matching receiver.
+    ///
+    /// The entry lives exactly as long as the [`Registration`]: it is removed
+    /// when that is dropped, if a terminal event has not removed it first.
+    pub fn register(
+        &self,
+        request_id: String,
+        buffer: usize,
+    ) -> (Registration, mpsc::Receiver<Event>) {
         let (tx, rx) = mpsc::channel(buffer);
-        self.inner.insert(request_id, tx);
-        rx
+        self.inner.insert(request_id.clone(), tx);
+        let registration = Registration {
+            router: self.clone(),
+            request_id,
+        };
+        (registration, rx)
     }
 
     /// Remove the channel for `request_id`.  No-op if absent.
@@ -143,5 +182,42 @@ impl RouterActor {
         if terminal {
             self.inner.remove(&rid);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_entry_lives_as_long_as_its_registration() {
+        let router = RouterActor::default();
+        let (registration, _events) = router.register("r".into(), 1);
+        assert_eq!(router.all_request_ids(), vec!["r".to_string()]);
+        drop(registration);
+        assert!(router.is_empty());
+    }
+
+    /// The terminal event removes the entry first; the registration's drop
+    /// then has nothing left to do, and must not mind.
+    #[tokio::test]
+    async fn a_terminal_event_then_the_drop_is_fine() {
+        let router = RouterActor::default();
+        let (registration, mut events) = router.register("r".into(), 1);
+        router
+            .route(Event::Error {
+                request_id: "r".into(),
+                code: oasr_wire::ErrorCode::Shutdown,
+                message: "bye".into(),
+            })
+            .await;
+        assert!(router.is_empty());
+        assert!(events.recv().await.is_some());
+        assert!(
+            events.recv().await.is_none(),
+            "the channel should be closed"
+        );
+        drop(registration);
+        assert!(router.is_empty());
     }
 }
