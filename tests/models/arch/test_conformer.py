@@ -106,7 +106,9 @@ def test_conformer_encoder_matches_wenet(output_size: int, num_blocks: int, dtyp
 
     # Through the converter, as a checkpoint is: a config built by hand here
     # cannot see a field the converter drops or misroutes.
-    raw = {"input_dim": 80, "output_dim": 32, "encoder_conf": wenet_encoder_config}
+    # ``input_size`` is WeNet's ``input_dim``, never an ``encoder_conf`` key.
+    encoder_conf = {k: v for k, v in wenet_encoder_config.items() if k != "input_size"}
+    raw = {"input_dim": 80, "output_dim": 32, "encoder_conf": encoder_conf}
     impl_encoder = ConformerEncoder(build_config_from_wenet(raw).encoder)
 
     # Pass full WeNet state dict; _load_from_state_dict hooks in OASR modules

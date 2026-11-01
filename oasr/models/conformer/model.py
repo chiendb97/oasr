@@ -846,6 +846,9 @@ class ConformerEncoder(BaseEncoder):
         subsampling_cls = _INPUT_LAYER_SUBSAMPLING.get(config.input_layer)
         if subsampling_cls is None:
             raise NotImplementedError(f"input_layer={config.input_layer}")
+        # The embed always builds WeNet's ``RelPositionalEncoding``.
+        if config.pos_enc_layer_type != "rel_pos":
+            raise NotImplementedError(f"pos_enc_layer_type={config.pos_enc_layer_type}")
         self.embed = subsampling_cls(
             config.input_size,
             config.output_size,
