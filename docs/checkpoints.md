@@ -92,7 +92,7 @@ its model exactly.
 
 | Ecosystem | Detect marker | Architecture | Notes |
 |---|---|---|---|
-| WeNet | `train.yaml` | `conformer` | U2/U2++ dirs with a `(bi)transformer` decoder keep the AED branch → `capabilities={"ctc","ctc_aed_rescoring"}` |
+| WeNet | `train.yaml` | `conformer` | U2/U2++ dirs with a `(bi)transformer` decoder keep the AED branch → `capabilities={"ctc","ctc_aed_rescoring"}`; an encoder, model class or `encoder_conf` value the Conformer does not implement is refused (see [models](models.md#conformer-wenet-u2u2)) |
 | icefall | `tokens.txt`/`bpe.model` + `epoch-*.pt`/`pretrained.pt` | `zipformer` (CTC) | config shape-inferred from the checkpoint |
 | icefall pruned-transducer | **not auto-detected** — `architecture="transducer"` | `transducer` | `encoder_type ∈ {conformer, zipformer}`; config inferred from `decoder.*`/`joiner.*` |
 | HF Whisper | `config.json: model_type=whisper` | `whisper` | emits `whisper` tokenizer + `whisper_logmel` features (`audio_scale=1.0`) |
