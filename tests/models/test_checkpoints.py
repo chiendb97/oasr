@@ -452,13 +452,18 @@ class TestConcatAfterIsRejected:
         with pytest.raises(ValueError, match="concat_after"):
             build_config_from_wenet(self._yaml(concat_after=True))
 
-    def test_decoder_concat_after_raises(self):
+    def test_decoder_concat_after_drops_the_decoder(self, caplog):
+        """It costs attention rescoring only, so the CTC model still loads."""
+        import logging
+
         from oasr.models.conformer.convert import build_config_from_wenet
 
         raw = self._yaml()
+        raw["decoder"] = "bitransformer"
         raw["decoder_conf"] = {"concat_after": True}
-        with pytest.raises(ValueError, match="concat_after"):
-            build_config_from_wenet(raw)
+        with caplog.at_level(logging.WARNING):
+            assert build_config_from_wenet(raw).decoder is None
+        assert any("decoder_conf.concat_after=True" in r.getMessage() for r in caplog.records)
 
     def test_the_default_is_accepted(self):
         from oasr.models.conformer.convert import build_config_from_wenet

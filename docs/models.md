@@ -227,6 +227,21 @@ Rescoring is opt-in via `EngineConfig.decode_method`. The decoder config — inc
 `sos`/`eos` (raw vocab − 1) and the trained `reverse_weight` — lives on
 `ConformerModelConfig.decoder`.
 
+The converter builds only a WeNet `asr_model` or `k2_model` with a
+`ConformerEncoder`, because OASR decodes through the CTC head those two train. It
+refuses, at load:
+- another `encoder` or model class, and `model_conf.ctc_weight: 0`;
+- an `encoder_conf` value this Conformer does not implement, such as a
+  `pos_enc_layer_type` other than `rel_pos`, a `selfattention_layer_type` other
+  than `rel_selfattn`, RMSNorm, `concat_after`, or a static chunk without a
+  dynamic one;
+- an activation other than `swish` or `relu`. WeNet's `gelu` is exact erf, while
+  the convolution module's fused one is the tanh approximation;
+- an `encoder_conf` key it does not know.
+
+A `decoder_conf` it cannot build drops the AED branch with a warning instead. The
+tables of keys are in `convert.py`.
+
 ### Zipformer (icefall CTC)
 
 `model.py`, `encoder.py`, `subsampling.py`, `scaling.py`, `config.py`,

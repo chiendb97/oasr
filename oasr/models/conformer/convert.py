@@ -46,38 +46,208 @@ def parse_wenet_yaml(yaml_path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
-    """Translate a WeNet ``train.yaml`` into a :class:`ConformerModelConfig`."""
-    enc = raw.get("encoder_conf", {})
+#: Every ``encoder_conf`` key WeNet's ``ConformerEncoder`` has taken, v1.0 through
+#: main, by what this converter does with it.  WeNet passes ``encoder_conf`` to
+#: that constructor as keyword arguments, so a key outside these tables comes from
+#: another encoder class or a newer WeNet, and may change what the encoder computes.
+#:
+#: Read by :func:`build_config_from_wenet`.
+_ENCODER_READ = frozenset(
+    {
+        "output_size",
+        "attention_heads",
+        "linear_units",
+        "num_blocks",
+        "input_layer",
+        "normalize_before",
+        "macaron_style",
+        "use_cnn_module",
+        "cnn_module_kernel",
+        "causal",
+        "conv_bias",
+        "conv_norm_eps",
+        "conv_inner_factor",
+        "norm_eps",
+        "final_norm",
+        "static_chunk_size",
+        "use_dynamic_chunk",
+    }
+)
+#: No effect on what the encoder computes at inference.
+_ENCODER_INERT = frozenset(
+    {
+        "dropout_rate",
+        "positional_dropout_rate",
+        "attention_dropout_rate",
+        "use_dynamic_left_chunk",
+        "gradient_checkpointing",
+        "use_sdpa",
+        # Accepted and never read, in every WeNet version.
+        "positionwise_conv_kernel_size",
+        # Read only by ``mlp_type="moe"``, which is refused.
+        "n_expert",
+        "n_expert_activated",
+    }
+)
+_RMS_NORM = "WeNet's RMSNorm scales by 1 + weight, and OASR's by weight"
+_BIAS = "every attention and feed-forward projection here carries a bias"
+#: Keys this Conformer implements at some values only: the values, and why.
+_ENCODER_VALUES: Dict[str, Tuple[Tuple[Any, ...], str]] = {
+    # WeNet picks the attention class by ``pos_enc_layer_type`` before v3 and by
+    # ``selfattention_layer_type`` from v3, so both must name the relative form.
+    "pos_enc_layer_type": (("rel_pos",), "only WeNet's RelPositionalEncoding is implemented"),
+    "selfattention_layer_type": (
+        ("rel_selfattn",),
+        "only WeNet's RelPositionMultiHeadedAttention is implemented",
+    ),
+    # WeNet's ``gelu`` is exact erf; the convolution module's fused one is the tanh
+    # approximation.
+    "activation_type": (
+        ("swish", "relu"),
+        "the convolution module's gelu is the tanh approximation, and hardtanh, tanh "
+        "and selu are not implemented",
+    ),
+    "layer_norm_type": (("layer_norm",), _RMS_NORM),
+    "cnn_module_norm": (("batch_norm", "layer_norm"), _RMS_NORM),
     # ``concat_after`` replaces each sub-layer's residual add with
-    # ``concat_linear(cat([x, sublayer_out]))``.  OASR's encoder implements only
-    # the residual form, so honouring a checkpoint that asks for the other one is
-    # impossible — and *ignoring* it would load a plausible-looking model that
-    # silently computes something else.  Fail where the information is, rather
-    # than shipping wrong transcripts.  (Checkpoints trained with the default
-    # still *carry* the unused ``concat_linear`` parameters, which is why the
-    # converter declares them expected-unused.)
-    for section in ("encoder_conf", "decoder_conf"):
-        if raw.get(section, {}).get("concat_after"):
-            raise ValueError(
-                f"train.yaml sets {section}.concat_after=True, which this "
-                "Conformer implementation does not support (it uses the residual "
-                "form). Loading it would silently compute a different model."
+    # ``concat_linear(cat([x, out]))``.  Checkpoints trained without it still
+    # carry ``concat_linear``, hence ``expected_unused_prefixes``.
+    "concat_after": ((False,), "it uses the residual form"),
+    "mlp_type": (
+        ("position_wise_feed_forward",),
+        "only WeNet's PositionwiseFeedForward is implemented",
+    ),
+    "query_bias": ((True,), _BIAS),
+    "key_bias": ((True,), _BIAS),
+    "value_bias": ((True,), _BIAS),
+    "mlp_bias": ((True,), _BIAS),
+    "n_kv_head": ((None,), "grouped-query attention is not checked against WeNet's"),
+    "head_dim": ((None,), "grouped-query attention is not checked against WeNet's"),
+}
+
+#: The same for ``decoder_conf`` and WeNet's ``(Bi)TransformerDecoder``.  A
+#: decoder this converter cannot build costs attention rescoring only, so it is
+#: dropped rather than refused.
+_DECODER_READ = frozenset({"attention_heads", "linear_units", "num_blocks", "r_num_blocks"})
+_DECODER_INERT = frozenset(
+    {
+        "dropout_rate",
+        "positional_dropout_rate",
+        "self_attention_dropout_rate",
+        "src_attention_dropout_rate",
+        "gradient_checkpointing",
+        "use_sdpa",
+        "n_expert",
+        "n_expert_activated",
+        # Tied, both tensors are saved and equal; a missing one fails the load.
+        "tie_word_embedding",
+    }
+)
+_DECODER_VALUES: Dict[str, Tuple[Tuple[Any, ...], str]] = {
+    key: (values, "the decoder implements WeNet's default only")
+    for key, values in {
+        "input_layer": ("embed",),
+        "use_output_layer": (True,),
+        "normalize_before": (True,),
+        "src_attention": (True,),
+        "activation_type": ("relu",),
+        "layer_norm_type": ("layer_norm",),
+        "norm_eps": (1e-5,),
+        "mlp_type": ("position_wise_feed_forward",),
+        "mlp_bias": (True,),
+        "query_bias": (True,),
+        "key_bias": (True,),
+        "value_bias": (True,),
+        "src_query_bias": (True,),
+        "src_key_bias": (True,),
+        "src_value_bias": (True,),
+        "n_kv_head": (None,),
+        "head_dim": (None,),
+        "concat_after": (False,),
+    }.items()
+}
+
+#: WeNet model classes OASR serves: both train the CTC head OASR decodes, and
+#: WeNet decodes ``K2Model`` (an ``ASRModel`` trained with LF-MMI) through it too.
+_CTC_MODELS = ("asr_model", "k2_model")
+
+
+def _unsupported(
+    section: str,
+    conf: Mapping[str, Any],
+    known: frozenset,
+    values: Mapping[str, Tuple[Tuple[Any, ...], str]],
+) -> Optional[str]:
+    """The first thing in a ``train.yaml`` section OASR cannot build, or ``None``."""
+    for key, value in conf.items():
+        if key in values:
+            supported, why = values[key]
+            if isinstance(value, str) and any(isinstance(s, float) for s in supported):
+                # YAML 1.1 reads ``1e-5`` (no dot) as a string.
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass
+            if value not in supported:
+                return f"sets {section}.{key}={value}, which is not supported ({why})"
+        elif key not in known:
+            return (
+                f"sets {section}.{key}, which no WeNet version this converter knows takes, "
+                "and which may change what the model computes"
             )
-    # WeNet's ``RMSNorm`` scales by ``1 + weight`` (``add_unit_offset``) and
-    # OASR's by ``weight``, so the same tensors would load and compute something
-    # else.  Refused for the same reason as ``concat_after``.
-    for key in ("layer_norm_type", "cnn_module_norm"):
-        if enc.get(key) == "rms_norm":
-            raise ValueError(
-                f"train.yaml sets encoder_conf.{key}=rms_norm, which this Conformer "
-                "implementation does not support (WeNet's RMSNorm scales by "
-                "1 + weight). Loading it would silently compute a different model."
-            )
+    return None
+
+
+def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
+    """Translate a WeNet ``train.yaml`` into a :class:`ConformerModelConfig`.
+
+    Refuses a ``train.yaml`` whose encoder or model class this Conformer does not
+    implement: its weights could load by name and compute something else.
+    """
+    # WeNet builds the encoder class ``encoder`` names, ``conformer`` by default.
+    encoder = raw.get("encoder", "conformer")
+    if encoder != "conformer":
+        raise ValueError(
+            f"train.yaml declares encoder={encoder!r}, and the WeNet converter builds "
+            "only WeNet's ConformerEncoder ('conformer'). The checkpoint is refused "
+            "rather than built as a Conformer."
+        )
+    # Before v3, WeNet picked the model class by these keys instead of ``model``.
+    model = raw.get("model") or (
+        "transducer" if "predictor" in raw else "paraformer" if "paraformer" in raw else "asr_model"
+    )
+    if model not in _CTC_MODELS:
+        raise ValueError(
+            f"train.yaml declares a WeNet {model!r} model. OASR decodes a WeNet "
+            f"checkpoint through the CTC head that {' and '.join(_CTC_MODELS)} train, "
+            "and that head need not be trained in this one."
+        )
+    if float((raw.get("model_conf") or {}).get("ctc_weight", 0.5)) == 0.0:
+        raise ValueError(
+            "train.yaml sets model_conf.ctc_weight=0, so the checkpoint's CTC head was "
+            "never trained, and OASR decodes a WeNet checkpoint through it."
+        )
+    enc = raw.get("encoder_conf", {})
+    problem = _unsupported("encoder_conf", enc, _ENCODER_READ | _ENCODER_INERT, _ENCODER_VALUES)
+    if problem is not None:
+        raise ValueError(
+            f"train.yaml {problem}. The checkpoint is refused rather than loaded as a "
+            "Conformer that computes something else."
+        )
+    # A static chunk without a dynamic one masks attention to that chunk whatever
+    # the decoding chunk (WeNet's ``add_optional_chunk_mask``), offline included,
+    # and OASR's offline forward attends to the whole utterance.
+    static_chunk = int(enc.get("static_chunk_size", 0))
+    if static_chunk > 0 and not enc.get("use_dynamic_chunk", False):
+        raise ValueError(
+            f"train.yaml sets encoder_conf.static_chunk_size={static_chunk} without "
+            "use_dynamic_chunk, so WeNet decodes it with that chunk's attention mask "
+            "even offline, and OASR's offline forward attends to the whole utterance."
+        )
     encoder_cfg = ConformerEncoderConfig(
         input_size=raw.get("input_dim", 80),
         output_size=enc.get("output_size", 256),
-        num_blocks=enc.get("num_blocks", 12),
+        num_blocks=enc.get("num_blocks", 6),
         attention_heads=enc.get("attention_heads", 4),
         linear_units=enc.get("linear_units", 2048),
         cnn_module_kernel=enc.get("cnn_module_kernel", 15),
@@ -116,7 +286,14 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
     decoder_cfg = None
     dec_name = raw.get("decoder")
     dec = raw.get("decoder_conf") or {}
-    if dec_name in ("transformer", "bitransformer") and raw_vocab:
+    problem = _unsupported("decoder_conf", dec, _DECODER_READ | _DECODER_INERT, _DECODER_VALUES)
+    if dec_name in ("transformer", "bitransformer") and problem is not None:
+        logger.warning(
+            "train.yaml %s; the checkpoint's decoder.* weights will be dropped and "
+            "attention rescoring will be unavailable",
+            problem,
+        )
+    elif dec_name in ("transformer", "bitransformer") and raw_vocab:
         model_conf = raw.get("model_conf") or {}
         decoder_cfg = TransformerDecoderConfig(
             vocab_size=int(raw_vocab),
@@ -174,8 +351,8 @@ class WenetConverter(BaseCheckpointConverter):
     capability_drop_hints: Dict[str, str] = {
         "decoder.": (
             "the attention-decoder (CTC+AED rescoring) branch was not loaded "
-            "(unsupported decoder type in train.yaml); attention rescoring is "
-            "unavailable for this checkpoint"
+            "(train.yaml declares a decoder type or structure OASR does not model); "
+            "attention rescoring is unavailable for this checkpoint"
         ),
     }
 
