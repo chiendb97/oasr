@@ -1538,8 +1538,8 @@ class TestLongFormEngine:
             )
         )
 
-    def _drain(self, eng, audio, rid="long"):
-        eng.add_request(audio=audio, request_id=rid, streaming=False)
+    def _drain(self, eng, audio, rid="long", decoding=None):
+        eng.add_request(audio=audio, request_id=rid, streaming=False, decoding=decoding)
         got = {}
         for _ in range(50000):
             for out in eng.step():
@@ -1614,6 +1614,27 @@ class TestLongFormEngine:
             assert sum(k in text for k in ("modern", "chinese", "exhibition")) >= 2
         finally:
             eng.shutdown()
+            del eng
+            torch.cuda.empty_cache()
+
+    def test_a_seam_repeats_no_word_timing_token_or_timestamp(self):
+        """Each window repeats the last second of the one before.  The merge
+        dropped that repeat from the text and kept it everywhere else: on these
+        12 clips, 198 words of text came with 201 word timings, the extra three
+        a second "the 15th century", and the tokens and timestamps likewise."""
+        from oasr.engine.request import DecodingOptions
+
+        eng = self._engine(True)
+        try:
+            got = self._drain(eng, self._audio(12), decoding=DecodingOptions(word_timestamps=True))
+            out = got["long"]
+            assert len(out.text.split()) > 150, "fixture must span three windows"
+            assert [w.word for w in out.words] == out.text.split()
+            assert len(out.timestamps) == len(out.tokens[0])
+            # The seam's words read forward in time rather than restarting at it.
+            starts = [w.start for w in out.words]
+            assert all(b > a - 1.0 for a, b in zip(starts, starts[1:]))
+        finally:
             del eng
             torch.cuda.empty_cache()
 

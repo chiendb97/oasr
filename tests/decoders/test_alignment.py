@@ -706,7 +706,7 @@ class TestOptInIsRespected:
         from oasr.engine.request import RequestOutput
 
         tracker = LongFormTracker()
-        tracker.register("parent", ["c0", "c1"], [0.0, 30.0])
+        tracker.register("parent", ["c0", "c1"], [0.0, 30.0], [30.0, 60.0])
         tracker.absorb(
             [
                 RequestOutput(

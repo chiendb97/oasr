@@ -436,7 +436,9 @@ class ASREngine:
                 )
             else:
                 sr = int(config.feature_config.sample_rate)
-                self._longform = LongFormTracker()
+                self._longform = LongFormTracker(
+                    self._output_processor.strategy.detokenizer.token_pieces
+                )
                 self._longform_window_samples = int(sr * window_s)
                 self._longform_overlap_samples = int(
                     sr * min(float(config.long_form_overlap_seconds), window_s / 2.0)
@@ -469,7 +471,9 @@ class ASREngine:
             device = torch.device(vad_cfg.device or "cpu")
             self._vad_splitter = OfflineVadSegmenter(vad_cfg.resolve("offline"), device)
             if self._longform is None:
-                self._longform = LongFormTracker()
+                self._longform = LongFormTracker(
+                    self._output_processor.strategy.detokenizer.token_pieces
+                )
             feature_config = config.feature_config
             assert feature_config is not None, "EngineConfig always materialises one"
             fixed_window_s = feature_config.fixed_window_seconds
@@ -1022,9 +1026,12 @@ class ASREngine:
                 # to the fixed-window splitter below.
                 spans = [(0, int(wave.numel()))]
 
+        # Window starts in samples, so the tracker sees two windows that only
+        # touch as exactly touching, with no rounding to read as an overlap.
+        first: List[int]
         if spans is not None:
             windows: List[torch.Tensor] = []
-            starts: List[float] = []
+            first = []
             for start, end in spans:
                 piece = wave[start:end]
                 if 0 < self._vad_resplit_samples < int(piece.numel()):
@@ -1042,12 +1049,10 @@ class ASREngine:
                     stride = self._vad_resplit_samples - overlap
                     subs = split_windows(piece, self._vad_resplit_samples, overlap)
                     windows.extend(subs)
-                    starts.extend(
-                        (start + k * stride) / float(sample_rate) for k in range(len(subs))
-                    )
+                    first.extend(start + k * stride for k in range(len(subs)))
                     continue
                 windows.append(piece)
-                starts.append(start / float(sample_rate))
+                first.append(start)
         else:
             # No VAD, or VAD found nothing worth cutting at — fall back to the
             # fixed-window splitter, which is a no-op for audio that already
@@ -1062,7 +1067,9 @@ class ASREngine:
                 wave, self._longform_window_samples, self._longform_overlap_samples
             )
             stride = self._longform_window_samples - self._longform_overlap_samples
-            starts = [(i * stride) / float(sample_rate) for i in range(len(windows))]
+            first = [i * stride for i in range(len(windows))]
+        starts = [s / float(sample_rate) for s in first]
+        ends = [(s + int(w.numel())) / float(sample_rate) for s, w in zip(first, windows)]
 
         parent_id = req.request_id
         tracker = self._longform
@@ -1098,7 +1105,7 @@ class ASREngine:
         # the caller has already validated.  Under the lock, which is reentrant,
         # so no step can finish a window before its parent is registered.
         with self._lock:
-            tracker.register(parent_id, child_ids, starts)
+            tracker.register(parent_id, child_ids, starts, ends)
             try:
                 if self._overlap_admit:
                     with self._admit_inflight_lock:

@@ -952,6 +952,32 @@ def test_bulk_admission_segments_at_the_vad_spans(overlap):
     assert admitted == [eng._longform.child_id("file", i) for i in range(2)]
 
 
+@pytest.mark.parametrize(
+    "overlap_samples,spans,expected",
+    [
+        # Fixed windows of 16000 with no overlap: each ends where the next starts.
+        (0, None, [(0, 16000), (16000, 32000), (32000, 40000)]),
+        # 4000 samples of overlap: stride 12000.
+        (4000, None, [(0, 16000), (12000, 28000), (24000, 40000)]),
+        # VAD spans, cut in silence: a gap between them.
+        (0, [(0, 8000), (24000, 40000)], [(0, 8000), (24000, 40000)]),
+    ],
+    ids=["touching", "overlapping", "vad_gap"],
+)
+def test_the_fan_out_registers_where_each_window_ends(overlap_samples, spans, expected):
+    """The merge drops a repeat only where windows share audio, so it is told
+    where each one ends -- from sample counts, so windows that only touch
+    compare equal rather than overlapping by a rounding error."""
+    eng = _fan_out_engine(spans=spans)
+    eng._longform_overlap_samples = overlap_samples
+    eng.add_requests_batch_checked(
+        [{"request_id": "long", "audio": torch.zeros(40000), "streaming": False}]
+    )
+    entry = eng._longform._pending["long"]
+    assert entry.window_starts_s == [s / 16000 for s, _ in expected]
+    assert entry.window_ends_s == [e / 16000 for _, e in expected]
+
+
 def test_a_rejected_long_request_registers_no_windows():
     """Options are validated before the fan-out, not by each window.
 
@@ -1037,7 +1063,7 @@ def test_long_form_keeps_a_window_that_overflowed():
     from oasr.engine.request import RequestOutput
 
     tracker = LongFormTracker()
-    tracker.register("file", ["file#0", "file#1"], [0.0, 30.0])
+    tracker.register("file", ["file#0", "file#1"], [0.0, 30.0], [30.0, 60.0])
     parent = tracker.absorb(
         [
             RequestOutput(request_id="file#0", text="a b", tokens=[[1, 2]], finished=True),
@@ -1053,7 +1079,7 @@ def test_long_form_keeps_a_window_that_overflowed():
     assert [p.request_id for p in parent] == ["file"]
     assert parent[0].search_overflow == 16
 
-    tracker.register("clean", ["clean#0"], [0.0])
+    tracker.register("clean", ["clean#0"], [0.0], [30.0])
     (out,) = tracker.absorb(
         [RequestOutput(request_id="clean#0", text="a", tokens=[[1]], finished=True)]
     )

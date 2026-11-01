@@ -147,6 +147,11 @@ class DecodeStrategy(ABC):
             "serve an AED / speech-LLM decode family."
         )
 
+    @property
+    def detokenizer(self) -> "Detokenizer":
+        """What renders this family's ``RequestOutput.text`` from its tokens."""
+        return self._detok
+
     # -- per-request options ------------------------------------------------
 
     #: Options that change what is decoded. Unsupported entries are rejected;
