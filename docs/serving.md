@@ -401,9 +401,10 @@ curl -sS -X POST \
 ```
 
 Query parameters: `encoding` (required), `sample_rate` (defaults to the model's
-own rate; ignored when the body carries a container header), `priority`,
-`max_alternatives`, plus the per-request decoding options (autoregressive decode
-families only — AED / speech-LLM; CTC ignores them): `max_new_tokens`,
+own rate; ignored when the body carries a container header), `priority` (lower
+is sooner; `0`, the default, is the most urgent class and a negative value counts
+as `0`), `max_alternatives`, plus the per-request decoding options
+(autoregressive decode families only — AED / speech-LLM; CTC ignores them): `max_new_tokens`,
 `temperature` (0 = greedy), `top_k`, `top_p`, `prompt` (speech-LLM user-prompt
 override), `task` and `language`.  `max_alternatives > 1` makes the engine
 detokenize that many n-best hypotheses (beam decode families), so every returned

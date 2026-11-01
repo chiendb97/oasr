@@ -22,12 +22,20 @@ supported (set via ``EngineConfig.schedule_policy``):
     the shortest group.  Best throughput, but relies on
     ``max_wait_time`` to bound starvation of long requests.
 
+Priority: lower ``Request.priority`` is sooner, FIFO within a class, and the
+default (0) is the most urgent class.
+
 Starvation bound: any request whose ``waited_for`` exceeds ``max_wait_time``
-becomes an immediate-flush anchor regardless of policy.
+becomes an immediate-flush anchor regardless of policy or priority.  Before a
+selection the overdue requests move to the head of their queue, oldest first --
+for offline, only when one has turned overdue or a request was filed ahead of
+others since the last time.
 """
 
 from __future__ import annotations
 
+import math
+import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
@@ -35,6 +43,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 from .batching import (
     build_batching_policy,
     build_partition_policy,
+    promote_overdue,
     snap_to_preferred,
     sort_streams_for_admission,
 )
@@ -101,6 +110,12 @@ class Scheduler:
         # backlog-style workloads.
         self._index: Dict[str, Request] = {}
         self._next_stream_id: int = 0
+        # When the offline wait bound next has work (``promote_overdue``): the
+        # instant a waiting request turns overdue, or -inf once a request has
+        # been filed ahead of others.  Until then the bound would only re-read
+        # every request's arrival time, which is most of a selection's cost on a
+        # deep queue.
+        self._offline_promote_at: float = math.inf
 
         # Pluggable offline batch-selection + micro-batch partition policies.
         # New policies plug in via the batching registries — no scheduler edits.
@@ -123,7 +138,11 @@ class Scheduler:
         if request.streaming:
             self._insert_ordered(self._streaming_waiting, request)
         else:
-            self._insert_ordered(self._offline_waiting, request)
+            appended = self._insert_ordered(self._offline_waiting, request)
+            # Filed ahead of others, it may be ahead of an overdue request.
+            due = request.arrival_time + self._config.max_wait_time if appended else -math.inf
+            if due < self._offline_promote_at:
+                self._offline_promote_at = due
         self._index[request.request_id] = request
 
     def schedule_offline(self, limit: Optional[int] = None) -> List[Request]:
@@ -135,8 +154,16 @@ class Scheduler:
         ``_running`` (that pool tracks streaming admissions only).
 
         Batch *selection* is delegated to the configured
-        :class:`~oasr.engine.batching.BatchingPolicy` (fcfs / bucket / sjf).
+        :class:`~oasr.engine.batching.BatchingPolicy` (fcfs / bucket / sjf /
+        window), after the wait bound has moved every overdue request to the
+        head of the queue, whatever its priority.  The bound runs only when it
+        can have work; removing requests, or leaving them in order as every
+        policy does while one is overdue, gives it none.
         """
+        if time.monotonic() >= self._offline_promote_at:
+            self._offline_promote_at = promote_overdue(
+                self._offline_waiting, self._config.max_wait_time
+            )
         batch = self._batching_policy.select_offline_batch(
             self._offline_waiting, self._config, limit
         )
@@ -266,10 +293,12 @@ class Scheduler:
 
         The length sort is bounded by ``max_wait_time``, as the offline
         policies are: a stream that has waited that long is admitted ahead
-        of the sorted rest, oldest first.  Without the bound the sort is
-        last-in, first-out under load, because a waiting stream's
-        ``num_frames`` grows with the audio it buffers (see
-        :func:`~oasr.engine.batching.sort_streams_for_admission`).
+        of the sorted rest, oldest first, whatever its priority.  Without the
+        bound the sort is last-in, first-out under load, because a waiting
+        stream's ``num_frames`` grows with the audio it buffers (see
+        :func:`~oasr.engine.batching.sort_streams_for_admission`).  Without
+        the sort, the queue is in priority order and the same bound applies
+        (:func:`~oasr.engine.batching.promote_overdue`).
 
         When ``preferred_batch_size`` is set, the admit count is snapped
         so that the resulting running pool size lands on a preferred
@@ -286,6 +315,8 @@ class Scheduler:
         policy = cfg.schedule_policy
         if cfg.streaming_cohort_admit or policy == "sjf":
             sort_streams_for_admission(self._streaming_waiting, cfg.max_wait_time)
+        else:
+            promote_overdue(self._streaming_waiting, cfg.max_wait_time)
 
         n_avail = min(budget, len(self._streaming_waiting))
         if cfg.preferred_batch_size is not None:
@@ -293,10 +324,9 @@ class Scheduler:
             target = snap_to_preferred(candidate, cfg.preferred_batch_size)
             n_admit = max(0, target - len(self._running))
             if n_admit == 0:
-                # The longest wait, not the head's: the head is the
-                # highest-priority stream, which need not be the oldest.
-                oldest = max(r.waited_for for r in self._streaming_waiting)
-                if oldest >= cfg.max_wait_time:
+                # Either ordering above puts the overdue streams first, oldest
+                # first, so the head has waited longest whenever any is overdue.
+                if self._streaming_waiting[0].waited_for >= cfg.max_wait_time:
                     n_admit = n_avail
                 else:
                     return []
@@ -316,23 +346,27 @@ class Scheduler:
     # Internal — priority/length ordering
     # ------------------------------------------------------------------
 
-    def _insert_ordered(self, queue: Deque[Request], request: Request) -> None:
-        """Append respecting priority.  Lower priority value inserts earlier.
+    def _insert_ordered(self, queue: Deque[Request], request: Request) -> bool:
+        """Insert behind every request of the same or a better (lower) priority.
 
-        Within the same priority the insertion is FIFO, preserving arrival
-        order.  For the default case (all priority=0) this degenerates to
-        ``append`` and is O(1).
+        Returns whether the request went to the back.  Within a class the order
+        is FIFO.  When every request has the same priority -- the default --
+        this is an ``append`` and O(1).
+
+        The scan runs from the back.  Requests the wait bound moved to the head
+        (:func:`~oasr.engine.batching.promote_overdue`) are in arrival order, not
+        priority order, so a scan from the front could stop at a deferred one
+        there and file this request ahead of better ones waiting behind it.
         """
-        if request.priority == 0 or not queue or queue[-1].priority <= request.priority:
+        if not queue or queue[-1].priority <= request.priority:
             queue.append(request)
-            return
-        # Find the first slot whose priority is strictly worse (higher) and
-        # insert before it.  Queues are expected to be small (< 10³).
-        for i, existing in enumerate(queue):
-            if existing.priority > request.priority:
-                queue.insert(i, request)
-                return
-        queue.append(request)
+            return True
+        for i in range(len(queue) - 2, -1, -1):
+            if queue[i].priority <= request.priority:
+                queue.insert(i + 1, request)
+                return False
+        queue.appendleft(request)
+        return False
 
     # ------------------------------------------------------------------
     # Status

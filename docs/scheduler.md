@@ -59,7 +59,7 @@ are O(1) regardless of which queue the request is in.
 
 | Field | Type | Role |
 |-------|------|------|
-| `_streaming_waiting` | `Deque[Request]` | Streaming requests not yet admitted. Priority-aware insertion; FIFO within the same priority. |
+| `_streaming_waiting` | `Deque[Request]` | Streaming requests not yet admitted. Priority-aware insertion; FIFO within the same priority (§4.4). |
 | `_offline_waiting` | `Deque[Request]` | Offline requests awaiting a batched forward pass. |
 | `_running` | `OrderedDict[str, Request]` | Admitted streaming requests with allocated KV cache. Iteration order = admission order. |
 | `_index` | `Dict[str, Request]` | O(1) lookup across all three queues. Kept in sync on every add / finish / abort. |
@@ -93,13 +93,16 @@ if q empty: return []
 cap = max(1, max_batch_size)
 policy = config.schedule_policy
 
+if now >= promote_at:                        # §4.5: only when the bound has work
+    promote_at = promote_overdue(q)          # overdue requests to the head
 force_flush = q[0].waited_for >= max_wait_time
 
 if policy == "fcfs":
     return [popleft() up to cap]
 
 if policy == "window":                       # the default; see §4.1.1
-    window = oldest cap * length_window_factor requests of q[0]'s priority
+    window = up to cap * length_window_factor requests from the head:
+             the overdue ones (any priority), then the best class waiting
     sort window by cost; among the contiguous runs of cap that contain
     q[0] and pass the guards below (and max_batch_frames), take the one
     with the least padding (max_len * cap - sum_len); if none passes,
@@ -167,7 +170,8 @@ choosing the least-padded length-run of `max_batch_size` that contains it:
   while it is still inside the window;
 - **a no-op below capacity** — with fewer than `max_batch_size` requests
   waiting there is nothing to choose, so light load sees FIFO exactly;
-- **one priority class at a time** — the window is the anchor's class.
+- **one priority class at a time** — the window is the best class waiting,
+  plus any request that has waited out `max_wait_time`, whatever its class.
 
 With the default factor of 4 the padding falls to ~1.11× (simulated on 2048
 LJSpeech arrivals; no request delayed more than 8 batches). The accuracy gate's
@@ -185,10 +189,13 @@ if budget <= 0: return []
 
 # Length bucketing only — no offset gate (heterogeneous-offset batching).
 if streaming_cohort_admit or policy == "sjf":
-    # within each priority: overdue streams first, oldest first; the rest by length
+    # overdue streams first, oldest first, whatever their priority;
+    # the rest by priority, then length
     sort _streaming_waiting by
-        (priority, 0, arrival_time)  if waited_for >= max_wait_time
-        (priority, 1, num_frames)    otherwise
+        (0, arrival_time)            if waited_for >= max_wait_time
+        (1, priority, num_frames)    otherwise
+else:
+    promote_overdue(_streaming_waiting)      # §4.5
 
 admitted = []
 while _streaming_waiting and len(admitted) < budget:
@@ -232,22 +239,55 @@ Practical consequences:
 
 ### 4.4 Priority handling
 
-Both queues use `_insert_ordered` on `add_request`:
+Lower `Request.priority` is sooner. `0` is the default and the most urgent
+class: `Request` clamps a priority to at least `0`, so a caller can defer its
+own work but cannot move it ahead of everyone else's. The front-ends pass the
+wire's `priority` (an `i32`) straight through, so the clamp is what stops one
+client with a negative value from overtaking all the others.
 
-- `priority == 0` (default) → `append` (O(1)).
-- Higher-priority requests (lower numeric value) are inserted before
-  the first slot whose priority is strictly worse — O(N) but queues
-  are expected to stay small (< 10³).
+Both queues use `_insert_ordered` on `add_request`, which files a request
+behind every request of the same or a better class:
 
-Priority is a stable secondary key in `_sort_by_length`: SJF / cohort
-sorting orders by `(priority, num_frames)` so high-priority work is
-scheduled first within each length bucket.
+- When every request has the same priority (the default) this is an
+  `append` (O(1)).
+- Otherwise it scans from the back for the last request whose priority is
+  not worse, O(N). From the back, because the head may hold overdue requests
+  (§4.5) in arrival order rather than priority order; a scan from the front
+  could stop at a deferred one there and file the request ahead of better
+  ones behind it.
+
+Priority is the leading key of the length sorts: SJF orders by
+`(priority, num_frames)`, and cohort admission sorts the streams that are not
+overdue by `(priority, num_frames)`.
 
 ### 4.5 Forced flush (starvation bound)
 
 ```
+promote_overdue(q)        # every request with waited_for >= max_wait_time,
+                          # oldest first, moves to the head
 force_flush = q[0].waited_for >= cfg.max_wait_time
 ```
+
+The bound outranks priority. The queue is otherwise in priority order, so its
+head is the best class's oldest request, and a flush read off the head alone
+never fired for a deferred request while better work kept arriving: it waited
+for as long as the better load lasted. `promote_overdue` runs before every
+offline selection that can need it and before every unsorted streaming
+admission (cohort admission's sort puts overdue streams first itself), so the
+head is the request that has waited longest whenever any is overdue. A
+consequence: under sustained overload every waiting request is soon overdue,
+and service falls back to arrival order across classes. Priority orders work
+within `max_wait_time`; it cannot defer a request past it.
+
+An offline selection skips the bound until it can have work, since re-reading
+every waiting request's arrival time was most of a selection's cost on a deep
+queue. `promote_overdue` returns the instant the next waiting request turns
+overdue, and `add_request` brings that forward to the new request's own
+deadline, or to now when the request was filed ahead of others (it may be
+ahead of an overdue one). Nothing else can put an overdue request out of
+place: removing a request never does, and while the head is overdue every
+policy leaves what it does not take in order (the `BatchingPolicy` contract;
+`sjf` sorts only when nothing is overdue).
 
 When the oldest offline request has been waiting too long:
 
@@ -423,16 +463,21 @@ while sched.has_pending():
 | Cohort-admit gate blocking | Empty `newly_admitted` list with non-zero waiting queue — recover when running pool drains. |
 | `length_bucket_ratio=0` and `max_offline_pad_ratio=0` | Effectively disables bucketing; behaves like FCFS within each step but still respects cap. |
 | Forced flush fires | All bucket guards skipped; the resulting batch may be highly padded. |
-| Priority insert into already long queue | O(N) walk, but priority is rare and queues are small. |
+| Priority insert into already long queue | O(N) walk from the back, but only when priorities differ. |
+| Negative `priority` | Clamped to `0` by `Request`. |
 
 ## 9. Performance Considerations
 
-1. **`add_request` is O(1)** when `priority == 0` (default), O(N) only
-   for non-default priorities.
-2. **`schedule()` is O(N_offline)** per call where N_offline is the
-   waiting queue length, bounded by `max_batch_size`. It does one
-   `_sort_by_length` (O(N log N)) for SJF or cohort admission with
-   length-similar streams.
+1. **`add_request` is O(1)** when the new request's priority is no better
+   than the queue's last, which includes the all-default case; O(N) otherwise.
+2. **The offline wait bound is O(N), and runs rarely.** When it runs it reads
+   every waiting request's arrival time, sorts those times if any request is
+   overdue (linear on a queue already in arrival order), and rebuilds the
+   queue only when the overdue requests are not already at the head. It runs
+   only when a request has turned overdue or was filed ahead of others
+   (§4.5): once per burst of one class, not once per selection. Unsorted
+   streaming admission runs it every time; SJF and cohort admission add one
+   O(N log N) sort.
 3. **`find_request` / `abort_request` are O(1)** thanks to `_index`.
 4. **No GPU work.** The scheduler is pure Python on dataclasses; it is
    rarely the bottleneck. Profile with NVTX (`engine.step → schedule`)

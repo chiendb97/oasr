@@ -26,8 +26,10 @@ import time
 from collections import deque
 from typing import List, Optional, Sequence
 
+import pytest
 import torch
 
+import oasr.engine.scheduler as scheduler_module
 from oasr.engine.config import EngineConfig
 from oasr.engine.request import Request
 from oasr.engine.scheduler import Scheduler
@@ -422,8 +424,8 @@ class TestStreamingAdmissionIsNotLifo:
     def test_the_wait_bound_is_read_off_the_oldest_stream(self, monkeypatch):
         """``preferred_batch_size`` holds for a fuller batch until the oldest is overdue.
 
-        Not the queue's head: the head is the highest-priority stream, which may
-        have just arrived while a lower-priority one has waited past the bound.
+        Whatever its class: the stream that has waited past the bound here is a
+        deferred one, behind a default-priority stream that has just arrived.
         """
         clock = _Clock()
         monkeypatch.setattr(time, "monotonic", clock)
@@ -431,10 +433,10 @@ class TestStreamingAdmissionIsNotLifo:
             EngineConfig(ckpt_dir="/tmp/fake", max_batch_size=8, preferred_batch_size=[4, 8])
         )
         old = _preferred_streaming()
+        old.priority = 1
         sched.add_request(old)
         clock.now += 1.0
         urgent = _preferred_streaming()
-        urgent.priority = -1
         sched.add_request(urgent)
         new, _ = sched.schedule_streaming()
         assert set(new) == {old, urgent}
@@ -889,13 +891,13 @@ class TestWindowPolicy:
                 shipped_at[r.request_id],
             )
 
-    def test_only_the_anchors_priority_class_is_mixed(self):
+    def test_only_the_best_waiting_priority_class_is_mixed(self):
         sched = _window_scheduler(mb=2, factor=4)
         urgent = _make_requests([900, 890])
-        for r in urgent:
-            r.priority = -1
-        normal = _make_requests([895, 100])
-        for r in normal + urgent:
+        deferred = _make_requests([895, 100])
+        for r in deferred:
+            r.priority = 1
+        for r in deferred + urgent:
             sched.add_request(r)
         assert sched.schedule_offline() == urgent
 
@@ -944,3 +946,229 @@ class TestWindowPolicy:
         for r in _make_requests([200] * 8):
             sched.add_request(r)
         assert len(sched.schedule_offline(limit=3)) == 3
+
+
+# ---------------------------------------------------------------------------
+# Priority: lower is sooner, clamped at the default, and bounded by the wait
+# ---------------------------------------------------------------------------
+
+_POLICIES = ["fcfs", "bucket", "sjf", "window"]
+
+
+def _offline(priority: int = 0, num_frames: int = 200) -> Request:
+    req = Request("audio.wav", streaming=False, priority=priority)
+    req.num_frames = num_frames
+    return req
+
+
+def _streaming(priority: int = 0) -> Request:
+    req = _preferred_streaming()
+    req.priority = priority
+    return req
+
+
+class TestPriority:
+    """``priority`` is a queue order: lower is sooner, and 0 is the default.
+
+    Three defects made it the opposite of that.  ``_insert_ordered`` appended any
+    priority-0 request without looking, so the default class queued behind every
+    deferred one.  The wait bound read only the head of the queue, which is the
+    best class's oldest, so a deferred request that had waited past
+    ``max_wait_time`` was never flushed while better work kept arriving -- and
+    the streaming sort applied the bound within each class only.  And a client
+    could send any ``i32``, so a negative value put one client ahead of everyone.
+    """
+
+    TICK_S = 0.1
+    MAX_WAIT_S = 0.15  # overdue on the second tick, clear of the boundary
+
+    @pytest.mark.parametrize("policy", _POLICIES)
+    def test_the_default_class_is_served_before_deferred_requests(self, monkeypatch, policy):
+        monkeypatch.setattr(time, "monotonic", _Clock())
+        sched = Scheduler(_make_config(max_batch_size=1, schedule_policy=policy))
+        deferred = [_offline(priority=5) for _ in range(3)]
+        urgent = _offline()
+        for r in deferred + [urgent]:
+            sched.add_request(r)
+        assert sched.schedule_offline() == [urgent]
+
+    @pytest.mark.parametrize("cohort", [True, False], ids=["cohort", "fifo"])
+    def test_the_default_class_is_admitted_before_deferred_streams(self, monkeypatch, cohort):
+        monkeypatch.setattr(time, "monotonic", _Clock())
+        sched = Scheduler(
+            EngineConfig(ckpt_dir="/tmp/fake", max_batch_size=1, streaming_cohort_admit=cohort)
+        )
+        deferred = [_streaming(priority=5) for _ in range(3)]
+        urgent = _streaming()
+        for r in deferred + [urgent]:
+            sched.add_request(r)
+        new, _ = sched.schedule_streaming()
+        assert new == [urgent]
+
+    def test_classes_stay_in_order_behind_an_overdue_head(self, monkeypatch):
+        """An insert must not land inside the overdue requests at the head.
+
+        Those are in arrival order, not by priority, so a scan from the front
+        for the first worse class finds one there and files the new request
+        ahead of better ones waiting behind them.
+        """
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = Scheduler(_make_config(max_batch_size=1, schedule_policy="fcfs"))
+        sched._config.max_wait_time = self.MAX_WAIT_S  # noqa: SLF001
+        old_a = _offline(priority=5)
+        sched.add_request(old_a)
+        clock.now += 0.01
+        sched.add_request(_offline(priority=6))
+        clock.now += 1.0
+        sched.add_request(_offline(priority=0))
+        sched.add_request(_offline(priority=3))
+        assert sched.schedule_offline() == [old_a]
+        # The queue is now [old_b (overdue), 0, 3].
+        sched.add_request(_offline(priority=1))
+        served = [sched.schedule_offline()[0].priority for _ in range(4)]
+        assert served == [6, 0, 1, 3]
+
+    def test_a_request_filed_ahead_of_an_overdue_one_does_not_jump_it(self, monkeypatch):
+        """The bound runs only when it can have work, and a request filed at the
+        front -- here ahead of an overdue deferred one -- is such a moment even
+        though nothing new has turned overdue."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = Scheduler(_make_config(max_batch_size=1, schedule_policy="fcfs"))
+        sched._config.max_wait_time = self.MAX_WAIT_S  # noqa: SLF001
+        sched.add_request(_offline(priority=5))
+        clock.now += 0.01
+        old_b = _offline(priority=5)
+        sched.add_request(old_b)
+        clock.now += 1.0
+        sched.schedule_offline()
+        urgent = _offline()
+        sched.add_request(urgent)  # no priority <= 0 is waiting: filed at the front
+        assert sched.schedule_offline() == [old_b]
+        assert sched.schedule_offline() == [urgent]
+
+    def test_the_bound_reads_the_queue_only_when_it_can_have_work(self, monkeypatch):
+        """Re-reading every arrival time on every selection was most of a
+        selection's cost on a deep queue.  Nothing turns overdue before the
+        oldest request does, and once all are overdue nothing more can."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        calls = []
+        real = scheduler_module.promote_overdue
+        monkeypatch.setattr(
+            scheduler_module, "promote_overdue", lambda q, w: calls.append(len(q)) or real(q, w)
+        )
+        sched = Scheduler(_make_config(max_batch_size=2, schedule_policy="window"))
+        sched._config.max_wait_time = self.MAX_WAIT_S  # noqa: SLF001
+        for _ in range(12):
+            sched.add_request(_offline())
+        shipped = len(sched.schedule_offline()) + len(sched.schedule_offline())
+        assert calls == []
+        clock.now += 1.0
+        while sched.num_waiting_offline:
+            shipped += len(sched.schedule_offline())
+        assert shipped == 12
+        assert calls == [8]
+
+    @pytest.mark.parametrize("better", [0, 1])
+    @pytest.mark.parametrize("policy", _POLICIES)
+    def test_a_deferred_request_ships_once_overdue_under_load(self, monkeypatch, policy, better):
+        """A full batch of better work arrives every tick, and one deferred
+        request waits.  It must wait while it is within the bound -- that is
+        what priority is for -- and ship on the first tick it is past it."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        cap = 4
+        sched = Scheduler(_make_config(max_batch_size=cap, schedule_policy=policy))
+        sched._config.max_wait_time = self.MAX_WAIT_S  # noqa: SLF001
+        deferred = _offline(priority=5, num_frames=900)
+        sched.add_request(deferred)
+        shipped_at = None
+        for tick in range(1, 8):
+            clock.now += self.TICK_S
+            for _ in range(cap):
+                sched.add_request(_offline(priority=better))
+            if deferred in sched.schedule_offline():
+                shipped_at = tick
+                break
+        assert shipped_at == 2
+
+    @pytest.mark.parametrize("better", [0, 1])
+    @pytest.mark.parametrize("cohort", [True, False], ids=["cohort", "fifo"])
+    def test_a_deferred_stream_is_admitted_once_overdue_under_load(
+        self, monkeypatch, cohort, better
+    ):
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        slots = 2
+        sched = Scheduler(
+            EngineConfig(
+                ckpt_dir="/tmp/fake",
+                max_batch_size=slots,
+                streaming_cohort_admit=cohort,
+                max_wait_time=self.MAX_WAIT_S,
+            )
+        )
+        deferred = _streaming(priority=5)
+        sched.add_request(deferred)
+        admitted_at = None
+        for tick in range(1, 8):
+            clock.now += self.TICK_S
+            for _ in range(slots):
+                sched.add_request(_streaming(priority=better))
+            new, running = sched.schedule_streaming()
+            if deferred in new:
+                admitted_at = tick
+                break
+            for req in running:
+                sched.finish_request(req.request_id)
+        assert admitted_at == 2
+
+    def test_an_sjf_flush_ships_the_oldest_not_the_sorted_head(self, monkeypatch):
+        """``sjf`` sorts the queue in place, so its head is the shortest request
+        left by the last sort, and a flush anchored there skips the long request
+        that has waited longest."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = Scheduler(_make_config(max_batch_size=1, schedule_policy="sjf"))
+        long = _offline(num_frames=900)
+        sched.add_request(long)
+        clock.now += 0.01
+        for _ in range(3):
+            sched.add_request(_offline(num_frames=100))
+        assert sched.schedule_offline()[0].num_frames == 100
+        clock.now += 1.0
+        assert sched.schedule_offline() == [long]
+
+    def test_a_window_flush_mixes_overdue_requests_of_any_class(self, monkeypatch):
+        """Once overdue, a request has outrun its class: the window takes the
+        overdue requests, then the best class waiting -- never a fresh request
+        of a worse class."""
+        clock = _Clock()
+        monkeypatch.setattr(time, "monotonic", clock)
+        sched = _window_scheduler(mb=3, factor=4)
+        sched._config.max_wait_time = self.MAX_WAIT_S  # noqa: SLF001
+        old_a = _offline(priority=5, num_frames=500)
+        sched.add_request(old_a)
+        clock.now += 0.01
+        old_b = _offline(num_frames=510)
+        sched.add_request(old_b)
+        clock.now += 1.0
+        fresh_worse = _offline(priority=7, num_frames=505)
+        fresh_best = _offline(priority=1, num_frames=490)
+        sched.add_request(fresh_worse)
+        sched.add_request(fresh_best)
+        assert sched.schedule_offline() == [old_a, old_b, fresh_best]
+
+    def test_a_negative_priority_is_clamped_to_the_default(self):
+        assert Request("audio.wav", priority=-7).priority == 0
+        assert Request("audio.wav", priority=3).priority == 3
+
+    def test_a_negative_priority_does_not_overtake_the_default(self, monkeypatch):
+        monkeypatch.setattr(time, "monotonic", _Clock())
+        sched = Scheduler(_make_config(max_batch_size=1, schedule_policy="fcfs"))
+        first = _offline()
+        sched.add_request(first)
+        sched.add_request(_offline(priority=-(2**31)))
+        assert sched.schedule_offline() == [first]
