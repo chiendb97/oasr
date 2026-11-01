@@ -1153,7 +1153,9 @@ class ASREngine:
             ``True`` routes the request through the paged-cache streaming
             path; ``False`` routes it through the batched offline path.
         priority : int, default ``0``
-            Lower values are scheduled first within each waiting queue.
+            Lower values are scheduled sooner.  ``0`` is the most urgent class
+            and a negative value is clamped to it; ``max_wait_time`` bounds
+            every request's wait, whatever its class.
         decoding : DecodingOptions or dict, optional
             Per-request decoding options (n-best, generation cap, sampling,
             prompt).  A plain dict is coerced — the PyO3 dispatcher passes
@@ -1741,7 +1743,7 @@ class ASREngine:
             does not resample, and rejecting here (at open) beats discovering
             it after the client has been told the stream is live.
         priority : int, default ``0``
-            Lower values are scheduled first within the streaming queue.
+            Lower values are admitted sooner; see :meth:`add_request`.
         decoding : DecodingOptions or dict, optional
             Per-request decoding options; see :meth:`add_request`.
 

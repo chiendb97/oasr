@@ -9,6 +9,7 @@ snapping, and ``max_wait_time`` forced-flush semantics.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, ClassVar, Deque, List, Optional
 
 from ..request import Request
@@ -195,10 +196,12 @@ class WindowPolicy(BatchingPolicy):
     also the only time padding costs throughput.
 
     Batches stay in arrival order internally and only one priority class is mixed
-    (the anchor's).  The guards the other length-aware policies apply to a batch
-    hold here too — ``max_batch_frames``, ``max_offline_pad_ratio`` and
-    ``length_bucket_ratio``: a run that breaks one is not a candidate, and the
-    batch narrows until one fits (the anchor alone always ships).  At their
+    (the best one waiting), together with any request that has waited out
+    ``max_wait_time``, whatever its class.  The guards the other length-aware
+    policies apply to a batch hold here too — ``max_batch_frames``,
+    ``max_offline_pad_ratio`` and ``length_bucket_ratio``: a run that breaks one
+    is not a candidate, and the batch narrows until one fits (the anchor alone
+    always ships).  At their
     defaults they leave every LJSpeech benchmark batch as it is; set explicitly,
     they mean what they mean under ``bucket``, rather than being dropped when
     the default policy changed.  ``preferred_batch_size`` snaps the result as it
@@ -216,13 +219,24 @@ class WindowPolicy(BatchingPolicy):
         cap = _batch_cap(config, limit)
         force_flush = q[0].waited_for >= config.max_wait_time
         factor = max(1, int(getattr(config, "length_window_factor", 4)))
-        anchor = q[0]
 
-        # The window: the oldest requests of the anchor's priority, arrival order.
+        # The window, in queue order: the overdue requests at the head (any
+        # priority, oldest first), then the oldest requests of the best class
+        # waiting.  An overdue request has outrun its class, so mixing them is
+        # the wait bound; a fresh request of a worse class never joins.
+        now = time.monotonic()
+        wait = config.max_wait_time
+        best: Optional[int] = None
         window: List[Request] = []
         for r in q:
-            if len(window) >= cap * factor or r.priority != anchor.priority:
+            if len(window) >= cap * factor:
                 break
+            # Priority first: in the best class, the age need not be read.
+            if best is not None:
+                if r.priority != best and now - r.arrival_time < wait:
+                    break
+            elif now - r.arrival_time < wait:
+                best = r.priority
             window.append(r)
         costs = [request_cost_frames(r, config) for r in window]
 

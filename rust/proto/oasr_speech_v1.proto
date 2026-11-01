@@ -66,7 +66,10 @@ message RecognitionConfig {
     bool          enable_word_time_offsets = 8;
     string        model                = 5;  // accepted, ignored (single model per process)
     uint32        audio_channel_count  = 6;  // accepted, ignored (mono only)
-    int32         priority             = 100; // OASR extension
+    // OASR extension: scheduling class, lower is sooner.  0 (the default) is the
+    // most urgent class; a negative value is treated as 0.  The engine bounds
+    // every request's queue wait, so a deferred request is not starved.
+    int32         priority             = 100;
     // OASR extensions → per-request DecodingOptions (AR families only).
     uint32        max_new_tokens       = 101; // 0 = engine default
     float         temperature          = 102; // 0 = greedy (default)

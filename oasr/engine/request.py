@@ -33,8 +33,9 @@ class RequestState(enum.Enum):
     FINISHED = "finished"
 
 
-# Default priority level (lower value = higher priority).
-# Streaming requests default to this; offline can be bumped lower-priority.
+#: The default priority, and the most urgent class.  Lower values are scheduled
+#: sooner, and :class:`Request` clamps a priority to at least this, so a caller
+#: can defer its own work but never move it ahead of everyone else's.
 DEFAULT_PRIORITY = 0
 
 #: Sampling-temperature bounds for :class:`DecodingOptions`.  ``0`` means greedy;
@@ -379,6 +380,10 @@ class Request:
         engine does not resample and derives every frame count from
         ``FeatureConfig.sample_rate``; admission rejects a mismatch.  Prefer
         letting :meth:`ASREngine.add_request` default it.
+    priority : int
+        Scheduling class: lower is sooner, within the bound ``max_wait_time``
+        puts on every request's wait.  A value below :data:`DEFAULT_PRIORITY`
+        is clamped to it.
     decoding : DecodingOptions, optional
         Per-request decoding options (n-best, generation cap, sampling,
         prompt).  ``None`` keeps every engine default.
@@ -400,7 +405,12 @@ class Request:
         self.audio: Optional[Union[torch.Tensor, "np.ndarray"]] = audio
         self.streaming: bool = streaming
         self.sample_rate: int = sample_rate
-        self.priority: int = priority
+        # Clamped here, the one constructor every entry point reaches: the
+        # front-ends pass the wire's ``priority`` through as an unchecked i32,
+        # and a negative one would put that client ahead of all the others.
+        self.priority: int = int(priority)
+        if self.priority < DEFAULT_PRIORITY:
+            self.priority = DEFAULT_PRIORITY
         self.arrival_time: float = time.monotonic()
 
         # Lifecycle state

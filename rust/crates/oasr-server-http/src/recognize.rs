@@ -212,6 +212,8 @@ pub struct RawParams {
     /// `[4000, 384000]` are rejected.
     #[serde(default)]
     pub sample_rate: u32,
+    /// Scheduling class, lower is sooner.  0 (the default) is the most urgent
+    /// class; the engine treats a negative value as 0.
     #[serde(default)]
     pub priority: i32,
     #[serde(default)]

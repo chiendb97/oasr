@@ -655,9 +655,11 @@ class _FakeExecutor:
 
     def __init__(self):
         self.admitted = []
+        self.requests = []
 
     def admit(self, request):
         self.admitted.append(request.request_id)
+        self.requests.append(request)
 
 
 class _FakeStrategy:
@@ -766,6 +768,25 @@ def test_overlap_admission_isolates_a_bad_spec():
     # Only the valid request was queued for prep and counted as in-flight.
     assert eng._admit_inflight == 1
     assert eng._prep_in.qsize() == 1
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["direct", "overlap"])
+def test_bulk_admission_clamps_a_negative_priority(overlap):
+    """The dispatcher hands the wire's ``priority`` (an unchecked ``i32``) to this
+    entry point.  Lower is sooner, so a negative value put that client's requests
+    ahead of every other client's; it now lands in the default class."""
+    eng = _admission_engine(overlap=overlap)
+    specs = [
+        {"request_id": "a", "streaming": False, "priority": -(2**31)},
+        {"request_id": "b", "streaming": False, "priority": 4},
+    ]
+    results = eng.add_requests_batch_checked(specs)
+    assert all("error" not in r for r in results)
+    if overlap:
+        admitted = [eng._prep_in.get_nowait() for _ in specs]
+    else:
+        admitted = eng._executor.requests
+    assert [r.priority for r in admitted] == [0, 4]
 
 
 def test_add_requests_batch_still_raises_for_python_callers():
