@@ -312,6 +312,20 @@ class PagedStreamingBackend(StreamingEncoderBackend):
             return self._fixed_cache_t1
         return self._att_mgr.cached_frames(stream_ids)
 
+    def _key_width(self, cache_t1: int) -> int:
+        """The ``cache_t1`` a forward runs at: the ladder rung that holds ``cache_t1``.
+
+        Chosen before the graph/eager branch and used by both.  The width sizes
+        the positional projection and the bias matmul, whose kernels may round
+        differently at another size: the eager fallback (a saturated cache, a
+        failed capture) used to run at the exact length while the graph ran at
+        the rung, and in fp32 909 of 991 chunks of a 2.5-minute U2++ stream came
+        out different.  The keys past a stream's own length are masked either way.
+        """
+        if self._fixed_cache_t1 is not None:
+            return cache_t1
+        return pick_cache_bucket(cache_t1, self._cache_ladder)
+
     def _call_chunk_forward(
         self,
         xs: torch.Tensor,
@@ -693,13 +707,11 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         #    disabled. Captures are lazy and per-(B, cache_t1_bucket); a
         #    typical workload sees a small set of (B, bucket) combos
         #    because the scheduler keeps streams in lockstep cohorts and
-        #    cache_t1 grows in N_BLOCK-sized steps.
+        #    cache_t1 grows in N_BLOCK-sized steps.  Both branches run at the
+        #    rung (``_key_width``), so whether this shape was captured cannot
+        #    change what the stream decodes.
         nvtx_push("encoder_call")
-        cache_t1_bucket = (
-            cache_t1
-            if self._fixed_cache_t1 is not None
-            else pick_cache_bucket(cache_t1, self._cache_ladder)
-        )
+        cache_t1_bucket = self._key_width(cache_t1)
         out = None
         if self._use_cuda_graphs and self._graph_cache is not None:
             out = self._graph_cache.replay(
@@ -720,9 +732,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
-                c.host_seqlen_max = cache_t1
+                c.host_seqlen_max = cache_t1_bucket
             out = self._call_chunk_forward(
-                xs, offsets_device, batched_att_caches, cnn_cache, cache_t1, states
+                xs, offsets_device, batched_att_caches, cnn_cache, cache_t1_bucket, states
             )
         out = out[:B_active]  # the padding rows are the lane's own; drop them
         actual_frames = out.size(1)
@@ -814,15 +826,10 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         states = self._state_mgr.views(slot_ids_device)
         cnn_cache = states[CONV_STATE]
 
-        cache_t1 = self._cache_t1([req.stream_id])  # type: ignore[list-item]
         # The ladder, as in the batched path: it is what the pre-warm covered, and
         # a flat 64-frame round is off the ladder past its knee, so a long stream
         # reaching here would have captured a graph on a live tick.
-        cache_t1_bucket = (
-            cache_t1
-            if self._fixed_cache_t1 is not None
-            else pick_cache_bucket(cache_t1, self._cache_ladder)
-        )
+        cache_t1_bucket = self._key_width(self._cache_t1([req.stream_id]))  # type: ignore[list-item]
         nvtx_push("single.encoder_call")
         out = None
         # Only graph **full-window** chunks. Sub-window (partial/final-tail)
@@ -848,9 +855,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         if out is None:
             batched_att_caches, _, _ = self._att_mgr.get_batched_paged_caches(slot_ids_device)
             for c in batched_att_caches:
-                c.host_seqlen_max = cache_t1
+                c.host_seqlen_max = cache_t1_bucket
             out = self._call_chunk_forward(
-                chunk, offsets_device, batched_att_caches, cnn_cache, cache_t1, states
+                chunk, offsets_device, batched_att_caches, cnn_cache, cache_t1_bucket, states
             )
         nvtx_pop()
         actual_frames = out.size(1)

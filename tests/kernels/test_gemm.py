@@ -710,6 +710,80 @@ class TestParallelSplitK:
             fn(out, A, B, None, 1)
 
 
+@pytest.mark.skipif(_PK_CFG is None, reason="parallel split-K configs not built for this arch")
+class TestACaptureOwnsItsWorkspace:
+    """A captured split-K GEMM must not share the stream's cached workspace.
+
+    The cache is keyed on the stream, and a graph keeps the address it was
+    captured with but replays on any stream.  So a buffer handed to a capture is
+    shared -- with nothing ordering the users -- by every eager launch on the
+    capture stream and every other graph captured on it.  Parallel split-K then
+    reduces another GEMM's partials (46 and 72 of 200 outputs wrong here); serial
+    split-K and Stream-K deadlock on each other's semaphores, which is why only
+    the parallel lane is tested: on the old cache the others hang the run.
+
+    Both streams are held behind a GPU sleep while every launch is queued, so the
+    two run back to back and overlap, rather than at the host's launch pace.
+    """
+
+    ITERS = 200
+
+    @staticmethod
+    def _operands(seed):
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        M, N, K = 64, 256, 8192
+        a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, generator=g)
+        b = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, generator=g)
+        c = torch.randn(N, device="cuda", dtype=torch.bfloat16, generator=g)
+        return a, b, c, torch.empty(M, N, device="cuda", dtype=torch.bfloat16)
+
+    @pytest.mark.parametrize("other", ["eager_on_the_capture_stream", "a_second_graph"])
+    def test_concurrent_users_get_their_own_answers(self, other):
+        fn = getattr(_get_gemm_module(), f"gemm_{_PK_CFG.compile_name}")
+        split = 8
+        capture_stream = torch.cuda.Stream()
+        first, second = self._operands(1), self._operands(2)
+        with torch.cuda.stream(capture_stream):
+            fn(first[3], *first[:3], split)  # the stream now has a cached workspace
+            fn(second[3], *second[:3], split)
+        torch.cuda.synchronize()
+        want_first, want_second = first[3].clone(), second[3].clone()
+
+        graphs = []
+        for ops in (first, second) if other == "a_second_graph" else (first,):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=capture_stream):
+                fn(ops[3], *ops[:3], split)
+            graphs.append(g)
+        torch.cuda.synchronize()
+
+        lanes = [torch.cuda.current_stream()]
+        lanes.append(torch.cuda.Stream() if other == "a_second_graph" else capture_stream)
+        got_first = torch.empty(self.ITERS, *want_first.shape, device="cuda", dtype=torch.bfloat16)
+        got_second = torch.empty_like(got_first)
+        for lane in lanes:
+            with torch.cuda.stream(lane):
+                torch.cuda._sleep(int(2e9))
+        for i in range(self.ITERS):
+            with torch.cuda.stream(lanes[0]):
+                graphs[0].replay()
+                got_first[i].copy_(first[3])
+            with torch.cuda.stream(lanes[1]):
+                if other == "a_second_graph":
+                    graphs[1].replay()
+                else:
+                    fn(second[3], *second[:3], split)
+                got_second[i].copy_(second[3])
+        torch.cuda.synchronize()
+
+        wrong_first = int((got_first != want_first).flatten(1).any(1).sum())
+        wrong_second = int((got_second != want_second).flatten(1).any(1).sum())
+        assert (wrong_first, wrong_second) == (0, 0), (
+            f"{wrong_first} and {wrong_second} of {self.ITERS} outputs took the other "
+            "GEMM's partials"
+        )
+
+
 def _split_k_variant(kind: str):
     """A registered variant of one kind, or ``None``.
 

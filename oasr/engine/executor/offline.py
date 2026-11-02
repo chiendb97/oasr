@@ -686,6 +686,16 @@ class OfflineExecutor(Executor):
                 self._collate_done = ready
         except Exception as exc:  # noqa: BLE001 — see _run_micro_batch
             nvtx_pop()
+            if self._collate_stream is not None:
+                # The retry collates again, on this stream, into the same reused
+                # staging -- the padded device batch and the pinned host pack --
+                # that the failed collate may still have work queued against on
+                # the side stream.  The host waits, not the stream: the pack is
+                # a host write.  Failure path only.
+                try:
+                    self._collate_stream.synchronize()
+                except Exception:  # noqa: BLE001 — a broken device fails the retry, by name
+                    logger.debug("collate stream did not drain", exc_info=True)
             # Nothing was collated, so the isolation pass starts from the
             # waveforms: ``collate`` only releases them once the features exist.
             return self._isolate_failure(chunk, exc, None, None)

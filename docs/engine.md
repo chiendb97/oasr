@@ -767,6 +767,13 @@ which becomes the `stage` label on the `oasr_requests_failed_total` metric
      width between them captured on first appearance. It now defaults to every
      width.
 
+   The rung is also the width the eager fallback runs at (a saturated cache, a
+   failed capture, graphs off): it is chosen before the graph/eager branch, like
+   the offline padding above. The fallback used to run at the exact cached length,
+   which sizes the positional projection and the bias matmul differently, and in
+   fp32 a 2.5-minute stream then differed from its graph replay on 909 of 991
+   chunks.
+
    Together: **p99 31.4 → 3.2 ms** on long streams and **max 32.6 → 4.0 ms** at
    sustained concurrency 16, with zero live-tick captures in both. The cost is
    startup — ~25 ms and a few MiB per shape — bounded by

@@ -45,12 +45,19 @@
 //    streaming, asks this cache for 152-296 bytes of semaphore and at most
 //    1 MiB of scratch.  ``oasr::cachedWorkspaceBytes()`` is exported through the
 //    gemm module so that is checkable rather than asserted.
-//  * during CUDA graph capture no new allocation is attempted (a
-//    ``cudaMallocAsync`` recorded into a graph is graph-owned and unsafe to
-//    cache).  A pre-existing large-enough buffer IS returned — its address is
-//    baked into the graph, which is safe because buffers are never freed.
-//    Otherwise ``nullptr`` is returned and the caller must fall back to the
-//    legacy per-call ``GraphSafeWorkspace`` path.
+//  * during CUDA graph capture it hands out nothing, not even a buffer that
+//    already fits, and the caller takes the per-call ``GraphSafeWorkspace``
+//    path, whose stream-ordered allocation the graph records and owns.  A graph
+//    keeps the address it was captured with and is replayed on any stream, so a
+//    cached buffer baked into it would be shared, with nothing ordering the
+//    users, by every eager launch on the capture stream and every other graph
+//    captured there.  Measured with the capture stream warmed first: parallel
+//    split-K returned wrong outputs, serial split-K and Stream-K deadlocked on
+//    each other's semaphores.  The engine captures on torch's default capture
+//    stream, which runs nothing eagerly, so its graphs already took the per-call
+//    path; a stream handle is reused after 32 ``torch.cuda.Stream()`` calls,
+//    though, and then a side stream IS the capture stream.  The kernel and its
+//    arithmetic are the same on both paths (rule 11): only the workspace moves.
 //  * rollback: set ``OASR_GEMM_WS_CACHE=0`` to always return ``nullptr``
 //    (callers then behave exactly as before this optimisation).
 
@@ -122,13 +129,23 @@ inline bool workspaceCacheEnabled() {
 ///
 /// ``kZeroedSemaphore`` buffers are zero-filled at allocation (stream-ordered
 /// on ``stream``) and rely on their users to restore zeros.  Returns
-/// ``nullptr`` when ``bytes`` is 0, when the cache is disabled, when a stream
-/// capture is in progress and no cached buffer fits, when ``bytes`` exceeds
+/// ``nullptr`` when ``bytes`` is 0, when the cache is disabled, when ``stream``
+/// is being captured (see the header comment), when ``bytes`` exceeds
 /// ``kMaxBytesPerKey``, when the cache is already holding ``kMaxTotalBytes``, or
 /// on allocation failure — callers must fall back to a per-call workspace in
 /// that case.
 inline void* getCachedWorkspace(size_t bytes, cudaStream_t stream, WorkspacePool pool) {
     if (bytes == 0 || bytes > detail::kMaxBytesPerKey || !detail::workspaceCacheEnabled()) {
+        return nullptr;
+    }
+
+    // Before the lookup: a capture must not be handed even a buffer that fits.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) {
+        (void)cudaGetLastError();  // clear (e.g. legacy-stream capture error)
+        return nullptr;
+    }
+    if (capture != cudaStreamCaptureStatusNone) {
         return nullptr;
     }
 
@@ -144,16 +161,6 @@ inline void* getCachedWorkspace(size_t bytes, cudaStream_t stream, WorkspacePool
     auto it = state.buffers.find(key);
     if (it != state.buffers.end() && it->second.second >= bytes) {
         return it->second.first;
-    }
-
-    // Need to (re)allocate.  Not safe while this stream is being captured.
-    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) {
-        (void)cudaGetLastError();  // clear (e.g. legacy-stream capture error)
-        return nullptr;
-    }
-    if (capture != cudaStreamCaptureStatusNone) {
-        return nullptr;
     }
 
     // Grow-only: round up (min 4 KiB, 2× headroom) to avoid churn, but never
