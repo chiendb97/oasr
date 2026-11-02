@@ -1223,6 +1223,38 @@ class TestSymbolTablePieces:
         assert "".join(tokenizer.token_pieces(ids)) == tokenizer.decode(ids) == "THE"
 
 
+@requires_cpp
+class TestFunASRCharWordTimings:
+    """Paraformer's tokenizer through the real grouping: an abbreviation is one
+    word timed from its first letter to its last.
+
+    The FunASR pieces used to hand the merged prefix to the second letter, so
+    ``we are b b c news`` came out with a ``bwe`` word and a second ``are``.
+    """
+
+    def test_an_abbreviation_is_one_word_spanning_its_letters(self, tmp_path):
+        import json
+
+        from oasr.engine.decode.detokenize import Detokenizer
+        from oasr.tokenizers import TokenizerSpec, build_tokenizer
+
+        vocab = ["<blank>", "<s>", "</s>", "we", "are", "b", "c", "news", "你", "好"]
+        path = tmp_path / "tokens.json"
+        path.write_text(json.dumps(vocab, ensure_ascii=False), encoding="utf-8")
+        tok = build_tokenizer(
+            TokenizerSpec(kind="funasr_char", files={"tokens": str(path)}, options={})
+        )
+        detok = Detokenizer(tokenizer=tok)
+
+        words, _ = _align([3, 4, 5, 5, 6, 7], detok)
+        assert [w.word for w in words] == ["we", "are", "BBC", "news"]
+        assert (words[2].start, words[2].end) == (pytest.approx(0.08), pytest.approx(0.20))
+
+        words, _ = _align([8, 9, 5, 5, 6], detok)
+        assert [w.word for w in words] == ["你", "好", "BBC"]
+        assert (words[2].start, words[2].end) == (pytest.approx(0.08), pytest.approx(0.20))
+
+
 class TestNothingIsAskedOfTheExtensionUntilItIsNeeded:
     """The no-op cases are answered before the C++ is reached.
 

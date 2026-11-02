@@ -17,7 +17,7 @@ not applied.
 from __future__ import annotations
 
 import json
-from typing import FrozenSet, Iterable, List, Sequence
+from typing import FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .base import DEFAULT_SPECIAL_IDS, Tokenizer, TokenizerSpec
 from .registry import register_tokenizer
@@ -60,8 +60,12 @@ def _is_all_alpha(word: Iterable[str]) -> bool:
     return True
 
 
-def _abbr_dispose(words: List[str]) -> List[str]:
-    """Collapse spelled-out single-letter runs into abbreviations (b b c → BBC)."""
+def _abbr_spans(words: Sequence[str]) -> Tuple[Set[int], Set[int]]:
+    """Where :func:`_abbr_dispose` starts and ends each abbreviation, as index sets.
+
+    FunASR keeps these as lists and tests membership per word, which is
+    quadratic in the number of abbreviations; the sets answer the same question.
+    """
     words_size = len(words)
     abbr_begin: List[int] = []
     abbr_end: List[int] = []
@@ -96,7 +100,13 @@ def _abbr_dispose(words: List[str]) -> List[str]:
                             break
                     else:
                         break
+    return set(abbr_begin), set(abbr_end)
 
+
+def _abbr_dispose(words: List[str]) -> List[str]:
+    """Collapse spelled-out single-letter runs into abbreviations (b b c → BBC)."""
+    words_size = len(words)
+    abbr_begin, abbr_end = _abbr_spans(words)
     out: List[str] = []
     last_num = -1
     for num in range(words_size):
@@ -160,6 +170,122 @@ def sentence_postprocess(tokens: Sequence[str]) -> str:
     return "".join(word_lists).strip()
 
 
+# --- per-token pieces ----------------------------------------------------------
+
+#: ``(text, token)``: a run of output text and the position of the token that
+#: produced it, or ``None`` for a separator space the pipeline inserted.
+_Fragment = Tuple[str, Optional[int]]
+
+
+def sentence_pieces(tokens: Sequence[str]) -> List[str]:
+    """Each token's share of :func:`sentence_postprocess`'s text, in one pass.
+
+    ``"".join(sentence_pieces(tokens)) == sentence_postprocess(tokens)``.  The
+    same pipeline, with every string replaced by fragments that remember which
+    token produced them, so an abbreviation merge (``b b c`` → ``BBC``) gives
+    each letter to its own token instead of rewriting the text before it.
+
+    The pieces run in token order and the text does not always: a pending
+    ``@@`` piece is written out after a Chinese character that arrived later
+    (``i@@ 打 pho`` → ``打ipho``).  Such a fragment, like a separator space,
+    joins the next fragment that *is* in order, which is the token whose
+    arrival put it in the text.
+    """
+    pieces = [""] * len(tokens)
+    kept = [i for i, t in enumerate(tokens) if t not in _STRIP_TOKENS]
+    middle = [tokens[i] for i in kept]
+
+    words: List[List[_Fragment]] = []
+    item: List[_Fragment] = []
+    if _is_all_chinese(middle):
+        words = [[(tokens[i].replace(" ", ""), i)] for i in kept]
+    elif _is_all_alpha(middle):
+        for i in kept:
+            ch = tokens[i]
+            if "@@" in ch:
+                item.append((ch.replace("@@", ""), i))
+            else:
+                item.append((ch, i))
+                words += [item, [(" ", None)]]
+                item = []
+    else:
+        alpha_blank = False
+        for i in kept:
+            ch = tokens[i]
+            if _is_all_chinese(ch):
+                if alpha_blank:
+                    words.pop()
+                words.append([(ch, i)])
+                alpha_blank = False
+            elif "@@" in ch:
+                item.append((ch.replace("@@", ""), i))
+                alpha_blank = False
+            elif _is_all_alpha(ch):
+                item.append((ch, i))
+                words += [item, [(" ", None)]]
+                item = []
+                alpha_blank = True
+            else:
+                words.append([(ch, i)])
+
+    fragments = [f for word in _abbr_dispose_fragments(words) for f in word]
+    _strip_fragments(fragments)
+
+    latest = -1
+    pending = ""
+    for text, token in fragments:
+        if token is None or token < latest:
+            pending += text
+            continue
+        latest = token
+        pieces[token] += pending + text
+        pending = ""
+    if pending and latest >= 0:
+        pieces[latest] += pending
+    return pieces
+
+
+def _abbr_dispose_fragments(words: List[List[_Fragment]]) -> List[List[_Fragment]]:
+    """:func:`_abbr_dispose` over fragment lists; each letter keeps its token."""
+    texts = ["".join(text for text, _ in word) for word in words]
+    abbr_begin, abbr_end = _abbr_spans(texts)
+
+    def upper(word: List[_Fragment]) -> List[_Fragment]:
+        return [(text.upper(), token) for text, token in word]
+
+    out: List[List[_Fragment]] = []
+    last_num = -1
+    for num in range(len(words)):
+        if num <= last_num:
+            continue
+        if num in abbr_begin:
+            abbr_word = upper(words[num])
+            num += 1
+            while num < len(words):
+                if num in abbr_end:
+                    abbr_word += upper(words[num])
+                    last_num = num
+                    break
+                if texts[num].encode("utf-8").isalpha():
+                    abbr_word += upper(words[num])
+                num += 1
+            out.append(abbr_word)
+        else:
+            out.append(words[num])
+    return out
+
+
+def _strip_fragments(fragments: List[_Fragment]) -> None:
+    """``str.strip`` of the joined text, applied to the fragments in place."""
+    for order in (range(len(fragments)), range(len(fragments) - 1, -1, -1)):
+        for i in order:
+            text, token = fragments[i]
+            kept = text.lstrip() if order.step == 1 else text.rstrip()
+            fragments[i] = (kept, token)
+            if kept:
+                break
+
+
 # --- tokenizer ---------------------------------------------------------------
 
 
@@ -201,6 +327,24 @@ class FunASRCharTokenizer(Tokenizer):
             if i not in self._special_ids and 0 <= i < len(self._tokens)
         ]
         return sentence_postprocess(tokens)
+
+    def token_pieces(self, ids: Sequence[int]) -> List[str]:
+        """:func:`sentence_pieces` over the ids ``decode`` keeps; the rest own ``""``.
+
+        The base class drives :meth:`decode_incremental`, which re-renders the
+        whole prefix per id (quadratic) and, when an abbreviation merge
+        rewrites it, hands the rewritten prefix to the merging id: ``b b c``
+        came out as ``['b', 'BB', 'C']``, joining to ``bBBC``.
+        """
+        kept = [
+            pos
+            for pos, i in enumerate(ids)
+            if i not in self._special_ids and 0 <= i < len(self._tokens)
+        ]
+        pieces = [""] * len(ids)
+        for pos, piece in zip(kept, sentence_pieces([self._tokens[ids[pos]] for pos in kept])):
+            pieces[pos] = piece
+        return pieces
 
     def encode(self, text: str) -> List[int]:
         ids: List[int] = []

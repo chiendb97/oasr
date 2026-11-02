@@ -386,6 +386,81 @@ class TestByteLevelCharacterSplits:
         assert max(widest) <= 2 * tok._INCREMENTAL_WINDOW + 1
 
 
+class TestFunASRCharPieces:
+    """FunASR's abbreviation merge rewrites text an earlier token already rendered.
+
+    ``token_pieces`` used to come from the base class's incremental re-render,
+    which gave the rewritten prefix to the merging token: ``b b c`` became
+    ``['b', 'BB', 'C']``, joining to ``bBBC``, and a sentence before it was
+    repeated inside the second letter's piece.  Paraformer word timings are cut
+    from these pieces.  The re-render was also quadratic: 1 s at 2000 tokens.
+    """
+
+    #: Every branch of ``sentence_postprocess``: CJK, digits, single letters,
+    #: whole words, ``@@`` pieces (one empty), apostrophes, punctuation, the
+    #: stripped tokens, and tokens holding a space.
+    VOCAB = [
+        "<blank>", "<s>", "</s>", "<unk>", "<OOV>",
+        "b", "c", "x", "Z", "news", "we", "it's", "'",
+        "你", "好", "打", "2", "0", "，", "。", "a1",
+        "hel@@", "lo", "i@@", "@@", "e@@", "pho", "中 文", " ",
+    ]  # fmt: skip
+
+    @pytest.fixture(scope="class")
+    def tok(self, tmp_path_factory):
+        import json
+
+        path = tmp_path_factory.mktemp("funasr") / "tokens.json"
+        path.write_text(json.dumps(self.VOCAB, ensure_ascii=False), encoding="utf-8")
+        return build_tokenizer(
+            TokenizerSpec(
+                kind="funasr_char", files={"tokens": str(path)}, options={"special_ids": [0, 1, 2]}
+            )
+        )
+
+    def _ids(self, *tokens):
+        return [self.VOCAB.index(t) for t in tokens]
+
+    @pytest.mark.parametrize(
+        "tokens,pieces",
+        [
+            (("b", "b", "c"), ["B", "B", "C"]),
+            (("we", "b", "b", "c", "news"), ["we", " B", "B", "C", " news"]),
+            (("你", "好", "b", "b", "c", "打"), ["你", "好", "B", "B", "C", "打"]),
+            (("<s>", "b", "x", "</s>", "<unk>"), ["", "B", "X", "", ""]),
+        ],
+    )
+    def test_an_abbreviation_gives_each_letter_to_its_own_token(self, tok, tokens, pieces):
+        ids = self._ids(*tokens)
+        assert tok.token_pieces(ids) == pieces
+        assert "".join(pieces) == tok.decode(ids)
+
+    def test_a_late_fragment_joins_the_token_that_completes_its_word(self, tok):
+        """A pending ``@@`` piece is written after a later CJK character, so it
+        cannot keep its own place in token order."""
+        ids = self._ids("i@@", "打", "pho")
+        assert tok.decode(ids) == "打ipho"
+        assert tok.token_pieces(ids) == ["", "打", "ipho"]
+
+    def test_pieces_join_to_decode_on_random_sequences(self, tok):
+        rng = random.Random(14)
+        for _ in range(20000):
+            ids = [rng.randrange(-1, len(self.VOCAB) + 1) for _ in range(rng.randrange(0, 14))]
+            pieces = tok.token_pieces(ids)
+            assert len(pieces) == len(ids), ids
+            assert "".join(pieces) == tok.decode(ids), ids
+
+    def test_one_pass_not_a_render_per_token(self, tok):
+        calls = []
+        original = tok.decode
+        tok.decode = lambda ids: (calls.append(len(ids)), original(ids))[1]
+        try:
+            tok.token_pieces(self._ids("we", "b", "b", "c", "hel@@", "lo") * 50)
+        finally:
+            del tok.decode
+        assert not calls
+
+
 class TestSentencePieceIncremental:
     """SentencePiece re-renders a bounded window, not the whole prefix (audit #27).
 
