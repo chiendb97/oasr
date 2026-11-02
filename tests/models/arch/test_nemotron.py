@@ -171,6 +171,129 @@ class TestRelativePositionEmbedding:
         torch.testing.assert_close(centre[1::2], torch.ones(2))
 
 
+def _attention_sensitive_encoder(**overrides):
+    """A tiny encoder whose output moves when the attention's key set does.
+
+    The shared random init (every parameter ``N(0, 0.05)``, LayerNorm gains
+    included) leaves attention almost invisible at the output: a block missing
+    the oldest trained chunk moved it by 3e-7, under any fp32 tolerance.  Unit
+    gains and ``N(0, 0.3)`` attention weights make that 1e-4 or more, against
+    1e-6 of fp32 rounding.
+    """
+    from oasr.layers import LayerNorm
+    from oasr.layers.norm import LayerNormActivation
+
+    enc = TestStreamingEqualsOffline._encoder(**overrides)
+    with torch.no_grad():
+        for module in enc.modules():
+            if isinstance(module, (LayerNorm, LayerNormActivation)):
+                module.weight.fill_(1.0)
+                module.bias.zero_()
+        for layer in enc.layers:
+            for p in layer.self_attn.parameters():
+                torch.nn.init.normal_(p, std=0.3)
+    return enc
+
+
+class TestOfflineAttentionBlocks:
+    """The offline attention scores each block of queries against its own key window.
+
+    Upstream builds the whole ``T x (2T - 1)`` relative table and masks all but
+    ~60 keys per query; at 400 s that was 2 GiB per layer, and it is what ran
+    long audio out of memory.  Blocking may change what is *computed*, never
+    what is *attended to*: the windows are checked against the mask's
+    definition, the forward against the dense one, and the bias against growing
+    with the utterance.
+    """
+
+    @pytest.mark.parametrize(
+        "left,right,block", [(12, 1, 4), (12, 1, 64), (56, 3, 64), (56, 13, 64), (56, 2, 7)]
+    )
+    def test_every_block_holds_every_key_its_queries_may_see(self, left, right, block):
+        """Scattered back to absolute positions, the blocked mask is the dense one.
+
+        A key a query may see but its block does not hold would come back False
+        here; ``(56, 2, 7)`` is the case where the history is not a whole number
+        of chunks (``56 // 3 * 3 = 54``).
+        """
+        from oasr.models.nemotron.encoder import AttentionBlocks, blocked_window_mask
+
+        chunk = right + 1
+        size = chunk * -(-block // chunk)
+        # Several blocks whatever the dense-below threshold says, the last one partial.
+        blocks = AttentionBlocks(size, (left // chunk) * chunk, 7)
+        t = blocks.num * size - 3
+        lengths = torch.tensor([t, t - 2 * size + 1, 2])
+        got = blocked_window_mask(lengths, blocks, left, right)
+        got = got.view(len(lengths), blocks.num, blocks.size, blocks.keys)
+
+        scattered = torch.zeros(len(lengths), t, t, dtype=torch.bool)
+        for n in range(blocks.num):
+            q0, k0 = n * size, n * size - blocks.left
+            rows = got[:, n, : min(size, t - q0)]
+            lo, hi = max(0, -k0), min(blocks.keys, t - k0)
+            assert not rows[..., :lo].any() and not rows[..., hi:].any()
+            scattered[:, q0 : q0 + rows.size(1), k0 + lo : k0 + hi] = rows[..., lo:hi]
+        keep = torch.arange(t).unsqueeze(0) < lengths.unsqueeze(1)
+        want = chunked_limited_mask(t, t, left, right, torch.device("cpu"))[0] & keep.unsqueeze(1)
+        assert torch.equal(scattered, want)
+
+    def test_one_dense_block_until_blocks_halve_the_scores(self):
+        """The released window: chunk 4, 56 frames of history, so 120 keys a block."""
+        from oasr.models.nemotron.encoder import AttentionBlocks, offline_attention_blocks
+
+        assert offline_attention_blocks(240, 56, 3, 64) == AttentionBlocks(240, 0, 1)
+        assert offline_attention_blocks(241, 56, 3, 64) == AttentionBlocks(64, 56, 4)
+        # A block is whole trained chunks, and the history is too.
+        assert offline_attention_blocks(1000, 56, 13, 64) == AttentionBlocks(70, 56, 15)
+        assert offline_attention_blocks(1000, 56, 2, 64) == AttentionBlocks(66, 54, 16)
+        # Unlimited history has no window to block by.
+        assert offline_attention_blocks(5000, -1, 3, 64) == AttentionBlocks(5000, 0, 1)
+
+    @pytest.mark.parametrize("lookahead,block", [(0, 16), (1, 64), (1, 7), (3, 64)])
+    def test_the_blocked_forward_equals_the_dense_one(self, lookahead, block, monkeypatch):
+        """Ragged lengths, so padded keys and fully masked query rows are in play."""
+        from oasr.models.nemotron import encoder as encoder_module
+
+        enc = _attention_sensitive_encoder(
+            default_num_lookahead_tokens=lookahead, sliding_window=4 * (lookahead + 1) + 1
+        )
+        feats = torch.randn(3, 8 * 300, enc.config.num_mel_bins)
+        lengths = torch.tensor([8 * 300, 8 * 170, 8 * 12])
+        with torch.no_grad():
+            monkeypatch.setattr(encoder_module, "OFFLINE_BLOCK_FRAMES", 10**9)
+            dense, keep = enc(feats, lengths)
+            monkeypatch.setattr(encoder_module, "OFFLINE_BLOCK_FRAMES", block)
+            blocked, _ = enc(feats, lengths)
+        blocks = encoder_module.offline_attention_blocks(
+            dense.size(1), *enc.attention_context(), block
+        )
+        assert blocks.num > 1
+        valid = keep.squeeze(1)
+        torch.testing.assert_close(blocked[valid], dense[valid], rtol=0, atol=1e-5)
+
+    def test_the_bias_is_sized_by_the_window_not_the_utterance(self, monkeypatch):
+        """What the change is for: the bias handed to the attention is
+        ``(B * num, H, size, keys)``, not ``(B, H, T, T)``."""
+        from oasr.models.nemotron.encoder import offline_attention_blocks
+
+        enc = _attention_sensitive_encoder()
+        attn = enc.layers[0].self_attn.attn
+        seen = []
+
+        def spy(*args, **kwargs):
+            seen.append(tuple(kwargs["attn_bias"].shape))
+            return type(attn).forward(attn, *args, **kwargs)
+
+        monkeypatch.setattr(attn, "forward", spy)
+        feats = torch.randn(2, 8 * 600, enc.config.num_mel_bins)
+        with torch.no_grad():
+            out, _ = enc(feats, torch.tensor([8 * 600, 8 * 400]))
+        blocks = offline_attention_blocks(out.size(1), *enc.attention_context())
+        assert seen == [(2 * blocks.num, enc.config.num_attention_heads, blocks.size, blocks.keys)]
+        assert blocks.keys * 4 < out.size(1)
+
+
 class TestPredictorProtocol:
     """The four operations that let one greedy loop drive a recurrent predictor."""
 
@@ -478,6 +601,23 @@ class TestStreamingEqualsOffline:
         # in a stream those frames arrive with the next chunk.
         assert offline.size(1) >= n
         torch.testing.assert_close(got, offline[:, :n], rtol=0, atol=2e-6)
+
+    def test_a_long_stream_equals_its_blocked_offline_pass(self):
+        """Past ``2 * keys`` frames the offline attention runs in blocks, each one a
+        streaming step with ``cache_t1 = left``; the stream checks all of them."""
+        from oasr.models.nemotron.encoder import offline_attention_blocks
+
+        enc = _attention_sensitive_encoder()
+        chunk_size = 4
+        cfg, att, states = _streaming_harness(enc, chunk_size)
+        window = chunk_size * enc.subsampling_rate
+        feats = torch.randn(2, window * 50, enc.config.num_mel_bins)
+        with torch.no_grad():
+            offline, _ = enc(feats, torch.tensor([feats.size(1)] * 2, dtype=torch.int32))
+            streamed = _stream_encoder(enc, cfg, att, states, feats, chunk_size)
+        assert offline_attention_blocks(offline.size(1), *enc.attention_context()).num > 1
+        got = torch.cat([streamed[0], streamed[1]], dim=0)
+        torch.testing.assert_close(got, offline[:, : got.size(1)], rtol=0, atol=1e-5)
 
     @pytest.mark.parametrize("lookahead", [0, 3])
     def test_every_trained_lookahead_streams(self, lookahead):
@@ -822,6 +962,29 @@ class TestRealCheckpointParity:
         # this breaks, which of the two comparisons fails localises it.
         torch.testing.assert_close(hidden, expected.last_hidden_state, atol=1e-5, rtol=0)
         torch.testing.assert_close(projected, expected.pooler_output, atol=5e-5, rtol=0)
+
+    def test_a_blocked_encoder_pass_matches_hf(self, hf, ours):
+        """Past 240 encoder frames (19 s) the offline attention runs in blocks of
+        queries; HF masks the whole table, so it is the oracle for the blocking."""
+        import numpy as np
+
+        from oasr.models.nemotron.encoder import offline_attention_blocks
+
+        processor, reference = hf
+        audio = np.concatenate(self._audios(8))
+        inputs = processor(audio, sampling_rate=16000, language="en-US")
+        lengths = torch.tensor([int(inputs["attention_mask"].sum())])
+        with torch.no_grad():
+            expected = reference.get_audio_features(
+                input_features=inputs["input_features"],
+                attention_mask=inputs["attention_mask"],
+                prompt_ids=inputs["prompt_ids"],
+                num_lookahead_tokens=inputs["num_lookahead_tokens"],
+            )
+            hidden, _ = ours.model.encoder(inputs["input_features"], lengths)
+        encoder = ours.model.encoder
+        assert offline_attention_blocks(hidden.size(1), *encoder.attention_context()).num > 1
+        torch.testing.assert_close(hidden, expected.last_hidden_state, atol=1e-5, rtol=0)
 
     def test_greedy_is_token_exact_vs_hf(self, hf, ours, strategy):
         processor, reference = hf
@@ -1220,8 +1383,13 @@ class TestOfflineForwardStaysCapturable:
         return int(mask.logical_not().all(dim=-1).sum())
 
     #: ``(name, lengths)`` — one batch with no silent row (the branch that used
-    #: to skip the fill) and one with several (the branch that never could).
-    _BATCHES = {"uniform": [320, 320], "ragged": [320, 200, 96, 24]}
+    #: to skip the fill), one with several (the branch that never could), and one
+    #: long enough that the attention runs in blocks.
+    _BATCHES = {
+        "uniform": [320, 320],
+        "ragged": [320, 200, 96, 24],
+        "blocked": [2400, 1200, 160],
+    }
 
     @pytest.mark.parametrize("case", list(_BATCHES))
     def test_no_host_synchronisation(self, case):
@@ -1248,11 +1416,17 @@ class TestOfflineForwardStaysCapturable:
 
     def test_the_ragged_batch_really_has_silent_rows(self):
         """Otherwise the case above only ever exercises the easy path."""
+        from oasr.models.nemotron.encoder import offline_attention_blocks
+
         enc = self._encoder()
-        lens = self._BATCHES["ragged"]
-        feats = torch.randn(len(lens), max(lens), 32, device="cuda")
-        lengths = torch.tensor(lens, device="cuda", dtype=torch.int32)
-        assert self._silent_rows(enc, feats, lengths) > 0
+        for case in ("ragged", "blocked"):
+            lens = self._BATCHES[case]
+            feats = torch.randn(len(lens), max(lens), 32, device="cuda")
+            lengths = torch.tensor(lens, device="cuda", dtype=torch.int32)
+            assert self._silent_rows(enc, feats, lengths) > 0, case
+        with torch.no_grad():
+            t = enc(feats, lengths)[0].size(1)
+        assert offline_attention_blocks(t, *enc.attention_context()).num > 1
         uniform = self._BATCHES["uniform"]
         assert (
             self._silent_rows(

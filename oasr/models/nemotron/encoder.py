@@ -21,6 +21,15 @@ whether or not the caller is streaming.  Dropping the mask offline would be
 "full attention on a model trained without it" — different arithmetic, not a
 better-conditioned version of the same one.
 
+**Offline attention runs in query blocks.**  The same window bounds what the
+offline pass has to compute: a block of queries needs only its own frames plus
+the trained history before them (:class:`AttentionBlocks`), so an utterance of
+``T`` frames costs ``T * (block + left)`` scores rather than the ``T * (2T - 1)``
+a whole-utterance relative table gives.  Upstream computes the full table and
+masks almost all of it; at 400 s that was 2 GiB of transient per layer and the
+reason long audio ran out of memory.  Each block is one streaming step with
+``cache_t1 = left``, run for every block at once.
+
 Layout: ``(B, T, C)`` throughout, including inside the convolution module.
 Upstream transposes to ``(B, C, T)`` four times per layer for ``nn.Conv1d``;
 OASR's depthwise and pointwise conv1d kernels are channel-last, so those
@@ -30,7 +39,7 @@ transposes are simply absent here.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, List, Mapping, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, List, Mapping, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn.functional as F
@@ -59,9 +68,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MASK_FLOOR",
+    "OFFLINE_BLOCK_FRAMES",
+    "AttentionBlocks",
     "NemotronEncoder",
     "NemotronEncoderLayer",
+    "blocked_window_mask",
     "chunked_limited_mask",
+    "offline_attention_blocks",
     "rel_shift",
     "relative_position_embedding",
 ]
@@ -81,6 +94,59 @@ __all__ = [
 #: masked query row a finite average instead of leaving the row's value to the
 #: backend.
 MASK_FLOOR = -1.0e4
+
+#: Query frames per block of the offline attention, before rounding up to whole
+#: trained chunks.  A block of ``Q`` queries is scored against ``Q + left`` keys,
+#: about twice the ~60 its queries can see on the released window.  From 60 s up,
+#: 64 measured 0.3-2% faster than 128 and 4-8% faster than 256 (RTX 5090, fp16).
+OFFLINE_BLOCK_FRAMES = 64
+
+
+class AttentionBlocks(NamedTuple):
+    """How the offline attention splits an utterance into independent query blocks.
+
+    Block ``n`` holds queries ``[n * size, (n + 1) * size)`` and keys
+    ``[n * size - left, (n + 1) * size)``: its own frames plus ``left`` frames of
+    trained history.  That is one streaming step with ``cache_t1 = left`` (the
+    same key window and the same relative distances), so the offline pass is
+    every step of a stream computed at once.
+    """
+
+    size: int
+    left: int
+    num: int
+
+    @property
+    def keys(self) -> int:
+        return self.left + self.size
+
+
+def offline_attention_blocks(
+    length: int,
+    left_context: int,
+    right_context: int,
+    block_frames: int = OFFLINE_BLOCK_FRAMES,
+) -> AttentionBlocks:
+    """The blocks for an utterance of ``length`` encoder frames.
+
+    A block is a whole number of trained chunks, so every chunk one of its
+    queries may see lies inside the block's key window, and ``left`` is the
+    trained history in whole chunks: the furthest back a query's oldest
+    visible chunk can start, measured from its block's first frame.
+
+    A window with unlimited history, or an utterance that blocks would not cut
+    to at most half the dense scores (``length <= 2 * keys``), is one block
+    holding everything, which is exactly the dense attention.  Below that
+    point, copying K and V into overlapping blocks costs more than the scores
+    it saves: two 64-frame blocks were 6% slower than dense at 126 frames,
+    break-even came near 300 and 1500 frames took 0.62x (graph replay, fp16).
+    """
+    chunk = right_context + 1
+    size = chunk * -(-block_frames // chunk)
+    left = (left_context // chunk) * chunk
+    if left_context < 0 or length <= 2 * (left + size):
+        return AttentionBlocks(length, 0, 1)
+    return AttentionBlocks(size, left, -(-length // size))
 
 
 def rel_shift(scores: torch.Tensor) -> torch.Tensor:
@@ -151,6 +217,48 @@ def chunked_limited_mask(
     k_chunk = torch.arange(key_len, device=device).div(chunk, rounding_mode="trunc")
     diff = q_chunk.unsqueeze(1) - k_chunk.unsqueeze(0)
     return ((diff >= 0) & (diff <= left_chunks)).view(1, 1, query_len, key_len)
+
+
+def _chunk_window(
+    q_abs: torch.Tensor,
+    k_abs: torch.Tensor,
+    left_context: int,
+    right_context: int,
+    num_keys: int,
+) -> torch.Tensor:
+    """:func:`chunked_limited_mask` on broadcastable **absolute** frame positions.
+
+    ``num_keys`` bounds the chunk difference when history is unlimited.
+    """
+    chunk = right_context + 1
+    left_chunks = left_context // chunk if left_context >= 0 else num_keys
+    diff = q_abs.div(chunk, rounding_mode="trunc") - k_abs.div(chunk, rounding_mode="trunc")
+    # ``k_abs >= 0`` has to be in the conjunction, not merely implied by it:
+    # ``trunc`` rounds a negative ``k_abs`` *toward zero*, so a column at absolute
+    # -1 would land in chunk 0 and satisfy the window test.
+    return (k_abs >= 0) & (diff >= 0) & (diff <= left_chunks)
+
+
+def blocked_window_mask(
+    lengths: torch.Tensor,
+    blocks: AttentionBlocks,
+    left_context: int,
+    right_context: int,
+) -> torch.Tensor:
+    """``(B * num, 1, size, keys)`` bool mask, True where block ``n``'s query attends.
+
+    :func:`chunked_limited_mask` and key padding, in each block's own
+    coordinates: query ``i`` of block ``n`` is frame ``n * size + i`` and key
+    ``j`` is frame ``n * size - left + j``.  The first block's ``left`` leading
+    keys are padding before the utterance, which ``k_abs >= 0`` masks.
+    """
+    device = lengths.device
+    start = (torch.arange(blocks.num, device=device) * blocks.size).view(-1, 1, 1)
+    q_abs = start + torch.arange(blocks.size, device=device).view(1, -1, 1)
+    k_abs = start - blocks.left + torch.arange(blocks.keys, device=device).view(1, 1, -1)
+    window = _chunk_window(q_abs, k_abs, left_context, right_context, blocks.keys)
+    keep = window & (k_abs < lengths.to(torch.long).view(-1, 1, 1, 1))
+    return keep.view(-1, 1, blocks.size, blocks.keys)
 
 
 class NemotronConvolutionModule(nn.Module):
@@ -253,6 +361,7 @@ class NemotronEncoderLayer(nn.Module):
         pos_emb: torch.Tensor,
         attn_mask: torch.Tensor,
         silent: Optional[torch.Tensor],
+        blocks: AttentionBlocks,
     ) -> torch.Tensor:
         residual = x
         x = self.norm_feed_forward1(x)
@@ -260,7 +369,7 @@ class NemotronEncoderLayer(nn.Module):
         ff1 = self.feed_forward1(x)
         x, residual = self.norm_self_att.forward_add_residual(ff1, residual, alpha=0.5)
 
-        attn = self.self_attn(x, pos_emb, attn_mask, silent)
+        attn = self.self_attn(x, pos_emb, attn_mask, silent, blocks)
         x, residual = self.norm_conv.forward_add_residual(attn, residual)
 
         conv = self.conv(x, silent)
@@ -335,31 +444,66 @@ class NemotronRelPositionAttention(nn.Module):
         pos_emb: torch.Tensor,
         attn_mask: torch.Tensor,
         silent: Optional[torch.Tensor],
+        blocks: AttentionBlocks,
     ) -> torch.Tensor:
-        q = self.attn.split_heads(self.q_proj(x))
-        k = self.attn.split_heads(self.k_proj(x))
-        v = self.attn.split_heads(self.v_proj(x))
-        key_len = k.size(2)
+        """``x (B, T, C)``, attended block by block (:class:`AttentionBlocks`).
 
-        # (b) + (d): the position-biased query against the projected relative table.
-        rel_k = self.relative_k_proj(pos_emb)  # (1, 2L-1, C)
-        rel_k = rel_k.view(rel_k.size(0), -1, self.num_heads, self.head_dim)
-        matrix_bd = (q + self.bias_v.unsqueeze(1)) @ rel_k.permute(0, 2, 3, 1)
-        matrix_bd = rel_shift(matrix_bd)[..., :key_len] * self.scaling
-
-        # A large *finite* floor rather than upstream's ``-inf``: the same mask
-        # for every row with a live key.  See :data:`MASK_FLOOR`.
-        bias = matrix_bd.masked_fill(attn_mask.logical_not(), MASK_FLOOR)
+        ``pos_emb`` is the table for ``blocks.keys`` and ``attn_mask`` the
+        :func:`blocked_window_mask`; the encoder builds both once per forward.
+        """
+        q = self._blocks(self.q_proj(x), blocks, 0)
+        k = self._blocks(self.k_proj(x), blocks, blocks.left)
+        v = self._blocks(self.v_proj(x), blocks, blocks.left)
+        bias = self._position_bias(q, pos_emb, attn_mask, blocks.keys)
         out = self.attn(q + self.bias_u.unsqueeze(1), k, v, attn_bias=bias)
+
+        # Back to ``(B, T, C)``, dropping the last block's padded queries.
+        b, t = x.size(0), x.size(1)
+        out = out.view(b, blocks.num, self.num_heads, blocks.size, self.head_dim)
+        out = out.permute(0, 1, 3, 2, 4).reshape(b, -1, self.num_heads * self.head_dim)[:, :t]
         if silent is not None:
             # A query row with no unmasked key softmaxes over all ``-inf``: the
             # fused kernel clamps it to zero, SDPA's math backend returns NaN.
             # Force zero so the two backends agree *and* so one padding row cannot
             # poison real rows in the next layer (a masked key still contributes
             # ``0 * NaN``).
-            out = out.masked_fill(silent.transpose(1, 2).unsqueeze(-1), 0.0)
-        projected: torch.Tensor = self.o_proj(self.attn.merge_heads(out))
+            out = out.masked_fill(silent, 0.0)
+        projected: torch.Tensor = self.o_proj(out)
         return projected
+
+    def _blocks(self, x: torch.Tensor, blocks: AttentionBlocks, left: int) -> torch.Tensor:
+        """``x (B, T, C)`` → ``(B * num, H, left + size, D)``: block ``n``'s rows.
+
+        Block ``n`` takes frames ``[n * size - left, (n + 1) * size)``, zero-padded
+        before the utterance and past its end; the mask covers both.  With one
+        block and no history this is the head split of the dense attention.
+        """
+        b, t, _ = x.shape
+        tail = blocks.num * blocks.size - t
+        if left or tail:
+            x = F.pad(x, (0, 0, left, tail))
+        rows = left + blocks.size
+        windows = x.unfold(1, rows, blocks.size)  # (B, num, C, rows), a view
+        windows = windows.view(b, blocks.num, self.num_heads, self.head_dim, rows)
+        return windows.permute(0, 1, 2, 4, 3).reshape(-1, self.num_heads, rows, self.head_dim)
+
+    def _position_bias(
+        self, q: torch.Tensor, pos_emb: torch.Tensor, attn_mask: torch.Tensor, key_len: int
+    ) -> torch.Tensor:
+        """Terms (b) + (d), scaled and masked: the ``attn_bias`` for ``q (B, H, T_q, D)``.
+
+        ``pos_emb`` spans ``L = key_len`` and :func:`rel_shift` gives query ``i``
+        against key ``j`` the distance ``key_len - T_q + i - j``: the number of
+        keys before the queries' own frames, plus ``i - j``.
+        """
+        rel_k = self.relative_k_proj(pos_emb)  # (1, 2L-1, C)
+        rel_k = rel_k.view(rel_k.size(0), -1, self.num_heads, self.head_dim)
+        matrix_bd = (q + self.bias_v.unsqueeze(1)) @ rel_k.permute(0, 2, 3, 1)
+        matrix_bd = rel_shift(matrix_bd)[..., :key_len] * self.scaling
+        # A large *finite* floor rather than upstream's ``-inf``: the same mask
+        # for every row with a live key.  See :data:`MASK_FLOOR`.
+        bias: torch.Tensor = matrix_bd.masked_fill(attn_mask.logical_not(), MASK_FLOOR)
+        return bias
 
     def forward_chunk(
         self,
@@ -392,12 +536,7 @@ class NemotronRelPositionAttention(nn.Module):
         # heterogeneous gather/scatter is not paid per layer per chunk.
         cache.write_kv_chunk(k, v, offset=cache_t1)
 
-        rel_k = self.relative_k_proj(pos_emb)  # (1, 2L-1, C)
-        rel_k = rel_k.view(rel_k.size(0), -1, self.num_heads, self.head_dim)
-        matrix_bd = (q + self.bias_v.unsqueeze(1)) @ rel_k.permute(0, 2, 3, 1)
-        matrix_bd = rel_shift(matrix_bd)[..., :key_len] * self.scaling
-
-        bias = matrix_bd.masked_fill(attn_mask.logical_not(), MASK_FLOOR)
+        bias = self._position_bias(q, pos_emb, attn_mask, key_len)
         out = self.attn(
             q + self.bias_u.unsqueeze(1),
             cache.k_cache,
@@ -551,14 +690,14 @@ class NemotronEncoder(BaseEncoder):
         assert out_lengths is not None
 
         # No ``max_position_embeddings`` limit: the relative table is computed for
-        # the length at hand, as NeMo's ``update_max_seq_length`` extends its own,
-        # and the trained window keeps every attended distance inside it anyway.
-        # Refusing past it rejected anything over 400 s that streaming decodes.
-        t_out = hidden.size(1)
+        # one block's keys (the whole utterance when it is a single block), which
+        # the trained window keeps every attended distance inside.  Refusing past
+        # it rejected anything over 400 s that streaming decodes.
+        b, t_out = hidden.size(0), hidden.size(1)
         keep = torch.arange(t_out, device=hidden.device).unsqueeze(0) < out_lengths.unsqueeze(1)
-        # ``(1, 1, T, T)`` trained window ∧ ``(B, 1, 1, T)`` key padding.
-        window = chunked_limited_mask(t_out, t_out, *self.attention_context(), hidden.device)
-        attn_mask = window & keep.view(-1, 1, 1, t_out)
+        # The trained window ∧ key padding, per block of queries.
+        blocks = offline_attention_blocks(t_out, *self.attention_context(), OFFLINE_BLOCK_FRAMES)
+        attn_mask = blocked_window_mask(out_lengths, blocks, *self.attention_context())
         # A row with nothing left to attend to: only reachable in a batch whose
         # rows differ enough in length that a padded query's whole chunk window
         # falls past the end.  Zeroed at the attention and before the depthwise
@@ -574,17 +713,17 @@ class NemotronEncoder(BaseEncoder):
         # stranded GiB per engine (see oasr/engine/capture_recovery.py).  An
         # all-false ``masked_fill`` is a numerical no-op, so paying it always is
         # bit-exact -- and it is what buys the capture back.
-        silent = attn_mask.logical_not().all(dim=-1).transpose(1, 2)  # (B, T, 1)
+        silent = attn_mask.logical_not().all(dim=-1).view(b, -1, 1)[:, :t_out]  # (B, T, 1)
 
         pos_emb = relative_position_embedding(
-            t_out,
+            blocks.keys,
             self.config.hidden_size,
             hidden.device,
             hidden.dtype,
             inv_freq=cast(torch.Tensor, self.inv_freq),
         )
         for layer in self.layers:
-            hidden = layer(hidden, pos_emb, attn_mask, silent)
+            hidden = layer(hidden, pos_emb, attn_mask, silent, blocks)
         return hidden, keep.unsqueeze(1)
 
     # ------------------------------------------------------------------
@@ -670,19 +809,11 @@ class NemotronEncoder(BaseEncoder):
         relative-position table correct too.
         """
         device = offsets.device
-        left_context, right_context = self.attention_context()
-        chunk = right_context + 1
-        left_chunks = left_context // chunk if left_context >= 0 else cache_t1 + t_q
-
         q_abs = offsets.view(-1, 1, 1) + torch.arange(t_q, device=device).view(1, -1, 1)
         k_abs = (
             offsets.view(-1, 1, 1)
             - cache_t1
             + torch.arange(cache_t1 + t_q, device=device).view(1, 1, -1)
         )
-        diff = q_abs.div(chunk, rounding_mode="trunc") - k_abs.div(chunk, rounding_mode="trunc")
-        # ``k_abs >= 0`` has to be in the conjunction, not merely implied by it:
-        # ``trunc`` rounds a negative ``k_abs`` *toward zero*, so a prefill column at
-        # absolute -1 would land in chunk 0 and satisfy the window test.
-        keep = (k_abs >= 0) & (diff >= 0) & (diff <= left_chunks)
+        keep = _chunk_window(q_abs, k_abs, *self.attention_context(), cache_t1 + t_q)
         return keep.unsqueeze(1)

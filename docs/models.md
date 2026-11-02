@@ -339,6 +339,16 @@ sum of encoder and decoder projections before the vocabulary head.
   trained, not a streaming-only device: a query sees its own chunk of
   `num_lookahead_tokens + 1` frames plus `(sliding_window - 1) // chunk` earlier
   ones.
+- **Offline attention runs in query blocks.** The same window bounds what the
+  offline pass computes: each block of `OFFLINE_BLOCK_FRAMES` queries (64,
+  rounded up to whole chunks) is scored against its own frames plus the trained
+  history, i.e. one streaming step with `cache_t1 = left`, run for every block at
+  once. Scores and the relative table then grow with `T`, not `T²`. Upstream
+  builds the whole `T x (2T - 1)` table and masks almost all of it, which ran
+  long audio out of memory. An utterance that blocks would not cut to half the
+  dense scores (`T <= 2 * keys`, 240 frames on the release) stays one dense
+  block, because copying K and V into overlapping blocks costs more than it saves
+  there.
 - `predictor.py` — 2-layer **LSTM** predictor on `oasr.layers.LSTM`'s fused
   recurrent kernels + additive joint
   `head(relu(enc_proj + dec_proj))` + the language-prompt projector (a 128-wide
