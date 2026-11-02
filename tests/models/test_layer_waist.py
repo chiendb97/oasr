@@ -350,8 +350,8 @@ ALLOWED_MASKED_FILL = {
         "the two NonlinAttention activation masks — KG12, not scores",
     ),
     "nemotron/encoder.py": (
-        4,
-        "two silence gates on activations (KG12) and two floors applied to the "
+        3,
+        "two silence gates on activations (KG12) and the floor applied to the "
         "rel-pos bias handed to oasr.fmha as attn_bias — that kernel never "
         "materializes scores, so there is no softmax to fuse into; removing "
         "the bias pass is KG8 (in-kernel Transformer-XL rel-pos)",

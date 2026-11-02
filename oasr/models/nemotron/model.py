@@ -231,7 +231,8 @@ class NemotronModel(BaseAsrModel):
         predictor (``decoder``), the ``joint`` and the language-prompt projector.
         Pinned batch-invariant when quantized: the subsampling projection
         (``M = B x T``) and ``relative_k_proj`` (``M = 2L - 1`` with ``L`` the
-        padded length, so it depends on what shares the batch) -- the two fp
+        padded length, or one attention block's keys once the offline pass runs
+        in blocks, so it can depend on what shares the batch) -- the two fp
         GEMMs ahead of int8 layers.
         """
         groups: List[SmoothGroup] = []
