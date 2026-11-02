@@ -35,7 +35,7 @@
 //! | Message | Meaning |
 //! |---|---|
 //! | `{"type":"transcription_session.created","session":{…}}` | Handshake, echoing the resolved config. |
-//! | `{"type":"conversation.item.input_audio_transcription.delta","delta":"…"}` | Interim transcript. |
+//! | `{"type":"conversation.item.input_audio_transcription.delta","delta":"…"}` | Interim transcript: the increment. A partial that revises what was sent instead carries `"delta":""` and `"text"`, the whole transcript so far (an OASR extension), which replaces it. |
 //! | `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. |
 //! | `{"type":"error","error":{…}}` | Terminal failure. |
 //!
@@ -679,23 +679,28 @@ struct Emitted(String);
 impl Emitted {
     /// The event for one cumulative partial, or `None` when it added nothing.
     ///
-    /// Revisions carry corrected full text with an empty delta because they have
-    /// no append-only representation.
+    /// A partial that extends what was sent is its suffix and nothing else.  A
+    /// revision has no append-only form, so it carries the corrected transcript
+    /// as `text` (an OASR extension) with an empty delta, and a client replaces
+    /// what it holds.  `text` used to ride on every delta, which made a
+    /// session's traffic quadratic in its transcript: 15.5 MB of events for a
+    /// 17 KB transcript over 30 minutes, and on a streaming CTC model not one
+    /// of those partials was a revision.
     fn event(&mut self, partial: &str) -> Option<Value> {
-        let delta = match partial.strip_prefix(self.0.as_str()) {
+        let event = match partial.strip_prefix(self.0.as_str()) {
             Some("") => return None,
-            Some(suffix) => suffix.to_string(),
-            None => String::new(),
+            Some(suffix) => json!({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": suffix,
+            }),
+            None => json!({
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "",
+                "text": partial,
+            }),
         };
         self.0 = partial.to_string();
-        Some(json!({
-            "type": "conversation.item.input_audio_transcription.delta",
-            "delta": delta,
-            // OASR extension: the authoritative transcript so far.  Present on
-            // every delta so a caller never has to reconstruct it, and the only
-            // way a revision can be communicated at all.
-            "text": partial,
-        }))
+        Some(event)
     }
 }
 
@@ -1127,11 +1132,12 @@ mod tests {
         let mut emitted = Emitted::default();
         let ev = emitted.event("he").unwrap();
         assert_eq!(ev["delta"], "he");
-        assert_eq!(ev["text"], "he");
 
         let ev = emitted.event("hello").unwrap();
         assert_eq!(ev["delta"], "llo", "only what the partial added");
-        assert_eq!(ev["text"], "hello", "and the full transcript alongside");
+        // Not the transcript so far as well: carried on every delta, that made
+        // a session's traffic quadratic in its transcript.
+        assert!(ev.get("text").is_none(), "{ev}");
 
         // An unchanged partial says nothing rather than sending an empty event.
         assert!(emitted.event("hello").is_none());
@@ -1151,5 +1157,11 @@ mod tests {
         // And the next extension is relative to the corrected text.
         let ev = emitted.event("there are two").unwrap();
         assert_eq!(ev["delta"], " two");
+        assert!(ev.get("text").is_none(), "{ev}");
+        // A retraction is a revision too, down to nothing.
+        let ev = emitted.event("there").unwrap();
+        assert_eq!((&ev["delta"], &ev["text"]), (&json!(""), &json!("there")));
+        let ev = emitted.event("").unwrap();
+        assert_eq!(ev["text"], "");
     }
 }

@@ -159,13 +159,16 @@ async function postOffline(fileOrBlob, filename) {
 function openStream(onFinalClose) {
   const ws = new WebSocket(WS_BASE + "/v1/realtime");
   ws.binaryType = "arraybuffer";
+  // The transcript so far, which is what a caption line shows.
+  let sofar = "";
   ws.onmessage = (ev) => {
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
-    // `delta` is the increment; `text` is the transcript so far, which is what
-    // a caption line wants — a revised partial arrives with an empty delta.
+    // `delta` extends the transcript.  A partial that revises it arrives with
+    // an empty delta and `text`, the corrected transcript, which replaces it.
     if (m.type && m.type.endsWith("input_audio_transcription.delta")) {
-      setPartial(m.text !== undefined ? m.text : m.delta);
+      sofar = m.text !== undefined ? m.text : sofar + (m.delta || "");
+      setPartial(sofar);
     } else if (m.type && m.type.endsWith("input_audio_transcription.completed")) {
       commitFinal(m.transcript);
       try { ws.close(); } catch {}

@@ -298,7 +298,7 @@ Server → client:
 | Message | Meaning |
 |---|---|
 | `{"type":"transcription_session.created","session":{…}}` | Handshake, echoing the resolved configuration. |
-| `{"type":"conversation.item.input_audio_transcription.delta","delta":"…","text":"…"}` | Interim. `delta` is the increment; `text` (an OASR extension) is the transcript so far. |
+| `{"type":"conversation.item.input_audio_transcription.delta","delta":"…"}` | Interim: `delta` extends the transcript. A partial that *revises* it instead (a beam re-ranked) carries `"delta":""` and `"text":"…"`, an OASR extension holding the whole transcript so far, which replaces what the client holds. |
 | `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. |
 | `{"type":"error","error":{…}}` | Terminal failure. |
 

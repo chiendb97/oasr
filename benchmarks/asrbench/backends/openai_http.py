@@ -90,12 +90,11 @@ class _WsStream(StreamSession):
                 ev = json.loads(message)
                 kind = ev.get("type", "")
                 if kind.endswith("input_audio_transcription.delta"):
-                    # ``text`` is OASR's extension (full transcript so far); a
-                    # server without it gets the deltas accumulated.
+                    # A delta extends the transcript; a revision arrives with
+                    # ``text``, OASR's extension, which replaces it (even with "").
                     prev = next((e.text for e in reversed(self.events) if e.kind == "partial"), "")
-                    self.push(
-                        StreamEvent("partial", t, ev.get("text") or prev + ev.get("delta", ""))
-                    )
+                    text = ev["text"] if "text" in ev else prev + ev.get("delta", "")
+                    self.push(StreamEvent("partial", t, text))
                 elif kind.endswith("input_audio_transcription.completed"):
                     self.push(StreamEvent("final", t, ev.get("transcript", ""), ev.get("words")))
                     return
