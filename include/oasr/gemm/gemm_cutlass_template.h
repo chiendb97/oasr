@@ -198,8 +198,8 @@ struct CutlassGemmKernel {
                     return runSerialSplitKPreZeroed<GemmBasic, ThreadblockShape>(
                         args, static_cast<int*>(semaphore), stream);
                 }
-                // Fallback (cache disabled, OOM, or first touch during CUDA
-                // graph capture): legacy per-call workspace + memset.
+                // Fallback (cache disabled, OOM, or a CUDA graph capture, which
+                // owns its own): legacy per-call workspace + memset.
                 oasr::GraphSafeWorkspace workspace(workspace_size, stream);
                 return runInitialized(gemm_op, args, workspace.get(), stream);
             }

@@ -1139,14 +1139,16 @@ def test_no_streaming_backend_accepts_a_missing_cache_config():
 # ---------------------------------------------------------------------------
 
 
-def _tiny_paged_conformer(*, graphs: bool, num_left_chunks: int = -1):
-    """A real causal Conformer (random weights) on the paged runtime, fp16 on CUDA."""
+def _tiny_paged_conformer(
+    *, graphs: bool, num_left_chunks: int = -1, dtype=torch.float16, max_blocks_per_seq: int = 32
+):
+    """A real causal Conformer (random weights) on the paged runtime, on CUDA."""
     from oasr.cache.types import CacheConfig
     from oasr.engine.streaming_backend.paged import PagedStreamingBackend
     from oasr.models.conformer.config import ConformerEncoderConfig, ConformerModelConfig
     from oasr.models.conformer.model import ConformerModel
 
-    dtype, chunk = torch.float16, 16
+    chunk = 16
     torch.manual_seed(7)
     model = (
         ConformerModel.from_config(
@@ -1177,8 +1179,8 @@ def _tiny_paged_conformer(*, graphs: bool, num_left_chunks: int = -1):
         chunk_size=chunk,
         num_left_chunks=num_left_chunks,
         block_size_frames=chunk,
-        max_num_blocks=128,
-        max_blocks_per_seq=32,
+        max_num_blocks=max(128, 2 * max_blocks_per_seq),
+        max_blocks_per_seq=max_blocks_per_seq,
         max_batch_size=2,
         device=torch.device("cuda"),
         dtype=dtype,
@@ -1211,7 +1213,14 @@ class TestTheCacheKeyIsTheCachedLength:
 
         def chunk_forward(xs, offsets, caches, cnn_cache, cache_t1=0):
             held = int(caches[0].cache_seqlens.max())  # what the rows really hold
-            seen.append({"cache_t1": cache_t1, "held": held, "offset": int(offsets.max())})
+            seen.append(
+                {
+                    "cache_t1": cache_t1,
+                    "held": held,
+                    "offset": int(offsets.max()),
+                    "kernel_extent": caches[0].host_seqlen_max,
+                }
+            )
             return xs.new_zeros(xs.size(0), 16, 3)  # one chunk of encoder frames
 
         class _RecordingGraphs:
@@ -1237,37 +1246,63 @@ class TestTheCacheKeyIsTheCachedLength:
         ids=["left2", "left3_off_tile", "recycled"],
     )
     def test_eviction_keeps_the_key_on_the_ladder(self, num_left_chunks, recycle):
+        from oasr.engine.graph_cache import pick_cache_bucket
+
         backend, req, forwards, buckets = self._drive(num_left_chunks, recycle)
         assert req.offset == 16 * self.CHUNKS, "the stream ran past its window"
 
-        # The encoder is handed exactly what the batch holds, never its age.
-        assert all(f["cache_t1"] == f["held"] for f in forwards), forwards[-1]
+        # The encoder is handed the rung of what the batch holds, never its age.
+        ladder = backend.cache_bucket_ladder
+        assert all(f["cache_t1"] == pick_cache_bucket(f["held"], ladder) for f in forwards)
         visible = (backend._cache_config.max_logical_blocks - 1) * 16  # noqa: SLF001
-        assert max(f["cache_t1"] for f in forwards) == visible
+        assert max(f["held"] for f in forwards) == visible
 
         # Every key is a rung the pre-warm captures, so none lands on a live tick.
-        ladder = set(backend.cache_bucket_ladder)
         assert len(buckets) == self.CHUNKS
-        assert set(buckets) <= ladder, (sorted(set(buckets)), sorted(ladder))
+        assert set(buckets) <= set(ladder), (sorted(set(buckets)), sorted(ladder))
 
     def test_without_eviction_the_key_still_follows_the_offset(self):
         """The control: whole history kept, so held length and offset coincide."""
+        from oasr.engine.graph_cache import pick_cache_bucket
+
         backend, req, forwards, buckets = self._drive(-1, chunks=6)
-        assert [f["cache_t1"] for f in forwards] == [16 * i for i in range(6)]
-        assert all(f["cache_t1"] == f["offset"] == f["held"] for f in forwards)
-        assert set(buckets) <= set(backend.cache_bucket_ladder)
+        assert [f["held"] for f in forwards] == [16 * i for i in range(6)]
+        assert all(f["offset"] == f["held"] for f in forwards)
+        ladder = backend.cache_bucket_ladder
+        assert all(f["cache_t1"] == pick_cache_bucket(f["held"], ladder) for f in forwards)
+        assert set(buckets) <= set(ladder)
+
+    @pytest.mark.parametrize(
+        "num_left_chunks, recycle",
+        [(-1, False), (2, False), (3, False), (-1, True)],
+        ids=["whole_history", "left2", "left3_off_tile", "recycled"],
+    )
+    def test_the_eager_fallback_runs_at_the_graphs_width(self, num_left_chunks, recycle):
+        """A declined replay (a saturated cache, a failed capture) runs eager at the
+        same rung the graph is keyed on, kernel extent included.
+
+        The eager branch used to run at the exact cached length.  The width sizes
+        the positional projection and the bias matmul, so whether a shape had been
+        captured changed the arithmetic: in fp32 (cuBLAS) a 2.5-minute U2++ stream
+        differed on 909 of 991 chunks between graph and fallback.
+        """
+        _, _, forwards, buckets = self._drive(num_left_chunks, recycle, chunks=40)
+        assert [f["cache_t1"] for f in forwards] == buckets
+        assert all(f["kernel_extent"] == f["cache_t1"] for f in forwards)
 
     def test_the_single_path_keys_on_the_cached_length_too(self):
         """``_forward_single`` reads the same helper; drive it past the window."""
         backend, req, _, _ = self._drive(2, chunks=10)
         seen = []
         backend._chunk_forward = lambda xs, offs, caches, cnn, cache_t1=0: (  # noqa: SLF001
-            seen.append((cache_t1, int(caches[0].cache_seqlens.max()))) or xs.new_zeros(1, 16, 3)
+            seen.append((cache_t1, caches[0].host_seqlen_max, int(caches[0].cache_seqlens.max())))
+            or xs.new_zeros(1, 16, 3)
         )
         backend._forward_single(  # noqa: SLF001
             req, backend.decoding_window, backend.stride, backend._context, {}  # noqa: SLF001
         )
-        assert seen == [(16, 16)], seen
+        # The rung that holds the 16 cached frames, as the graph would be keyed.
+        assert seen == [(64, 64, 16)], seen
         assert req.offset == 16 * 11
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
@@ -1309,6 +1344,47 @@ class TestTheCacheKeyIsTheCachedLength:
         bounded, unbounded = run(False), run(True)
         for step, (a, b) in enumerate(zip(bounded, unbounded)):
             torch.testing.assert_close(a, b, **tol(torch.float16), msg=f"chunk {step}")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32], ids=["fp16", "fp32"])
+    def test_a_declined_replay_decodes_as_the_graph_does(self, dtype):
+        """Graph replay and the eager fallback are the same arithmetic, bit for bit.
+
+        The fallback is what runs when the capture cache is saturated or a shape
+        failed to capture, so it must not decode differently from the graph it
+        stands in for.  Past the ladder's knee a rung is up to 1.5x the cached
+        length, wide enough for the width-sized matmuls to pick other kernels: two
+        streams, the second opened 7 chunks late so their lengths differ, reach
+        768 cached frames.  On the exact-width fallback 30 of 89 fp32 outputs
+        differed; fp16 is a control (OASR's kernels agreed at either width).
+        """
+        chunks, late = 48, 7
+
+        def run(decline: bool):
+            backend = _tiny_paged_conformer(graphs=True, dtype=dtype, max_blocks_per_seq=80)
+            gen = torch.Generator(device="cuda").manual_seed(5)
+            n = backend.decoding_window + backend.stride * chunks
+            first, second = (
+                _make_request(i, torch.randn(n, 80, dtype=dtype, device="cuda", generator=gen))
+                for i in range(2)
+            )
+            backend.allocate(first)
+            if decline:
+                backend._graph_cache.replay = lambda *a, **k: None  # noqa: SLF001
+            outs = []
+            for step in range(chunks):
+                if step == late:
+                    backend.allocate(second)
+                reqs = [first, second] if step >= late else [first]
+                res = backend.forward_step(reqs)
+                outs.append([res[r.request_id].clone() for r in reqs if r.request_id in res])
+            return outs
+
+        replayed, eager = run(False), run(True)
+        for step, (got, want) in enumerate(zip(eager, replayed)):
+            assert len(got) == len(want), f"chunk {step}"
+            for a, b in zip(got, want):
+                assert torch.equal(a, b), f"chunk {step}: max |diff| {(a - b).abs().max().item()}"
 
 
 class TestBackendReset:

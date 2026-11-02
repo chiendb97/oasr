@@ -1541,6 +1541,37 @@ class TestOfflineCollatePrefetch:
 
         assert seen == [f"r{i}" for i in range(5)]
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA side stream")
+    def test_a_failed_side_stream_collate_is_retried_after_that_stream_drains(self):
+        """The isolation pass collates again, on the main stream, into the staging
+        the failed collate used: ``InputProcessor`` reuses one padded device batch
+        and one pinned host pack for every collate.  A side-stream collate that
+        raised after queueing its zero / copy / scale writes still has them in
+        flight, and they land on whatever the retry put there -- a peer's audio,
+        for instance.  So the retry starts only once that stream is idle.
+        """
+        order = _OrderRecorder()
+        ex = _prefetch_executor(order, [[_request("a"), _request("b")]], prefetch=True)
+        side = torch.cuda.Stream()
+        ex._collate_stream = side
+        stream_idle_at_retry: list[bool] = []
+
+        def collate(chunk):
+            if len(chunk) == 2:
+                # Work queued on the side stream, then a refusal on the host.
+                assert torch.cuda.current_stream() == side
+                torch.cuda._sleep(int(5e8))
+                raise ValueError("feature kernel refused the batch")
+            stream_idle_at_retry.append(side.query())
+            return [r.request_id for r in chunk], torch.tensor([1] * len(chunk))
+
+        ex._collate = collate
+        outs = ex.step()
+
+        assert sorted(o.request_id for o in outs) == ["a", "b"]
+        assert all(o.finish_reason is None for o in outs), "both rows decode on retry"
+        assert stream_idle_at_retry == [True, True]
+
 
 def _overlap_executor(order: _OrderRecorder, batches):
     """``_prefetch_executor`` with a family that can queue its decode read-back."""
