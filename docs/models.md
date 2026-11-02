@@ -303,6 +303,16 @@ checkpoints carry both branches, so load with
 from `decoder.*` / `joiner.*`; `simple_*_proj` is declared-dropped and
 `ctc_output.*` is a named capability hint.
 
+**The predictor starts from icefall's window.** Before the first label the state
+is `[-1] * (context_size - 1) + [blank]` (`StatelessDecoder.init_state`), and a
+negative label embeds to zero in `StatelessDecoder.forward` and in both fused
+decode kernels. That is the input icefall trains on: `[blank] + y`, with the
+embeddings left-padded by zero vectors. It is also where icefall's own decoders
+and sherpa-onnx start. A window of blanks is a different input wherever
+blank's embedding row is not zero. The Zipformer recipes declare no
+`padding_idx`, so their blank row is learned, and a blank-filled start window
+changes the first emitted tokens.
+
 The predictor's post-embedding/conv ReLU and the joiner's tanh-over-projection-sum
 use standalone activation modules. Neither can use a GEMM epilogue: the former
 also covers the no-conv context-size-one case, and the latter precedes the

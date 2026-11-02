@@ -33,7 +33,10 @@ def _ref_greedy(enc_b, length, model, max_sym):
     decoder, joiner = model.decoder, model.joiner
     blank = model.blank_id
     device = enc_b.device
-    context = torch.full((1, decoder.context_size), blank, dtype=torch.long, device=device)
+    # icefall's start window (beam_search.py::greedy_search), written out here
+    # rather than taken from the decoder under test.
+    start = [-1] * (decoder.context_size - 1) + [blank]
+    context = torch.tensor([start], dtype=torch.long, device=device)
     enc_proj = joiner.encoder_proj(enc_b)  # (T, J)
     dec_proj = joiner.decoder_proj(decoder(context))  # (1, J)
     hyp, t, sym = [], 0, 0
@@ -56,7 +59,7 @@ def test_component_shapes():
     dec = StatelessDecoder(VOCAB, DEC_DIM, blank_id=0, context_size=2)
     st = dec.init_state(4, torch.device("cpu"))
     assert st.shape == (4, 2) and st.dtype == torch.long
-    assert (st == 0).all()  # blank-filled
+    assert st.tolist() == [[-1, 0]] * 4  # icefall's start window
     out = dec(st)
     assert out.shape == (4, DEC_DIM)
     join = TransducerJoiner(ENC_DIM, DEC_DIM, JOINER_DIM, VOCAB)
@@ -1320,6 +1323,75 @@ class TestPredictorConvGroupSize:
 
 
 # --------------------------------------------------------------------------- #
+# The window before the first label
+# --------------------------------------------------------------------------- #
+
+
+class TestStartWindow:
+    """The predictor starts from icefall's window, not from ``context_size`` blanks.
+
+    icefall trains on ``[blank] + y`` with the embeddings left-padded by
+    ``context_size - 1`` zero vectors, and decodes from ``[-1] * (context_size -
+    1) + [blank]``, where a negative label embeds to zero.  A window of blanks
+    puts blank's row where training had zeros.  That changes the first
+    prediction wherever the row is nonzero, and a Zipformer predictor declares no
+    ``padding_idx``, so its blank row is learned.
+    """
+
+    DIM = 16
+
+    def _decoder(self, context, group, blank):
+        torch.manual_seed(0)
+        dec = StatelessDecoder(
+            32, self.DIM, blank_id=blank, context_size=context, conv_group_size=group
+        ).eval()
+        w_ice = torch.randn(self.DIM, group, context)  # icefall's Conv1d layout
+        sd = dict(dec.state_dict())
+        sd["conv.weight"] = w_ice
+        dec.load_state_dict(sd)
+        return dec, w_ice
+
+    @pytest.mark.parametrize("context", [1, 2, 3])
+    @pytest.mark.parametrize("blank", [0, 5])
+    def test_init_state_is_icefalls_start_window(self, context, blank):
+        state = StatelessDecoder(32, 16, blank_id=blank, context_size=context).init_state(
+            3, torch.device("cpu")
+        )
+        assert state.dtype == torch.long
+        assert state.tolist() == [[-1] * (context - 1) + [blank]] * 3
+
+    @pytest.mark.parametrize("context,group", [(2, 1), (2, 4), (3, 4)])
+    @pytest.mark.parametrize("blank", [0, 5])
+    def test_first_prediction_is_the_one_training_saw(self, context, group, blank):
+        """icefall's ``Decoder.forward(need_pad=True)`` at the first position.
+
+        The control at the end is what makes this a test of the start window:
+        the blank-filled window this replaced gives a different prediction here.
+        """
+        import torch.nn.functional as F
+
+        dec, w_ice = self._decoder(context, group, blank)
+        assert dec.embedding.weight[blank].abs().max() > 0  # a learned blank row
+        with torch.inference_mode():
+            got = dec(dec.init_state(1, torch.device("cpu")))
+            e = F.embedding(torch.tensor([[blank]]), dec.embedding.weight).permute(0, 2, 1)
+            e = F.pad(e, (context - 1, 0))  # zeros, padded *after* the embedding
+            e = F.conv1d(e, w_ice, groups=self.DIM // group)
+            ref = F.relu(e.permute(0, 2, 1))[:, -1, :]
+            blanks = dec(torch.full((1, context), blank))
+        torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-6)
+        assert not torch.allclose(blanks, ref, rtol=1e-3, atol=1e-3)
+
+    def test_a_negative_label_embeds_to_zero_wherever_it_sits(self):
+        """Not only at the front: the fused kernels zero any negative slot too."""
+        dec, _ = self._decoder(3, 4, 0)
+        with torch.no_grad():
+            zeroed = dec(torch.tensor([[7, -1, 9]]))
+            dec.embedding.weight[0].zero_()  # now label 0 embeds to zero as well
+            assert torch.equal(zeroed, dec(torch.tensor([[7, 0, 9]])))
+
+
+# --------------------------------------------------------------------------- #
 # Real icefall checkpoint
 # --------------------------------------------------------------------------- #
 
@@ -1393,6 +1465,45 @@ class TestRealIcefallTransducer:
             e = F.conv1d(e, w_ice, groups=cfg.decoder_dim // cfg.decoder_conv_group_size)
             ref = F.relu(e.permute(0, 2, 1))[:, -1, :]
         torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-6)
+
+    @pytest.mark.requires_assets("STREAMING_ZIPFORMER_CKPT")
+    def test_start_window_matches_icefalls_own_decoder(self, bundle):
+        """The first prediction, against icefall's ``Decoder`` code itself.
+
+        The streaming release's TorchScript export carries that code
+        (``embedding(y.clamp(min=0)) * (y >= 0)``, then the window convolution).
+        Its weights are swapped for this checkpoint's: the streaming release's
+        blank row happens to be exactly zero, where the start window cannot
+        matter, while this one's is not.  Observed bit-identical; asserted with
+        a tolerance, as the other predictor checks are.
+        """
+        import os
+
+        import assets
+
+        from oasr.models.registry import instantiate_from_bundle
+
+        arch, b = bundle
+        model, cfg, _ = instantiate_from_bundle(arch, b)
+        model.eval()
+        emb_w = b.state_dict["decoder.embedding.weight"]
+        assert emb_w[cfg.blank_id].abs().max() > 0
+        export = os.path.join(
+            assets.require("STREAMING_ZIPFORMER_CKPT"), "exp", "jit_script_chunk_16_left_128.pt"
+        )
+        icefall = torch.jit.load(export, map_location="cpu").decoder.eval()
+        with torch.no_grad():
+            icefall.embedding.weight.copy_(emb_w)
+            icefall.conv.weight.copy_(b.state_dict["decoder.conv.weight"])
+
+        start = [-1] * (cfg.context_size - 1) + [cfg.blank_id]
+        with torch.inference_mode():
+            got = model.decoder(model.decoder.init_state(1, torch.device("cpu")))
+            want = icefall(torch.tensor([start]), need_pad=False)[:, -1, :]
+            blanks = model.decoder(torch.full((1, cfg.context_size), cfg.blank_id))
+        torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+        # The window this replaced: about 44% off in norm on these weights.
+        assert (blanks - want).norm() > 0.3 * want.norm()
 
     @pytest.mark.slow
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")

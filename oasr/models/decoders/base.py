@@ -49,7 +49,9 @@ class StatelessPredictorTensors:
 
     The prediction is ``relu(conv(embedding[window]))``: an embedding lookup of
     the last ``context_size`` labels, a convolution over that window down to one
-    frame (none when ``context_size == 1``), and a ReLU.  ``conv_weight`` is the
+    frame (none when ``context_size == 1``), and a ReLU.  A negative label is a
+    slot before the utterance start and embeds to zero (icefall's start window
+    is ``[-1] * (context_size - 1) + [blank]``).  ``conv_weight`` is the
     layer's own parameter in the layout its kernel reads -- ``(D, 1, context,
     group)`` KRSC for a grouped convolution, ``(context, 1, D)`` for a depthwise
     one (``group_size == 1``) -- so nothing is copied or re-laid-out to expose it.

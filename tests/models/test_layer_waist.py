@@ -360,6 +360,11 @@ ALLOWED_MASKED_FILL = {
         2,
         "token-id padding on the decoder input, not a float score tensor",
     ),
+    "transducer/decoder.py": (
+        1,
+        "zeroes the embedding of a label-window slot before the utterance start "
+        "(icefall's -1), not a score floor",
+    ),
 }
 
 

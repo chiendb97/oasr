@@ -106,8 +106,10 @@ def exact_transducer(
     joiner_cls = _relu_joiner_cls() if activation == "relu" else TransducerJoiner
     joiner = joiner_cls(joiner_dim, dec_dim, joiner_dim, vocab)
     with torch.no_grad():
+        # Blank's row stays nonzero, as icefall's Zipformer predictors learn it: a
+        # zero row would make the start window's -1 slots indistinguishable from
+        # blank ones, and an oracle could not see which one a kernel embedded.
         decoder.embedding.weight.copy_(_ternary(decoder.embedding.weight.shape, gen))
-        decoder.embedding.weight[BLANK].zero_()
         if context > 1:
             decoder.conv.weight.copy_(_ternary(decoder.conv.weight.shape, gen))
         joiner.encoder_proj.weight.copy_(torch.eye(joiner_dim))

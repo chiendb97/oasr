@@ -556,7 +556,19 @@
         "(one transcript of 200 changes, LJ001-0079). The extra substitution is",
         "NOT from that change: the pre-fix tree measures 64S 31D 16I = 3.26 today,",
         "so one substitution drifted in from somewhere between 2026-08-11 and now",
-        "and is recorded here rather than silently absorbed."
+        "and is recorded here rather than silently absorbed.",
+        "",
+        "Re-recorded 2026-11-01 at 3.14 (was 3.23; 64S 31D 15I -> 63S 30D 14I)",
+        "when the predictor's start window became icefall's [-1, blank] instead",
+        "of [blank, blank]: training pads the window with zero embeddings, and",
+        "this checkpoint's blank row is not zero. Three transcripts change, all at",
+        "the first word and all to the reference, one error of each kind:",
+        "LJ001-0039 recovers 'the', LJ001-0070 'that' -> 'and', and LJ001-0064",
+        "loses the extra leading 'many' the paragraph above put down to reduction",
+        "order (it sat on the first prediction). Batch 1 now scores 3.11%",
+        "(62S 31D 13I). beam_size=4 measures 3.11% (64S 27D 15I), against 3.14%",
+        "(64S 28D 15I) on the tree just before the change, where the 3.03% above",
+        "no longer reproduced either."
       ],
       "key": "transducer",
       "asset": "TRANSDUCER_CKPT",
@@ -567,11 +579,11 @@
       "max_batch_size": 16,
       "metric": "wer",
       "normalizer": "english",
-      "error_rate_pct": 3.23,
+      "error_rate_pct": 3.14,
       "ref_units": 3403,
-      "substitutions": 64,
-      "deletions": 31,
-      "insertions": 15
+      "substitutions": 63,
+      "deletions": 30,
+      "insertions": 14
     },
     {
       "_comment": [
