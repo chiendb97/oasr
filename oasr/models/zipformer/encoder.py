@@ -24,10 +24,11 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
-import oasr
 from oasr.layers import Tanh
-from oasr.layers.conv import DepthwiseConv1d
+from oasr.layers.conv import DepthwiseConv1d, glu
 from oasr.layers.linear import Linear
+from oasr.layers.matmul import bmm
+from oasr.layers.softmax import masked_softmax
 
 from .scaling import (
     ActivationDropoutAndLinear,
@@ -174,7 +175,7 @@ def _masked_softmax_batch_major(
     and masks are broadcast against it and read through their strides, so they
     are permuted views, not copies.
     """
-    probs = oasr.masked_softmax(
+    probs = masked_softmax(
         attn_scores.transpose(0, 1),
         bias=pos_scores.transpose(0, 1),
         mask=attn_mask,
@@ -295,7 +296,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         k = heads[..., query_head_dim : 2 * query_head_dim].permute(2, 1, 0, 3)
 
         # Batch-major storage, head-major view: see "Layout" at the top.
-        attn_scores = oasr.bmm(q, k, out=_batch_major_scores(q, seq_len))
+        attn_scores = bmm(q, k, out=_batch_major_scores(q, seq_len))
 
         pos_scores = self._pos_scores(x, pos_emb, seq_len, seq_len)
         if attn_mask is not None:
@@ -324,7 +325,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         p = rows[..., 2 * self.query_head_dim :].transpose(0, 1)  # (head, time1 * batch, phd)
         pos_emb = self.linear_pos(pos_emb)
         pos_emb = pos_emb.reshape(seq_len2, num_heads, pos_head_dim).transpose(0, 1)
-        pos_scores = oasr.bmm(p, pos_emb)  # (head, time1 * batch, seq_len2)
+        pos_scores = bmm(p, pos_emb)  # (head, time1 * batch, seq_len2)
         # [h, b, i, j] -> pos_scores[h, i * B + b, (seq_len - 1) - i + j]
         return pos_scores.as_strided(  # type: ignore[no-any-return]
             (num_heads, batch_size, seq_len, k_len),
@@ -359,7 +360,7 @@ class RelPositionMultiheadAttentionWeights(nn.Module):
         q = q.permute(2, 1, 0, 3)  # (head, batch, time1, query_head_dim)
         k = k.permute(2, 1, 0, 3)  # (head, batch, k_len, query_head_dim)
 
-        attn_scores = oasr.bmm(q, k, out=_batch_major_scores(q, k_len))
+        attn_scores = bmm(q, k, out=_batch_major_scores(q, k_len))
 
         assert pos_emb.shape[-2] == 2 * seq_len - 1 + left_context_len, pos_emb.shape
         pos_scores = self._pos_scores(x, pos_emb, seq_len, k_len)
@@ -387,7 +388,7 @@ class SelfAttention(nn.Module):
         # view: its N axis is the contiguous one, which oasr.bmm accepts.  The
         # result lands in ``out`` already time-major.
         x = x.view(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0)
-        oasr.bmm(attn_weights, x, out=_head_view(out, num_heads))
+        bmm(attn_weights, x, out=_head_view(out, num_heads))
         return self.out_proj(out)
 
     def streaming_forward(
@@ -402,7 +403,7 @@ class SelfAttention(nn.Module):
         x = torch.cat([cached_val, x], dim=0)
         cached_val = x[-left_context_len:, ...]
         x = x.view(seq_len2, batch_size, num_heads, -1).permute(2, 1, 3, 0)
-        oasr.bmm(attn_weights, x, out=_head_view(out, num_heads))
+        bmm(attn_weights, x, out=_head_view(out, num_heads))
         return self.out_proj(out), cached_val
 
 
@@ -441,7 +442,7 @@ class NonlinAttention(nn.Module):
 
         num_heads = attn_weights.shape[0]
         out = torch.empty_like(x)
-        oasr.bmm(
+        bmm(
             attn_weights,
             x.view(seq_len, batch_size, num_heads, -1).permute(2, 1, 3, 0),
             out=_head_view(out, num_heads),
@@ -467,7 +468,7 @@ class NonlinAttention(nn.Module):
         # The cache is (head, batch, time, dim), so the [N, K] operand is its
         # transposed view; ``cat`` already made it contiguous along dim.
         out = torch.empty(seq_len, batch_size, hidden_channels, device=y.device, dtype=y.dtype)
-        oasr.bmm(attn_weights, x_pad.permute(0, 1, 3, 2), out=_head_view(out, num_heads))
+        bmm(attn_weights, x_pad.permute(0, 1, 3, 2), out=_head_view(out, num_heads))
         return self.out_proj(out.mul_(y)), cached_x
 
 
@@ -524,7 +525,7 @@ class ConvolutionModule(nn.Module):
         The mask is applied by the same elementwise pass that transposes, so the
         conv's layout costs no pass of its own.
         """
-        x = oasr.glu(self.in_proj(x)).transpose(0, 1)
+        x = glu(self.in_proj(x)).transpose(0, 1)
         if src_key_padding_mask is None:
             return x.contiguous()
         return torch.where(src_key_padding_mask.unsqueeze(-1), self._zero, x)

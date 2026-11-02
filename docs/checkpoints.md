@@ -93,7 +93,7 @@ its model exactly.
 | Ecosystem | Detect marker | Architecture | Notes |
 |---|---|---|---|
 | WeNet | `train.yaml` | `conformer` | U2/U2++ dirs with a `(bi)transformer` decoder keep the AED branch → `capabilities={"ctc","ctc_aed_rescoring"}`; an encoder, model class or `encoder_conf` value the Conformer does not implement is refused (see [models](models.md#conformer-wenet-u2u2)) |
-| icefall | `tokens.txt`/`bpe.model` + `epoch-*.pt`/`pretrained.pt` | `zipformer` (CTC) | config shape-inferred from the checkpoint |
+| icefall | `tokens.txt`/`bpe.model` + `epoch-*.pt`/`pretrained.pt` | `zipformer` (CTC) | config shape-inferred from the checkpoint; weights from `checkpoint_name` if present, else `pretrained.pt` / `model.pt` / `checkpoint.pt` / `cpu_jit.pt`, else the highest-numbered `epoch-<N>.pt`, else a lone `*.pt` (several other `.pt` files are refused, not resolved by name order); in the directory or its `exp/` |
 | icefall pruned-transducer | **not auto-detected** — `architecture="transducer"` | `transducer` | `encoder_type ∈ {conformer, zipformer}`; config inferred from `decoder.*`/`joiner.*` |
 | HF Whisper | `config.json: model_type=whisper` | `whisper` | emits `whisper` tokenizer + `whisper_logmel` features (`audio_scale=1.0`) |
 | HF Qwen2-Audio | `config.json: model_type=qwen2_audio` | `speech_llm` | fills omitted `text_config` fields from Qwen2 defaults; sharded safetensors |

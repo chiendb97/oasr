@@ -39,7 +39,7 @@ a spec selects them (`module_types` chooses which kinds)
 | What | Use |
 |---|---|
 | Projections | `Linear`, and the TP-shaped `ColumnParallelLinear` / `RowParallelLinear` where the shard axis is unambiguous (QKV and gate/up are column, output and down are row) |
-| Activation | `Gelu`, `Relu`, `Sigmoid`, and `Tanh` for standalone activation; `LinearActivation` for fused `relu` / `swish` / exact-erf `gelu` / `gelu_tanh` GEMM epilogues |
+| Activation | `Gelu`, `Relu`, `Sigmoid`, `Tanh`, and Zipformer's `SwooshL` / `SwooshR` for standalone activation; `Glu` for gating; `LinearActivation` for fused `relu` / `swish` / exact-erf `gelu` / `gelu_tanh` GEMM epilogues |
 | Normalization | `LayerNorm`, `RMSNorm`, `BiasNorm`, `AddLayerNorm`, and `AddRMSNorm`; LayerNorm/RMSNorm expose fused residual-add methods (including residual passthrough for pre-norm chains), with the eps conventions named (`TORCH_EPS`, `ESPNET_EPS`, `QWEN2_RMS_EPS`) |
 | Embeddings | `Embedding` (alias `VocabParallelEmbedding`) |
 | Attention compute | `Attention` — takes projected, head-split q/k/v; the projections stay on the model under their checkpoint's names |
@@ -48,6 +48,7 @@ a spec selects them (`module_types` chooses which kinds)
 | Convolution | BTC-native `Conv1d`, `DepthwiseConv1d`, and `PointwiseConv1d`; `DepthwiseConv1d` accepts `(left, right)` padding and an optional fused masked residual for FSMN blocks; NHWC-native `Conv2d` / `Conv2dActivation` |
 | Pooling | BTC-native `AvgPool1d`; the CUDA kernel covers symmetric padding, ceil mode, and include/exclude-pad divisors without transposing the residual stream to BCT |
 | Recurrent | `LSTM` and tanh/ReLU `RNN`; PyTorch-compatible checkpoint parameters with fused CUDA inference and formula-level CPU/fp32 oracles |
+| Attention scores | `MaskedSoftmax` (an additive bias and two broadcast boolean masks, one pass) for a relative-position attention that forms its own scores |
 
 ### OASR is the backend; torch is one you select
 
@@ -65,6 +66,15 @@ closed. Three cases, kept apart on purpose:
 `OASR_LAYERS_BACKEND` selects the backend: `oasr` (default) or `torch` (the
 optional backend, used by the CPU oracles and as the "is this the kernels'
 fault" A/B). There is no `auto`.
+
+A model that calls a kernel inline -- from a free function, or on a path too
+host-bound to pay a module call -- uses the routed function form of the same
+decision rather than the bare `oasr.<op>` functional, which has no torch path:
+`oasr.layers.matmul.bmm`, `oasr.layers.softmax.masked_softmax`,
+`oasr.layers.conv.glu`, `oasr.layers.activation.swoosh_l` / `swoosh_r`.
+Zipformer called the functionals directly, so its forward raised on a CPU
+tensor and ignored `OASR_LAYERS_BACKEND=torch`; `test_architecture_encodes_on_cpu`
+now runs every architecture's encoder on CPU.
 
 One kernel-side gap is declared:
 

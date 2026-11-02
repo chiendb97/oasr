@@ -172,6 +172,8 @@ def _tiny_configs():
             decoder_hidden_size=24,
             num_decoder_layers=1,
             num_prompts=8,
+            # The release's default prompt (101) is outside an 8-wide one-hot.
+            default_prompt_id=3,
             prompt_intermediate_size=48,
             encoder=NemotronEncoderConfig(
                 hidden_size=32,
@@ -203,6 +205,46 @@ def test_every_architecture_has_a_tiny_config():
         f"architectures with no tiny config in tests/test_layer_waist.py: {missing}; "
         "add one so the waist conformance check actually covers them"
     )
+
+
+def _cpu_features(arch):
+    """A small fp32 batch at the tiny model's feature width (and fixed window)."""
+    cfg = _tiny_configs()[arch]
+    encoder = getattr(cfg, "encoder", None)
+    width = (
+        getattr(cfg, "num_mel_bins", None)
+        or getattr(cfg, "audio_num_mel_bins", None)
+        or getattr(encoder, "num_mel_bins", None)
+        or getattr(encoder, "input_size", None)
+        or getattr(encoder, "feature_dim", None)
+        or getattr(cfg, "input_size", None)
+    )
+    # Whisper-family encoders take one fixed window: two input frames per position.
+    window = getattr(cfg, "max_source_positions", None) or getattr(
+        cfg, "audio_max_source_positions", None
+    )
+    frames = 2 * window if window else 120
+    lengths = [frames, frames] if window else [frames, frames - 24]
+    torch.manual_seed(0)
+    return torch.randn(2, frames, width), torch.tensor(lengths)
+
+
+@pytest.mark.parametrize("arch", list_models())
+def test_architecture_encodes_on_cpu(arch):
+    """Every architecture's offline encoder runs on CPU/fp32.
+
+    CPU is out of the kernels' scope, so each layer has to route it to torch
+    (rule 3) -- and the CPU suite and the fp32 parity oracles only mean something
+    if the whole forward gets there.  Zipformer (and the transducer, which uses
+    its encoder) did not: its Swoosh, GLU, BMM and masked-softmax calls went
+    straight to the CUDA kernels, so a CPU forward raised on the first one.
+    """
+    model = _build(arch).eval()
+    features, lengths = _cpu_features(arch)
+    with torch.no_grad():
+        hidden, _ = model.encode_offline(features, lengths)
+    assert hidden.device.type == "cpu" and hidden.shape[0] == 2
+    assert torch.isfinite(hidden).all()
 
 
 @pytest.mark.parametrize("arch", list_models())
@@ -411,8 +453,10 @@ def test_zipformer_attention_weights_use_the_fused_masked_softmax():
     """The offline and streaming score paths both have to reach the kernel.
 
     Both go through one module-level helper (the batch-major softmax), so the
-    check is that the helper calls ``oasr.masked_softmax`` and that each of the
-    two methods calls the helper or the kernel directly.
+    check is that the helper calls the kernel -- ``oasr.masked_softmax``, or the
+    waist's routed ``oasr.layers.softmax.masked_softmax``, which takes it on CUDA
+    and has a torch path for CPU -- and that each of the two methods calls the
+    helper or the kernel directly.
     """
     encoder = REPO_ROOT / "oasr" / "models" / "zipformer" / "encoder.py"
     tree = ast.parse(encoder.read_text(), filename=str(encoder))
@@ -420,10 +464,16 @@ def test_zipformer_attention_weights_use_the_fused_masked_softmax():
     def calls_in(node):
         return {_dotted_name(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)} - {None}
 
+    kernel = {"oasr.masked_softmax"}
+    if any(
+        isinstance(n, ast.ImportFrom)
+        and n.module == "oasr.layers.softmax"
+        and any(a.name == "masked_softmax" and a.asname is None for a in n.names)
+        for n in tree.body
+    ):
+        kernel.add("masked_softmax")
     functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    reaching = {"oasr.masked_softmax"} | {
-        name for name, fn in functions.items() if "oasr.masked_softmax" in calls_in(fn)
-    }
+    reaching = kernel | {name for name, fn in functions.items() if kernel & calls_in(fn)}
     (weights_cls,) = [
         n
         for n in tree.body
@@ -753,6 +803,58 @@ class TestLayersRunOnCpu:
         q_rot, _ = apply_rotary_pos_emb(q, q, cos, sin)
         # Position 0 is the identity rotation.
         torch.testing.assert_close(q_rot[:, :, 0], q[:, :, 0])
+
+    def test_swoosh(self):
+        from oasr.layers import SwooshL, SwooshR
+
+        x = torch.linspace(-12.0, 12.0, 997)
+        torch.testing.assert_close(SwooshL()(x), _ref_swoosh(x, 4.0, 0.035))
+        torch.testing.assert_close(SwooshR()(x), _ref_swoosh(x, 1.0, 0.313261687))
+
+    def test_masked_softmax(self):
+        from oasr.layers import MaskedSoftmax
+
+        x, bias, mask, mask2 = _masked_softmax_operands("cpu", torch.float32)
+        got = MaskedSoftmax(mask_value=-1000.0)(x, bias=bias, mask=mask, mask2=mask2)
+        torch.testing.assert_close(got, _ref_masked_softmax(x, bias, mask, mask2, -1000.0))
+        torch.testing.assert_close(MaskedSoftmax()(x), torch.softmax(x, dim=-1))
+
+    def test_bmm_writes_through_an_out_view(self):
+        from oasr.layers.matmul import bmm
+
+        torch.manual_seed(0)
+        a, b = torch.randn(3, 2, 5, 8), torch.randn(3, 2, 7, 8)
+        out = torch.empty(2, 3, 5, 7).transpose(0, 1)  # a batch-major view, as Zipformer's
+        assert bmm(a, b, out=out) is out
+        torch.testing.assert_close(out, a @ b.transpose(-1, -2))
+        # One operand broadcast along the batch, as the relative-position product.
+        p = torch.randn(1, 7, 8)
+        torch.testing.assert_close(bmm(a[0], p), a[0] @ p.transpose(-1, -2))
+
+
+def _ref_swoosh(x, shift, offset):
+    """icefall's form: ``logaddexp(0, x - shift) - 0.08 x - offset``."""
+    xf = x.double()
+    return (torch.logaddexp(torch.zeros_like(xf), xf - shift) - 0.08 * xf - offset).to(x.dtype)
+
+
+def _masked_softmax_operands(device, dtype):
+    """Zipformer's shapes: contiguous ``(B, H, T, K)`` scores, a strided bias
+    view, a ``(T, K)`` attention mask and a ``(B, 1, 1, K)`` key-padding mask."""
+    g = torch.Generator().manual_seed(0)
+    B, H, T, K = 2, 3, 6, 40
+    x = torch.randn(B, H, T, K, generator=g).to(device, dtype)
+    bias = torch.randn(H, B, T, K, generator=g).to(device, dtype).transpose(0, 1)
+    mask = (torch.rand(T, K, generator=g) < 0.2).to(device)
+    pad = torch.zeros(B, K, dtype=torch.bool)
+    pad[1, 30:] = True
+    return x, bias, mask, pad.to(device)[:, None, None, :]
+
+
+def _ref_masked_softmax(x, bias, mask, mask2, mask_value):
+    """The kernel's documented definition, op by op."""
+    scores = (x + bias).to(x.dtype).masked_fill(mask | mask2, mask_value)
+    return torch.softmax(scores.float(), dim=-1).to(x.dtype)
 
 
 class TestBackendSelection:
@@ -1243,6 +1345,80 @@ class TestKernelAndTorchPathsAgree:
                 ref = a(q, k, v, **kwargs)
             assert not torch.isnan(got).any()
             torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_swoosh(self, dtype, monkeypatch):
+        import oasr
+        from oasr.layers import SwooshL, SwooshR
+
+        calls = _count_calls(monkeypatch, oasr, "swoosh_l", "swoosh_r")
+        x = torch.linspace(-12.0, 12.0, 4096, device="cuda", dtype=dtype)
+        for module in (SwooshL(), SwooshR()):
+            got = module(x)
+            with layers_backend_override("torch"):
+                ref = module(x)
+            torch.testing.assert_close(got, ref, rtol=0, atol=1e-2)
+        assert calls == ["swoosh_l", "swoosh_r"]
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_masked_softmax(self, dtype, monkeypatch):
+        import oasr
+        from oasr.layers import MaskedSoftmax
+
+        calls = _count_calls(monkeypatch, oasr, "masked_softmax")
+        x, bias, mask, mask2 = _masked_softmax_operands("cuda", dtype)
+        m = MaskedSoftmax(mask_value=-1000.0)
+        got = m(x, bias=bias, mask=mask, mask2=mask2)
+        with layers_backend_override("torch"):
+            ref = m(x, bias=bias, mask=mask, mask2=mask2)
+        assert calls == ["masked_softmax"]
+        tol = 1e-6 if dtype == torch.float32 else 1e-2
+        torch.testing.assert_close(got, ref, rtol=tol, atol=tol)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_bmm(self, dtype, monkeypatch):
+        import oasr
+        from oasr.layers.matmul import bmm
+
+        calls = _count_calls(monkeypatch, oasr, "bmm")
+        a = torch.randn(3, 2, 5, 12, device="cuda", dtype=dtype)
+        b = torch.randn(3, 2, 7, 12, device="cuda", dtype=dtype)
+        got = bmm(a, b, out=torch.empty(2, 3, 5, 7, device="cuda", dtype=dtype).transpose(0, 1))
+        with layers_backend_override("torch"):
+            ref = bmm(a, b, out=torch.empty_like(got))
+        assert calls == ["bmm"]
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
+        # fp32 is outside the kernel's contract: routed, not raised.
+        a32, b32 = a.float(), b.float()
+        torch.testing.assert_close(bmm(a32, b32), a32 @ b32.transpose(-1, -2))
+        assert calls == ["bmm"]
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_zipformer(self, dtype):
+        """The whole encoder: the kernel path against every layer's torch path."""
+        model = _build("zipformer").eval().cuda().to(dtype)
+        features, lengths = _cpu_features("zipformer")
+        features, lengths = features.cuda().to(dtype), lengths.cuda()
+        with torch.no_grad():
+            got, got_lens = model.forward_offline(features, lengths)
+            with layers_backend_override("torch"):
+                ref, ref_lens = model.forward_offline(features, lengths)
+        assert torch.equal(got_lens, ref_lens)
+        torch.testing.assert_close(got.float(), ref.float(), rtol=5e-2, atol=5e-2)
+
+
+def _count_calls(monkeypatch, module, *names):
+    """Record each call to ``module.<name>`` (still running it)."""
+    calls = []
+    for name in names:
+        real = getattr(module, name)
+
+        def counted(*args, _real=real, _name=name, **kwargs):
+            calls.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, counted)
+    return calls
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

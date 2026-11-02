@@ -29,6 +29,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _NAMED_CANDIDATES = ("pretrained.pt", "model.pt", "checkpoint.pt", "cpu_jit.pt")
+#: icefall's per-epoch training checkpoint, ``exp/epoch-<N>.pt``.
+_EPOCH_FILE = re.compile(r"epoch-(\d+)\.pt")
+
+
+def _epoch_number(path: Path) -> Optional[int]:
+    """``N`` of an ``epoch-<N>.pt`` file; ``None`` for any other name
+    (``epoch-30-avg-9.pt`` is an averaged model, not an epoch)."""
+    m = _EPOCH_FILE.fullmatch(path.name)
+    return int(m.group(1)) if m else None
+
+
 # icefall recipes universally use pos_head_dim=4; this disambiguates the
 # (num_heads, *_head_dim) factorization, which is otherwise degenerate in the
 # weight shapes.
@@ -147,6 +158,16 @@ class IcefallConverter(BaseCheckpointConverter):
     }
 
     def _find_ckpt(self, ckpt_dir: Path, checkpoint_name: Optional[str] = None) -> Optional[Path]:
+        """The weights file to load, in order: the one named, a released name
+        (:data:`_NAMED_CANDIDATES`), the latest ``epoch-<N>.pt``, a lone ``*.pt``.
+
+        The latest epoch is the highest ``N``, not the last name: sorted as
+        strings, ``epoch-9.pt`` comes after ``epoch-30.pt``, and a training
+        directory loaded its ninth epoch without a word.  For the same reason a
+        directory of several other ``.pt`` files is refused rather than resolved
+        by name order: nothing in ``best-valid-loss.pt`` / ``checkpoint-8000.pt``
+        / ``jit_script.pt`` says which one is meant.
+        """
         ckpt_dir = Path(ckpt_dir)
         # icefall keeps checkpoints under exp/; search both the dir and exp/.
         search_dirs = [ckpt_dir, ckpt_dir / "exp"]
@@ -159,10 +180,28 @@ class IcefallConverter(BaseCheckpointConverter):
                 if (d / c).exists():
                     return d / c
         for d in search_dirs:
-            epochs = sorted(d.glob("epoch-*.pt"))
+            epochs = [(n, p) for p in d.glob("epoch-*.pt") if (n := _epoch_number(p)) is not None]
             if epochs:
-                return epochs[-1]
+                _, latest = max(epochs)
+                if len(epochs) > 1:
+                    logger.info(
+                        "%s: %d epoch checkpoints, loading the latest (%s); set "
+                        "checkpoint_name to load another",
+                        d,
+                        len(epochs),
+                        latest.name,
+                    )
+                return latest
+        for d in search_dirs:
             pts = sorted(d.glob("*.pt"))
+            if len(pts) > 1:
+                raise ValueError(
+                    f"{d} holds {len(pts)} checkpoints and none of them is "
+                    f"{' / '.join(_NAMED_CANDIDATES)} or epoch-<N>.pt: "
+                    f"{', '.join(p.name for p in pts)}. Name the one to load with "
+                    "checkpoint_name (EngineConfig.checkpoint_name, "
+                    "oasr-convert --checkpoint-name)."
+                )
             if pts:
                 return pts[0]
         return None

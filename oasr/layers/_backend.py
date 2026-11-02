@@ -527,6 +527,39 @@ def use_softmax_kernel(x: torch.Tensor) -> bool:
     return True
 
 
+def use_masked_softmax_kernel(x: torch.Tensor) -> bool:
+    """Should this bias + mask + softmax go through ``oasr.masked_softmax``?
+
+    Only the out-of-scope gate, and no :func:`is_row_dense` walk: the kernel
+    requires a *contiguous* input and its launcher says so, and this is on
+    Zipformer's per-layer path, which is host-issue-bound (the walk is ~1 us).
+    The kernel dispatches fp32 as well (``NORM_DTYPES``).
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in NORM_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    return True
+
+
+def use_bmm_kernel(x: torch.Tensor) -> bool:
+    """Should this batched product go through ``oasr.bmm``?
+
+    Only the out-of-scope gate: the general BMM lane takes any N and K, either
+    memory layout for B and broadcasting batch axes, so there is no shape to
+    refuse; it serves fp16 and bf16 only (fp32 raises in the launcher).
+    """
+    if layers_backend() == "torch":
+        return False
+    if not x.is_cuda:
+        return out_of_scope("CPU tensor")
+    if x.dtype not in SERVED_DTYPES:
+        return out_of_scope(f"dtype {x.dtype}")
+    return True
+
+
 def use_conv_kernel(x: torch.Tensor) -> bool:
     """Should this convolution / activation go through an OASR kernel?
 

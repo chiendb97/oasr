@@ -10,7 +10,6 @@ import os
 from typing import List, Mapping, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from oasr.cache.paged_kv import PagedKVCache
@@ -1304,7 +1303,8 @@ class ConformerModel(BaseAsrModel):
         """Load a WeNet-format state-dict into this model.
 
         Keeps the ``encoder.*`` parameters, the ``ctc.ctc_lo.*`` projection
-        (zero-padded up to this model's 8-aligned vocab when the checkpoint's
+        (widened to this model's 8-aligned vocab by
+        :func:`~oasr.models.base.pad_output_projection` when the checkpoint's
         vocab is smaller), and — when this model was built with an AED decoder
         branch (``config.decoder``) — the U2++ ``decoder.*`` weights, mapped
         1:1 (a plain-``transformer`` checkpoint's ``decoder.decoders.*`` keys
@@ -1352,15 +1352,12 @@ class ConformerModel(BaseAsrModel):
         ]
 
         if "ctc.ctc_lo.weight" in state_dict and "ctc.ctc_lo.bias" in state_dict:
-            target_vocab = self.ctc.ctc_lo.weight.shape[0]
-            ctc_w = state_dict["ctc.ctc_lo.weight"]
-            ctc_b = state_dict["ctc.ctc_lo.bias"]
-            pad = target_vocab - ctc_w.shape[0]
-            if pad > 0:
-                ctc_w = F.pad(ctc_w, (0, 0, 0, pad))
-                ctc_b = F.pad(ctc_b, (0, pad))
-            sd["ctc.ctc_lo.weight"] = ctc_w
-            sd["ctc.ctc_lo.bias"] = ctc_b
+            sd["ctc.ctc_lo.weight"] = state_dict["ctc.ctc_lo.weight"]
+            sd["ctc.ctc_lo.bias"] = state_dict["ctc.ctc_lo.bias"]
+            # Padding classes get a PAD_LOGIT bias, not 0: at 0 a padding class
+            # beats every real one on a frame whose real logits are all negative,
+            # and takes probability mass from them on every other frame.
+            pad_output_projection(sd, "ctc.ctc_lo.", self.ctc.ctc_lo.weight.shape[0])
         else:
             # An attention-only WeNet checkpoint (no CTC branch) used to die here
             # with a bare KeyError.  Name the missing capability instead — the

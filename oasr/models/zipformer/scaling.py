@@ -9,10 +9,12 @@ ScaleGrad, Dropout, ScheduledFloat, custom autograd) is dropped or reduced to an
 identity, since at eval time those are no-ops.  Module + parameter names mirror
 icefall exactly so that an icefall checkpoint loads with a 1:1 key mapping.
 
-Compute goes through OASR CUDA kernels: ``oasr.swoosh_l`` / ``oasr.swoosh_r``
-(Swoosh activations), ``oasr.bias_norm`` (BiasNorm), ``oasr.depthwise_conv1d``
-(the causal depthwise convs), and ``oasr.gemm`` (the fused activation+linear).
-The module is therefore CUDA-only and runs in FP16 / BF16.
+Compute goes through the layer waist, which takes the OASR CUDA kernels for the
+served dtypes (FP16 / BF16) and torch elsewhere: the Swoosh activations
+(``oasr.swoosh_l`` / ``oasr.swoosh_r``), BiasNorm (``oasr.bias_norm``), the
+causal depthwise convs (``oasr.depthwise_conv1d``) and the fused
+activation+linear (``oasr.gemm``).  So the module also runs on CPU, which the
+parity oracles and the CPU test suite need.
 
 Reference:
 https://github.com/k2-fsa/icefall/blob/master/egs/librispeech/ASR/zipformer/scaling.py
@@ -28,21 +30,15 @@ from torch import Tensor, nn
 
 import oasr
 from oasr.layers._backend import use_gemm_kernel
+
+# Re-export the waist's Swoosh activations under the import path this model has
+# always used (they lived here, and called the kernel even on a CPU tensor).
+from oasr.layers.activation import SwooshL as SwooshL, SwooshR as SwooshR, swoosh_l, swoosh_r
 from oasr.layers.conv import DepthwiseConv1d
 
 # Re-export the shared BiasNorm under the checkpoint-compatible import path and
 # parameter names (``bias``, ``log_scale``).
 from oasr.layers.norm import BiasNorm as BiasNorm
-
-
-class SwooshL(nn.Module):
-    def forward(self, x: Tensor) -> Tensor:
-        return oasr.swoosh_l(x)
-
-
-class SwooshR(nn.Module):
-    def forward(self, x: Tensor) -> Tensor:
-        return oasr.swoosh_r(x)
 
 
 class ChunkCausalDepthwiseConv1d(nn.Module):
@@ -156,9 +152,9 @@ class ActivationDropoutAndLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.activation == "SwooshL":
-            x = oasr.swoosh_l(x)
+            x = swoosh_l(x)
         elif self.activation == "SwooshR":
-            x = oasr.swoosh_r(x)
+            x = swoosh_r(x)
         else:
             raise ValueError(self.activation)
         # Holds bare ``weight``/``bias`` (icefall's key layout has no ``.l.``
