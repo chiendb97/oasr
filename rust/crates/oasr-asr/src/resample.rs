@@ -57,7 +57,7 @@ pub fn validate_sample_rate(hz: u32) -> Result<(), AudioError> {
 }
 
 /// Number of output frames a resample of `n_in` frames should produce.
-fn expected_out(n_in: u64, from_hz: u32, to_hz: u32) -> u64 {
+pub(crate) fn expected_out(n_in: u64, from_hz: u32, to_hz: u32) -> u64 {
     ((n_in as f64) * (to_hz as f64) / (from_hz as f64)).round() as u64
 }
 

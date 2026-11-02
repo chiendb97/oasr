@@ -14,7 +14,9 @@
 
 #![cfg(feature = "codecs")]
 
-use oasr_asr::{decode_audio, decode_wav, AudioError, DecodeOptions, PcmEncoding, SourceEncoding};
+use oasr_asr::{
+    decode_audio, decode_wav, resample_mono, AudioError, DecodeOptions, PcmEncoding, SourceEncoding,
+};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
@@ -125,6 +127,65 @@ fn the_decoded_length_cap_applies_to_compressed_bodies() {
     )
     .unwrap_err();
     assert!(matches!(err, AudioError::TooLong(_, 4_000)), "{err:?}");
+}
+
+/// A container upload decoded at its own rate (no target), with that rate.
+fn decode_at_source_rate(name: &str) -> (u32, Vec<f32>) {
+    let dec = decode_audio(
+        &fixture(name),
+        &DecodeOptions {
+            encoding: SourceEncoding::Container,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (dec.sample_rate, samples(&dec.samples))
+}
+
+/// `max_samples` counts the waveform the decode *returns*.  A serving caller
+/// converts to its model's rate and sizes the cap as `--max-audio-seconds x`
+/// that rate; counted at the source rate, as it was, a 4-hour cap refused a
+/// 48 kHz upload after 80 minutes.  `tone_48k.flac` is one second at 48 kHz:
+/// `ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000:duration=1 -ac 1
+/// -c:a flac`.
+#[test]
+fn the_cap_counts_samples_at_the_rate_the_decode_returns() {
+    let body = fixture("tone_48k.flac");
+    let opts = |cap| DecodeOptions {
+        encoding: SourceEncoding::Container,
+        target_sample_rate: Some(16_000),
+        max_samples: Some(cap),
+        ..Default::default()
+    };
+    let dec = decode_audio(&body, &opts(16_000)).unwrap();
+    assert_eq!(samples(&dec.samples).len(), 16_000);
+    let err = decode_audio(&body, &opts(15_999)).unwrap_err();
+    assert!(
+        matches!(err, AudioError::TooLong(16_000, 15_999)),
+        "{err:?}"
+    );
+}
+
+/// A container is converted a packet at a time, so that its waveform is never
+/// held at the source rate; that must not change a sample, since the
+/// resampler feeds its filter the same chunks however the packets cut it.
+#[test]
+fn a_container_converted_while_it_decodes_equals_the_one_shot_resample() {
+    for (name, to) in [
+        ("tone_48k.flac", 16_000),
+        ("tone.flac", 48_000),
+        ("tone.mp3", 8_000),
+        ("tone.ogg", 44_100),
+        ("tone.m4a", 22_050),
+    ] {
+        let (from, source) = decode_at_source_rate(name);
+        let want = resample_mono(&source, from, to).unwrap();
+        let got = decode_upload(name, Some(to)).unwrap();
+        assert!(
+            got == want,
+            "{name}: {from} -> {to} Hz differs from the one-shot resample"
+        );
+    }
 }
 
 /// Sample-exact G.711 checks against reference decodes; aggregate energy would

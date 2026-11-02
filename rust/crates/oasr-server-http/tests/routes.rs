@@ -47,6 +47,11 @@ fn router(mode: ServiceMode, served: &[&str]) -> axum::Router {
 /// A valid 16 kHz mono 16-bit WAV of `n` samples, built by hand so the test
 /// needs no encoder and no fixture path.
 fn wav(n: usize) -> Vec<u8> {
+    wav_at(n, 16_000)
+}
+
+/// [`wav`] at `rate` Hz.
+fn wav_at(n: usize, rate: u32) -> Vec<u8> {
     let data_len = (n * 2) as u32;
     let mut out = Vec::with_capacity(44 + data_len as usize);
     out.extend_from_slice(b"RIFF");
@@ -55,8 +60,8 @@ fn wav(n: usize) -> Vec<u8> {
     out.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
     out.extend_from_slice(&1u16.to_le_bytes()); // PCM
     out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&16_000u32.to_le_bytes());
-    out.extend_from_slice(&32_000u32.to_le_bytes()); // byte rate
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(2 * rate).to_le_bytes()); // byte rate
     out.extend_from_slice(&2u16.to_le_bytes()); // block align
     out.extend_from_slice(&16u16.to_le_bytes()); // bits
     out.extend_from_slice(b"data");
@@ -472,6 +477,32 @@ async fn audio_longer_than_the_ceiling_is_413() {
     .await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(body.contains("too long"), "{body}");
+}
+
+/// `max_audio_samples` is `--max-audio-seconds` at the model's 16 kHz, and an
+/// upload is held to it after conversion: one second is one second whatever
+/// rate it arrives at.  Counted at the upload's rate, as it was, a 48 kHz
+/// second was three seconds and an 8 kHz one half a second.
+#[tokio::test]
+async fn the_duration_ceiling_holds_whatever_rate_the_upload_has() {
+    for (rate, cap, want) in [
+        (48_000, 16_000, StatusCode::SERVICE_UNAVAILABLE), // one second under a one-second cap
+        (8_000, 8_000, StatusCode::PAYLOAD_TOO_LARGE),     // one second under a half-second cap
+    ] {
+        let mut st = state(ServiceMode::Offline, &[]);
+        Arc::get_mut(&mut st).unwrap().max_audio_samples = Some(cap);
+        let audio = wav_at(rate as usize, rate);
+        let (status, body) = send(
+            build_router(st, RouterLimits::default()),
+            upload(
+                "/v1/audio/transcriptions",
+                &[],
+                Some(("a.wav", "audio/wav", &audio)),
+            ),
+        )
+        .await;
+        assert_eq!(status, want, "{rate} Hz under a {cap}-sample cap: {body}");
+    }
 }
 
 /// axum's own multipart default is 2 MiB — an order of magnitude under

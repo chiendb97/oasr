@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Compressed-container decoding via [symphonia].
 //!
-//! Everything here is *demux + decode to f32 mono*; rate conversion stays in
-//! [`crate::resample`] and the raw-PCM paths stay in [`crate::audio`].  The
+//! Everything here is *demux + decode to f32 mono*, converted to the caller's
+//! rate a packet at a time by [`crate::resample`]'s streaming resampler; the
+//! raw-PCM paths stay in [`crate::audio`].  The
 //! whole module is behind the `codecs` feature, which is on by default: real
 //! callers have MP3 podcasts, M4A voice memos and FLAC archives, not headerless
 //! PCM, and requiring every one of them to transcode first was the single
@@ -38,6 +39,8 @@ use symphonia::core::meta::MetadataOptions;
 
 #[cfg(feature = "codecs")]
 use crate::audio::{AudioError, DecodedAudio, Waveform};
+#[cfg(feature = "codecs")]
+use crate::resample::{expected_out, Resampler};
 
 /// Container families this crate recognises by magic bytes.
 ///
@@ -187,15 +190,23 @@ pub fn decode_container(
     container: Container,
     max_samples: Option<usize>,
 ) -> Result<DecodedAudio, AudioError> {
-    container_waveform(body, container, max_samples).map(Waveform::into_decoded)
+    container_waveform(body, container, None, max_samples).map(Waveform::into_decoded)
 }
 
-/// [`decode_container`] up to the samples, which stay a `Vec<f32>` for the
-/// resampler to read.
+/// [`decode_container`] up to the samples, converted to `target` Hz while they
+/// decode when it is set, and held to `max_samples` at that rate.
+///
+/// A packet at a time, so a long upload is never held at its source rate: the
+/// ceiling bounds the decode's memory as well as its duration, and a 48 kHz
+/// waveform held whole until a one-shot resample was three times the 16 kHz
+/// one the ceiling is sized for.  The output is the one-shot resample's, sample
+/// for sample, because [`Resampler`] feeds its filter the same chunks however
+/// the input is cut.
 #[cfg(feature = "codecs")]
 pub(crate) fn container_waveform(
     body: &[u8],
     container: Container,
+    target: Option<u32>,
     max_samples: Option<usize>,
 ) -> Result<Waveform, AudioError> {
     let mut hint = Hint::new();
@@ -223,14 +234,7 @@ pub(crate) fn container_waveform(
         .first_track_known_codec(TrackType::Audio)
         .ok_or_else(|| AudioError::Container(format!("{container:?}: no decodable audio track")))?;
     let track_id = track.id;
-    // Reserve what the track says it holds, so the waveform is not regrown --
-    // and copied -- a doubling at a time.  The header is only a hint, and an
-    // untrusted one: the reservation never exceeds the cap the decode is held
-    // to anyway, and without a cap nothing is reserved.
-    let reserve = match (track.num_frames, max_samples) {
-        (Some(n), Some(cap)) => usize::try_from(n).unwrap_or(usize::MAX).min(cap),
-        _ => 0,
-    };
+    let num_frames = track.num_frames;
     let params = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p.clone(),
         _ => {
@@ -239,9 +243,22 @@ pub(crate) fn container_waveform(
             )))
         }
     };
-    // The container's declared rate; the decoded buffers carry it too, and the
-    // buffer wins (a track header can lie, a decoded frame cannot).
-    let mut sample_rate = params.sample_rate.unwrap_or(0);
+    // Reserve what the track says it holds, at the rate the decode returns, so
+    // the waveform is not regrown -- and copied -- a doubling at a time.  The
+    // header is only a hint, and an untrusted one: the reservation never
+    // exceeds the cap the decode is held to anyway, and without a cap (or a
+    // declared rate to convert the count with) nothing is reserved.  The
+    // decoded buffers carry the rate the samples are actually read at.
+    let reserve = match (num_frames, params.sample_rate, max_samples) {
+        (Some(n), Some(rate), Some(cap)) if rate > 0 => {
+            let returned = match target {
+                Some(t) => expected_out(n, rate, t),
+                None => n,
+            };
+            usize::try_from(returned).unwrap_or(usize::MAX).min(cap)
+        }
+        _ => 0,
+    };
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&params, &AudioDecoderOptions::default())
@@ -252,9 +269,7 @@ pub(crate) fn container_waveform(
             ))
         })?;
 
-    let mut out: Vec<f32> = Vec::new();
-    // A failed reservation is not an error: the decode grows `out` as before.
-    let _ = out.try_reserve_exact(reserve);
+    let mut sink = Sink::new(target, max_samples, reserve);
     let mut scratch: Vec<f32> = Vec::new();
     loop {
         let packet = match format.next_packet() {
@@ -277,29 +292,153 @@ pub(crate) fn container_waveform(
             Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::ResetRequired) => continue,
             Err(e) => return Err(AudioError::Container(format!("{container:?}: {e}"))),
         };
-        append_mono(&decoded, &mut out, &mut scratch);
-        sample_rate = decoded.spec().rate();
-        if let Some(cap) = max_samples {
-            if out.len() > cap {
-                return Err(AudioError::TooLong(out.len(), cap));
-            }
+        let rate = decoded.spec().rate();
+        if rate == 0 {
+            return Err(AudioError::Container(format!(
+                "{container:?}: stream declares no sample rate"
+            )));
         }
+        append_mono(&decoded, sink.packet(rate)?, &mut scratch);
+        sink.commit()?;
     }
 
-    if out.is_empty() {
+    let waveform = sink.finish()?;
+    if waveform.samples.is_empty() {
         return Err(AudioError::Container(format!(
             "{container:?}: decoded to zero audio frames"
         )));
     }
-    if sample_rate == 0 {
-        return Err(AudioError::Container(format!(
-            "{container:?}: stream declares no sample rate"
-        )));
+    Ok(waveform)
+}
+
+/// Where a container's decoded packets go: straight into the waveform while
+/// they are at the rate the decode returns, through a [`Resampler`] when not.
+///
+/// The returned rate is the target's, or without one the first packet's.  A
+/// decoded buffer at another rate than the one before it opens a segment that
+/// is converted from its own rate; labelled with the last packet's rate
+/// instead, as the waveform was, every earlier sample played back at the wrong
+/// speed.  symphonia's readers were not seen to change rate within a track (it
+/// drops concatenated MP3 frames at another rate, as ffmpeg does), but nothing
+/// in the decoder's contract rules it out.
+#[cfg(feature = "codecs")]
+struct Sink {
+    target: Option<u32>,
+    max_samples: Option<usize>,
+    /// The rate the waveform is returned at: the target's, or without one the
+    /// first packet's.  0 until a packet arrives.
+    rate: u32,
+    out: Vec<f32>,
+    /// The packet a resampled segment decodes into before it is pushed.
+    packet: Vec<f32>,
+    segment: Option<Segment>,
+}
+
+#[cfg(feature = "codecs")]
+struct Segment {
+    rate: u32,
+    /// `None` while the segment is already at the returned rate.
+    resampler: Option<Resampler>,
+    /// `out.len()` when the segment began: every earlier segment, flushed.
+    start: usize,
+    /// Source samples the segment's resampler has taken.
+    consumed: u64,
+}
+
+#[cfg(feature = "codecs")]
+impl Sink {
+    fn new(target: Option<u32>, max_samples: Option<usize>, reserve: usize) -> Self {
+        let mut out = Vec::new();
+        // A failed reservation is not an error: the decode grows `out` as before.
+        let _ = out.try_reserve_exact(reserve);
+        Self {
+            target,
+            max_samples,
+            rate: 0,
+            out,
+            packet: Vec::new(),
+            segment: None,
+        }
     }
-    Ok(Waveform {
-        sample_rate,
-        samples: out,
-    })
+
+    /// The buffer a packet at `rate` Hz decodes into, opening a segment when
+    /// the rate is not the current one's.
+    fn packet(&mut self, rate: u32) -> Result<&mut Vec<f32>, AudioError> {
+        if self.segment.as_ref().map(|seg| seg.rate) != Some(rate) {
+            self.close_segment()?;
+            if self.rate == 0 {
+                self.rate = self.target.unwrap_or(rate);
+            }
+            let resampler = if rate == self.rate {
+                None
+            } else {
+                Some(Resampler::new(rate, self.rate)?)
+            };
+            self.segment = Some(Segment {
+                rate,
+                resampler,
+                start: self.out.len(),
+                consumed: 0,
+            });
+        }
+        if self
+            .segment
+            .as_ref()
+            .is_some_and(|seg| seg.resampler.is_some())
+        {
+            self.packet.clear();
+            Ok(&mut self.packet)
+        } else {
+            Ok(&mut self.out)
+        }
+    }
+
+    /// Take the packet [`packet`](Self::packet) handed out, and refuse the
+    /// decode as soon as what it has read would come out longer than the cap.
+    fn commit(&mut self) -> Result<(), AudioError> {
+        let Some(seg) = self.segment.as_mut() else {
+            return Ok(());
+        };
+        let returned_len = match seg.resampler.as_mut() {
+            Some(resampler) => {
+                resampler.push(&self.packet, &mut self.out)?;
+                seg.consumed += self.packet.len() as u64;
+                // What the segment comes to once flushed, which is exactly
+                // `round(consumed x to / from)`.  The resampler holds up to a
+                // chunk back, so `out.len()` alone would let the decode run
+                // past the cap and then hand back more than it allows.
+                seg.start as u64 + expected_out(seg.consumed, seg.rate, self.rate)
+            }
+            None => self.out.len() as u64,
+        };
+        if let Some(cap) = self.max_samples {
+            let returned_len = usize::try_from(returned_len).unwrap_or(usize::MAX);
+            if returned_len > cap {
+                return Err(AudioError::TooLong(returned_len, cap));
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush the current segment's resampler into the waveform.
+    fn close_segment(&mut self) -> Result<(), AudioError> {
+        if let Some(Segment {
+            resampler: Some(mut resampler),
+            ..
+        }) = self.segment.take()
+        {
+            resampler.flush(&mut self.out)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Waveform, AudioError> {
+        self.close_segment()?;
+        Ok(Waveform {
+            sample_rate: self.rate,
+            samples: self.out,
+        })
+    }
 }
 
 /// Append one decoded buffer to `out`, averaging its channels down to mono.
@@ -323,6 +462,93 @@ fn append_mono(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, scratch: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(rate, samples)` packets through a [`Sink`], as the decode loop feeds it.
+    #[cfg(feature = "codecs")]
+    fn through_sink(
+        target: Option<u32>,
+        cap: Option<usize>,
+        packets: &[(u32, &[f32])],
+    ) -> Result<Waveform, AudioError> {
+        let mut sink = Sink::new(target, cap, 0);
+        for &(rate, samples) in packets {
+            sink.packet(rate)?.extend_from_slice(samples);
+            sink.commit()?;
+        }
+        sink.finish()
+    }
+
+    #[cfg(feature = "codecs")]
+    fn tone(n: usize, rate: u32) -> Vec<f32> {
+        (0..n)
+            .map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    /// Packets of any size give the one-shot resample, and the cap refuses the
+    /// packet whose output would cross it rather than finishing the decode.
+    #[cfg(feature = "codecs")]
+    #[test]
+    fn the_sink_resamples_packet_by_packet_and_holds_the_cap_at_the_returned_rate() {
+        use crate::resample::resample_mono;
+
+        let src = tone(48_000 + 333, 48_000);
+        let packets: Vec<_> = src.chunks(1_151).map(|c| (48_000, c)).collect();
+        let want = resample_mono(&src, 48_000, 16_000).unwrap();
+
+        let got = through_sink(Some(16_000), Some(want.len()), &packets).unwrap();
+        assert_eq!(got.sample_rate, 16_000);
+        assert!(got.samples == want, "differs from the one-shot resample");
+
+        let err = through_sink(Some(16_000), Some(want.len() - 1), &packets).unwrap_err();
+        assert!(
+            matches!(err, AudioError::TooLong(n, _) if n == want.len()),
+            "{err:?}"
+        );
+
+        // Half the length: refused within one packet's output of the cap.
+        let cap = want.len() / 2;
+        match through_sink(Some(16_000), Some(cap), &packets) {
+            Err(AudioError::TooLong(n, c)) => assert!(c == cap && n <= cap + 1_151 / 3 + 1),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+    }
+
+    /// A rate change opens a segment converted from its own rate, whether the
+    /// decode has a target or returns the first packet's rate.
+    #[cfg(feature = "codecs")]
+    #[test]
+    fn a_rate_change_opens_a_segment_converted_from_its_own_rate() {
+        use crate::resample::resample_mono;
+
+        let a = tone(8_000, 16_000);
+        let b = tone(4_000, 8_000);
+        let c = tone(3_000, 16_000);
+        let packets = [
+            (16_000, &a[..5_000]),
+            (16_000, &a[5_000..]),
+            (8_000, &b[..1_000]),
+            (8_000, &b[1_000..]),
+            (16_000, &c[..]),
+        ];
+
+        let mut at_16k = a.clone();
+        at_16k.extend(resample_mono(&b, 8_000, 16_000).unwrap());
+        at_16k.extend(&c);
+        for target in [None, Some(16_000)] {
+            let got = through_sink(target, None, &packets).unwrap();
+            assert_eq!(got.sample_rate, 16_000);
+            assert!(got.samples == at_16k, "target {target:?}");
+        }
+
+        let mut at_48k = resample_mono(&a, 16_000, 48_000).unwrap();
+        at_48k.extend(resample_mono(&b, 8_000, 48_000).unwrap());
+        at_48k.extend(resample_mono(&c, 16_000, 48_000).unwrap());
+        let got = through_sink(Some(48_000), Some(at_48k.len()), &packets).unwrap();
+        assert!(got.samples == at_48k, "segments converted to 48 kHz");
+        let err = through_sink(Some(48_000), Some(at_48k.len() - 1), &packets).unwrap_err();
+        assert!(matches!(err, AudioError::TooLong(..)), "{err:?}");
+    }
 
     #[test]
     fn sniffs_the_container_families() {

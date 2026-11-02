@@ -6,7 +6,7 @@ use bytes::Bytes;
 use hound::{SampleFormat, WavReader};
 use thiserror::Error;
 
-use crate::resample::{resample_mono, Resampler, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
+use crate::resample::{expected_out, resample_mono, Resampler, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 
 #[derive(Debug, Error)]
 pub enum AudioError {
@@ -40,7 +40,8 @@ pub enum AudioError {
     #[error("unsupported codec: {0}")]
     UnsupportedCodec(String),
     /// The decoded waveform exceeded the configured ceiling.  Reported in
-    /// samples because that is what the caller can convert to seconds; a byte
+    /// samples at the rate the decode returns (the model's, for a serving
+    /// caller), because that is what the caller can convert to seconds; a byte
     /// cap on a compressed body says nothing about the decode's cost.
     #[error("decoded audio is too long ({0} samples > the {1}-sample limit)")]
     TooLong(usize, usize),
@@ -330,10 +331,16 @@ pub struct DecodeOptions<'a> {
     /// and ignores the request's, so audio arriving at another rate must be
     /// converted before it crosses PyO3.  `None` decodes without conversion.
     pub target_sample_rate: Option<u32>,
-    /// Ceiling on the decoded waveform, in samples at its **source** rate.
+    /// Ceiling on the decoded waveform, in samples at the rate the decode
+    /// **returns**: `target_sample_rate` when set, the source's own otherwise.
     /// `None` disables.  A byte cap on the request body cannot stand in for
     /// this once compressed containers are accepted: 1 MiB of Opus is an hour
     /// of audio, and the allocation happens before anything could notice.
+    ///
+    /// A serving caller converts to its model's rate, so `seconds x model rate`
+    /// is the same duration whatever rate the upload arrives at.  Counted at
+    /// the source rate, as it was, a 4-hour cap refused 48 kHz audio after 80
+    /// minutes and let 8 kHz audio run 8 hours.
     pub max_samples: Option<usize>,
 }
 
@@ -343,13 +350,33 @@ pub struct DecodeOptions<'a> {
 /// CPU-bound for as long as the clip is -- seconds for an hour of compressed
 /// audio -- so an async caller runs it through [`crate::DecodePool`].
 pub fn decode_audio(body: &[u8], opts: &DecodeOptions<'_>) -> Result<DecodedAudio, AudioError> {
-    let decoded = decode_to_source_rate(body, opts)?;
-    if let Some(cap) = opts.max_samples {
-        let n = decoded.samples.len();
-        if n > cap {
-            return Err(AudioError::TooLong(n, cap));
+    let decoded = match route(body, opts)? {
+        Route::Pcm(enc) => {
+            let sr = opts
+                .source_sample_rate
+                .ok_or(AudioError::MissingSampleRate)?;
+            // The sample count is known from the body, so a long one is
+            // refused before it is widened to f32.
+            check_length(body.len() / enc.sample_width(), sr, opts)?;
+            Waveform {
+                sample_rate: sr,
+                samples: pcm_to_f32(body, enc)?,
+            }
         }
-    }
+        // WAV stays on `hound`: it is the hot path for the raw-PCM surfaces,
+        // it handles 24-bit containers symphonia's reader treats differently,
+        // and it keeps WAV working with the `codecs` feature off.  Its waveform
+        // is bounded by the body, so it is decoded whole and checked before
+        // the conversion.
+        Route::Container(crate::codec::Container::Wav) => {
+            let wav = wav_waveform(body)?;
+            check_length(wav.samples.len(), wav.sample_rate, opts)?;
+            wav
+        }
+        // Converted while it decodes, and the ceiling checked a packet at a
+        // time: a compressed body says nothing about its decoded length.
+        Route::Container(other) => decode_compressed(body, other, opts)?,
+    };
     let converted = match opts.target_sample_rate {
         Some(target) => decoded.resampled_to(target)?,
         None => decoded,
@@ -399,40 +426,42 @@ pub(crate) fn linear_pass_samples(body: &[u8], opts: &DecodeOptions<'_>) -> Opti
     }
 }
 
-/// Decode without rate conversion: pick the container (or raw PCM) and run it.
-fn decode_to_source_rate(body: &[u8], opts: &DecodeOptions<'_>) -> Result<Waveform, AudioError> {
-    match route(body, opts)? {
-        Route::Pcm(enc) => {
-            let sr = opts
-                .source_sample_rate
-                .ok_or(AudioError::MissingSampleRate)?;
-            Ok(Waveform {
-                sample_rate: sr,
-                samples: pcm_to_f32(body, enc)?,
-            })
+/// Refuse a waveform of `n` samples at `rate` whose length at the rate the
+/// decode returns would exceed `opts.max_samples` -- before it is converted.
+///
+/// The converted length is the resampler's own, `round(n x target / rate)`,
+/// so the check agrees with the waveform the decode would have returned.
+fn check_length(n: usize, rate: u32, opts: &DecodeOptions<'_>) -> Result<(), AudioError> {
+    let Some(cap) = opts.max_samples else {
+        return Ok(());
+    };
+    let returned = match opts.target_sample_rate {
+        Some(target) if target != rate => {
+            crate::resample::validate_sample_rate(rate)?;
+            usize::try_from(expected_out(n as u64, rate, target)).unwrap_or(usize::MAX)
         }
-        // WAV stays on `hound`: it is the hot path for the raw-PCM surfaces,
-        // it handles 24-bit containers symphonia's reader treats differently,
-        // and it keeps WAV working with the `codecs` feature off.
-        Route::Container(crate::codec::Container::Wav) => wav_waveform(body),
-        Route::Container(other) => decode_compressed(body, other, opts.max_samples),
+        _ => n,
+    };
+    if returned > cap {
+        return Err(AudioError::TooLong(returned, cap));
     }
+    Ok(())
 }
 
 #[cfg(feature = "codecs")]
 fn decode_compressed(
     body: &[u8],
     container: crate::codec::Container,
-    max_samples: Option<usize>,
+    opts: &DecodeOptions<'_>,
 ) -> Result<Waveform, AudioError> {
-    crate::codec::container_waveform(body, container, max_samples)
+    crate::codec::container_waveform(body, container, opts.target_sample_rate, opts.max_samples)
 }
 
 #[cfg(not(feature = "codecs"))]
 fn decode_compressed(
     _body: &[u8],
     container: crate::codec::Container,
-    _max_samples: Option<usize>,
+    _opts: &DecodeOptions<'_>,
 ) -> Result<Waveform, AudioError> {
     Err(AudioError::CodecsDisabled(format!("{container:?}")))
 }
@@ -840,6 +869,41 @@ mod tests {
             ..opts
         };
         assert!(decode_audio(&wav, &opts).is_ok());
+    }
+
+    /// The ceiling counts the waveform the decode returns -- the model's rate,
+    /// for a serving caller -- not the upload's.  Counted at the source rate,
+    /// a cap of `seconds x 16 kHz` refused a 48 kHz WAV at a third of its
+    /// duration and let an 8 kHz one run twice as long.
+    #[test]
+    fn the_ceiling_counts_samples_at_the_rate_the_decode_returns() {
+        for rate in [48_000u32, 8_000] {
+            // One second at `rate`, converted to 16 kHz.
+            let wav = write_wav_i16(&vec![0i16; rate as usize], rate, 1);
+            let opts = |cap| DecodeOptions {
+                target_sample_rate: Some(16_000),
+                max_samples: Some(cap),
+                ..Default::default()
+            };
+            let dec = decode_audio(&wav, &opts(16_000)).unwrap();
+            assert_eq!(dec.samples.len(), 16_000 * 4, "{rate} Hz");
+            assert!(
+                matches!(
+                    decode_audio(&wav, &opts(15_999)),
+                    Err(AudioError::TooLong(16_000, 15_999))
+                ),
+                "{rate} Hz"
+            );
+        }
+        // Declared PCM is refused from the body's length, before it is widened.
+        let opts = DecodeOptions {
+            max_samples: Some(15_999),
+            ..pcm_opts(PcmEncoding::I16Le, Some(8_000), Some(16_000))
+        };
+        assert!(matches!(
+            decode_audio(&[0u8; 2 * 8_000], &opts),
+            Err(AudioError::TooLong(16_000, 15_999))
+        ));
     }
 
     /// A file upload declares no encoding, so a body matching no container is

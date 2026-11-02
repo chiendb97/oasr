@@ -359,8 +359,8 @@ pub struct Cli {
     /// docs recommend gRPC as the higher-throughput offline path.
     #[arg(long, default_value_t = 256)]
     pub max_audio_mib: usize,
-    /// Longest **decoded** audio one request may carry, in seconds.  0
-    /// disables.
+    /// Longest **decoded** audio one request may carry, in seconds of audio
+    /// whatever its sample rate.  0 disables.
     ///
     /// `--max-audio-mib` bounds the *encoded* body, and once compressed
     /// containers are accepted the two stop being related: a few MiB of MP3 is
@@ -461,6 +461,10 @@ impl Cli {
 
     /// Ceiling on the decoded waveform in samples at `model_sample_rate`, or
     /// `None` when disabled.
+    ///
+    /// The model's rate is the one every consumer counts in: a unary decode
+    /// applies the cap after converting to it (`DecodeOptions::max_samples`),
+    /// and the streaming surfaces buffer audio already converted.
     pub fn max_audio_samples(&self, model_sample_rate: u32) -> Option<usize> {
         (self.max_audio_seconds > 0)
             .then(|| (self.max_audio_seconds as usize).saturating_mul(model_sample_rate as usize))
