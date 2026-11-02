@@ -415,11 +415,12 @@ def _validate_inputs(
 
     if attn_bias is not None:
         bs = attn_bias.shape
-        # ``attn_bias`` may be padded up to the kernel's (M_BLOCK, N_BLOCK)
-        # tile size along the T_q and T_k axes so the cute kernel's
-        # unpredicated bias-tile reads stay in-bounds even when the active
-        # ``T_q`` / ``T_k`` are smaller. We accept any padded extent.
-        if len(bs) != 4 or bs[0] != B or bs[1] != H or bs[2] < T_q or bs[3] < T_k:
+        # Any padded extent is accepted: a caller may pad up to the CuTeDSL
+        # kernel's (M_BLOCK, N_BLOCK) tile itself.  A paged bias's key axis is
+        # not checked.  It is the caller's logical extent, which only the
+        # per-stream lengths bound, and `T_k` here is the table's width cut to
+        # it in whole K tiles, so it can exceed the bias without anything wrong.
+        if len(bs) != 4 or bs[0] != B or bs[1] != H or bs[2] < T_q or (not paged and bs[3] < T_k):
             raise ValueError(
                 f"attn_bias must be (B, H, ≥T_q, ≥T_k) = ({B}, {H}, ≥{T_q}, ≥{T_k}); "
                 f"got {tuple(attn_bias.shape)}"
@@ -565,17 +566,10 @@ def fmha(
         assert block_table is not None  # narrowing for the type checker
         H_kv = k.size(2)
         block_size = k.size(1)
-        # Pad the caller's bias up to the cute kernel's CTA tile and trim
-        # the block table to match.  The cute kernel reads the bias tile
-        # unpredicated; padding keeps every read in-bounds under CUDA Graph
-        # capture.  The SDPA fallback trims oversized bias, so this is
-        # backend-neutral.
-        attn_bias, block_table = _pad_paged_inputs(
-            attn_bias,
-            block_table,
-            block_size=block_size,
-        )
-        T_k = block_table.size(1) * block_size
+        # The extent the CuTeDSL lane's padded inputs have, without padding
+        # them: only that lane needs the padding (`_pad_paged_inputs`, at its
+        # call), and the C++ split decision sees this number.
+        T_k = _paged_table_width(attn_bias, block_table, block_size=block_size) * block_size
     else:
         H_kv = k.size(1)
         T_k = k.size(2)
@@ -692,6 +686,11 @@ def fmha(
     if backend == "sdpa" or q.dtype not in (torch.float16, torch.bfloat16):
         if block_table is not None:
             k_dense, v_dense = gather_paged_kv(k, v, block_table)
+            # The gathered key axis is a whole number of pages and the bias is
+            # the caller's logical extent, which bounds the lengths anyway.
+            if attn_bias is not None and attn_bias.size(-1) < k_dense.size(2):
+                k_dense = k_dense[:, :, : attn_bias.size(-1)]
+                v_dense = v_dense[:, :, : attn_bias.size(-1)]
         else:
             k_dense, v_dense = k, v
         out.copy_(
@@ -710,6 +709,8 @@ def fmha(
         )
         return out
 
+    if block_table is not None:
+        attn_bias, block_table = _pad_paged_inputs(attn_bias, block_table, block_size=block_size)
     return _call_cute_dsl(
         q,
         k,
@@ -1036,18 +1037,53 @@ def _call_cute_dsl_varlen(
 # ---------------------------------------------------------------------------
 
 
+def _round_up(n: int, tile: int) -> int:
+    return -(-n // tile) * tile
+
+
+def _paged_table_width(
+    attn_bias: Optional[torch.Tensor],
+    block_table: torch.Tensor,
+    *,
+    block_size: int,
+) -> int:
+    """How many block-table columns :func:`_pad_paged_inputs` leaves.
+
+    The table squared to whole K tiles, then cut to the bias's key axis rounded
+    up to a K tile, when there is a bias.  A number, so the C++ lane, which
+    needs neither, can size its split decision without the copies.  There it
+    feeds only that heuristic (the kernel walks each stream's own length), and
+    it is the number the split decision has always seen.
+    """
+    blocks_per_tile = max(1, _KERNEL_N_BLOCK // max(1, block_size))
+    width = _round_up(block_table.size(1), blocks_per_tile)
+    if attn_bias is not None:
+        width = min(width, _round_up(attn_bias.size(-1), _KERNEL_N_BLOCK) // block_size)
+    return width
+
+
 def _pad_paged_inputs(
     attn_bias: Optional[torch.Tensor],
     block_table: torch.Tensor,
     *,
     block_size: int,
 ) -> tuple:
-    """Pad ``attn_bias`` and square ``block_table`` up to the kernel tile.
+    """Pad ``attn_bias`` and square ``block_table`` up to the CuTeDSL kernel's tile.
+
+    For the CuTeDSL lane only.  The C++ lane predicates its page-id read against
+    the table's width and its bias read against the bias's own extents
+    (``include/oasr/attention/fmha_paged_kv.h``, ``fmha_bias.h``); handed the
+    padded bias, it read a whole 64-row tile per streaming chunk of 8 or 16
+    query rows.  And the cut below is exact only for a page that divides the K
+    tile, which the CuTeDSL lane requires and the others do not: at 13- or
+    48-frame pages it dropped a page of real keys from the C++ lane's and the
+    SDPA reference's walks.
 
     Two separate requirements, both about tiles the kernel walks whole.
 
-    **The block table**, always.  A paged K tile spans ``N_BLOCK // block_size``
-    pool blocks and the loader indexes them *unpredicated* — tile row ``r`` reads
+    **The block table**, with or without a bias.  A paged K tile spans
+    ``N_BLOCK // block_size`` pool blocks and the loader indexes them
+    *unpredicated* — tile row ``r`` reads
     ``block_table[b, n_block * blocks_per_tile + r // block_size]``.  A table
     whose width is not a multiple of ``blocks_per_tile`` therefore has its last
     tile read past the tensor, and what comes back is not a page id but whatever
@@ -1067,20 +1103,20 @@ def _pad_paged_inputs(
     the ``ceil(T_kv / N_BLOCK)`` walk only indexes rows we populated — still a
     whole number of tiles, so the widening above is preserved.
     """
-    blocks_per_tile = max(1, _KERNEL_N_BLOCK // max(1, block_size))
-    width = block_table.size(1)
-    squared = -(-width // blocks_per_tile) * blocks_per_tile
-    if squared > width:
-        tail = block_table[:, -1:].expand(-1, squared - width)
+    width = _paged_table_width(attn_bias, block_table, block_size=block_size)
+    if width > block_table.size(1):
+        tail = block_table[:, -1:].expand(-1, width - block_table.size(1))
         block_table = torch.cat([block_table, tail], dim=1)
+    elif width < block_table.size(1):
+        block_table = block_table[:, :width]
 
     if attn_bias is None:
         return attn_bias, block_table
 
     T_q = attn_bias.size(-2)
     T_kv = attn_bias.size(-1)
-    T_q_padded = ((T_q + _KERNEL_M_BLOCK - 1) // _KERNEL_M_BLOCK) * _KERNEL_M_BLOCK
-    T_kv_padded = ((T_kv + _KERNEL_N_BLOCK - 1) // _KERNEL_N_BLOCK) * _KERNEL_N_BLOCK
+    T_q_padded = _round_up(T_q, _KERNEL_M_BLOCK)
+    T_kv_padded = _round_up(T_kv, _KERNEL_N_BLOCK)
 
     if T_q_padded > T_q or T_kv_padded > T_kv:
         B, H = attn_bias.shape[:2]
@@ -1094,10 +1130,6 @@ def _pad_paged_inputs(
         )
         padded[:, :, :T_q, :T_kv] = attn_bias
         attn_bias = padded
-
-    max_blocks_needed = T_kv_padded // block_size
-    if block_table.size(1) > max_blocks_needed:
-        block_table = block_table[:, :max_blocks_needed]
 
     return attn_bias, block_table
 
@@ -1218,13 +1250,10 @@ def _fmha_kv8(
     if paged:
         assert block_table is not None
         block_size = k.size(1)
-        # The split decision sees the K extent the served-dtype path would see
-        # after squaring the table to whole K tiles (`_pad_paged_inputs`), so
+        # The split decision sees the K extent the served-dtype path sees, so
         # both decide alike for one cache; the table itself is passed as-is,
         # because the C++ loader predicates the page-id read.
-        blocks_per_tile = max(1, _KERNEL_N_BLOCK // max(1, block_size))
-        width = -(-block_table.size(1) // blocks_per_tile) * blocks_per_tile
-        T_k = width * block_size
+        T_k = _paged_table_width(None, block_table, block_size=block_size) * block_size
     else:
         T_k = k.size(2)
 

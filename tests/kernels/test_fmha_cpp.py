@@ -371,6 +371,99 @@ class TestArbitraryStrides:
         torch.testing.assert_close(got, want, **FMHA_TOL)
 
 
+class TestPagedInputsAsGiven:
+    """A paged call hands the caller's bias and block table to this lane untouched.
+
+    The CuTeDSL kernel reads the bias tile and the table's last K tile
+    unpredicated, so ``fmha`` pads the bias to whole 64x64 tiles and squares the
+    table for it (``_pad_paged_inputs``).  This lane predicates both reads
+    (``fmha_bias.h``, ``fmha_paged_kv.h``) and was handed the padded copies
+    anyway: two allocations per layer per chunk, and a 64-row bias read for an 8-
+    or 16-row streaming chunk.  The padding also cut the table to
+    ``T_kv_padded // page`` pages, which drops a page of real keys whenever the
+    page does not divide the K tile -- a page this lane takes and the CuTeDSL one
+    refuses.
+    """
+
+    @staticmethod
+    def _paged(B, H, T_q, T_kv, page, *, extra=0, seed=0):
+        """A pool, a shuffled table ``extra`` pages wider than ``T_kv`` needs, a bias."""
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        width = -(-T_kv // page) + extra
+        npages = B * width + 3
+        k = torch.randn(npages, page, H, 64, dtype=torch.float16, device="cuda", generator=g)
+        v = torch.randn(npages, page, H, 64, dtype=torch.float16, device="cuda", generator=g)
+        table = torch.randperm(npages, device="cuda", generator=g)[: B * width]
+        q = torch.randn(B, H, T_q, 64, dtype=torch.float16, device="cuda", generator=g)
+        bias = torch.randn(B, H, T_q, T_kv, dtype=torch.float16, device="cuda", generator=g)
+        lens = torch.full((B,), T_kv, dtype=torch.int32, device="cuda")
+        return q, k, v, bias, lens, table.view(B, width).to(torch.int32)
+
+    def test_a_streaming_chunk_is_not_copied(self, fmha_cxx):
+        # 16 query rows against 64 cached frames plus themselves, 16-frame
+        # pages, and a table of 7 pages: neither tile-aligned nor whole K tiles.
+        q, k, v, bias, lens, table = self._paged(4, 4, 16, 80, 16, extra=2)
+        out = torch.empty_like(q)
+        n = TestArbitraryStrides._allocations(
+            lambda: fmha_cxx(
+                q,
+                k,
+                v,
+                softmax_scale=0.125,
+                attn_bias=bias,
+                cache_seqlens=lens,
+                block_table=table,
+                out=out,
+            )
+        )
+        assert n == 0, (
+            f"the C++ lane made {n} allocation(s) on a paged call with a bias -- "
+            f"the CuTeDSL lane's tile padding, which this lane does not read"
+        )
+
+    @pytest.mark.parametrize(
+        "B,T_q,T_kv,page",
+        [
+            (4, 16, 80, 16),  # a streaming chunk
+            (2, 8, 133, 8),  # an 8-row chunk, odd keys
+            (3, 64, 200, 64),  # a page per K tile
+            (1, 1, 4095, 32),  # one query: the split-KV path
+        ],
+    )
+    def test_the_padding_changes_no_bit(self, fmha_cxx, B, T_q, T_kv, page):
+        from oasr.functionals.attention import _pad_paged_inputs
+
+        q, k, v, bias, lens, table = self._paged(B, 4, T_q, T_kv, page, extra=1, seed=T_kv)
+        got = fmha_cxx(
+            q, k, v, softmax_scale=0.125, attn_bias=bias, cache_seqlens=lens, block_table=table
+        )
+        padded_bias, padded_table = _pad_paged_inputs(bias, table, block_size=page)
+        want = fmha_cxx(
+            q,
+            k,
+            v,
+            softmax_scale=0.125,
+            attn_bias=padded_bias,
+            cache_seqlens=lens,
+            block_table=padded_table,
+        )
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("page,T_kv", [(13, 64), (14, 127), (48, 100), (100, 120)])
+    def test_every_page_of_keys_is_read(self, fmha_cxx, page, T_kv):
+        from oasr.functionals.attention import gather_paged_kv
+
+        q, k, v, bias, lens, table = self._paged(2, 4, 16, T_kv, page, seed=page)
+        got = fmha_cxx(
+            q, k, v, softmax_scale=0.125, attn_bias=bias, cache_seqlens=lens, block_table=table
+        )
+        k_d, v_d = gather_paged_kv(k, v, table)
+        want = ref_fmha(
+            q, k_d[:, :, :T_kv], v_d[:, :, :T_kv], 0.125, attn_bias=bias, cache_seqlens=lens
+        )
+        torch.testing.assert_close(got, want, **FMHA_TOL)
+
+
 class TestOutIsHonouredWhenStrided:
     def test_a_strided_out_receives_the_result(self, fmha_cxx):
         B, H, T, D = 2, 4, 32, 64

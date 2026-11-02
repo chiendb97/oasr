@@ -290,6 +290,45 @@ def test_fmha_paged_matches_sdpa(fmha, cuda, dtype, shape, with_bias):
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("page,T_kv", [(13, 64), (14, 127), (48, 100), (100, 120)])
+def test_the_paged_reference_reads_every_page(cuda, page, T_kv):
+    """``backend="sdpa"`` on a page that does not divide the 64-wide K tile.
+
+    The reference used to get the CuTeDSL lane's padded inputs, which cut the
+    table to ``T_kv_padded // page`` pages: exact for a page that divides the K
+    tile, the only kind that lane takes, and a page of real keys short for the
+    rest.  ``OASR_ATTN_BACKEND=sdpa`` sends every paged call here, those pages
+    included (Nemotron pages by its chunk, a multiple of 4 frames).
+    """
+    from oasr.functionals.attention import gather_paged_kv
+
+    B, H, T_q, D = 2, 4, 16, 64
+    torch.manual_seed(page)
+    width = -(-T_kv // page)
+    k_pool = torch.randn(B * width + 3, page, H, D, device=cuda, dtype=torch.float16)
+    v_pool = torch.randn_like(k_pool)
+    table = torch.randperm(B * width + 3, device=cuda)[: B * width].view(B, width).int()
+    q = torch.randn(B, H, T_q, D, device=cuda, dtype=torch.float16)
+    bias = torch.randn(B, H, T_q, T_kv, device=cuda, dtype=torch.float16)
+    lens = torch.full((B,), T_kv, dtype=torch.int32, device=cuda)
+
+    out = _dense_fmha(
+        q,
+        k_pool,
+        v_pool,
+        softmax_scale=D**-0.5,
+        attn_bias=bias,
+        cache_seqlens=lens,
+        block_table=table,
+        backend="sdpa",
+    )
+    k_d, v_d = gather_paged_kv(k_pool, v_pool, table)
+    ref = _ref_fmha(
+        q, k_d[:, :, :T_kv], v_d[:, :, :T_kv], D**-0.5, attn_bias=bias, cache_seqlens=lens
+    )
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+
 def test_offline_lengths_belong_to_the_call(cuda):
     """A captured offline call must write only memory it owns.
 

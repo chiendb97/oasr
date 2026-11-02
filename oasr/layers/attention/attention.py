@@ -257,7 +257,7 @@ class RelPositionMultiHeadedAttention(nn.Module):
         #    and enforces the per-stream length mask from ``cache_seqlens``
         #    (no host-side pad_bias add).  ``attn_bias`` is the pre-scaled
         #    Transformer-XL ``matrix_bd``; ``oasr.fmha`` rounds it up to the
-        #    cute kernel's CTA tile internally.
+        #    CuTeDSL kernel's CTA tile when that lane serves the call.
         scale = 1.0 / math.sqrt(self.d_k)
         combined_bias = matrix_bd * scale  # (B, H, T_q, T_kv_max)
         total_kv_lens = cache.cache_seqlens + T_q  # (B,) on GPU
