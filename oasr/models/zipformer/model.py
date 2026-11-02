@@ -19,12 +19,11 @@ import math
 from typing import List, Mapping, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from oasr.cache.state import StreamStateSpec
 
-from ..base import BaseAsrModel, BaseEncoder, LoadReport
+from ..base import BaseAsrModel, BaseEncoder, LoadReport, pad_output_projection
 from ..heads.ctc import CTCHead
 from .config import ZipformerEncoderConfig, ZipformerModelConfig
 from .encoder import Zipformer2, _to_tuple
@@ -382,9 +381,11 @@ class ZipformerModel(BaseAsrModel):
 
         icefall keys ``encoder_embed.*`` / ``encoder.*`` / ``ctc_output.1.*`` map
         to ``encoder.encoder_embed.*`` / ``encoder.encoder.*`` / ``ctc.ctc_lo.*``.
-        The CTC weight/bias is zero-padded up to this model's (8-aligned) vocab
-        when the checkpoint's vocab is smaller (the GEMM kernels require
-        N % 8 == 0).  Non-consumed checkpoint keys (transducer predictor/joiner,
+        The CTC projection is widened to this model's (8-aligned) vocab when the
+        checkpoint's vocab is smaller (the GEMM kernels require N % 8 == 0), by
+        :func:`~oasr.models.base.pad_output_projection`: zero weights and a
+        ``PAD_LOGIT`` bias, so a padding class never wins.  Non-consumed
+        checkpoint keys (transducer predictor/joiner,
         attention decoder, pruned-RNNT ``simple_*_proj``) land in
         ``LoadReport.dropped`` — the registry decides which of those are
         expected vs. a named capability loss.
@@ -401,14 +402,8 @@ class ZipformerModel(BaseAsrModel):
             else:
                 dropped.append(k)
 
-        if "ctc.ctc_lo.weight" in remapped:
-            target_vocab = self.ctc.ctc_lo.weight.shape[0]
-            w = remapped["ctc.ctc_lo.weight"]
-            b = remapped["ctc.ctc_lo.bias"]
-            pad = target_vocab - w.shape[0]
-            if pad > 0:
-                remapped["ctc.ctc_lo.weight"] = F.pad(w, (0, 0, 0, pad))
-                remapped["ctc.ctc_lo.bias"] = F.pad(b, (0, pad))
+        # Padding classes get a PAD_LOGIT bias, not 0 (see pad_output_projection).
+        pad_output_projection(remapped, "ctc.ctc_lo.", self.ctc.ctc_lo.weight.shape[0])
 
         missing, unexpected = self.load_state_dict(remapped, strict=strict)
         if missing:

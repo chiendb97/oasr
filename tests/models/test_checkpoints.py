@@ -265,7 +265,9 @@ class TestBaseContract:
 
 class TestLoadWeights:
     def test_load_weights_pads_ctc_vocab(self):
-        """load_weights zero-pads an unpadded-vocab CTC head up to the model's vocab."""
+        """load_weights widens an unpadded-vocab CTC head up to the model's vocab."""
+        from oasr.models.base import PAD_LOGIT
+
         model = ConformerModel.from_config(_tiny_config())  # vocab=32 (8-aligned)
         sd = dict(model.state_dict())
         # Simulate a checkpoint whose CTC vocab (30) is smaller than the model's.
@@ -276,8 +278,23 @@ class TestLoadWeights:
 
         assert model.ctc.ctc_lo.weight.shape[0] == 32
         assert model.ctc.ctc_lo.bias.shape[0] == 32
-        # The padded rows are zero-filled.
+        # The padded rows have zero weights and a PAD_LOGIT bias, not 0.
         assert model.ctc.ctc_lo.weight[30:].abs().sum().item() == 0.0
+        assert model.ctc.ctc_lo.bias[30:].tolist() == [PAD_LOGIT, PAD_LOGIT]
+
+    def test_a_ctc_padding_class_never_wins(self):
+        """On a frame whose real logits are all negative, a padding class at
+        bias 0 was the argmax -- an id past the tokenizer's vocabulary."""
+        model = ConformerModel.from_config(_tiny_config()).eval()
+        sd = dict(model.state_dict())
+        sd["ctc.ctc_lo.weight"] = torch.zeros(30, sd["ctc.ctc_lo.weight"].shape[1])
+        sd["ctc.ctc_lo.bias"] = torch.linspace(-3.0, -1.0, 30)
+        model.load_weights(sd)
+
+        with torch.no_grad():
+            log_probs = model.ctc(torch.zeros(1, 1, sd["ctc.ctc_lo.weight"].shape[1]))
+        assert log_probs.argmax(-1).item() == 29
+        assert log_probs[..., 30:].exp().sum().item() == 0.0
 
     def test_load_weights_returns_report(self):
         """Every checkpoint key is accounted for: mapped or dropped, never silent."""

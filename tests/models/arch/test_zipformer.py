@@ -76,6 +76,15 @@ def _load_reference(tmp_path):
     return ref_zip, ref_sub
 
 
+#: CPU/fp32 always (the torch path of every layer), and the served kernel path
+#: when there is a GPU.
+_DEVICES = [("cpu", torch.float32)] + (
+    [("cuda", torch.float16)] if torch.cuda.is_available() else []
+)
+#: One device for a test that needs only one: the kernels when there is a GPU.
+_DEVICE, _DTYPE = _DEVICES[-1]
+
+
 def _tiny_encoder_config(causal=False, chunk_size=(-1,), left_context_frames=(-1,)):
     # All derived projection dims must be multiples of 8: the OASR GEMM kernels
     # (oasr.gemm / oasr.layers.Linear) require N % 8 == K % 8 == 0.  encoder_dim
@@ -168,16 +177,14 @@ class TestZipformerRegistry:
         with pytest.raises(ValueError, match="not configured for streaming"):
             _ = model.encoder.streaming_chunk_frames
 
-    def test_forward_shapes(self):
-        # The CTC head uses the CUDA-only gemm_log_softmax kernel.
-        if not torch.cuda.is_available():
-            pytest.skip("CTC head (gemm_log_softmax) requires CUDA")
-        device = "cuda"
+    @pytest.mark.parametrize("device,dtype", _DEVICES)
+    def test_forward_shapes(self, device, dtype):
+        # CPU/fp32 is the torch path of every layer; it raised on the first
+        # Swoosh before the model's kernel calls went through the waist.
         cfg = ZipformerModelConfig(encoder=_tiny_encoder_config(), vocab_size=32)
-        # gemm_log_softmax supports FP16/BF16 only.
-        model = ZipformerModel.from_config(cfg).eval().to(device).half()
+        model = ZipformerModel.from_config(cfg).eval().to(device, dtype)
         B, T = 2, 80
-        x = torch.randn(B, T, 80, device=device, dtype=torch.float16)
+        x = torch.randn(B, T, 80, device=device, dtype=dtype)
         xl = torch.tensor([T, T - 8], dtype=torch.int32, device=device)
         with torch.no_grad():
             log_probs, out_lens = model.forward_offline(x, xl)
@@ -240,6 +247,76 @@ class TestZipformerRegistry:
 # --------------------------------------------------------------------------- #
 # in_proj head-interleave migration (always run, CPU)
 # --------------------------------------------------------------------------- #
+
+
+class TestCheckpointLoading:
+    """What the icefall converter loads, and from which file."""
+
+    def test_ctc_padding_classes_get_pad_logit(self):
+        """The CTC head is widened 30 -> 32 with zero weights and a PAD_LOGIT
+        bias.  At bias 0 a padding class was the argmax of any frame whose real
+        logits were all negative."""
+        from oasr.models.base import PAD_LOGIT
+
+        cfg = ZipformerModelConfig(encoder=_tiny_encoder_config(), vocab_size=32)
+        model = ZipformerModel.from_config(cfg).eval()
+        dim = model.encoder.output_size
+        sd = {
+            "ctc_output.1.weight": torch.zeros(30, dim),
+            "ctc_output.1.bias": torch.linspace(-3.0, -1.0, 30),
+        }
+        model.load_weights(sd)  # encoder keys absent: non-strict
+
+        head = model.ctc.ctc_lo
+        assert head.weight[30:].abs().sum().item() == 0.0
+        assert head.bias[30:].tolist() == [PAD_LOGIT, PAD_LOGIT]
+        with torch.no_grad():
+            log_probs = model.ctc(torch.zeros(1, 1, dim))
+        assert log_probs.argmax(-1).item() == 29
+
+    @staticmethod
+    def _save(path, marker):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model": {"marker": torch.tensor(marker)}}, path)
+
+    def _loaded(self, ckpt_dir, checkpoint_name="final.pt"):
+        sd = IcefallConverter().load_state_dict(ckpt_dir, checkpoint_name, "cpu")
+        return int(sd["marker"])
+
+    def test_the_latest_epoch_is_the_highest_number(self, tmp_path):
+        """Sorted as strings, ``epoch-9.pt`` came after ``epoch-30.pt``."""
+        for n in (9, 10, 30, 2):
+            self._save(tmp_path / "exp" / f"epoch-{n}.pt", n)
+        # An averaged model is not an epoch; it does not shadow epoch-30.
+        self._save(tmp_path / "exp" / "epoch-30-avg-9.pt", -1)
+        assert self._loaded(tmp_path) == 30
+
+    def test_a_named_checkpoint_selects_an_older_epoch(self, tmp_path):
+        for n in (9, 30):
+            self._save(tmp_path / "exp" / f"epoch-{n}.pt", n)
+        assert self._loaded(tmp_path, "epoch-9.pt") == 9
+
+    def test_a_released_name_outranks_the_epochs(self, tmp_path):
+        self._save(tmp_path / "exp" / "epoch-30.pt", 30)
+        self._save(tmp_path / "exp" / "pretrained.pt", 0)
+        assert self._loaded(tmp_path) == 0
+
+    def test_epochs_under_exp_outrank_stray_files_at_the_root(self, tmp_path):
+        self._save(tmp_path / "averaged.pt", -1)
+        self._save(tmp_path / "exp" / "epoch-3.pt", 3)
+        assert self._loaded(tmp_path) == 3
+
+    def test_a_lone_checkpoint_is_taken(self, tmp_path):
+        self._save(tmp_path / "best-valid-loss.pt", 7)
+        assert self._loaded(tmp_path) == 7
+
+    def test_several_unnamed_checkpoints_are_refused(self, tmp_path):
+        """Name order said nothing about which was meant, so the first name won."""
+        self._save(tmp_path / "best-valid-loss.pt", 1)
+        self._save(tmp_path / "checkpoint-8000.pt", 2)
+        with pytest.raises(ValueError, match="best-valid-loss.pt, checkpoint-8000.pt"):
+            self._loaded(tmp_path)
+        assert self._loaded(tmp_path, "checkpoint-8000.pt") == 2
 
 
 def _attn_weight_modules(model):
@@ -350,15 +427,13 @@ class TestStreamingContract:
         enc = self._model(chunk=chunk).encoder
         assert enc.streaming_window_frames == 2 * chunk + 13
         assert enc.streaming_chunk_frames == 2 * chunk
-        if not torch.cuda.is_available():
-            return  # the embed's streaming forward runs OASR kernels
-        embed = enc.encoder_embed.half().cuda()
-        x = torch.zeros(1, enc.streaming_window_frames, 80, device="cuda", dtype=torch.float16)
+        embed = enc.encoder_embed.to(_DEVICE, _DTYPE)
+        x = torch.zeros(1, enc.streaming_window_frames, 80, device=_DEVICE, dtype=_DTYPE)
         with torch.no_grad():
             y, y_lens, _ = embed.streaming_forward(
                 x,
-                torch.tensor([x.size(1)], device="cuda"),
-                embed.get_init_states(1, device="cuda", dtype=torch.float16),
+                torch.tensor([x.size(1)], device=_DEVICE),
+                embed.get_init_states(1, device=_DEVICE, dtype=_DTYPE),
             )
         assert y.size(1) == chunk and int(y_lens[0]) == chunk
 
@@ -381,18 +456,16 @@ class TestStreamingContract:
     def test_the_left_context_is_masked_until_it_holds_audio(self):
         """icefall masks the part of the cache that is still initial zeros; the
         counter that drives it advances by the embed frames of every chunk."""
-        if not torch.cuda.is_available():
-            pytest.skip("the streaming forward runs OASR kernels")
-        model = self._model(chunk=16, left=32).half().cuda()
+        model = self._model(chunk=16, left=32).to(_DEVICE, _DTYPE)
         enc = model.encoder
-        states = enc.get_streaming_init_states(1, device="cuda", dtype=torch.float16)
+        states = enc.get_streaming_init_states(1, device=_DEVICE, dtype=_DTYPE)
         w = enc.streaming_window_frames
         seen = []
         with torch.no_grad():
             for _ in range(3):
-                x = torch.randn(1, w, 80, device="cuda", dtype=torch.float16)
+                x = torch.randn(1, w, 80, device=_DEVICE, dtype=_DTYPE)
                 _, _, states = enc.streaming_forward(
-                    x, torch.tensor([w], dtype=torch.int32, device="cuda"), states
+                    x, torch.tensor([w], dtype=torch.int32, device=_DEVICE), states
                 )
                 seen.append(int(states[-1][0]))
         assert seen == [16, 32, 48]

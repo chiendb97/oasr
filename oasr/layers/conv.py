@@ -731,10 +731,15 @@ class Glu(nn.Module):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if use_conv_kernel(x):
-            gated: torch.Tensor = oasr.glu(x)
-            return gated
-        return F.glu(x, dim=-1)
+        return glu(x)
+
+
+def glu(x: torch.Tensor) -> torch.Tensor:
+    """The function form of :class:`Glu`, for a caller that gates inline."""
+    if use_conv_kernel(x):
+        gated: torch.Tensor = oasr.glu(x)
+        return gated
+    return F.glu(x, dim=-1)
 
 
 __all__ = [

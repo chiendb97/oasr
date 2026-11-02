@@ -25,7 +25,7 @@ from ._quantizable import (
     QuantizableLayer,
     QuantizedActivation,
 )
-from .activation import Gelu, Relu, Sigmoid, Tanh
+from .activation import Gelu, Relu, Sigmoid, SwooshL, SwooshR, Tanh
 from .attention import Attention, RelPositionMultiHeadedAttention
 from .conv import (
     Conv1d,
@@ -77,6 +77,8 @@ __all__ = [
     "Gelu",
     "Relu",
     "Sigmoid",
+    "SwooshL",
+    "SwooshR",
     "Tanh",
     # Convolution
     "Conv1d",
