@@ -323,18 +323,10 @@ class TestRealtimeStreaming:
                 elif event["type"] == "input_audio_buffer.commit":
                     seen["committed"] = True
                     break
-            # Two interim updates, then the final — the server's own shape:
-            # `delta` is the increment, `text` the transcript so far.
-            for delta, text in (("hello", "hello"), (" world", "hello world")):
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "conversation.item.input_audio_transcription.delta",
-                            "delta": delta,
-                            "text": text,
-                        }
-                    )
-                )
+            # Two interim updates, then the final -- the server's own shape:
+            # `delta` is the increment and nothing else.
+            for delta in ("hello", " world"):
+                await ws.send(_delta(delta))
             await ws.send(
                 json.dumps(
                     {
@@ -402,6 +394,220 @@ class TestRealtimeStreaming:
 
         with pytest.raises(OASRClientError, match="no audio received"):
             asyncio.run(go())
+
+    @staticmethod
+    def _session(handler, consume):
+        """Serve ``handler`` on a local socket and run ``consume(client)``."""
+        import asyncio
+
+        websockets = pytest.importorskip("websockets")
+
+        async def go():
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                return await asyncio.wait_for(
+                    consume(AsyncOASRClient(f"http://127.0.0.1:{port}")), 10
+                )
+
+        return asyncio.run(go())
+
+    def test_a_revision_replaces_the_transcript(self):
+        """A partial that revises the transcript has no increment: the server
+        sends the corrected text as ``text``, including a revision to nothing."""
+
+        async def handler(ws):
+            async for message in ws:
+                if isinstance(message, str) and "commit" in message:
+                    break
+            for event in (
+                _delta("their"),
+                _delta("", text="there are"),
+                _delta(" two"),
+                _delta("", text=""),
+                _delta("two"),
+            ):
+                await ws.send(event)
+            await ws.send(_completed("two"))
+
+        async def consume(client):
+            return [(e.text, e.delta) async for e in client.stream([b"\x00\x01"])]
+
+        assert self._session(handler, consume) == [
+            ("their", "their"),
+            ("there are", ""),
+            ("there are two", " two"),
+            ("", ""),
+            ("two", "two"),
+            ("two", ""),
+        ]
+
+    def test_events_arrive_while_the_audio_is_still_being_sent(self):
+        """Interim results are read as the audio goes out, not after it.
+
+        The source does not produce its second chunk until the caller has seen
+        40 events -- more than the 16 that `websockets` queues unread before it
+        stops reading the socket, pongs included.  Read only after the commit,
+        this waited forever; against a live server, a session longer than ~40 s
+        died of its own keepalive timeout.
+        """
+        import asyncio
+
+        async def handler(ws):
+            sent = False
+            async for message in ws:
+                if isinstance(message, bytes) and not sent:
+                    sent = True
+                    for i in range(40):
+                        await ws.send(_delta(f" w{i}"))
+                elif isinstance(message, str) and "commit" in message:
+                    break
+            await ws.send(_completed("done"))
+
+        async def consume(client):
+            seen = asyncio.Event()
+            events = []
+
+            async def source():
+                yield b"\x00\x01" * 40
+                await asyncio.wait_for(seen.wait(), 5)
+                yield b"\x00\x01" * 40
+
+            async for e in client.stream(source()):
+                events.append(e)
+                if len(events) == 40:
+                    seen.set()
+            return events
+
+        events = self._session(handler, consume)
+        assert len(events) == 41 and events[-1].is_final
+        assert events[39].text == "".join(f" w{i}" for i in range(40))
+
+    def test_a_sync_source_that_never_suspends_still_lets_events_in(self):
+        """A list or a plain generator never yields to the loop, and a send
+        that the socket takes at once does not either, so the sender gives the
+        reader a turn per chunk.  Without it the first event waited for the
+        last chunk, exactly as when nothing read until the commit."""
+        seen = {}
+
+        async def handler(ws):
+            answered = False
+            async for message in ws:
+                if isinstance(message, bytes) and not answered:
+                    answered = True
+                    await ws.send(_delta("hi"))
+                elif isinstance(message, str) and "commit" in message:
+                    break
+            await ws.send(_completed("hi"))
+
+        def source():
+            for i in range(5000):
+                seen["pending"] = i
+                yield b"\x00\x01" * 40
+
+        async def consume(client):
+            async for _ in client.stream(source()):
+                seen.setdefault("first_event_at_chunk", seen["pending"])
+            return seen
+
+        got = self._session(handler, consume)
+        assert got["first_event_at_chunk"] < 4999, got
+
+    def test_a_failing_source_raises_its_own_error(self):
+        async def handler(ws):
+            async for _ in ws:
+                pass
+
+        async def consume(client):
+            async def source():
+                yield b"\x00\x01" * 40
+                raise ValueError("microphone unplugged")
+
+            return [e async for e in client.stream(source())]
+
+        with pytest.raises(ValueError, match="microphone unplugged"):
+            self._session(handler, consume)
+
+    def test_a_session_closed_without_a_final_raises(self):
+        """The iterator ending normally means the final arrived; a session the
+        server dropped must not look like one that finished."""
+
+        async def handler(ws):
+            async for message in ws:
+                if isinstance(message, str) and "commit" in message:
+                    break
+            await ws.send(_delta("partial"))
+
+        async def consume(client):
+            return [e async for e in client.stream([b"\x00\x01"])]
+
+        with pytest.raises(OASRClientError, match="closed before the final"):
+            self._session(handler, consume)
+
+    def test_a_final_before_the_audio_ends_finishes_the_stream(self):
+        """A server may close the turn itself (an endpointer, a length cap)
+        while audio is still going out.  That is the end of the stream, not a
+        failure to send the rest."""
+        import asyncio
+
+        async def handler(ws):
+            async for message in ws:
+                if isinstance(message, bytes):
+                    break
+            await ws.send(_completed("short"))
+
+        async def consume(client):
+            async def endless():
+                while True:
+                    yield b"\x00\x01" * 40
+                    await asyncio.sleep(0.01)
+
+            return [e async for e in client.stream(endless())]
+
+        events = self._session(handler, consume)
+        assert [(e.text, e.is_final) for e in events] == [("short", True)]
+
+    def test_a_caller_that_stops_reading_ends_the_session(self):
+        import asyncio
+        import contextlib
+
+        closed = []
+
+        async def handler(ws):
+            try:
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        await ws.send(_delta("x"))
+            finally:
+                closed.append(True)
+
+        async def consume(client):
+            async def endless():
+                while True:
+                    yield b"\x00\x01" * 40
+                    await asyncio.sleep(0.01)
+
+            async with contextlib.aclosing(client.stream(endless())) as events:
+                async for _ in events:
+                    break
+            for _ in range(100):
+                if closed:
+                    break
+                await asyncio.sleep(0.02)
+            return closed
+
+        assert self._session(handler, consume) == [True], "the socket outlived the caller"
+
+
+def _delta(delta, **extra):
+    return json.dumps(
+        {"type": "conversation.item.input_audio_transcription.delta", "delta": delta, **extra}
+    )
+
+
+def _completed(transcript):
+    return json.dumps(
+        {"type": "conversation.item.input_audio_transcription.completed", "transcript": transcript}
+    )
 
 
 # --------------------------------------------------------------------------- #

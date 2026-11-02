@@ -8,6 +8,7 @@ extra.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -421,7 +422,13 @@ class AsyncOASRClient(_BaseClient):
 
         ``chunks`` yields raw PCM in ``encoding`` at ``sample_rate``; they are
         sent as **binary** frames, which skips base64's ~33% inflation.  The
-        iterator ends after the final event, whose ``is_final`` is ``True``.
+        iterator ends after the final event, whose ``is_final`` is ``True``, and
+        raises :class:`OASRClientError` if the session ends without one.
+
+        The audio is sent from a background task while events are read, so
+        interim results arrive as the audio does.  A live source that blocks
+        between chunks (a microphone read) should be an async iterator: a
+        blocking sync one holds the event loop, and so the reader, while it waits.
 
         Works against either service mode.  A streaming engine decodes as the
         audio arrives; an offline one buffers it and streams the *text* back, so
@@ -451,35 +458,52 @@ class AsyncOASRClient(_BaseClient):
 
         async with websockets.connect(self._ws_url(), **_ws_header_kwarg(self._headers())) as ws:
             await ws.send(json.dumps({"type": "session.update", "session": session}))
-            async for chunk in _aiter(chunks):
-                if chunk:
-                    await ws.send(chunk)
-            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-
-            text = ""
-            async for message in ws:
-                if isinstance(message, bytes):
-                    continue
-                event = json.loads(message)
-                kind = event.get("type", "")
-                if kind.endswith("input_audio_transcription.delta"):
-                    delta = event.get("delta", "")
-                    # `text` is OASR's extension carrying the authoritative
-                    # transcript so far.  Prefer it: a frame-synchronous family
-                    # can *revise* a partial, which arrives as an empty delta
-                    # plus corrected text, and accumulating deltas alone would
-                    # keep the superseded words on screen until the final.
-                    text = event.get("text") or (text + delta)
-                    yield TranscriptEvent(text=text, delta=delta, is_final=False)
-                elif kind.endswith("input_audio_transcription.completed"):
-                    text = event.get("transcript", text)
-                    yield TranscriptEvent(text=text, delta="", is_final=True)
-                    return
-                elif kind == "error":
-                    detail = event.get("error", {})
-                    raise OASRClientError(
-                        f"realtime session failed: {detail.get('message', detail)}"
-                    )
+            # Sent while the events are read, not before: read only after the
+            # commit, a live session yielded nothing until its audio ended, and
+            # `websockets` stops reading the socket -- pongs included -- once 16
+            # messages wait unread, so a live session longer than ~40 s died of
+            # its own keepalive timeout.
+            source_failed: List[BaseException] = []
+            sender = asyncio.get_running_loop().create_task(_send_audio(ws, chunks, source_failed))
+            try:
+                text = ""
+                async for message in ws:
+                    if isinstance(message, bytes):
+                        continue
+                    event = json.loads(message)
+                    kind = event.get("type", "")
+                    if kind.endswith("input_audio_transcription.delta"):
+                        delta = event.get("delta", "")
+                        # A delta extends the transcript.  A partial that
+                        # *revises* it (a frame-synchronous family re-ranking its
+                        # beam) has no increment, so it arrives with an empty
+                        # delta and the corrected transcript as `text`, an OASR
+                        # extension.  Test for the key: a revision to "" is one.
+                        text = event["text"] if "text" in event else text + delta
+                        yield TranscriptEvent(text=text, delta=delta, is_final=False)
+                    elif kind.endswith("input_audio_transcription.completed"):
+                        text = event.get("transcript", text)
+                        yield TranscriptEvent(text=text, delta="", is_final=True)
+                        return
+                    elif kind == "error":
+                        detail = event.get("error", {})
+                        raise OASRClientError(
+                            f"realtime session failed: {detail.get('message', detail)}"
+                        )
+                # The socket closed with no final.  If the audio source failed,
+                # that is why, and its own exception is what the caller gets.
+                if source_failed:
+                    raise source_failed[0]
+                raise OASRClientError("the realtime session closed before the final transcript")
+            finally:
+                # A final, an error or a caller that stopped iterating can all
+                # arrive while audio is still going out.  `wait` rather than
+                # `await sender`: it does not raise the sender's exception, and
+                # a cancellation of the caller's own task still propagates.
+                sender.cancel()
+                await asyncio.wait({sender})
+                if not sender.cancelled():
+                    sender.exception()  # retrieved: reported above, or moot
 
     async def __aenter__(self) -> "AsyncOASRClient":
         return self
@@ -505,6 +529,36 @@ def _ws_header_kwarg(headers: Dict[str, str]) -> Dict[str, Any]:
     params = inspect.signature(websockets.connect).parameters
     name = "additional_headers" if "additional_headers" in params else "extra_headers"
     return {name: headers}
+
+
+async def _send_audio(
+    ws: Any,
+    chunks: Union[Iterable[bytes], AsyncIterator[bytes]],
+    source_failed: List[BaseException],
+) -> None:
+    """Send every chunk as a binary frame, then the commit.
+
+    If the source raises, its exception goes into ``source_failed`` *before* the
+    socket is closed, so the reader, which stops at the close, finds it there.
+    A failed send needs nothing here: the reader sees the same closed socket.
+    """
+    source = _aiter(chunks)
+    while True:
+        try:
+            chunk = await source.__anext__()
+        except StopAsyncIteration:
+            break
+        except Exception as exc:
+            source_failed.append(exc)
+            await ws.close()
+            return
+        if chunk:
+            await ws.send(chunk)
+        # `send` returns without suspending while the socket takes the bytes,
+        # so a source that never suspends either would hold the loop, and the
+        # reader would see nothing until the last chunk.
+        await asyncio.sleep(0)
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
 
 
 async def _aiter(chunks: Union[Iterable[bytes], AsyncIterator[bytes]]) -> AsyncIterator[bytes]:
