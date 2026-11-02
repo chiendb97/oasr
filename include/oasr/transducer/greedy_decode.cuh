@@ -35,6 +35,12 @@
 //     no conversion instructions, and the bf16 x bf16 product is exact in fp32,
 //     so the arithmetic is bit-identical to `fmaf(float(w), float(x), acc)`.
 //
+// The label window.  A negative label is a slot before the utterance start
+// (icefall's start window is `[-1] * (ctx - 1) + [blank]`) and embeds to zero,
+// as in `StatelessDecoder.forward`.  `embedRow` points such a slot at row 0 and
+// `embedAt` replaces what it loads with zero, so the read stays in bounds and
+// no row takes a branch.
+//
 // Numerical contract.  Every rounding point of the op-by-op path is kept: the
 // joiner input `enc + dec` and its activation are rounded to the activation
 // dtype, logits are rounded to it before the argmax (ties resolve to the lowest
@@ -120,6 +126,23 @@ namespace detail {
 template <typename T>
 __device__ __forceinline__ float roundTo(float x) {
     return toFloat<T>(fromFloat<T>(x));
+}
+
+// The row of `label` in a (V, D) embedding, or row 0 for a negative label;
+// `embedAt` zeroes what such a row contributes.
+template <typename T>
+__device__ __forceinline__ const T* embedRow(const T* emb, int64_t label, int D) {
+    return emb + (label < 0 ? 0 : label) * static_cast<int64_t>(D);
+}
+
+// Element `i` of `label`'s embedding row (from `embedRow`): zero for a
+// negative label, which is a slot before the utterance start.  Exactly
+// zero, so the slot adds nothing to an fmaf accumulation, as the op-by-op
+// path's masked embedding adds nothing to its convolution.
+template <typename T>
+__device__ __forceinline__ float embedAt(const T* row, int64_t label, int i) {
+    const float v = toFloat<T>(row[i]);
+    return label < 0 ? 0.0f : v;
 }
 
 // (value, index) argmax order: larger value wins, NaN counts as the largest
@@ -484,11 +507,13 @@ __global__ void __launch_bounds__(kThreads, 1)
             const int d = idx - r * D;
             T h;
             if (ctx == 1) {
-                h = p.emb[s_win[r][0] * D + d];
+                const int64_t lab = s_win[r][0];
+                h = fromFloat<T>(detail::embedAt(detail::embedRow(p.emb, lab, D), lab, d));
             } else if (p.group == 1) {
                 float acc = 0.0f;
                 for (int s = 0; s < ctx; ++s) {
-                    acc = fmaf(toFloat<T>(p.emb[s_win[r][s] * D + d]),
+                    const int64_t lab = s_win[r][s];
+                    acc = fmaf(detail::embedAt(detail::embedRow(p.emb, lab, D), lab, d),
                                toFloat<T>(p.conv_w[static_cast<int64_t>(s) * D + d]), acc);
                 }
                 h = fromFloat<T>(acc);
@@ -497,9 +522,12 @@ __global__ void __launch_bounds__(kThreads, 1)
                 const int c0 = (d / gs) * gs;
                 float acc = 0.0f;
                 for (int s = 0; s < ctx; ++s) {
-                    const T* e = p.emb + s_win[r][s] * D + c0;
+                    const int64_t lab = s_win[r][s];
+                    const T* e = detail::embedRow(p.emb, lab, D) + c0;
                     const T* w = p.conv_w + (static_cast<int64_t>(d) * ctx + s) * gs;
-                    for (int i = 0; i < gs; ++i) acc = fmaf(toFloat<T>(e[i]), toFloat<T>(w[i]), acc);
+                    for (int i = 0; i < gs; ++i) {
+                        acc = fmaf(detail::embedAt(e, lab, i), toFloat<T>(w[i]), acc);
+                    }
                 }
                 h = fromFloat<T>(acc);
             }

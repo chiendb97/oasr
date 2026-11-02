@@ -356,7 +356,8 @@ __device__ __forceinline__ void loadGroup(T (&dst)[GS], const T* src) {
 // The predictor hidden state of channel `d` for every row: relu(round(conv
 // over the window's embeddings)), each row accumulating in the op-by-op
 // path's fmaf order (window position, then group member).  GS is the conv
-// group size when it is a compile-time case, else 0 (run-time `gs`).
+// group size when it is a compile-time case, else 0 (run-time `gs`).  A
+// negative label embeds to zero (greedy_decode.cuh's `embedAt`).
 template <typename T, int R, int GS>
 __device__ __forceinline__ void groupedHidden(T* hs, int D, int d, const T* emb, const T* conv_w,
                                               const int (*win)[kMaxContext], int ctx, int gs) {
@@ -372,16 +373,22 @@ __device__ __forceinline__ void groupedHidden(T* hs, int D, int d, const T* emb,
             loadGroup<T, GS>(wv, w);
 #pragma unroll
             for (int r = 0; r < R; ++r) {
+                const int lab = win[r][s];
                 alignas(16) T ev[GS];
-                loadGroup<T, GS>(ev, emb + static_cast<int64_t>(win[r][s]) * D + c0);
+                loadGroup<T, GS>(ev, detail::embedRow(emb, lab, D) + c0);
 #pragma unroll
-                for (int i = 0; i < GS; ++i) acc[r] = fmaf(toFloat<T>(ev[i]), toFloat<T>(wv[i]), acc[r]);
+                for (int i = 0; i < GS; ++i) {
+                    acc[r] = fmaf(detail::embedAt(ev, lab, i), toFloat<T>(wv[i]), acc[r]);
+                }
             }
         } else {
 #pragma unroll
             for (int r = 0; r < R; ++r) {
-                const T* e = emb + static_cast<int64_t>(win[r][s]) * D + c0;
-                for (int i = 0; i < g; ++i) acc[r] = fmaf(toFloat<T>(e[i]), toFloat<T>(w[i]), acc[r]);
+                const int lab = win[r][s];
+                const T* e = detail::embedRow(emb, lab, D) + c0;
+                for (int i = 0; i < g; ++i) {
+                    acc[r] = fmaf(detail::embedAt(e, lab, i), toFloat<T>(w[i]), acc[r]);
+                }
             }
         }
     }
@@ -536,7 +543,9 @@ __global__ void __launch_bounds__(kBeamThreads, 1)
             if (ctx == 1) {
 #pragma unroll
                 for (int r = 0; r < R; ++r) {
-                    hs[r * D + d] = relu<T>(p.emb[static_cast<int64_t>(win[r][0]) * D + d]);
+                    const int lab = win[r][0];
+                    hs[r * D + d] = relu<T>(
+                        fromFloat<T>(detail::embedAt(detail::embedRow(p.emb, lab, D), lab, d)));
                 }
             } else if (p.group == 1) {
                 float acc[R];
@@ -546,8 +555,9 @@ __global__ void __launch_bounds__(kBeamThreads, 1)
                     const float w = toFloat<T>(p.conv_w[static_cast<int64_t>(s) * D + d]);
 #pragma unroll
                     for (int r = 0; r < R; ++r) {
-                        acc[r] = fmaf(toFloat<T>(p.emb[static_cast<int64_t>(win[r][s]) * D + d]),
-                                      w, acc[r]);
+                        const int lab = win[r][s];
+                        acc[r] = fmaf(detail::embedAt(detail::embedRow(p.emb, lab, D), lab, d), w,
+                                      acc[r]);
                     }
                 }
 #pragma unroll

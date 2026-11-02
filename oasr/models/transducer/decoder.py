@@ -14,6 +14,18 @@ in every Zipformer one.  Those are different operators — 4x the parameters —
 assuming depthwise made every real icefall release fail to load on this single
 tensor.  See ``conv_group_size`` below and
 ``TransducerModelConfig.decoder_conv_group_size``.
+
+**The window before the first label.**  icefall trains the predictor on
+``[blank] + y`` with the embeddings left-padded by ``context_size - 1`` *zero
+vectors*, and its decoders (``greedy_search``, ``modified_beam_search``, the
+streaming ``DecodeStream``, and sherpa-onnx's) start from the window
+``[-1] * (context_size - 1) + [blank]``, where a negative label embeds to zero.
+A window of ``context_size`` blanks is a different input wherever blank's row is
+not zero, and only the oldest recipe (``transducer_stateless``) declares
+``padding_idx=blank``: a Zipformer predictor learns a nonzero blank row.
+:meth:`StatelessDecoder.init_state` returns icefall's start window, with
+:data:`NO_LABEL` for ``-1``, and a negative label embeds to zero both in
+:meth:`StatelessDecoder.forward` and in the fused decode kernels.
 """
 
 from __future__ import annotations
@@ -26,13 +38,18 @@ from oasr.layers import Conv2d, DepthwiseConv1d, Embedding, Relu
 
 from ..decoders.base import StatelessPredictorTensors, TransducerPredictor
 
+#: The label of a window slot before the utterance start.  Any negative label
+#: embeds to zero, as in icefall's ``Decoder.forward``.
+NO_LABEL = -1
+
 
 class StatelessDecoder(TransducerPredictor):
     """Label predictor: ``(B, context_size)`` token window → ``(B, decoder_dim)``.
 
     The transducer "decode state" is just the last ``context_size`` emitted
-    labels (blank-filled at init); :class:`~oasr.engine.decode.TransducerDecodeStrategy`
-    shifts a new label in after each emission via :meth:`advance`.
+    labels (see :meth:`init_state` for the window before the first one);
+    :class:`~oasr.engine.decode.TransducerDecodeStrategy` shifts a new label in
+    after each emission via :meth:`advance`.
     """
 
     decode_type = "transducer"
@@ -59,7 +76,10 @@ class StatelessDecoder(TransducerPredictor):
         self.blank_id = blank_id
         self.context_size = context_size
         self.conv_group_size = conv_group_size
-        self.embedding = Embedding(vocab_size, decoder_dim, padding_idx=blank_id)
+        # No ``padding_idx``: icefall's Zipformer and pruned-transducer predictors
+        # do not declare one, so blank's row is learned, and a test model built
+        # here must not have it zeroed either.
+        self.embedding = Embedding(vocab_size, decoder_dim)
         self.relu = Relu()
         if context_size > 1:
             # Convolve the unpadded label window to one frame. Grouped predictors
@@ -83,11 +103,18 @@ class StatelessDecoder(TransducerPredictor):
         device: torch.device,
         dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        """Blank-filled label window ``(batch_size, context_size)`` (int64)."""
+        """The start window ``[NO_LABEL] * (context_size - 1) + [blank]`` per row (int64).
+
+        This is the window icefall decodes from and the input its training saw
+        before the first label (see the module docstring); ``blank`` in every
+        slot is not.
+        """
         del dtype  # labels are always int64
-        return torch.full(
-            (batch_size, self.context_size), self.blank_id, dtype=torch.long, device=device
+        state = torch.full(
+            (batch_size, self.context_size), NO_LABEL, dtype=torch.long, device=device
         )
+        state[:, -1:].fill_(self.blank_id)
+        return state
 
     def _label_conv(self, emb: torch.Tensor) -> torch.Tensor:
         """``(B, U, dim)`` → ``(B, U - context_size + 1, dim)``."""
@@ -100,7 +127,8 @@ class StatelessDecoder(TransducerPredictor):
 
     def forward(self, y: torch.Tensor) -> torch.Tensor:
         """``(B, context_size)`` label window → ``(B, decoder_dim)`` prediction."""
-        emb = self.embedding(y)  # (B, U, dim)
+        # A slot before the utterance start (NO_LABEL) embeds to zero.
+        emb = self.embedding(y.clamp(min=0)).masked_fill((y < 0).unsqueeze(-1), 0.0)
         if self.context_size > 1:
             emb = self._label_conv(emb)  # (B, U - context_size + 1, dim) == (B, 1, dim)
         activated: torch.Tensor = self.relu(emb)
@@ -139,6 +167,7 @@ class StatelessDecoder(TransducerPredictor):
         Both convolution branches already hold the layout their kernels read --
         ``DepthwiseConv1d`` keeps ``(K, 1, C)``, the grouped ``Conv2d`` keeps KRSC
         ``(C, 1, K, group)`` -- which is the layout the fused greedy decode reads.
+        The kernels embed a negative label as zero, as :meth:`forward` does.
         """
         conv_weight = self.conv.weight if self.context_size > 1 else None
         return StatelessPredictorTensors(

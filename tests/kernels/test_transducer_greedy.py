@@ -16,7 +16,6 @@ from __future__ import annotations
 import pytest
 import torch
 from helpers.transducer import (
-    BLANK,
     DEC_DIM,
     JOINER_DIM,
     VOCAB,
@@ -69,7 +68,7 @@ def _weights(model):
 
 
 def _loop(strat, enc, lengths, track=False):
-    """The op-by-op loop's (hyps, marks, state, dec_proj) from blank state."""
+    """The op-by-op loop's (hyps, marks, state, dec_proj) from the start state."""
     state, dec_proj = strat._init_state(enc.size(0), enc.device)
     saved, strat._fused_enabled = strat._fused_enabled, False
     try:
@@ -113,7 +112,10 @@ class TestMatchesOpByOpLoop:
     )
     @pytest.mark.parametrize("activation", ["tanh", "relu"])
     def test_tokens_frames_and_state(self, dtype, context, group, activation):
-        model = _model(dtype, context=context, group=group, activation=activation)
+        # Seed 3 because the branch check at the end needs data that emits on some
+        # frames and not others: under seed 0 the ReLU group-4 model emits on every
+        # frame.  Seed 3 emits on 8 to 65 of the 90 frames in every case.
+        model = _model(dtype, context=context, group=group, activation=activation, seed=3)
         strat = _strategy(model)
         enc = _enc(len(LENGTHS), max(LENGTHS), dtype)
         lengths = torch.tensor(LENGTHS, device="cuda")
@@ -184,7 +186,7 @@ def _replay_posteriors(model, enc, length, tokens, frames):
     the kernel's an online one with fast-math exp/log.
     """
     decoder, joiner = model.decoder, model.joiner
-    window = torch.full((1, decoder.context_size), BLANK, dtype=torch.long, device="cuda")
+    window = decoder.init_state(1, torch.device("cuda"))
     enc_proj = joiner.encoder_proj(enc)
     out = []
     with torch.no_grad():

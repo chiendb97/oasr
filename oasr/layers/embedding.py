@@ -27,8 +27,8 @@ class Embedding(nn.Module):
     """``ids -> weight[ids]`` (drop-in for ``nn.Embedding``, inference paths).
 
     Only the inference-relevant subset of ``nn.Embedding``'s options is
-    carried: ``padding_idx`` (kept because icefall's stateless transducer
-    predictor declares it, and it must survive a state-dict round trip) and
+    carried: ``padding_idx`` (it zeroes that row at initialization; the forward
+    reads a loaded weight's row as it is, as ``nn.Embedding``'s does) and
     the ``device`` / ``dtype`` factory kwargs.  Training-only knobs
     (``max_norm``, ``scale_grad_by_freq``, ``sparse``) are deliberately absent
     rather than silently ignored.
