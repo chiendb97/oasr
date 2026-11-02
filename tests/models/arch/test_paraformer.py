@@ -10,6 +10,7 @@ transcript for ``example/asr_example.wav``.
 """
 
 import os
+import random
 
 import assets
 import numpy as np
@@ -301,6 +302,23 @@ class TestFunASRCharTokenizer:
         ids = tok.encode("正义")
         assert len(ids) == 2
         assert tok.decode(ids) == "正义"
+
+    def test_pieces_give_an_abbreviation_letter_by_letter(self, tok):
+        """Word timings are cut from these; see ``test_tokenizers.py``."""
+        ids = [tok._ids[t] for t in ("we", "are", "b", "b", "c")]
+        assert tok.token_pieces(ids) == ["we", " are", " B", "B", "C"]
+        assert tok.decode(ids) == "we are BBC"
+
+    def test_pieces_join_to_decode_over_the_real_vocabulary(self, tok):
+        """Random ids weighted toward the English pieces and single letters,
+        which is where the merges happen."""
+        english = [i for i, t in enumerate(tok._tokens) if t.isascii() and t.isalpha()]
+        pieces_at = [i for i, t in enumerate(tok._tokens) if t.endswith("@@")]
+        pools = (english, pieces_at, range(tok.vocab_size))
+        rng = random.Random(14)
+        for _ in range(5000):
+            ids = [rng.choice(rng.choice(pools)) for _ in range(rng.randrange(0, 24))]
+            assert "".join(tok.token_pieces(ids)) == tok.decode(ids), ids
 
 
 # ---------------------------------------------------------------------------

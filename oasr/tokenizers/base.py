@@ -142,11 +142,14 @@ class Tokenizer(ABC):
         nothing (a special id, a byte-BPE fragment absorbed by its neighbour)
         yields ``""`` and owns no characters.
 
-        The default drives :meth:`decode_incremental` one id at a time, which is
-        correct for every kind and inherits that method's complexity — constant
-        per token where it is overridden, quadratic where it is not.  A
-        tokenizer whose rendering is piece-local overrides this with a single
-        pass; the rest are correct as they stand.
+        The default drives :meth:`decode_incremental` one id at a time and
+        inherits that method's complexity: constant per token where it is
+        overridden, quadratic where it is not.  It is correct only for a kind
+        whose rendering of a longer prefix extends the shorter one.  Where a
+        later id rewrites earlier text, the rewritten prefix becomes that id's
+        piece and the pieces no longer join to ``decode``; FunASR's abbreviation
+        merge did exactly that (``b b c``: ``['b', 'BB', 'C']``), which is why
+        such a kind overrides this with its own pass.
         """
         state = self.new_decode_state()
         return [self.decode_incremental((int(i),), state) for i in ids]
