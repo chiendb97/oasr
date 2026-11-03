@@ -299,7 +299,7 @@ Server → client:
 |---|---|
 | `{"type":"transcription_session.created","session":{…}}` | Handshake, echoing the resolved configuration. |
 | `{"type":"conversation.item.input_audio_transcription.delta","delta":"…"}` | Interim: `delta` extends the transcript. A partial that *revises* it instead (a beam re-ranked) carries `"delta":""` and `"text":"…"`, an OASR extension holding the whole transcript so far, which replaces what the client holds. |
-| `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. |
+| `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. Carries `"finish_reason"`, an OASR extension, when the engine set one: `"length"` when it cut the transcript short (the streaming encoder's cache filled, a CTC beam hit its token capacity, an AED/LLM hit `max_new_tokens`), `"error"` when the request failed inside the engine and `transcript` is whatever it had (see [engine.md](engine.md) on failure isolation). The key is absent otherwise. |
 | `{"type":"error","error":{…}}` | Terminal failure. |
 
 Configuration is optional — a client that opens the socket and starts sending

@@ -9,7 +9,9 @@ Values resolve from dataclass defaults, compatible legacy fields, then generic
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Dict, List, Mapping, Optional
+import types
+import typing
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 def option(default: Any, *, legacy: Optional[str] = None, doc: str = "") -> Any:
@@ -84,37 +86,74 @@ def build_options(options_cls: Optional[type], config: Any) -> Any:
         if f.name in overrides:
             raw = overrides[f.name]
             # ``--decode-option k=v`` can only carry strings.  Type them here,
-            # against the option's declared default — the serving crate must not
+            # against the option's declared type — the serving crate must not
             # need a copy of every family's option table to do it.
-            default = None if f.default is dataclasses.MISSING else f.default
-            if isinstance(raw, str) and not isinstance(default, str) and default is not None:
+            if isinstance(raw, str):
                 try:
-                    raw = coerce_option_value(raw, default)
+                    raw = coerce_option_value(raw, _option_types(options_cls)[f.name])
                 except ValueError as exc:
                     raise ValueError(f"decode option {f.name}={raw!r}: {exc}") from exc
             kwargs[f.name] = raw
     return options_cls(**kwargs)
 
 
-def coerce_option_value(raw: str, default: Any) -> Any:
-    """Parse a ``--decode-option k=v`` string against the option's default type.
+def _option_types(options_cls: type) -> Dict[str, Any]:
+    """Each option's declared type, its annotation resolved.
 
-    The wire only carries strings, so the default is what says whether ``"4"``
-    means the int 4 or the string "4".  Unknown/None defaults stay strings —
-    the option dataclass's own ``__post_init__`` is the validator, not this.
+    The annotation, not the default, says what a string means: ``nbest`` is
+    ``Optional[int]`` with a ``None`` default, and typing from the default left
+    ``nbest=4`` the string ``"4"``, which the options' own validation then
+    compared with an int and raised ``TypeError``.
     """
-    if isinstance(default, bool):
+    return typing.get_type_hints(options_cls)
+
+
+#: Spellings of "unset" for an ``Optional`` option that is not a string.
+_NONE_SPELLINGS = ("none", "null")
+
+
+def _unwrap_optional(annotation: Any) -> Tuple[Any, bool]:
+    """``(T, True)`` for ``Optional[T]`` / ``T | None``; ``(annotation, False)`` otherwise."""
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        members = typing.get_args(annotation)
+        rest = [a for a in members if a is not type(None)]
+        if len(rest) == 1 and len(members) == 2:
+            return rest[0], True
+    return annotation, False
+
+
+def coerce_option_value(raw: str, annotation: Any) -> Any:
+    """Parse a ``--decode-option k=v`` string as the option's declared type.
+
+    The wire only carries strings, so the annotation is what says whether
+    ``"4"`` means the int 4 or the string "4".  ``Optional[int]`` and
+    ``Optional[float]`` also take ``none`` / ``null`` for ``None``;
+    ``Optional[str]`` keeps the string.  A type a string cannot spell (a
+    decoder sub-config) is refused rather than handed over as a string for the
+    first attribute access to trip on.  Range checks stay with the options
+    dataclass's own ``__post_init__``.
+    """
+    target, optional = _unwrap_optional(annotation)
+    if target is Any or target is str:
+        return raw
+    if optional and raw.strip().lower() in _NONE_SPELLINGS:
+        return None
+    if target is bool:
         low = raw.strip().lower()
         if low in ("1", "true", "yes", "on"):
             return True
         if low in ("0", "false", "no", "off"):
             return False
         raise ValueError(f"expected a boolean, got {raw!r}")
-    if isinstance(default, int):
+    if target is int:
         return int(raw)
-    if isinstance(default, float):
+    if target is float:
         return float(raw)
-    return raw
+    name = getattr(target, "__name__", repr(target))
+    raise ValueError(
+        f"a {name} cannot be given as a string; set it in Python "
+        "(EngineConfig(decode_options={...}))"
+    )
 
 
 def parse_decode_options(pairs, options_cls: Optional[type]) -> Dict[str, Any]:
@@ -122,18 +161,19 @@ def parse_decode_options(pairs, options_cls: Optional[type]) -> Dict[str, Any]:
 
     Used by the serving CLI so a new family's knobs are reachable the moment it
     registers, with no new flag.  Typing is driven by the family's declared
-    defaults, so this stays correct as families come and go.
+    types, so this stays correct as families come and go.
     """
-    defaults = {d["name"]: d["default"] for d in describe_options(options_cls)}
+    types = _option_types(options_cls) if options_cls is not None else {}
+    names = {d["name"] for d in describe_options(options_cls)}
     out: Dict[str, Any] = {}
     for pair in pairs or ():
         if "=" not in pair:
             raise ValueError(f"--decode-option expects k=v, got {pair!r}")
         key, _, raw = pair.partition("=")
         key = key.strip()
-        if key not in defaults:
-            raise ValueError(f"unknown decode option {key!r}; valid keys: {sorted(defaults)}")
-        out[key] = coerce_option_value(raw, defaults[key])
+        if key not in names:
+            raise ValueError(f"unknown decode option {key!r}; valid keys: {sorted(names)}")
+        out[key] = coerce_option_value(raw, types[key])
     return out
 
 

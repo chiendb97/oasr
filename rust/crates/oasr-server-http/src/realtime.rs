@@ -36,7 +36,7 @@
 //! |---|---|
 //! | `{"type":"transcription_session.created","session":{…}}` | Handshake, echoing the resolved config. |
 //! | `{"type":"conversation.item.input_audio_transcription.delta","delta":"…"}` | Interim transcript: the increment. A partial that revises what was sent instead carries `"delta":""` and `"text"`, the whole transcript so far (an OASR extension), which replaces it. |
-//! | `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. |
+//! | `{"type":"conversation.item.input_audio_transcription.completed","transcript":"…"}` | Final. Carries `"finish_reason"` (an OASR extension) when the engine set one — `"length"` means the transcript is a prefix, `"error"` that the engine failed the request. |
 //! | `{"type":"error","error":{…}}` | Terminal failure. |
 //!
 //! ## Both service modes
@@ -704,11 +704,26 @@ impl Emitted {
     }
 }
 
-fn completed_event(text: &str) -> Value {
-    json!({
+/// The final transcript, with the engine's `finish_reason` when it set one.
+///
+/// `"length"` says the transcript is a prefix: the streaming encoder's cache
+/// filled, a CTC beam hit its token capacity, an AED/LLM hit
+/// `max_new_tokens`.  `"error"` says the request failed inside the engine (its
+/// executor isolates a failed forward by finalizing the requests in it).
+/// Dropped here, a 60-minute stream that stopped decoding at 30 read as
+/// complete, and a failed one as an empty success -- gRPC and the OpenAI unary
+/// routes already passed it on.  An OASR extension, like `text` on a revising
+/// delta, and absent rather than `null` when unset, so the event is OpenAI's
+/// shape unless there is something to say.
+fn completed_event(text: &str, finish_reason: Option<&str>) -> Value {
+    let mut event = json!({
         "type": "conversation.item.input_audio_transcription.completed",
         "transcript": text,
-    })
+    });
+    if let Some(reason) = finish_reason {
+        event["finish_reason"] = Value::from(reason);
+    }
+    event
 }
 
 fn error_event(message: &str, kind: &str) -> Value {
@@ -779,7 +794,7 @@ async fn chunked_session(
                         }
                     }
                 }
-                Some(Event::Final { text, speech_events, endpoint_reason, .. }) => {
+                Some(Event::Final { text, speech_events, endpoint_reason, finish_reason, .. }) => {
                     handle.finish();
                     for ev in speech_activity_events(speech_events) {
                         send_json(socket, ev).await?;
@@ -793,11 +808,12 @@ async fn chunked_session(
                         send_json(socket, json!({"type": "input_audio_buffer.committed"}))
                             .await?;
                     }
-                    send_json(socket, completed_event(&text)).await?;
+                    send_json(socket, completed_event(&text, finish_reason.as_deref())).await?;
                     info!(
                         rid = %rid,
                         transcript = %text,
                         endpoint = endpoint_reason.as_deref().unwrap_or("audio_end"),
+                        finish_reason = finish_reason.as_deref().unwrap_or("stop"),
                         "realtime final"
                     );
                     break Ok(());
@@ -1014,10 +1030,19 @@ async fn buffered_session(
                     }
                 }
             }
-            Some(Event::Final { text, .. }) => {
+            Some(Event::Final {
+                text,
+                finish_reason,
+                ..
+            }) => {
                 handle.finish();
-                send_json(socket, completed_event(&text)).await?;
-                info!(rid = %rid, transcript = %text, "realtime final");
+                send_json(socket, completed_event(&text, finish_reason.as_deref())).await?;
+                info!(
+                    rid = %rid,
+                    transcript = %text,
+                    finish_reason = finish_reason.as_deref().unwrap_or("stop"),
+                    "realtime final"
+                );
                 break Ok(());
             }
             Some(Event::Error { code, message, .. }) => {
@@ -1118,10 +1143,23 @@ mod tests {
             "conversation.item.input_audio_transcription.delta"
         );
         assert_eq!(
-            completed_event("hi there")["type"],
+            completed_event("hi there", None)["type"],
             "conversation.item.input_audio_transcription.completed"
         );
-        assert_eq!(completed_event("hi there")["transcript"], "hi there");
+        assert_eq!(completed_event("hi there", None)["transcript"], "hi there");
+    }
+
+    /// A transcript the engine cut short must say so: without it a stream whose
+    /// encoder cache filled half-way through read as complete.  And a final that
+    /// was not cut keeps OpenAI's shape, with no `finish_reason` key at all.
+    #[test]
+    fn the_completed_event_carries_the_finish_reason() {
+        let cut = completed_event("the first half", Some("length"));
+        assert_eq!(cut["finish_reason"], "length", "{cut}");
+        assert_eq!(cut["transcript"], "the first half");
+
+        let whole = completed_event("all of it", None);
+        assert!(whole.get("finish_reason").is_none(), "{whole}");
     }
 
     /// The engine's partials are cumulative and the protocol's `delta` is an
