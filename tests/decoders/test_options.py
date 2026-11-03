@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -52,6 +53,10 @@ class _Opts:
     name: str = option("x")
     flag: bool = option(False)
     sub: list = option_factory(list, doc="lazily built")
+    # ``None`` defaults: only the annotation says what a string means.
+    limit: Optional[int] = option(None)
+    scale: Optional[float] = option(None)
+    label: Optional[str] = option(None)
 
     def __post_init__(self) -> None:
         if self.width < 1:
@@ -117,9 +122,16 @@ class TestStringValuesAreTyped:
             ("flag", "true", True),
             ("flag", "0", False),
             ("name", "hello", "hello"),
+            # A None default typed nothing: "4" stayed a string.
+            ("limit", "4", 4),
+            ("scale", "0.3", 0.3),
+            ("limit", "none", None),
+            ("scale", "NULL", None),
+            # An optional *string* keeps what it was given.
+            ("label", "none", "none"),
         ],
     )
-    def test_typed_from_the_declared_default(self, key, raw, want):
+    def test_typed_from_the_declared_type(self, key, raw, want):
         o = build_options(_Opts, _cfg(decode_options={key: raw}))
         got = getattr(o, key)
         assert got == want and type(got) is type(want)
@@ -128,15 +140,27 @@ class TestStringValuesAreTyped:
         with pytest.raises(ValueError, match="decode option flag="):
             build_options(_Opts, _cfg(decode_options={"flag": "maybe"}))
 
+    def test_a_type_a_string_cannot_spell_is_refused(self):
+        """Handed over as a string, a sub-config fails at its first attribute."""
+        with pytest.raises(ValueError, match="decode option sub=.*cannot be given as a string"):
+            build_options(_Opts, _cfg(decode_options={"sub": "[1, 2]"}))
+
     def test_coerce_rejects_a_non_numeric_int(self):
         with pytest.raises(ValueError):
-            coerce_option_value("abc", 1)
+            coerce_option_value("abc", int)
+        with pytest.raises(ValueError):
+            coerce_option_value("abc", Optional[int])
+
+    def test_both_spellings_of_an_optional(self):
+        assert coerce_option_value("7", Optional[int]) == 7
+        assert coerce_option_value("7", int | None) == 7
 
 
 class TestCliParsing:
     def test_pairs_are_typed_and_validated(self):
-        got = parse_decode_options(["width=8", "ratio=0.1"], _Opts)
-        assert got == {"width": 8, "ratio": 0.1}
+        got = parse_decode_options(["width=8", "ratio=0.1", "limit=3"], _Opts)
+        assert got == {"width": 8, "ratio": 0.1, "limit": 3}
+        assert type(got["limit"]) is int
 
     def test_missing_equals_is_rejected(self):
         with pytest.raises(ValueError, match="expects k=v"):
@@ -188,6 +212,25 @@ class TestRegisteredFamilies:
         cfg = EngineConfig(ckpt_dir="x", decode_options={key: value})
         opts = build_options(_REGISTRY[family].options_cls, cfg)
         assert getattr(opts, attr) == value
+
+    @pytest.mark.parametrize(
+        "key,raw,want",
+        [
+            ("nbest", "4", 4),
+            ("nbest", "none", None),
+            ("reverse_weight", "0.3", 0.3),
+        ],
+    )
+    def test_rescoring_options_from_the_wire_are_typed(self, key, raw, want):
+        """``--decode-option nbest=4`` reaches the engine as the string "4";
+        typed from its ``None`` default it stayed one, and ``nbest < 1`` raised
+        ``TypeError`` at engine construction."""
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.decode.base import _REGISTRY
+
+        cfg = EngineConfig(ckpt_dir="x", decode_options={key: raw})
+        got = getattr(build_options(_REGISTRY["ctc_aed_rescoring"].options_cls, cfg), key)
+        assert got == want and type(got) is type(want)
 
     @pytest.mark.parametrize(
         "family,legacy,value,attr",

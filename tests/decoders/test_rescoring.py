@@ -132,7 +132,7 @@ def _naive_rescoring(decoder, cfg, hidden, enc_lens, result, ctc_weight, reverse
     return picks, all_scores
 
 
-def _build_strategy(monkeypatch, tmp_path, model, result, **cfg_overrides):
+def _build_strategy(monkeypatch, tmp_path, model, result, max_seq_len=None, **cfg_overrides):
     from oasr.engine.config import EngineConfig
     from oasr.engine.decode import rescoring as rescoring_mod
     from oasr.engine.decode.detokenize import Detokenizer
@@ -143,7 +143,9 @@ def _build_strategy(monkeypatch, tmp_path, model, result, **cfg_overrides):
     cfg = EngineConfig(
         ckpt_dir=str(tmp_path),
         service_mode="offline",
-        ctc_decoder_config=GpuDecoderConfig(beam_size=result.scores.size(1)),
+        ctc_decoder_config=GpuDecoderConfig(
+            beam_size=result.scores.size(1), max_seq_len=max_seq_len
+        ),
         **cfg_overrides,
     )
     return rescoring_mod.CtcAedRescoringStrategy(cfg, Detokenizer(None, None), model)
@@ -290,6 +292,47 @@ class TestFusionMath:
 # ---------------------------------------------------------------------------
 # Engine seams
 # ---------------------------------------------------------------------------
+
+
+class TestFinishReason:
+    """A first pass cut at its token capacity is a truncated transcript.
+
+    The CTC family says so (``finish_reason="length"``); rescoring built its own
+    outputs from the same beam and said nothing, so the transcript read as
+    complete.  Each case forces the winner by disqualifying the other row with
+    an id past the decoder vocabulary (40).
+    """
+
+    def _final(self, monkeypatch, tmp_path, tokens, scores, cap):
+        from oasr.engine.decode.base import EncodeOutput
+
+        decoder, cfg = _tiny_decoder()
+        result = _FakeResult(tokens=[tokens], scores=torch.tensor([scores]))
+        strat = _build_strategy(
+            monkeypatch, tmp_path, _FakeModel(decoder, cfg), result, max_seq_len=cap
+        )
+        hidden = torch.randn(1, 6, cfg.encoder_output_size)
+        enc = EncodeOutput(hidden=hidden, log_probs=torch.zeros(1, 6, 40))
+        return strat.decode_offline(enc, torch.tensor([6], dtype=torch.int32))[0]
+
+    def test_a_winner_that_filled_the_capacity_is_cut(self, monkeypatch, tmp_path):
+        """The winner is longer than the CTC-best row, and it is the one that
+        filled the capacity."""
+        out = self._final(monkeypatch, tmp_path, [[45], [4, 5, 6]], [100.0, -1.0], cap=3)
+        assert out.tokens[0] == [4, 5, 6]
+        assert out.finish_reason == "length"
+
+    def test_a_capped_first_pass_is_reported_whichever_row_wins(self, monkeypatch, tmp_path):
+        """The CTC-best row filled the capacity and lost the fusion: the beam
+        the winner came from was still cut."""
+        out = self._final(monkeypatch, tmp_path, [[45, 4, 5], [4, 5]], [100.0, -2.0], cap=3)
+        assert out.tokens[0] == [4, 5]
+        assert out.finish_reason == "length"
+
+    @pytest.mark.parametrize("cap", [10, None])
+    def test_a_beam_under_its_capacity_is_not(self, monkeypatch, tmp_path, cap):
+        out = self._final(monkeypatch, tmp_path, [[4, 5, 6], [45]], [-1.0, 100.0], cap=cap)
+        assert out.finish_reason is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")

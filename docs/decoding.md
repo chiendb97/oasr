@@ -131,7 +131,11 @@ An unknown key in `decode_options` **raises at engine construction**, naming the
 valid ones.
 
 Operators reach every knob through the generic `oasr-server --decode-option k=v`,
-typed from the declared default, so a new family needs no new flag. This is what
+typed from the field's declared type, so a new family needs no new flag. The
+annotation, not the default, decides: `nbest: Optional[int] = None` takes
+`nbest=4` as the int 4 (it used to stay the string `"4"`), and `none` / `null`
+as `None`. A field a string cannot spell, such as a decoder sub-config, is
+refused by name. This is what
 stopped `EngineConfig` growing a field per family, and what stopped a Whisper
 engine constructing a CTC beam config and a WFST config it would never read.
 

@@ -40,6 +40,7 @@ from oasr.utils.staging import to_device
 from ..request import Request, RequestOutput
 from .base import DecodeStrategy, EncodeOutput, register_decode_strategy
 from .ctc_align import attach_emission_timings
+from .ctc_gpu import _declare_cap
 from .options import option, option_factory
 
 if TYPE_CHECKING:
@@ -260,14 +261,21 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             order = sorted(range(beam), key=lambda k: fused_cpu[b][k], reverse=True)
             token_seqs = [result.tokens[b][k] for k in order]
             winners.append(order[0])
+            out = RequestOutput(
+                request_id="",
+                text=self._detok.detokenize(token_seqs[0]),
+                tokens=token_seqs,
+                scores=[fused_cpu[b][k] for k in order],
+                finished=True,
+            )
+            # The first pass stops appending at its token capacity, as the CTC
+            # family does; that family reports it, and so must this one.  The
+            # winner may be a shorter hypothesis than the CTC-best one, so the
+            # longer of the two decides: a capped first pass means the beam the
+            # winner was chosen from was cut, whichever row won.
+            ctc_best = result.tokens[b][0] if result.tokens[b] else []
             outputs.append(
-                RequestOutput(
-                    request_id="",
-                    text=self._detok.detokenize(token_seqs[0]),
-                    tokens=token_seqs,
-                    scores=[fused_cpu[b][k] for k in order],
-                    finished=True,
-                )
+                _declare_cap(out, max(token_seqs[0], ctc_best, key=len), cfg.max_seq_len)
             )
         if requests is not None and log_probs is not None:
             # Time the hypothesis that *won the fusion*, not the CTC-best.
