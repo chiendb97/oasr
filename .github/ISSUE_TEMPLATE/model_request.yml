@@ -1,0 +1,51 @@
+name: Model request
+description: Ask for a speech recognition model or checkpoint format that OASR does not load yet.
+title: "[Model]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        OASR loads WeNet, icefall/k2, FunASR and Hugging Face checkpoints for seven
+        architectures (see the
+        [supported models](https://github.com/chiendb97/oasr#supported-models)).
+        If a variant of one of those fails to load, a **bug report** is the better fit.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Name and a link to the checkpoint (Hugging Face, ModelScope, a GitHub release, ...).
+      placeholder: https://huggingface.co/<org>/<model>
+    validations:
+      required: true
+  - type: dropdown
+    id: paradigm
+    attributes:
+      label: Decode paradigm
+      options:
+        - CTC
+        - Transducer (RNN-T / TDT)
+        - Attention encoder-decoder (AED)
+        - Non-autoregressive (CIF / Paraformer-style)
+        - Speech-LLM (audio encoder + LLM)
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: framework
+    attributes:
+      label: Training framework or format
+      placeholder: NeMo, ESPnet, SpeechBrain, transformers, k2/icefall, WeNet, FunASR, ...
+  - type: checkboxes
+    id: modes
+    attributes:
+      label: What do you need?
+      options:
+        - label: Offline (file) transcription
+        - label: Streaming transcription
+        - label: Word timestamps
+  - type: textarea
+    id: why
+    attributes:
+      label: Use case
+      description: What would you use it for? Language, domain and expected traffic all help prioritize.

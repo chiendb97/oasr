@@ -159,7 +159,7 @@ class OpenAIHttpBackend(Backend):
         try:
             import httpx  # noqa: F401
         except ImportError:
-            return False, "needs httpx (pip install 'oasr[serving]')"
+            return False, "needs httpx (pip install 'oasr-server[serving]')"
         return True, ""
 
     @classmethod
@@ -426,7 +426,7 @@ class OasrServerBackend(OpenAIHttpBackend):
         try:
             import websockets  # noqa: F401
         except ImportError:
-            return False, "needs websockets (pip install 'oasr[serving]')"
+            return False, "needs websockets (pip install 'oasr-server[serving]')"
         return True, ""
 
     @classmethod
@@ -618,9 +618,9 @@ class OasrServerBackend(OpenAIHttpBackend):
         return {"id": rows[0].get("id"), **(rows[0].get("info") or {})}
 
     def _server_version(self) -> str:
-        from benchmarks.asrbench.environment import packages
+        from benchmarks.asrbench.environment import OASR_DISTRIBUTION, packages
 
-        return packages().get("oasr", "")
+        return packages().get(OASR_DISTRIBUTION, "")
 
     def info(self) -> BackendInfo:
         from benchmarks.asrbench.backends.oasr_engine import checkpoint_fingerprint

@@ -23,7 +23,7 @@ def normalizer(kind: str = "english") -> Normalizer:
 
     ``english``
         Whisper's ``EnglishTextNormalizer`` — the one published WER tables use.
-        Requires ``transformers`` (``pip install oasr[tokenizers]`` also pulls
+        Requires ``transformers`` (``pip install oasr-server[tokenizers]`` also pulls
         it in via the model extras).
     ``basic``
         Whisper's ``BasicTextNormalizer``: case-folding, punctuation removal,

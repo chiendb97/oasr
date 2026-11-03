@@ -46,7 +46,7 @@ class HuggingFaceTokenizer(WindowedIncrementalTokenizer):
             raise ImportError(
                 "the `tokenizers` package is required for "
                 "TokenizerSpec(kind='huggingface'); install it with "
-                "`pip install oasr[tokenizers]` or `pip install tokenizers`"
+                "`pip install oasr-server[tokenizers]` or `pip install tokenizers`"
             ) from exc
         self._tok = HFTokenizer.from_file(tokenizer_json_path)
         if tokenizer_config_path:

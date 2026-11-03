@@ -1,0 +1,3 @@
+# Documentation site build (mkdocs.yml).  Pinned like requirements-dev.txt so CI and
+# a local `mkdocs build --strict` render the same site.
+mkdocs-material==9.8.0

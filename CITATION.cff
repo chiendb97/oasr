@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use OASR in your research or product, please cite it as below."
+type: software
+title: "OASR: Open Automatic Speech Recognition"
+abstract: >-
+  OASR is a high-performance CUDA inference and serving engine for automatic
+  speech recognition. It serves seven encoder architectures (Conformer,
+  Zipformer, RNN-T, FastConformer, Whisper, Paraformer and Qwen2-Audio) across
+  five decode paradigms (CTC, transducer, attention encoder-decoder,
+  non-autoregressive CIF and speech-LLM) from one engine, with custom
+  CUDA/CUTLASS kernels, GPU CTC and WFST beam search, offline and streaming
+  recognition, W8A8 int8/fp8 quantization, and a Rust front-end exposing an
+  OpenAI-compatible HTTP API, a realtime WebSocket and gRPC.
+authors:
+  - family-names: Dang
+    given-names: Bao Chien
+repository-code: "https://github.com/chiendb97/oasr"
+url: "https://github.com/chiendb97/oasr"
+license: Apache-2.0
+keywords:
+  - automatic speech recognition
+  - speech-to-text
+  - inference engine
+  - model serving
+  - CUDA
+  - streaming ASR
+  - Whisper
+  - Conformer
+  - Zipformer
+  - RNN-T
+  - Paraformer
+  - speech LLM

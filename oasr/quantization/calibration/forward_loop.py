@@ -78,7 +78,7 @@ def load_waveform(path: Path, expected_rate: int) -> torch.Tensor:
         import soundfile as sf
     except ImportError as exc:  # pragma: no cover - optional dep
         raise ImportError(
-            "calibration reads audio with soundfile; `pip install oasr[audio]`"
+            "calibration reads audio with soundfile; `pip install oasr-server[audio]`"
         ) from exc
     data, rate = sf.read(str(path), dtype="float32", always_2d=True)
     if rate != expected_rate:

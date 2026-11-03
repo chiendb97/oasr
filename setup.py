@@ -272,20 +272,20 @@ extras_require = {
         "ruff>=0.1.0",
     ],
     "all": [
-        "oasr[audio,serving,hub,tokenizers]",
+        "oasr-server[audio,serving,hub,tokenizers]",
     ],
 }
 
 
 setup(
-    name="oasr",
+    name="oasr-server",
     version=get_version(),
     author="OASR Contributors",
     author_email="",
     description="Open Automatic Speech Recognition - High-performance ASR inference framework",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
-    url="https://github.com/your-org/oasr",
+    url="https://github.com/chiendb97/oasr",
     license="Apache-2.0",
 
     # Package configuration

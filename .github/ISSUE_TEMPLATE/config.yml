@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/chiendb97/oasr/blob/main/docs/README.md
+    about: Architecture, engine, serving, decoding, kernels and quantization guides.
+  - name: FAQ
+    url: https://github.com/chiendb97/oasr/blob/main/docs/faq.md
+    about: Supported GPUs and models, the OpenAI-compatible API, and how OASR relates to other ASR toolkits.
+  - name: Report a security vulnerability
+    url: https://github.com/chiendb97/oasr/security/advisories/new
+    about: Please report vulnerabilities privately, not as a public issue.

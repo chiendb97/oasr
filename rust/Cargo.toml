@@ -32,7 +32,7 @@ default-members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/your-org/oasr"
+repository = "https://github.com/chiendb97/oasr"
 
 [workspace.dependencies]
 # Async runtime

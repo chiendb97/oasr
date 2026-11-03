@@ -20,11 +20,12 @@ transducer/AED/LLM loop).
 | Batching | `oasr.engine.batching.BatchingPolicy` / `PartitionPolicy` | `oasr.engine.batching` (`register_*_policy`, `build_*_policy`) | `config.schedule_policy` / partition flags | [scheduler.md](scheduler.md) |
 | Tokenizer | `oasr.tokenizers.Tokenizer` | `oasr.tokenizers` (`register_tokenizer`, `build_tokenizer`) | converter-emitted `TokenizerSpec.kind` | [tokenizers.md](tokenizers.md) |
 | Feature frontend | `oasr.features.ExtractorSpec` | `oasr.features` (`register_extractor`, `build_extractor`) | `FeatureConfig.feature_type`, materialized from the converter-emitted `FeatureSpec` | [features.md](features.md) |
+| Speech detector | `oasr.vad.SpeechDetector` / `VadSpec` | `oasr.vad` (`register_vad`, `build_detector`) | `VadConfig.backend`; `None` = the decode family's own per-frame signal | [vad.md](vad.md) |
 | Quantization scheme | `oasr.quantization.QuantMethod` (+ `ScaledMMLane`, `QuantAlgorithm`) | `oasr.quantization` (`register_quant_method`, `register_lane`, `register_quant_algorithm`) | the checkpoint's `QuantizationSpec` (native format v2), else `EngineConfig.quantization`; per layer by module path; a model declares its smoothing groups in `quantization_layout()` | [quantization.md](quantization.md) |
 
 ## The layer waist
 
-Orthogonal to the seven registries — which are about *what plugs in* — is the
+Orthogonal to the nine registries — which are about *what plugs in* — is the
 one about *what every architecture is built from*. Model implementations use
 `oasr.layers`, never `nn.Linear` / `nn.Conv1d` / `nn.AvgPool1d` / `nn.LSTM` /
 `nn.RNN` / `nn.LayerNorm` / `nn.Embedding` directly.

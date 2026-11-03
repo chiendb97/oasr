@@ -25,7 +25,7 @@ result = decoder.decode(log_probs)   # log_probs: torch.Tensor [T, V]
 ## Installation
 
 ```bash
-pip install "oasr[wfst]"   # installs k2 and kaldilm
+pip install "oasr-server[wfst]"   # installs k2 and kaldilm
 ```
 
 ---
