@@ -45,13 +45,13 @@ struct SeqlenInfoQK {
     int const seqlen_q;
     int const seqlen_k;    //!< exclusive upper bound on valid keys
     int const seqstart_k;  //!< inclusive lower bound on valid keys (left padding)
-    int const bias_offset; //!< element offset of this batch's block in a packed bias
+    int64_t const bias_offset;  //!< element offset of this batch's block in a packed bias
 
     CUTLASS_DEVICE
     SeqlenInfoQK(int const bidb, int const seqlen_q_static, int const seqlen_k_static,
                  int const* const cu_seqlens_q, int const* const cu_seqlens_k,
                  int const* const seqused_k, int const* const seqstarts_k,
-                 int const* const bias_offsets)
+                 int64_t const* const bias_offsets)
         : offset_q(cu_seqlens_q == nullptr ? 0 : cu_seqlens_q[bidb]),
           offset_k(cu_seqlens_k == nullptr ? 0 : cu_seqlens_k[bidb]),
           seqlen_q(cu_seqlens_q == nullptr ? seqlen_q_static

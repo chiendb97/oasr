@@ -493,11 +493,15 @@ struct CollectiveFmhaMainloopSm80 {
 
         // Vectorising the bias read needs every *row start* 4-byte aligned.
         // Under a packed bias that depends on this segment's own offset and
-        // length, so the host's CTA-uniform answer does not apply and the
-        // condition is re-derived here.  Note `bias_offset` is an element
+        // length as well as on the base, so the condition is re-derived here
+        // and the host's answer, which under a packed bias has only the base
+        // to look at (its strides are all zero), is one term of it.  Dropping
+        // that term issued 32-bit loads from a packed bias starting at an odd
+        // element: `misaligned address`.  Note `bias_offset` is an element
         // count, not a byte count.
         bool const bias_vectorizable =
-            bias_packed ? ((info.seqlen_k % 2) == 0 && (info.bias_offset % 2) == 0)
+            bias_packed ? (params.bias_vectorizable && (info.seqlen_k % 2) == 0 &&
+                           (info.bias_offset % 2) == 0)
                         : params.bias_vectorizable;
 
         cute::for_each(cute::make_int_sequence<kStages>{}, [&](auto stage) {

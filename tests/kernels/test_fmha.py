@@ -1224,6 +1224,33 @@ def test_varlen_matches_per_segment_dense(dtype, seg_lens, with_bias, device):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("bad", ["float", "short"])
+def test_varlen_bias_offsets_are_checked_as_integer_offsets(bad, device):
+    """``(S+1,)`` int64, as documented; either kernel reads them as integers.
+
+    Anything else was converted to int32 and passed on -- a float offset
+    truncated, a wide one wrapped -- so the contract is checked rather than
+    coerced.  int32 is still accepted, and widened.
+    """
+    q, k, v, cu = _varlen_make_packed([8, 16], 4, 4, 64, torch.float16, device)
+    bias, offsets = _build_packed_bias(q, cu, 4, 64, torch.float16, device, 0.125)
+    offsets = offsets.double() if bad == "float" else offsets[:-1]
+    with pytest.raises(ValueError, match="bias_offsets must be a 1-D int64"):
+        fmha_varlen(
+            q,
+            k,
+            v,
+            softmax_scale=0.125,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=16,
+            max_seqlen_k=16,
+            attn_bias=bias,
+            bias_offsets=offsets,
+        )
+
+
+@pytest.mark.cuda
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("gqa", [(8, 2), (8, 1)])
 def test_varlen_gqa(dtype, gqa, device):

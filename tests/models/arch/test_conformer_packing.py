@@ -129,6 +129,42 @@ class TestCapacities:
         assert int(b.bias_offsets[-1]) == int(a.bias_offsets[-1])
 
 
+class TestBiasOffsetsAreInt64:
+    """The packed bias is ``sum_s H * T_s^2`` elements, which passes ``2**31``.
+
+    At 8 heads that is 256 segments of 1024 frames.  Both builders took an
+    int32 prefix sum, which wrapped negative there, and the varlen kernel then
+    read a block from before the buffer.
+    """
+
+    @cuda_only
+    def test_the_device_builder_counts_past_int32(self):
+        # Two 16384-frame segments at 8 heads: 2 * 2**31 elements of bias.  The
+        # capacities keep every other tensor small, so only the offsets are big.
+        dev = torch.device("cuda")
+        lengths = torch.tensor([16384, 16384, 8], device=dev, dtype=torch.int32)
+        lay = build_packed_layout_device(
+            lengths,
+            16384,
+            31,
+            8,
+            total_capacity=32776,
+            max_seg_capacity=16384,
+            bias_capacity=64,
+        )
+        assert lay.bias_offsets.dtype == torch.int64
+        block = 8 * 16384**2
+        assert lay.bias_offsets.tolist() == [0, block, 2 * block, 2 * block + 8 * 64]
+
+    def test_the_host_builder_emits_int64(self):
+        # Reaching 2**31 here would materialise a 2**31-entry gather index, so
+        # the width is checked at a size that fits, against exact integers.
+        lengths = torch.tensor([40, 30, 20])
+        lay = build_packed_layout(_mask(lengths, 40), 15, num_heads=8)
+        assert lay.bias_offsets.dtype == torch.int64
+        assert lay.bias_offsets.tolist() == [0, 8 * 1600, 8 * 2500, 8 * 2900]
+
+
 @cuda_only
 class TestCapturable:
     def test_device_builder_captures_and_host_builder_does_not(self):

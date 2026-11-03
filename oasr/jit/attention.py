@@ -798,8 +798,13 @@ def _compiled_fmha_varlen(
         mBias = from_dlpack(bias, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=0
         )
-        bias_off = torch.zeros(S + 1, dtype=torch.int32, device=device)
-        mBiasOff = from_dlpack(bias_off, assumed_align=4, enable_tvm_ffi=True).mark_layout_dynamic(
+        # int64, the packed layout's own type: a packed bias outgrows an int32
+        # index long before memory runs out.  The buffer itself is still
+        # addressed with 32-bit indices here -- the binding refuses one past
+        # int32 -- so the kernel narrows each offset it reads, and
+        # `fmha_varlen` sends a longer buffer to the C++ lane.
+        bias_off = torch.zeros(S + 1, dtype=torch.int64, device=device)
+        mBiasOff = from_dlpack(bias_off, assumed_align=8, enable_tvm_ffi=True).mark_layout_dynamic(
             leading_dim=0
         )
     else:
@@ -809,8 +814,8 @@ def _compiled_fmha_varlen(
             enable_tvm_ffi=True,
         )
         mBiasOff = from_dlpack(
-            torch.empty((), dtype=torch.int32, device=device),
-            assumed_align=4,
+            torch.empty((), dtype=torch.int64, device=device),
+            assumed_align=8,
             enable_tvm_ffi=True,
         )
 

@@ -74,6 +74,41 @@ static constexpr DLDataType dl_int32 = {kDLInt, 32, 1};
             << " elements; got " << (x).stride(0);                                        \
     } while (0)
 
+// The same contract for a tensor of any rank that a kernel walks with 128-bit
+// accesses along its last axis: a 16-byte-aligned base, and the stride of every
+// other axis longer than one a whole number of vectors (an axis of extent 1 is
+// never stepped along, so its stride is free).  The vector width comes from the
+// dtype.  An odd element anywhere in `base + sum(i_d * stride_d)` misaligns the
+// whole access, and that is a sticky `misaligned address`, not an exception.
+inline void CheckVectorAlignedEveryAxis(TensorView const& x, char const* name) {
+    int64_t const elems = 128 / (int64_t(x.dtype().bits) * x.dtype().lanes);
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16, 0u)
+        << name << " must be 16-byte aligned (the 128-bit load/store width)";
+    for (int d = 0; d + 1 < x.ndim(); ++d) {
+        TVM_FFI_ICHECK(x.size(d) <= 1 || x.stride(d) % elems == 0)
+            << name << ": the stride of axis " << d << " must be a multiple of " << elems
+            << " elements (one 128-bit vector); got " << x.stride(d);
+    }
+}
+
+// A vector a kernel reads as `ptr[i]`: a CUDA tensor on `like`'s device, rank 1,
+// a signed integer of exactly `bits` bits, unit stride, and at least `min_len`
+// entries.  The Python wrappers convert lengths and offsets to the right width
+// before every call, so it is a direct caller who skips that -- and an int64
+// vector read as int32 is a wrong answer, not a fault.
+inline void CheckIntVector(TensorView const& x, int bits, int64_t min_len, char const* name,
+                           TensorView const& like) {
+    TVM_FFI_ICHECK(x.device().device_type == kDLCUDA &&
+                   x.device().device_id == like.device().device_id)
+        << name << " must be a CUDA tensor on the inputs' device";
+    TVM_FFI_ICHECK_EQ(x.ndim(), 1) << name << " must be 1-D";
+    TVM_FFI_ICHECK(x.dtype().code == kDLInt && x.dtype().bits == bits && x.dtype().lanes == 1)
+        << name << " must be int" << bits;
+    TVM_FFI_ICHECK(x.size(0) <= 1 || x.stride(0) == 1) << name << " must be contiguous";
+    TVM_FFI_ICHECK_GE(x.size(0), min_len)
+        << name << " needs at least " << min_len << " entries; got " << x.size(0);
+}
+
 // Full row-major contiguity.  Stronger than CHECK_LAST_DIM_CONTIGUOUS_INPUT and
 // what a kernel indexing rows as `base + row * row_len` actually needs: a
 // tensor can have stride(-1) == 1 and still have a padded row stride (any

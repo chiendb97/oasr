@@ -66,8 +66,10 @@ class PackedLayout:
         ``(num_segs, max_seg_len)`` bool — valid (non-pad) frames of the
         batched-per-segment conv grid.
     bias_offsets : Tensor or None
-        ``(num_segs+1,)`` int32 prefix sum of ``H * T_s * T_s`` — start of each
+        ``(num_segs+1,)`` int64 prefix sum of ``H * T_s * T_s`` — start of each
         segment's block in the packed block-diagonal varlen attention bias.
+        int64 because the sum passes 2**31 at 256 segments of 1024 frames and 8
+        heads.
         ``None`` when ``num_heads`` was not provided (conv-only layouts).
     bias_gather_idx : Tensor or None
         ``(sum H*T_s*T_s,)`` int64.  Source index into a batched
@@ -178,13 +180,16 @@ def build_packed_layout(
     bias_gather_idx = None
     if num_heads is not None and B > 0:
         H = int(num_heads)
+        # int64: the sum outgrows int32 at 256 segments of 1024 frames and 8
+        # heads, where the int32 prefix sum wrapped negative and the kernel
+        # read a block from before the buffer.
         block_sizes = torch.tensor(
             [H * t * t for t in seg_list],
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=device,
         )
-        bias_offsets = torch.zeros(B + 1, dtype=torch.int32, device=device)
-        bias_offsets[1:] = torch.cumsum(block_sizes, dim=0).to(torch.int32)
+        bias_offsets = torch.zeros(B + 1, dtype=torch.int64, device=device)
+        bias_offsets[1:] = torch.cumsum(block_sizes, dim=0)
         h_ar = torch.arange(H, device=device, dtype=torch.int64)
         idx_chunks = []
         for s, t in enumerate(seg_list):
@@ -313,18 +318,18 @@ def build_packed_layout_device(
     if num_heads is not None and S > 0:
         H = int(num_heads)
         block = H * sl64 * sl64
-        bias_offsets = torch.zeros(S + 1, dtype=torch.int32, device=device)
-        bias_offsets[1:] = torch.cumsum(block, dim=0).to(torch.int32)
-        bo64 = bias_offsets.to(torch.int64)
+        # int64, as in the host builder: an int32 prefix sum wraps.
+        bias_offsets = torch.zeros(S + 1, dtype=torch.int64, device=device)
+        bias_offsets[1:] = torch.cumsum(block, dim=0)
         BB = int(bias_capacity) if bias_capacity is not None else int(bias_offsets[S])
         # Decompose a flat packed-bias position into (segment, head, i, j) with
         # arithmetic instead of concatenating one arange per segment.  Segment
         # lengths are clamped to >= 1 so a padding segment cannot divide by zero;
         # its entries are never read, because ``bias_offsets`` bounds each block.
         p_ar = torch.arange(BB, device=device, dtype=torch.int64)
-        s_id = torch.searchsorted(bo64[1:].contiguous(), p_ar, right=True).clamp_(max=S - 1)
+        s_id = torch.searchsorted(bias_offsets[1:].contiguous(), p_ar, right=True).clamp_(max=S - 1)
         t_s = sl64[s_id].clamp(min=1)
-        rem = p_ar - bo64[s_id]
+        rem = p_ar - bias_offsets[s_id]
         t_sq = t_s * t_s
         head = (rem // t_sq).clamp_(0, H - 1)
         within = rem - head * t_sq

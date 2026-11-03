@@ -370,6 +370,245 @@ class TestArbitraryStrides:
         want = ref_fmha(q.contiguous(), k.contiguous(), v.contiguous(), 0.125)
         torch.testing.assert_close(got, want, **FMHA_TOL)
 
+    @staticmethod
+    def _offset_view(B, H, T, D, *, skip, pad=8):
+        """A ``(B, H, T, D)`` view starting ``skip`` elements into each wider row."""
+        store = torch.randn(B, H, T, D + pad, dtype=torch.float16, device="cuda")
+        return store[..., skip : skip + D]
+
+    @pytest.mark.parametrize(
+        "layout",
+        ["q_odd_base", "q_contiguous_odd_base", "k_row_stride_68", "v_odd_base", "out_odd_base"],
+    )
+    def test_a_layout_the_vectors_cannot_address_is_copied(self, fmha_cxx, layout):
+        """A last-axis-contiguous view that is off the 128-bit grid.
+
+        Every q/k/v/output access is a 16-byte vector, so an odd base, or a row
+        stride that is not a whole vector, is a sticky ``misaligned address``
+        -- and ``oasr.fmha(backend="cxx")`` used to pass both straight through,
+        because it copied only for a non-unit last stride.  Bit-exact against
+        the same call on aligned copies: the copy may move nothing but where
+        the operand lives.
+        """
+        B, H, T, D = 2, 4, 96, 64
+        torch.manual_seed(3)
+        q, k, v = _qkv(B, H, T, T, D, seed=3)
+        out = None
+        if layout == "q_odd_base":
+            q = self._offset_view(B, H, T, D, skip=1)
+        elif layout == "q_contiguous_odd_base":
+            # Contiguous, so `.contiguous()` hands it back unchanged: the copy
+            # has to be a real one.
+            q = torch.randn(q.numel() + 8, dtype=q.dtype, device="cuda")[1 : 1 + q.numel()]
+            q = q.view(B, H, T, D)
+            assert q.is_contiguous() and q.data_ptr() % 16 == 2
+        elif layout == "k_row_stride_68":
+            k = self._offset_view(B, H, T, D, skip=0, pad=4)
+            assert k.stride(2) == 68
+        elif layout == "v_odd_base":
+            v = self._offset_view(B, H, T, D, skip=3)
+        else:
+            out = self._offset_view(B, H, T, D, skip=1).zero_()
+        got = fmha_cxx(q, k, v, softmax_scale=0.125, out=out)
+        want = fmha_cxx(q.clone(), k.clone(), v.clone(), softmax_scale=0.125)
+        if out is not None:
+            assert got.data_ptr() == out.data_ptr(), "the caller's out must hold the result"
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def _module(**variant):
+    """The C++ lane's launcher for one fp16 head-64 variant, called directly."""
+    from oasr.jit.fmha import get_fmha_fn
+
+    return get_fmha_fn(dtype_str="float16", head_dim=64, **variant)
+
+
+def _t(*shape, dtype=torch.float16):
+    return torch.randn(*shape, dtype=dtype, device="cuda")
+
+
+def _lens(*values, dtype=torch.int32):
+    return torch.tensor(values, dtype=dtype, device="cuda")
+
+
+def _dense_call(q=None, k=None, v=None, out=None, bias=None, seqlens=None, block_table=None):
+    """A dense call with every argument valid unless overridden."""
+    q = _t(2, 2, 16, 64) if q is None else q
+    k = _t(2, 2, 16, 64) if k is None else k
+    v = _t(*k.shape) if v is None else v
+    out = torch.empty_like(q) if out is None else out
+    fn = _module(has_bias=bias is not None)
+    return lambda: fn(out, q, k, v, bias, seqlens, None, block_table, 0.125, -1, -1)
+
+
+def _varlen_call(q=None, cu=None, bias=None, offsets=None):
+    q = _t(24, 2, 64) if q is None else q
+    k, v = _t(24, 2, q.size(2)), _t(24, 2, q.size(2))
+    cu = _lens(0, 8, 24) if cu is None else cu
+    fn = _module(has_bias=bias is not None, varlen=True)
+    out = torch.empty_like(q)
+    return lambda: fn(out, q, k, v, bias, offsets, cu, cu, 16, 16, 0.125, -1, -1)
+
+
+def _split_call(q=None, o_partial=None):
+    q = _t(1, 2, 1, 64) if q is None else q
+    k, v = _t(1, 2, 512, q.size(3)), _t(1, 2, 512, q.size(3))
+    o_p = torch.empty(2, 1, 2, 1, q.size(3), device="cuda") if o_partial is None else o_partial
+    lse = torch.empty(2, 1, 2, 1, device="cuda")
+    fn = _module(split=True)
+    out = torch.empty_like(q)
+    return lambda: fn(out, o_p, lse, q, k, v, None, None, None, None, 2, 0.125, -1, -1)
+
+
+def _paged_call(block_table):
+    q = _t(2, 2, 1, 64)
+    pool = _t(4, 16, 2, 64)
+    fn = _module(paged=True)
+    out = torch.empty_like(q)
+    seqlens = _lens(16, 16)
+    return lambda: fn(out, q, pool, pool, None, seqlens, None, block_table, 0.125, -1, -1)
+
+
+def _packed_bias(lens=(8, 16), H=2):
+    flat = _t(sum(H * t * t for t in lens))
+    offs = [0]
+    for t in lens:
+        offs.append(offs[-1] + H * t * t)
+    return flat, offs
+
+
+# (case, call factory, what the refusal must say).  Each was, before the
+# launcher checked it, a sticky `misaligned address`, a read past a tensor or a
+# silently wrong answer -- the Python wrappers establish all of it, so only a
+# caller of the module itself could reach one.
+_REFUSALS = [
+    (
+        "head_dim_60_dense",
+        lambda: _dense_call(q=_t(2, 2, 16, 60), k=_t(2, 2, 16, 60)),
+        "head_dim must be a multiple of 8",
+    ),
+    ("head_dim_60_varlen", lambda: _varlen_call(q=_t(24, 2, 60)), "head_dim must be a multiple"),
+    ("head_dim_60_split", lambda: _split_call(q=_t(1, 2, 1, 60)), "head_dim must be a multiple"),
+    (
+        "q_odd_base",
+        lambda: _dense_call(q=_t(2, 2, 16, 72)[..., 1:65]),
+        "q must be 16-byte aligned",
+    ),
+    (
+        "k_row_stride_68",
+        lambda: _dense_call(k=_t(2, 2, 16, 68)[..., :64]),
+        "k: the stride of axis 2 must be a multiple of 8",
+    ),
+    (
+        "out_odd_base",
+        lambda: _dense_call(out=_t(2, 2, 16, 72)[..., 1:65]),
+        "output must be 16-byte aligned",
+    ),
+    ("q_bf16", lambda: _dense_call(q=_t(2, 2, 16, 64, dtype=torch.bfloat16)), "q must be float16"),
+    ("v_shorter_than_k", lambda: _dense_call(v=_t(2, 2, 15, 64)), "k and v must have the same"),
+    ("out_shape", lambda: _dense_call(out=_t(2, 2, 8, 64)), "q and output must have the same"),
+    ("k_batch", lambda: _dense_call(k=_t(1, 2, 16, 64)), "dense k must have the query's batch"),
+    (
+        "block_table_on_dense",
+        lambda: _dense_call(block_table=torch.zeros(2, 1, dtype=torch.int32, device="cuda")),
+        "dense variant takes no block_table",
+    ),
+    (
+        "cache_seqlens_int64",
+        lambda: _dense_call(seqlens=_lens(16, 16, dtype=torch.int64)),
+        "cache_seqlens must be int32",
+    ),
+    ("cache_seqlens_short", lambda: _dense_call(seqlens=_lens(16)), "cache_seqlens needs at least"),
+    (
+        "bias_batch",
+        lambda: _dense_call(bias=_t(1, 2, 16, 16)),
+        "bias must be (B, H, T_q, T_k) with q's B = 2",
+    ),
+    (
+        "bias_fp32",
+        lambda: _dense_call(bias=_t(2, 2, 16, 16, dtype=torch.float32)),
+        "bias must be float16",
+    ),
+    (
+        "cu_seqlens_int64",
+        lambda: _varlen_call(cu=_lens(0, 8, 24, dtype=torch.int64)),
+        "cu_seqlens_q must be int32",
+    ),
+    (
+        "bias_offsets_int32",
+        lambda: _varlen_call(
+            bias=_packed_bias()[0], offsets=_lens(*_packed_bias()[1], dtype=torch.int32)
+        ),
+        "bias_offsets must be int64",
+    ),
+    (
+        "bias_offsets_short",
+        lambda: _varlen_call(
+            bias=_packed_bias()[0], offsets=_lens(*_packed_bias()[1][:-1], dtype=torch.int64)
+        ),
+        "bias_offsets needs at least 3 entries",
+    ),
+    (
+        "packed_bias_strided",
+        # Rows of 64 a padded 128 apart: the last axis is contiguous, so only
+        # a whole-buffer contiguity check sees that the flat read is wrong.
+        lambda: _varlen_call(
+            bias=_t(10, 128)[:, :64], offsets=_lens(*_packed_bias()[1], dtype=torch.int64)
+        ),
+        "must be contiguous",
+    ),
+    (
+        "split_workspace_strided",
+        lambda: _split_call(o_partial=torch.empty(2, 1, 2, 1, 128, device="cuda")[..., ::2]),
+        "the split workspaces must be contiguous",
+    ),
+    (
+        "block_table_int64",
+        lambda: _paged_call(torch.zeros(2, 1, dtype=torch.int64, device="cuda")),
+        "block_table must be a 2-D int32",
+    ),
+    (
+        "block_table_short",
+        lambda: _paged_call(torch.zeros(1, 1, dtype=torch.int32, device="cuda")),
+        "block_table needs a row per batch row",
+    ),
+]
+
+
+class TestTheLauncherRefusesWhatItCannotAddress:
+    """A direct call to the module gets an exception, never a kernel.
+
+    ``oasr.fmha`` and ``oasr.fmha_varlen`` copy what the kernel cannot address,
+    convert lengths and offsets, and route a head_dim it cannot load; the
+    module trusted all of that.  Each case below reaches the launcher with one
+    argument wrong and every other one valid, so the refusal is that argument's
+    and the message must name it.  ``RuntimeError`` specifically: the check is
+    the launcher's, raised before anything is enqueued.
+    """
+
+    @pytest.mark.parametrize("case,call,match", _REFUSALS, ids=[c[0] for c in _REFUSALS])
+    def test_refused_before_launch(self, case, call, match):
+        _requires_cxx()
+        launch = call()
+        with pytest.raises(RuntimeError, match=match.replace("(", r"\(").replace(")", r"\)")):
+            launch()
+        torch.cuda.synchronize()  # nothing was enqueued that could fault later
+
+    def test_the_valid_calls_these_start_from_run(self):
+        """The control: every factory with nothing overridden launches."""
+        _requires_cxx()
+        flat, offs = _packed_bias()
+        for launch in (
+            _dense_call(),
+            _dense_call(bias=_t(2, 2, 16, 16), seqlens=_lens(16, 9)),
+            _varlen_call(),
+            _varlen_call(bias=flat, offsets=_lens(*offs, dtype=torch.int64)),
+            _split_call(),
+            _paged_call(torch.zeros(2, 1, dtype=torch.int32, device="cuda")),
+        ):
+            launch()
+        torch.cuda.synchronize()
+
 
 class TestPagedInputsAsGiven:
     """A paged call hands the caller's bias and block table to this lane untouched.
@@ -778,6 +1017,33 @@ class TestVarlenIsTheDenseKernel:
                 msg=f"segment {s} of {lens}: packed bias read with the wrong stride",
             )
 
+    def test_a_packed_bias_starting_at_an_odd_element_is_read(self, fmha_varlen_cxx):
+        """Only the base is off: every offset and every segment length is even.
+
+        The kernel reads a bias in 32-bit pairs where a row start allows it.
+        Under a packed bias it re-derived that from the segment's offset and
+        length and left the base out, so this layout issued 32-bit loads from a
+        2-byte-aligned address: a sticky ``misaligned address``.  Bit-exact
+        against the same blocks at an aligned base.
+        """
+        H, D, lens = 4, 64, [16, 32]
+        q, k, v, cu_q, cu_k, flat, offs = _pack(lens, lens, H, H, D, seed=11, bias=True)
+        store = torch.empty(flat.numel() + 1, dtype=flat.dtype, device="cuda")
+        store[1:] = flat
+        odd = store[1:]
+        assert odd.data_ptr() % 4 == 2
+        kw = {
+            "softmax_scale": 0.125,
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_k": cu_k,
+            "max_seqlen_q": max(lens),
+            "max_seqlen_k": max(lens),
+            "bias_offsets": offs,
+        }
+        got = fmha_varlen_cxx(q, k, v, attn_bias=odd, **kw)
+        want = fmha_varlen_cxx(q, k, v, attn_bias=flat, **kw)
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
     def test_varlen_names_a_backend_and_gets_it(self):
         """It used to fall back to SDPA in silence where ``fmha`` raises."""
         from oasr.functionals.attention import fmha_varlen
@@ -795,6 +1061,68 @@ class TestVarlenIsTheDenseKernel:
                 max_seqlen_k=8,
                 backend="cxx",
             )
+
+
+@pytest.mark.slow
+class TestPackedBiasPastInt32:
+    """Packed-bias offsets past ``2**31``, which int32 offsets read wrapped.
+
+    The buffer is ``sum_s H * T_s^2`` elements -- ``2**31`` at 256 segments of
+    1024 frames and 8 heads -- and the offsets were an int32 prefix sum read as
+    ``int``: the block came from before the buffer, an illegal access.  An
+    offset is any element index into the buffer, so no ``2**31``-element
+    attention is needed to reach one: segment 1's block is placed past element
+    ``2**31`` of a 4.3 GB buffer.  The oracle is the same blocks packed
+    tightly, bit-exact, because only the block's address moves.
+    """
+
+    FAR = (1 << 31) + 64
+    LENS = [48, 64]
+    H = 4
+
+    @pytest.fixture(scope="class")
+    def case(self):
+        _requires_cxx()
+        from oasr.functionals.attention import fmha_varlen
+
+        n0, n1 = (self.H * t * t for t in self.LENS)
+        need = 2 * (self.FAR + n1)
+        if torch.cuda.mem_get_info()[0] < need + (1 << 30):
+            pytest.skip(f"needs {need / 2**30:.1f} GiB of free device memory for the bias")
+        q, k, v, cu_q, cu_k, flat, offs = _pack(
+            self.LENS, self.LENS, self.H, self.H, 64, seed=5, bias=True
+        )
+        far = torch.zeros(self.FAR + n1, dtype=flat.dtype, device="cuda")
+        far[:n0] = flat[:n0]
+        far[self.FAR :] = flat[n0:]
+        far_offs = torch.tensor([0, self.FAR, self.FAR + n1], dtype=torch.int64, device="cuda")
+        kw = {
+            "softmax_scale": 0.125,
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_k": cu_k,
+            "max_seqlen_q": max(self.LENS),
+            "max_seqlen_k": max(self.LENS),
+        }
+        want = fmha_varlen(q, k, v, attn_bias=flat, bias_offsets=offs, backend="cxx", **kw)
+        yield fmha_varlen, (q, k, v), {**kw, "attn_bias": far, "bias_offsets": far_offs}, want
+        del far
+        torch.cuda.empty_cache()
+
+    def test_the_cxx_lane_reads_a_block_past_int32(self, case):
+        fmha_varlen, qkv, kw, want = case
+        got = fmha_varlen(*qkv, backend="cxx", **kw)
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    def test_auto_sends_it_to_the_lane_that_can_address_it(self, case):
+        """The CuTeDSL varlen kernel, ``auto``'s choice, indexes the buffer in 32 bits."""
+        fmha_varlen, qkv, kw, want = case
+        got = fmha_varlen(*qkv, **kw)
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    def test_naming_cute_says_why_it_cannot(self, case):
+        fmha_varlen, qkv, kw, _want = case
+        with pytest.raises(NotImplementedError, match="32-bit offsets"):
+            fmha_varlen(*qkv, backend="cute", **kw)
 
 
 # ---------------------------------------------------------------------------

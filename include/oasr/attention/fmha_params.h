@@ -87,7 +87,10 @@ struct FmhaArguments {
     Element const* ptr_bias = nullptr;
     ShapeBias shape_bias = {};
     StrideBias stride_bias = {};
-    int32_t const* bias_offsets = nullptr;  //!< packed block-diagonal bias
+    //! Packed block-diagonal bias: segment `s`'s block starts at element
+    //! `bias_offsets[s]`.  64-bit, because the buffer is `sum_s H * T_s^2`
+    //! elements and 256 segments of 1024 frames at 8 heads is already 2^31.
+    int64_t const* bias_offsets = nullptr;
 
     //! Paged KV.  Null when the K/V above are dense.
     int32_t const* ptr_pagetable = nullptr;
@@ -154,7 +157,7 @@ struct FmhaParams {
     Element const* ptr_bias;
     ShapeBias shape_bias;
     StrideBias stride_bias;
-    int32_t const* bias_offsets;
+    int64_t const* bias_offsets;
     //! True when a bias row can be read as 32-bit pairs: the row stride is an
     //! even number of elements and the column stride is 1.  A CTA-uniform
     //! runtime bool rather than a template parameter, because the vectorised
@@ -212,7 +215,10 @@ FmhaParams<Element> to_underlying_arguments(FmhaArguments<Element> const& args) 
     // `ptr + b*sB + h*sH + m*sM + even`, and a single odd term in that sum
     // misaligns the whole plane.  Checking only the row stride -- which is what
     // the obvious reading of "row start" gets you -- leaves a `bias[:, 1:]`
-    // style view passing the test and issuing a misaligned 32-bit load.
+    // style view passing the test and issuing a misaligned 32-bit load.  A
+    // packed bias's strides are all zero here (they are per segment), so for
+    // it this is the base's alignment alone, and the mainloop ANDs in the
+    // segment's own offset and row length.
     bool const bias_vec = args.ptr_bias != nullptr &&
                           (cute::get<1>(args.stride_bias) == 1) &&
                           ((cute::get<0>(args.stride_bias) % 2) == 0) &&
