@@ -214,6 +214,8 @@ class InputProcessor:
         #: Bytes the host cache held after the last trim: what the process keeps
         #: page-locked for reasons other than request audio (staging, mostly).
         self._pinned_host_baseline = 0
+        #: Set while page-locking is failing, so a run of failures logs once.
+        self._pinned_audio_failing = False
 
         # Shared CUDA Graph memory-pool handle injected by ``ASREngine`` so the
         # feature-extraction graph cache (added in Step 2 of the plan) shares
@@ -430,6 +432,12 @@ class InputProcessor:
         caching host allocator keeps what it takes, so an unbounded offer would
         let one long request — or a burst of them — hold a permanent
         reservation.
+
+        Also ``None`` when page-locking this buffer fails, for this request
+        only.  The failure seen is ``cudaHostAlloc`` running out
+        (``torch.AcceleratorError``), and the next allocation can succeed.  It
+        used to set the per-request cap to zero, which gave up the pinned path
+        for every later request until the process restarted.
         """
         if num_samples <= 0 or num_samples > self._max_pinned_audio_samples:
             return None
@@ -440,15 +448,22 @@ class InputProcessor:
             self._pinned_audio_since_trim = True
         try:
             buf = torch.empty(num_samples, dtype=torch.float32, pin_memory=True)
-        except RuntimeError:
+        except RuntimeError as exc:
             self._unpin_audio(num_samples)
-            # No usable CUDA context to page-lock against.  The caller's
-            # fallback is a correct, slightly slower path, so this is a
-            # capability answer rather than a failure — but it should never be
-            # reached on a device the engine reported as CUDA, hence the log.
-            logger.warning("cannot allocate pinned host memory; audio buffers stay on the heap")
-            self._max_pinned_audio_samples = 0
+            # The caller's fallback is the correct, slightly slower path.  Log
+            # the first failure of a run, not every request that meets it.
+            if not self._pinned_audio_failing:
+                self._pinned_audio_failing = True
+                logger.warning(
+                    "cannot page-lock %d audio samples (%s); this request uses heap "
+                    "memory, and later ones ask again",
+                    num_samples,
+                    str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                )
             return None
+        if self._pinned_audio_failing:
+            self._pinned_audio_failing = False
+            logger.info("page-locked audio buffers are available again")
         weakref.finalize(buf.untyped_storage(), self._unpin_audio, num_samples)
         return buf
 

@@ -741,9 +741,58 @@ pub fn assert_decoding_option_keys_match(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
-/// Avoid repeated pinned-buffer requests after the process reports them
-/// unavailable. Buffer-size policy remains engine-specific.
-static PINNED_AUDIO_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set while [`pinned_audio_buffer`] is seeing errors, so a run of them is
+/// logged once.  Only the log level reads it: every request still asks.
+static PINNED_AUDIO_FAILING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The engine's page-locked buffer for `n` samples, or `None` for heap audio.
+///
+/// Asked of this engine, for this request, every time:
+///
+/// - `None` from the engine is it declining *this* request: a CPU device, a
+///   request past a pinned-audio cap, or an allocation that failed.
+/// - An engine without the method (an older one, or a stand-in) has no pinned
+///   buffers.
+/// - Any other error costs this request the pinned path and nothing more.
+///
+/// Any error used to latch a process-wide flag, so one failure moved every
+/// later request, on every engine worker, to heap audio until the process
+/// restarted: 1.13-1.19x of the offline path, given up for good.
+fn pinned_audio_buffer<'py>(engine: &Bound<'py, PyAny>, n: usize) -> Option<Bound<'py, PyAny>> {
+    use std::sync::atomic::Ordering;
+
+    if n == 0 {
+        return None;
+    }
+    let py = engine.py();
+    let name = pyo3::intern!(py, "new_audio_buffer");
+    match engine.call_method1(name, (n,)) {
+        Ok(buf) => {
+            if PINNED_AUDIO_FAILING.swap(false, Ordering::Relaxed) {
+                tracing::info!("engine pinned audio buffers answer again");
+            }
+            (!buf.is_none()).then_some(buf)
+        }
+        Err(e)
+            if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py)
+                && !engine.hasattr(name).unwrap_or(true) =>
+        {
+            None
+        }
+        Err(e) => {
+            if PINNED_AUDIO_FAILING.swap(true, Ordering::Relaxed) {
+                tracing::debug!(error = %e, "new_audio_buffer failed; this request uses heap audio");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "new_audio_buffer failed; this request uses heap audio, and later ones ask again"
+                );
+            }
+            None
+        }
+    }
+}
 
 /// Materialise one offline request's PCM payload into the buffer the engine
 /// will DMA from.
@@ -756,31 +805,15 @@ fn offline_audio_to_py<'py>(
     engine: &Bound<'py, PyAny>,
     audio: &[u8],
 ) -> PyResult<Bound<'py, PyAny>> {
-    use std::sync::atomic::Ordering;
-
     let n = audio.len() / std::mem::size_of::<f32>();
-    if n > 0 && !PINNED_AUDIO_OFF.load(Ordering::Relaxed) {
-        match engine.call_method1("new_audio_buffer", (n,)) {
-            Ok(buf) if !buf.is_none() => {
-                // `numpy()` shares the tensor's storage and keeps it alive
-                // through the array's `base`, so this writes the pinned pages
-                // themselves rather than a copy of them.
-                let view = buf.call_method0("numpy")?;
-                let arr: &Bound<'py, PyArray1<f32>> = view.downcast()?;
-                fill_f32_array(arr, audio)?;
-                return Ok(buf);
-            }
-            // `None` is the engine declining this request (CPU device, or past
-            // the pinned-audio cap) — not an error, and not a reason to stop
-            // asking, since the cap is per request.
-            Ok(_) => {}
-            Err(e) => {
-                // An older engine without the method, or one that cannot pin.
-                // Latch off rather than paying the exception per request.
-                PINNED_AUDIO_OFF.store(true, Ordering::Relaxed);
-                tracing::debug!(error = %e, "engine has no pinned audio buffers; using heap arrays");
-            }
-        }
+    if let Some(buf) = pinned_audio_buffer(engine, n) {
+        // `numpy()` shares the tensor's storage and keeps it alive through the
+        // array's `base`, so this writes the pinned pages themselves rather
+        // than a copy of them.
+        let view = buf.call_method0("numpy")?;
+        let arr: &Bound<'py, PyArray1<f32>> = view.downcast()?;
+        fill_f32_array(arr, audio)?;
+        return Ok(buf);
     }
     Ok(audio_bytes_to_numpy(py, audio)?.into_any())
 }
@@ -797,22 +830,11 @@ fn offline_audio_dest<'py>(
     engine: &Bound<'py, PyAny>,
     n: usize,
 ) -> PyResult<(Bound<'py, PyAny>, *mut f32)> {
-    use std::sync::atomic::Ordering;
-
-    if n > 0 && !PINNED_AUDIO_OFF.load(Ordering::Relaxed) {
-        match engine.call_method1("new_audio_buffer", (n,)) {
-            Ok(buf) if !buf.is_none() => {
-                let view = buf.call_method0("numpy")?;
-                let arr: &Bound<'py, PyArray1<f32>> = view.downcast()?;
-                let dst = contiguous_f32_ptr(arr, n)?;
-                return Ok((buf, dst));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                PINNED_AUDIO_OFF.store(true, Ordering::Relaxed);
-                tracing::debug!(error = %e, "engine has no pinned audio buffers; using heap arrays");
-            }
-        }
+    if let Some(buf) = pinned_audio_buffer(engine, n) {
+        let view = buf.call_method0("numpy")?;
+        let arr: &Bound<'py, PyArray1<f32>> = view.downcast()?;
+        let dst = contiguous_f32_ptr(arr, n)?;
+        return Ok((buf, dst));
     }
     // SAFETY: uninitialized only until `copy_payloads` writes all `n` elements,
     // which happens before the array is handed to Python; f32 has no drop glue.
@@ -1003,5 +1025,103 @@ pub fn engine_error_event(rid: &str, err: &PyEngineError) -> Event {
         request_id: rid.to_owned(),
         code: ErrorCode::Internal,
         message: format!("{err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stand-in engines for the pinned-audio offer.  Pure Python: the offer
+    /// itself needs no numpy, so these run where `cargo test` has none.
+    const ENGINES: &str = r#"
+class Flaky:
+    """Fails its first `failures` offers, the way cudaHostAlloc running out
+    fails one allocation and not the next."""
+
+    def __init__(self, failures):
+        self.failures = failures
+        self.calls = 0
+
+    def new_audio_buffer(self, n):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError("CUDA error: out of memory")
+        return ("pinned", n)
+
+
+class Declining:
+    def __init__(self):
+        self.calls = 0
+
+    def new_audio_buffer(self, n):
+        self.calls += 1
+        return None
+
+
+class WithoutBuffers:
+    pass
+"#;
+
+    fn engine<'py>(
+        py: Python<'py>,
+        class: &str,
+        args: impl IntoPy<Py<pyo3::types::PyTuple>>,
+    ) -> Bound<'py, PyAny> {
+        let module = PyModule::from_code_bound(py, ENGINES, "engines.py", "engines")
+            .expect("the stand-in engines do not compile");
+        module.getattr(class).unwrap().call1(args).unwrap()
+    }
+
+    fn calls(engine: &Bound<'_, PyAny>) -> u32 {
+        engine.getattr("calls").unwrap().extract().unwrap()
+    }
+
+    /// One failed allocation used to latch pinned audio off for the life of
+    /// the process.
+    #[test]
+    fn a_failed_offer_costs_only_its_own_request() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let flaky = engine(py, "Flaky", (1,));
+            assert!(pinned_audio_buffer(&flaky, 16_000).is_none());
+            let buf = pinned_audio_buffer(&flaky, 16_000).expect("not asked again");
+            assert_eq!(
+                buf.extract::<(String, usize)>().unwrap(),
+                ("pinned".to_string(), 16_000)
+            );
+            assert_eq!(calls(&flaky), 2);
+        });
+    }
+
+    /// The latch was process-wide, so one worker's failure took the pinned
+    /// path from every engine in the process.
+    #[test]
+    fn one_engine_failing_leaves_the_others_their_buffers() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let failing = engine(py, "Flaky", (u32::MAX,));
+            let healthy = engine(py, "Flaky", (0,));
+            assert!(pinned_audio_buffer(&failing, 16_000).is_none());
+            assert!(pinned_audio_buffer(&healthy, 16_000).is_some());
+            assert!(pinned_audio_buffer(&failing, 16_000).is_none());
+            assert_eq!(calls(&failing), 2, "a failing engine is still asked");
+        });
+    }
+
+    /// The answers that mean heap audio without anything having failed.
+    #[test]
+    fn a_decline_or_an_engine_without_buffers_means_heap_audio() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let declining = engine(py, "Declining", ());
+            assert!(pinned_audio_buffer(&declining, 16_000).is_none());
+            assert!(pinned_audio_buffer(&declining, 16_000).is_none());
+            assert_eq!(calls(&declining), 2, "a decline is per request");
+            assert!(pinned_audio_buffer(&declining, 0).is_none());
+            assert_eq!(calls(&declining), 2, "an empty payload is not offered");
+            let old = engine(py, "WithoutBuffers", ());
+            assert!(pinned_audio_buffer(&old, 16_000).is_none());
+        });
     }
 }

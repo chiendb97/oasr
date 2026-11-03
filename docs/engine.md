@@ -120,7 +120,8 @@ audio, and skipping it measures **1.13–1.19×** on this path;
 request, and `max_pinned_audio_total_seconds` (default 3600 s, ~230 MB at
 16 kHz) how much across requests at once: that memory is process-global, and
 PyTorch's host cache keeps every block it frees. Past either cap a request gets
-ordinary heap memory. An idle engine also empties the host cache when it holds
+ordinary heap memory, and so does one whose page-lock fails; the next request is
+offered pinned memory again. An idle engine also empties the host cache when it holds
 more than twice the total cap above its baseline. That happens after bursts of
 different lengths, since cached blocks are never reused across power-of-two size
 classes. It is never emptied unconditionally: page-locking afresh costs the next

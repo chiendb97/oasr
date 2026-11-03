@@ -257,9 +257,9 @@ metrics_table! {
     REQUESTS_FAILED = "oasr_requests_failed_total", Counter, None, None,
         "Requests the engine finished with an error, labelled by the stage that failed";
     EVENTS_DROPPED = "oasr_events_dropped_total", Counter, None, None,
-        "Non-terminal events (partials) dropped because a client's channel was full";
+        "Partials a client never received because its channel was full: dropped, or superseded while queued";
     EVENTS_DEFERRED = "oasr_events_deferred_total", Counter, None, None,
-        "Terminal events handed to a background task because the channel was full";
+        "Events queued for in-order delivery because a client's channel was full (terminals, speech transitions, and what followed them)";
 
     // -- Engine scope (recorded in Python, drained by the dispatcher) --------
     /// `{engine, stage}` — **host** wall time, deliberately not GPU time.
