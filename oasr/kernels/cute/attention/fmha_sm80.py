@@ -1117,7 +1117,7 @@ class FmhaSm80(FmhaBase):
         mV: cute.Tensor,  # (total_k, H_kv, D)
         mO: cute.Tensor,  # (total_q, H,    D)
         mBias: cute.Tensor,  # packed block-diagonal bias or 0-rank dummy
-        mBiasOff: cute.Tensor,  # (S+1,) int32 bias block offsets or dummy
+        mBiasOff: cute.Tensor,  # (S+1,) int64 bias block offsets or dummy
         mCuSeqlensQ: cute.Tensor,  # (S+1,) int32
         mCuSeqlensK: cute.Tensor,  # (S+1,) int32
         max_seqlen_q: cutlass.Int32,
@@ -1269,9 +1269,12 @@ class FmhaSm80(FmhaBase):
             mV = self._seg_view(mV_packed, offset_k, seqlen_k)
             mO = self._seg_view(mO_packed, offset_q, seqlen_q)
             if cutlass.const_expr(self._has_bias):
+                # The offsets are int64 (the packed layout's type); the flat
+                # buffer they index is int32-addressed here, which its host
+                # binding enforces, so every offset into it fits an Int32.
                 mBias_seg = self._seg_bias_view(
                     mBias,
-                    mBiasOff[batch_seg],
+                    cutlass.Int32(mBiasOff[batch_seg]),
                     seqlen_q,
                     seqlen_k,
                 )

@@ -400,6 +400,50 @@ class TestMaskedRowsNeverReachTheOutput:
 
 
 @pytest.mark.cuda
+class TestUnalignedQueryAndOutput:
+    """The fp16 query and output move in 128-bit vectors, as the served lane's do.
+
+    The fp8 cache had its own alignment check; the query and the output had
+    none, and ``oasr.fmha`` copied them only for a non-unit last stride, so a
+    query starting one element into its row was a sticky ``misaligned
+    address``.  Bit-exact against the same call on aligned copies.
+    """
+
+    @pytest.mark.parametrize("which", ["q", "out"])
+    def test_an_odd_base_is_copied(self, which):
+        _requires_lane()
+        B, H, T_k, D = 2, 4, 128, 64
+        q, k, v = _dense_case(B, H, H, 1, T_k, D, torch.float16, seed=8)
+        k8, v8 = quantize_kv(k), quantize_kv(v)
+        args = {"k_scale": k8.scale, "v_scale": v8.scale, "softmax_scale": D**-0.5}
+        want = fmha(q, k8.data, v8.data, **args)
+        store = torch.zeros(B, H, 1, D + 8, dtype=q.dtype, device="cuda")
+        view = store[..., 1 : D + 1]
+        if which == "q":
+            view.copy_(q)
+            got = fmha(view, k8.data, v8.data, **args)
+        else:
+            got = fmha(q, k8.data, v8.data, out=view, **args)
+            assert got.data_ptr() == view.data_ptr(), "the caller's out must hold the result"
+        assert torch.equal(got, want)
+
+    def test_the_module_refuses_an_odd_base_rather_than_faulting(self):
+        """A direct call skips the copy above, so the launcher checks it."""
+        _requires_lane()
+        from oasr.jit.fmha import get_fmha_kv8_fn
+
+        B, H, T_k, D = 2, 4, 128, 64
+        q, k, v = _dense_case(B, H, H, 1, T_k, D, torch.float16, seed=9)
+        k8, v8 = quantize_kv(k), quantize_kv(v)
+        odd = torch.zeros(B, H, 1, D + 8, dtype=q.dtype, device="cuda")[..., 1 : D + 1]
+        fn = get_fmha_kv8_fn(dtype_str="float16", head_dim=D)
+        out = torch.empty_like(q)
+        with pytest.raises(RuntimeError, match="q must be 16-byte aligned"):
+            fn(out, odd, k8.data, v8.data, k8.scale, v8.scale, None, None, None, 0.125)
+        torch.cuda.synchronize()
+
+
+@pytest.mark.cuda
 class TestGraphReplay:
     def test_a_captured_paged_decode_step_recomputes(self):
         """Lengths, table and cache bytes all change through the captured buffers;

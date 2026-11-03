@@ -680,6 +680,28 @@ partials are summed (rule 11). The workspace is allocated in Python, from
 torch's caching allocator, deliberately **not** from `oasr::getCachedWorkspace`,
 which branches on `cudaStreamIsCapturing`.
 
+The kernel moves q, k, v and the output in 128-bit vectors along the head
+dimension:
+- **Every operand:** the base must be 16-byte aligned, and the stride of every
+  axis longer than one must be a whole vector. `oasr.fmha` and
+  `oasr.fmha_varlen` copy an operand that breaks this.
+- **head_dim:** it must be a multiple of 8, or 16 for an fp8 KV cache. A
+  backend left to choose picks another lane for any other head_dim; naming
+  `cxx` refuses it.
+- **Integer inputs:** the wrappers convert lengths, `cu_seqlens` and block
+  tables to int32, and packed-bias offsets to int64.
+- **Direct callers:** the launchers check all of this again
+  (`csrc/fmha_launcher.h`), along with dtypes and shapes. Calling the module
+  directly therefore raises an error instead of stopping the CUDA context with
+  `misaligned address`.
+
+Packed-bias offsets are int64 because the bias buffer holds `sum_s H * T_s^2`
+elements, which passes `2**31` at 256 segments of 1024 frames and 8 heads. The
+CuTeDSL varlen kernel still indexes the buffer with 32-bit indices. A larger
+packed bias therefore runs on `cxx` under `auto`, and `backend="cute"` refuses
+it. A packed bias may start at any element; when its base is not 4-byte
+aligned, the kernel reads it element by element instead of in pairs.
+
 Routing policy and measurements: `.artifacts/fmha_tuning.md` (CuTeDSL) and
 `.artifacts/fmha_cpp_validation.md` (the C++ lane's falsifications and the A/B).
 
@@ -700,7 +722,7 @@ where everything is in the other two:
 | Epilogue collective | `fmha_epilogue.h` | `gated_mlp_epilogue.h` | `recurrent_step_epilogue.h` |
 | Kernel shell (arch-free) | `fmha_kernel.h` + `fmha_tile_scheduler.h` | `gated_mlp_kernel.h` | `recurrent_step_kernel.h` |
 | Launch template (the one file naming an arch) | `fmha_launch_template.h` | `gated_mlp_launch_template.h` | `recurrent_step_launch_template.h` |
-| TVM-FFI launcher, one TU per variant | `csrc/templates/fmha{,_split}_template.cu.jinja` | `gated_mlp_template.cu.jinja` | `recurrent_step_template.cu.jinja` |
+| TVM-FFI launcher, one TU per variant | `csrc/templates/fmha{,_split,_kv8}_template.cu.jinja`, checks in `csrc/fmha_launcher.h` | `gated_mlp_template.cu.jinja` | `recurrent_step_template.cu.jinja` |
 | Capability oracle (the static TU) | `csrc/fmha_jit_binding.cu` | `csrc/gated_mlp_jit_binding.cu` | `csrc/recurrent_step_jit_binding.cu` |
 | JIT generator + Python tile mirror | `oasr/jit/fmha.py` | `oasr/jit/gated_mlp.py` | `oasr/jit/recurrent_step.py` |
 | Arbiter over the C++ and CuTeDSL lanes | `oasr/jit/attention.py` | `oasr/jit/mlp.py` | `oasr/jit/recurrent_cute.py` |

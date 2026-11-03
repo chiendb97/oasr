@@ -64,9 +64,13 @@ from oasr.jit.cute_runtime import current_stream as _current_stream
 # Typed dummy tensors satisfy optional kernel arguments without dereferencing.
 _dummy_bias_cache: dict = {}
 _dummy_block_table_cache: dict = {}
+_dummy_bias_offsets_cache: dict = {}
 
 # Must match the kernel tile. Paged bias reads full tiles, so padding is required
 # to keep every read in bounds, especially with graph-pool allocations.
+#: The largest element index an int32 offset can hold.
+_INT32_MAX = 2**31 - 1
+
 _KERNEL_M_BLOCK = 64
 _KERNEL_N_BLOCK = 64
 
@@ -88,6 +92,20 @@ def _get_dummy_block_table(device: torch.device) -> torch.Tensor:
     if t is None:
         t = torch.empty((), dtype=torch.int32, device=device)
         _dummy_block_table_cache[idx] = t
+    return t
+
+
+def _get_dummy_bias_offsets(device: torch.device) -> torch.Tensor:
+    """Return the cached zero-rank int64 stand-in for absent ``bias_offsets``.
+
+    int64 because the varlen kernel is compiled against int64 offsets, and the
+    stand-in has to be of the type it was compiled with.
+    """
+    idx = device.index if device.index is not None else 0
+    t = _dummy_bias_offsets_cache.get(idx)
+    if t is None:
+        t = torch.empty((), dtype=torch.int64, device=device)
+        _dummy_bias_offsets_cache[idx] = t
     return t
 
 
@@ -767,6 +785,15 @@ def _validate_varlen_inputs(
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have equal length")
     if (attn_bias is None) != (bias_offsets is None):
         raise ValueError("attn_bias and bias_offsets must be provided together")
+    if bias_offsets is not None and (
+        bias_offsets.dtype not in (torch.int64, torch.int32)
+        or bias_offsets.dim() != 1
+        or bias_offsets.numel() != cu_seqlens_q.numel()
+    ):
+        raise ValueError(
+            "bias_offsets must be a 1-D int64 tensor with one entry per segment plus one, "
+            f"like cu_seqlens; got {bias_offsets.dtype} {tuple(bias_offsets.shape)}"
+        )
     if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
         raise ValueError("out must match q in shape/dtype")
 
@@ -811,7 +838,12 @@ def fmha_varlen(
         flat buffer whose segment-``s`` block is ``(H, T_q_s, T_k_s)``
         row-major at ``bias_offsets[s]``.
     bias_offsets : Tensor, optional
-        ``(S+1,)`` int64 prefix sum of ``H * T_q_s * T_k_s`` block sizes.
+        ``(S+1,)`` int64 prefix sum of ``H * T_q_s * T_k_s`` block sizes (int32
+        is accepted and widened).  64-bit because the buffer outgrows an int32
+        index at 256 segments of 1024 frames and 8 heads.  The CuTeDSL varlen
+        kernel addresses the buffer itself with 32-bit indices, so a packed
+        bias of more than ``2**31 - 1`` elements runs on the C++ lane under
+        ``auto`` and raises under ``backend="cute"``.
     causal : bool
         Top-left causal masking *within* each segment.  ``cxx`` only -- the
         CuTeDSL varlen kernel has no causal path and raises rather than
@@ -865,15 +897,19 @@ def fmha_varlen(
     explicit = backend is not None
     fused_dtype = q.dtype in (torch.float16, torch.bfloat16)
     windowed = window_left >= 0 or window_right >= 0
+    # The CuTeDSL varlen kernel indexes the packed bias with 32-bit offsets
+    # (its host binding refuses a longer buffer); the C++ lane's are 64-bit.
+    bias_elems = attn_bias.numel() if attn_bias is not None else 0
+    wide_bias = bias_elems > _INT32_MAX
 
     if backend is None:
         # Nobody named one, so the *shape* gets a say, exactly as in `fmha`:
-        # causal and windowed varlen exist on the C++ lane only, and under
-        # `auto` a caller asking for one should be routed to a lane that can
-        # serve it rather than told no.  A named backend skips this -- naming
-        # one means requiring it.
+        # causal and windowed varlen exist on the C++ lane only, as does a
+        # packed bias past int32, and under `auto` a caller asking for one
+        # should be routed to a lane that can serve it rather than told no.
+        # A named backend skips this -- naming one means requiring it.
         backend = select_backend()
-        if (causal or windowed) and backend != "cxx" and fused_dtype:
+        if (causal or windowed or wide_bias) and backend != "cxx" and fused_dtype:
             # `fmha_backend_for` is the dense arbiter and would answer "cute"
             # here: the CuTeDSL kernel *does* do causal -- just not in its
             # separate varlen kernel, which has no mask argument at all.  So
@@ -914,6 +950,13 @@ def fmha_varlen(
         raise NotImplementedError(
             "fmha_varlen: causal and sliding-window masking are served by the "
             "C++ backend only; use backend='cxx' or backend='sdpa'"
+        )
+
+    if wide_bias and backend == "cute" and fused_dtype:
+        raise NotImplementedError(
+            f"fmha_varlen: the CuTeDSL varlen kernel indexes a packed bias with 32-bit "
+            f"offsets, and this one has {bias_elems} elements; use backend='cxx' "
+            f"or backend='sdpa'"
         )
 
     if backend == "cute" and fused_dtype and _varlen_cute_available() and not (causal or windowed):
@@ -1006,12 +1049,12 @@ def _call_cute_dsl_varlen(
 
     if has_bias:
         bias_t = _ensure_canonical(attn_bias)
-        if bias_offsets.dtype != torch.int32:
-            bias_offsets = bias_offsets.to(torch.int32)
+        if bias_offsets.dtype != torch.int64:
+            bias_offsets = bias_offsets.to(torch.int64)
         bias_off_t = _ensure_canonical(bias_offsets)
     else:
         bias_t = _get_dummy_bias(q.dtype, q.device)
-        bias_off_t = _get_dummy_block_table(q.device)
+        bias_off_t = _get_dummy_bias_offsets(q.device)
 
     stream = _current_stream()
     fn(
@@ -1135,17 +1178,61 @@ def _pad_paged_inputs(
 
 
 def _needs_stride_copy(t: torch.Tensor) -> bool:
-    """Does the C++ lane have to copy this tensor?
+    """Does the C++ lane have to copy this bias?
 
     Only one condition: the last dimension must be contiguous, because
-    ``StrideQKV``'s innermost mode is a compile-time 1.  Everything else --
-    head-split views, permuted-but-dense layouts, a capacity buffer's stride
-    gap on the *time* axis -- is expressible as runtime strides and is passed
-    through untouched.  That is the whole of lever L1: measured on real
-    call-site strides, the CuTeDSL path's canonical-stride copy costs
-    1.24-2.15x of the call (`.artifacts/fmha_cpp_validation.md` § L1).
+    ``StrideBias``'s innermost mode is a compile-time 1.  A bias is read in
+    32-bit pairs only where its base and strides allow (``bias_vectorizable``)
+    and element by element elsewhere, so its alignment is free.
     """
     return t.stride(-1) != 1
+
+
+#: The C++ lane moves q, k, v and the output in 128-bit vectors: 16 bytes, which
+#: for the 16-bit dtypes it serves (fp16 / bf16, the fp8 lane's query included)
+#: is 8 elements.
+_VECTOR_BYTES = 16
+_VECTOR_ELEMS = 8
+
+
+def _needs_operand_copy(t: torch.Tensor) -> bool:
+    """Does the C++ lane have to copy this q, k, v or output tensor?
+
+    When the 128-bit loads and stores cannot address it: the last dimension
+    must be contiguous (``StrideQKV``'s innermost mode is a compile-time 1),
+    the base 16-byte aligned, and the stride of every other axis longer than
+    one a whole vector -- the launcher refuses anything else, because the
+    kernel would stop on a sticky ``misaligned address``.  Everything else --
+    head-split views, permuted-but-dense layouts, a capacity buffer's stride
+    gap on the *time* axis -- is runtime strides and passes through untouched.
+    That is the whole of lever L1: measured on real call-site strides, the
+    CuTeDSL path's canonical-stride copy costs 1.24-2.15x of the call
+    (`.artifacts/fmha_cpp_validation.md` § L1).
+
+    It runs on every call to the lane, for four tensors, so it is written for
+    the case that passes: one ``stride()``, one ``data_ptr()``, and the strides
+    OR-ed together; only a stride off the grid pays for looking at the sizes.
+    """
+    strides = t.stride()
+    if strides[-1] != 1 or t.data_ptr() % _VECTOR_BYTES:
+        return True
+    bits = 0
+    for s in strides[:-1]:
+        bits |= s
+    if not bits % _VECTOR_ELEMS:
+        return False
+    return any(n > 1 and s % _VECTOR_ELEMS for n, s in zip(t.shape, strides[:-1]))
+
+
+def _addressable(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as the C++ lane can address it, copied only if it has to be.
+
+    A ``clone``, not ``.contiguous()``: a contiguous tensor whose base is off a
+    16-byte boundary comes back from ``.contiguous()`` as itself.
+    """
+    if _needs_operand_copy(t):
+        return t.clone(memory_format=torch.contiguous_format)
+    return t
 
 
 def _fmha_kv8(
@@ -1260,10 +1347,9 @@ def _fmha_kv8(
     if out is None:
         out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     out_target = out
-    if _needs_stride_copy(out):
+    if _needs_operand_copy(out):
         out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
-    if _needs_stride_copy(q):
-        q = q.contiguous()
+    q = _addressable(q)
 
     from oasr.jit.fmha import get_fmha_kv8_fn
 
@@ -1388,19 +1474,14 @@ def _call_cxx(
     dtype_str = "float16" if q.dtype is torch.float16 else "bfloat16"
     local = window_left >= 0 or window_right >= 0
 
-    # The one layout the kernel cannot express.  Rare enough to be worth a copy
-    # rather than a refusal, and named so it shows up in a profile.
-    if _needs_stride_copy(q):
-        q = q.contiguous()
-    if _needs_stride_copy(k):
-        k = k.contiguous()
-    if _needs_stride_copy(v):
-        v = v.contiguous()
+    # The layouts the kernel cannot address.  Rare enough to be worth a copy
+    # rather than a refusal, and named so they show up in a profile.
+    q, k, v = _addressable(q), _addressable(k), _addressable(v)
     if attn_bias is not None and _needs_stride_copy(attn_bias):
         attn_bias = attn_bias.contiguous()
 
     out_target = out
-    if _needs_stride_copy(out):
+    if _needs_operand_copy(out):
         out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
 
     # --- split-KV (flash decoding) ---------------------------------------
@@ -1502,23 +1583,19 @@ def _call_cxx_varlen(
     local = window_left >= 0 or window_right >= 0
     D = q.size(2)
 
-    if _needs_stride_copy(q):
-        q = q.contiguous()
-    if _needs_stride_copy(k):
-        k = k.contiguous()
-    if _needs_stride_copy(v):
-        v = v.contiguous()
-    if attn_bias is not None and _needs_stride_copy(attn_bias):
+    q, k, v = _addressable(q), _addressable(k), _addressable(v)
+    # A packed bias is one flat buffer, read without its strides.
+    if attn_bias is not None and not attn_bias.is_contiguous():
         attn_bias = attn_bias.contiguous()
-    if bias_offsets is not None and bias_offsets.dtype != torch.int32:
-        bias_offsets = bias_offsets.to(torch.int32)
+    if bias_offsets is not None and bias_offsets.dtype != torch.int64:
+        bias_offsets = bias_offsets.to(torch.int64)
     if cu_seqlens_q.dtype != torch.int32:
         cu_seqlens_q = cu_seqlens_q.to(torch.int32)
     if cu_seqlens_k.dtype != torch.int32:
         cu_seqlens_k = cu_seqlens_k.to(torch.int32)
 
     out_target = out
-    if _needs_stride_copy(out):
+    if _needs_operand_copy(out):
         out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
 
     fn = get_fmha_fn(

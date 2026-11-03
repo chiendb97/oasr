@@ -9,15 +9,22 @@
 
 #include <oasr/attention/fmha_launch_template.h>
 
+#include "fmha_launcher.h"
 #include "tvm_ffi_utils.h"
 
 using namespace oasr::attention;
+using namespace oasr::attention::launcher;
 
 namespace {
 
 using Element = {{ cutlass_dtype }};
 constexpr int kSm = {{ sm_version }};
 constexpr int kHeadDim = {{ head_dim }};
+//! What `q`, `k`, `v`, the output and a bias must be, and the 128-bit vector
+//! width in elements that the loads and stores move them in.
+constexpr DLDataType kElementType = {{ 'oasr::dl_float16' if dtype == 'float16' else 'oasr::dl_bfloat16' }};
+constexpr char const* kElementName = "{{ dtype }}";
+constexpr int kVecElems = int(sizeof(cute::uint128_t) / sizeof(Element));
 constexpr bool kIsCausal = {{ 'true' if is_causal else 'false' }};
 constexpr bool kIsLocal = {{ 'true' if is_local else 'false' }};
 constexpr bool kHasBias = {{ 'true' if has_bias else 'false' }};
@@ -42,20 +49,23 @@ void {{ func_name }}(TensorView output, TensorView q, TensorView k, TensorView v
                      Optional block_table, double softmax_scale, int64_t window_left,
                      int64_t window_right) {
     CHECK_INPUT(q);
-    CHECK_INPUT(k);
-    CHECK_INPUT(v);
-    CHECK_INPUT(output);
     CHECK_DIM(4, q);
     CHECK_DIM(4, k);
     CHECK_DIM(4, v);
     CHECK_DIM(4, output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-    CHECK_DEVICE(q, k);
-    CHECK_DEVICE(q, v);
-    CHECK_DEVICE(q, output);
+    // Everything the launcher reads below without a predicate.  `oasr.fmha`
+    // establishes all of it; this is for a caller of the module itself, for
+    // whom each miss was a sticky `misaligned address` or a read past a tensor
+    // (see `csrc/fmha_launcher.h`).  head_dim first: a whole-vector head_dim
+    // is what makes q's strides whole vectors, so it is the check that names
+    // the cause.
+    checkHeadDim(int(q.size(3)), kHeadDim, kVecElems);
+    checkVectorOperand(q, kElementType, kElementName, "q", q);
+    checkVectorOperand(k, kElementType, kElementName, "k", q);
+    checkVectorOperand(v, kElementType, kElementName, "v", q);
+    checkVectorOperand(output, kElementType, kElementName, "output", q);
+    checkSameShape(k, "k", v, "v");
+    checkSameShape(q, "q", output, "output");
 
     int const B = int(q.size(0));
     int const H = int(q.size(1));
@@ -65,9 +75,9 @@ void {{ func_name }}(TensorView output, TensorView q, TensorView k, TensorView v
     int const T_k = int(k.size({{ 1 if paged_kv else 2 }}));
 
     TVM_FFI_ICHECK_EQ(D, int(k.size(3))) << "q and k must share head_dim";
-    TVM_FFI_ICHECK_LE(D, kHeadDim) << "head_dim " << D << " exceeds this variant's " << kHeadDim;
     TVM_FFI_ICHECK_EQ(H % H_kv, 0) << "num_heads " << H << " must be divisible by "
                                    << "num_kv_heads " << H_kv;
+    checkLengths(cache_seqlens, cache_seqstarts, B, q);
 
     cudaStream_t stream = oasr::get_stream(q.device());
 
@@ -85,7 +95,7 @@ void {{ func_name }}(TensorView output, TensorView q, TensorView k, TensorView v
     args.shape_k = {T_k, D, H_kv, int(k.size(0))};
     args.stride_k = {k.stride(1), cute::_1{}, k.stride(2), k.stride(0)};
     args.stride_v = {v.stride(1), cute::_1{}, v.stride(2), v.stride(0)};
-    TVM_FFI_ICHECK(block_table.has_value()) << "paged variant requires a block_table";
+    checkBlockTable(block_table, B, q);
     // Without a length the logical KV extent would have to come from
     // `shape_k`, whose leading mode is the *page size* in this mode -- there is
     // nothing else to derive it from, so require it rather than guess.
@@ -97,6 +107,9 @@ void {{ func_name }}(TensorView output, TensorView q, TensorView k, TensorView v
     args.stride_pagetable = {block_table.value().stride(0), cute::_1{}};
     args.page_size = T_k;
 {% else %}
+    // A dense variant reading a pool as dense K/V would be wrong everywhere.
+    TVM_FFI_ICHECK(!block_table.has_value()) << "dense variant takes no block_table";
+    TVM_FFI_ICHECK_EQ(int(k.size(0)), B) << "dense k must have the query's batch";
     args.shape_k = {T_k, D, H_kv, B};
     args.stride_k = {k.stride(2), cute::_1{}, k.stride(1), k.stride(0)};
     args.stride_v = {v.stride(2), cute::_1{}, v.stride(1), v.stride(0)};
@@ -109,9 +122,7 @@ void {{ func_name }}(TensorView output, TensorView q, TensorView k, TensorView v
     TVM_FFI_ICHECK(bias.has_value()) << "this variant was compiled with a bias";
     {
         TensorView const b = bias.value();
-        CHECK_DIM(4, b);
-        CHECK_LAST_DIM_CONTIGUOUS_INPUT(b);
-        CHECK_DEVICE(q, b);
+        checkDenseBias(b, kElementType, kElementName, B, H, q);
         args.ptr_bias = static_cast<Element const*>(b.data_ptr());
         args.shape_bias = {int(b.size(2)), int(b.size(3)), int(b.size(1)), int(b.size(0))};
         args.stride_bias = {b.stride(2), cute::_1{}, b.stride(1), b.stride(0)};
@@ -152,7 +163,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC({{ func_name }}, {{ func_name }});
  * \param k,v          (total_k, H_kv, D)
  * \param bias         optional flat block-diagonal buffer; segment `s`'s block
  *                     is `(H, T_q_s, T_k_s)` row-major at `bias_offsets[s]`
- * \param bias_offsets optional (S+1,) int32 element offsets into `bias`
+ * \param bias_offsets optional (S+1,) int64 element offsets into `bias`
  * \param cu_seqlens_q (S+1,) int32 prefix sums
  * \param cu_seqlens_k (S+1,) int32 prefix sums
  * \param max_seqlen_q host-side max segment length; sizes the M-tile grid
@@ -163,27 +174,24 @@ void {{ func_name }}_varlen(TensorView output, TensorView q, TensorView k, Tenso
                             int64_t max_seqlen_k, double softmax_scale, int64_t window_left,
                             int64_t window_right) {
     CHECK_INPUT(q);
-    CHECK_INPUT(k);
-    CHECK_INPUT(v);
-    CHECK_INPUT(output);
     CHECK_DIM(3, q);
     CHECK_DIM(3, k);
     CHECK_DIM(3, v);
     CHECK_DIM(3, output);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
-    CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
-    CHECK_DEVICE(q, k);
-    CHECK_DEVICE(q, v);
-    CHECK_DEVICE(q, output);
-    CHECK_DEVICE(q, cu_seqlens_q);
-    CHECK_DEVICE(q, cu_seqlens_k);
-    CHECK_DIM(1, cu_seqlens_q);
-    CHECK_DIM(1, cu_seqlens_k);
+    // head_dim first: a whole-vector head_dim is what makes q's strides whole
+    // vectors, so this is the check that names the cause.
+    checkHeadDim(int(q.size(2)), kHeadDim, kVecElems);
+    checkVectorOperand(q, kElementType, kElementName, "q", q);
+    checkVectorOperand(k, kElementType, kElementName, "k", q);
+    checkVectorOperand(v, kElementType, kElementName, "v", q);
+    checkVectorOperand(output, kElementType, kElementName, "output", q);
+    checkSameShape(k, "k", v, "v");
+    checkSameShape(q, "q", output, "output");
+    // Read as int32 by every CTA; `oasr.fmha_varlen` converts them first.
+    oasr::CheckIntVector(cu_seqlens_q, 32, 2, "cu_seqlens_q", q);
+    oasr::CheckIntVector(cu_seqlens_k, 32, 2, "cu_seqlens_k", q);
     TVM_FFI_ICHECK_EQ(cu_seqlens_q.size(0), cu_seqlens_k.size(0))
         << "cu_seqlens_q and cu_seqlens_k must describe the same segments";
-    TVM_FFI_ICHECK_GE(cu_seqlens_q.size(0), 2) << "need at least one segment";
 
     int const S = int(cu_seqlens_q.size(0)) - 1;
     int const H = int(q.size(1));
@@ -191,7 +199,6 @@ void {{ func_name }}_varlen(TensorView output, TensorView q, TensorView k, Tenso
     int const H_kv = int(k.size(1));
 
     TVM_FFI_ICHECK_EQ(D, int(k.size(2))) << "q and k must share head_dim";
-    TVM_FFI_ICHECK_LE(D, kHeadDim) << "head_dim " << D << " exceeds this variant's " << kHeadDim;
     TVM_FFI_ICHECK_EQ(H % H_kv, 0) << "num_heads " << H << " must be divisible by "
                                    << "num_kv_heads " << H_kv;
     TVM_FFI_ICHECK_GT(max_seqlen_q, 0) << "max_seqlen_q must be positive";
@@ -220,18 +227,18 @@ void {{ func_name }}_varlen(TensorView output, TensorView q, TensorView k, Tenso
         << "a packed bias needs bias_offsets to locate each segment's block";
     {
         TensorView const b = bias.value();
-        CHECK_LAST_DIM_CONTIGUOUS_INPUT(b);
-        CHECK_DEVICE(q, b);
+        checkPackedBias(b, bias_offsets.value(), kElementType, kElementName, S, q);
         args.ptr_bias = static_cast<Element const*>(b.data_ptr());
         // The shape and the row/head strides of a packed bias are per segment,
         // so they are derived in the kernel from `seqlen_q`/`seqlen_k`; only
         // the column stride (a compile-time 1) is meaningful here.
         args.shape_bias = {0, 0, H, S};
         args.stride_bias = {0, cute::_1{}, 0, 0};
-        args.bias_offsets = oasr::OptionalDataPtr<int32_t const>(bias_offsets);
+        args.bias_offsets = oasr::OptionalDataPtr<int64_t const>(bias_offsets);
     }
 {% else %}
     TVM_FFI_ICHECK(!bias.has_value()) << "this variant was compiled without a bias";
+    TVM_FFI_ICHECK(!bias_offsets.has_value()) << "bias_offsets without a bias";
 {% endif %}
 
     args.cu_seqlens_q = static_cast<int32_t const*>(cu_seqlens_q.data_ptr());
