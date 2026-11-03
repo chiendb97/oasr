@@ -34,7 +34,7 @@ class SentencePieceTokenizer(WindowedIncrementalTokenizer):
         except ImportError as exc:  # pragma: no cover - optional dep
             raise ImportError(
                 "sentencepiece is required for TokenizerSpec(kind='sentencepiece'); "
-                "install it with `pip install oasr[tokenizers]` or `pip install sentencepiece`"
+                "install it with `pip install oasr-server[tokenizers]` or `pip install sentencepiece`"
             ) from exc
         self._sp = spm.SentencePieceProcessor()
         self._sp.Load(model_path)

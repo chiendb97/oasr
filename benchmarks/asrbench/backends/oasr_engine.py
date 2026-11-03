@@ -333,7 +333,7 @@ class OasrEngineBackend(Backend):
     def info(self) -> BackendInfo:
         import torch
 
-        from benchmarks.asrbench.environment import packages
+        from benchmarks.asrbench.environment import OASR_DISTRIBUTION, packages
 
         cfg = self.config
         model = checkpoint_fingerprint(cfg.ckpt_dir)
@@ -352,7 +352,7 @@ class OasrEngineBackend(Backend):
             dev = {"name": props.name, "sm": f"{props.major}.{props.minor}"}
         return BackendInfo(
             name=self.name,
-            version=packages().get("oasr", ""),
+            version=packages().get(OASR_DISTRIBUTION, ""),
             mode=self.mode,
             model=model,
             config={

@@ -27,9 +27,14 @@ from typing import Any, Dict, List
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _JIT_CACHE = Path.home() / ".cache" / "oasr" / "jit"
 
+#: OASR's distribution name, which differs from its import name. The ``oasr``
+#: project on PyPI is unrelated, so looking OASR up under that name records an
+#: empty version, or that project's.
+OASR_DISTRIBUTION = "oasr-server"
+
 #: Distributions whose versions are recorded when installed.
 PACKAGES = (
-    "oasr",
+    OASR_DISTRIBUTION,
     "torch",
     "torchaudio",
     "numpy",

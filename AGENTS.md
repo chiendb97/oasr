@@ -140,6 +140,7 @@ set -a; source .env; set +a          # cp .env.example .env first, and edit the 
 | An fp8 KV cache for an AR decoder | `oasr-server --ckpt-dir <dir> --quantization-option kv_cache=fp8_e4m3` · `EngineConfig(quantization={"kv_cache": "fp8_e4m3"})` |
 | Transcribe (server / in-process) | `oasr transcribe audio.mp3` · `oasr transcribe audio.mp3 --ckpt-dir <dir>` |
 | Word timestamps | `oasr transcribe audio.mp3 --response-format verbose_json --timestamp-granularity word` |
+| Docs site (a new `docs/` page must be added to the `mkdocs.yml` nav) | `pip install -r requirements-docs.txt && mkdocs build --strict` · `mkdocs serve` to preview |
 | Any benchmark | `python benchmarks/run.py --list` (kernels, decoders, engine, service, accuracy) |
 | Engine / service / accuracy benchmark | `python benchmarks/run.py --family {engine,service,accuracy}` — flags default from `.env` |
 | WER for one architecture | `python benchmarks/run.py --family accuracy --ckpt-dir $CKPT_DIR --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR` |
@@ -157,6 +158,11 @@ CUDA_ARCHITECTURES=80 pip install -e .
 pip install -e ".[all]"              # audio + hub + tokenizers + attention + serving
 cd rust && cargo build --release     # optional standalone oasr-server binary
 ```
+
+The distribution is named `oasr-server`; the import name is `oasr`. **Never
+`pip install oasr`**: that PyPI project is unrelated, and it replaces the `oasr`
+command and writes top-level `cli`, `config` and `registry` modules into
+site-packages.
 
 `pip install` produces three artifacts inside the package:
 
@@ -688,6 +694,7 @@ Workflows in `.github/workflows/`:
 | `test-cpu.yml` | GitHub-hosted | push to `main`, every PR (Python 3.10 + 3.12, no GPU) |
 | `test-gpu.yml` | self-hosted `oasr-gpu` | nightly + manual — **do not add a `pull_request` trigger** |
 | `test-gpu-modal.yml` | Modal, one GPU per arch (sm_80/89/90/100/120) | manual only (`pr=<n>` tests a PR and posts a commit status) |
+| `docs.yml` | GitHub-hosted | PRs and pushes touching `docs/` or `mkdocs.yml`; deploys the site to GitHub Pages from `main` |
 
 Both GPU backends run the same per-family split from `ci/gpu_suites.py` with
 `--strict-assets`. Modal runs it across architectures — `modal run
@@ -802,6 +809,7 @@ before process start.
 | Document | Covers |
 |---|---|
 | [`docs/README.md`](docs/README.md) | Documentation index |
+| [`docs/faq.md`](docs/faq.md) | Short user-facing answers: supported GPUs and models, the OpenAI-compatible API, alternatives |
 | [`docs/architecture.md`](docs/architecture.md) | The seven seams, the layer waist, the extension cookbook |
 | [`docs/engine.md`](docs/engine.md) | `ASREngine` step loop, executors, `EngineConfig`, VRAM sizing |
 | [`docs/scheduler.md`](docs/scheduler.md) | Batching and partition policies, starvation bounds |
@@ -819,7 +827,7 @@ before process start.
 | [`docs/serving.md`](docs/serving.md) | Rust front-end, HTTP/gRPC APIs, dispatcher, deployment |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark recipes and measurement protocol |
 | [`docs/asrbench.md`](docs/asrbench.md) | The ASR inference suite: datasets, workloads, protocols, backends, results, regression gating |
-| [`docs/ci.md`](docs/ci.md) | The four workflows, the asset gate, the accuracy gate, why mypy is a ratchet |
+| [`docs/ci.md`](docs/ci.md) | The five workflows, the asset gate, the accuracy gate, why mypy is a ratchet |
 | [`docs/autotuning.md`](docs/autotuning.md) | `oasr.tune` API and cache format |
 
 ### Skills

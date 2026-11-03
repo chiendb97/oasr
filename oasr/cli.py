@@ -180,7 +180,7 @@ def _transcribe_locally(args: argparse.Namespace) -> List[Transcription]:
 
     This is the path the README's Python API describes and that no example
     demonstrated; having it behind one command is also what makes
-    ``pip install oasr && oasr transcribe audio.mp3 --ckpt-dir ...`` a complete
+    ``pip install oasr-server && oasr transcribe audio.mp3 --ckpt-dir ...`` a complete
     story on a machine with a GPU and no server.
     """
     from oasr.engine import ASREngine, DecodingOptions, EngineConfig
@@ -247,7 +247,7 @@ def _load_audio(path: str, sample_rate: int):
         import torch
     except ImportError as exc:  # pragma: no cover - optional dep
         raise SystemExit(
-            "in-process transcription needs the audio extra: " 'pip install "oasr[audio]"'
+            "in-process transcription needs the audio extra: " 'pip install "oasr-server[audio]"'
         ) from exc
 
     data, sr = sf.read(path, dtype="float32", always_2d=True)

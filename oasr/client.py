@@ -115,7 +115,7 @@ def _import_httpx():
     except ImportError as exc:  # pragma: no cover - optional dep
         raise OASRClientError(
             "the OASR client needs `httpx`; install it with "
-            '`pip install "oasr[serving]"` or `pip install httpx`'
+            '`pip install "oasr-server[serving]"` or `pip install httpx`'
         ) from exc
     return httpx
 
@@ -439,7 +439,7 @@ class AsyncOASRClient(_BaseClient):
         except ImportError as exc:  # pragma: no cover - optional dep
             raise OASRClientError(
                 "streaming needs `websockets`; install it with "
-                '`pip install "oasr[serving]"` or `pip install websockets`'
+                '`pip install "oasr-server[serving]"` or `pip install websockets`'
             ) from exc
 
         session = {

@@ -1,6 +1,6 @@
 # CI and Testing
 
-Four workflows under `.github/workflows/`, plus a pre-commit config that mirrors
+Five workflows under `.github/workflows/`, plus a pre-commit config that mirrors
 the fast half of them locally.
 
 | Workflow | Runner | Trigger | Gates |
@@ -9,6 +9,7 @@ the fast half of them locally.
 | `test-cpu.yml` | GitHub-hosted | push to `main`, every PR | `pytest tests/` on Python 3.10 + 3.12 with no GPU, behind a `--min-passed` coverage floor |
 | `test-gpu.yml` | self-hosted `oasr-gpu` | nightly + manual | the full suite **with `--strict-assets`**, split per family, plus the `slow` and `concurrent` markers |
 | `test-gpu-modal.yml` | GitHub-hosted → Modal GPU | manual only | the same per-family split, on one rented accelerator per architecture (sm_80 / 89 / 90 / 100 / 120) |
+| `docs.yml` | GitHub-hosted | PRs and pushes touching `docs/`, `mkdocs.yml` or the hook | `mkdocs build --strict` (broken links and anchors, pages missing from the nav); deploys the site to GitHub Pages from `main` |
 
 ## Running the gates locally
 
@@ -442,4 +443,4 @@ Two settings there are load-bearing:
 per build, so one invocation covering both fails to compile. `oasr-core` is
 excluded from `default-members` and linted in its own step. Run cargo from
 `rust/`, not the repo root, so the target-dir redirect applies — see
-[CLAUDE.md](../CLAUDE.md#rust-workspace).
+[AGENTS.md](../AGENTS.md#rust-workspace).

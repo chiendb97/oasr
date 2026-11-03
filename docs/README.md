@@ -1,28 +1,35 @@
 # OASR Documentation
 
-Stable technical documentation for OASR: architecture, components, algorithms,
-interfaces and operation.
+OASR is an open-source inference and serving engine for speech recognition on
+NVIDIA GPUs. These pages are its stable technical documentation: architecture,
+components, algorithms, interfaces and operation. For installation and a quick
+start, see the [project README](../README.md).
 
-- Contributor and coding-agent instructions live in [`CLAUDE.md`](../CLAUDE.md).
+- Contributor and coding-agent instructions live in [`AGENTS.md`](../AGENTS.md)
+  (`CLAUDE.md` includes it); the contribution workflow is in
+  [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+- Common questions — what OASR is for, which GPUs and models it supports, how it
+  relates to other ASR toolkits — are answered in the [FAQ](faq.md).
 - Point-in-time material — benchmark results, active issues, investigations —
-  lives in [`.artifacts/`](../.artifacts/README.md) and is deliberately kept out
-  of these pages.
+  lives in a gitignored `.artifacts/` working directory and is deliberately kept
+  out of these pages.
 
 ## Getting started
 
 | Document | Covers |
 |---|---|
 | [`../README.md`](../README.md) | Project overview, install, quick start, supported models |
+| [faq.md](faq.md) | Short answers: supported models and GPUs, the OpenAI-compatible API, streaming, word timestamps, quantization, and when another tool fits better |
 | [checkpoints.md](checkpoints.md) | Loading a checkpoint: resolution precedence, converter contract, `oasr-convert`, the native format |
 | [benchmarks.md](benchmarks.md) | Engine, service and accuracy benchmark recipes; measurement protocol |
 | [asrbench.md](asrbench.md) | The ASR inference performance suite: datasets, workloads, latency/throughput/concurrency/streaming protocol, backends, regression gating, reports |
-| [ci.md](ci.md) | The four workflows, running the gates locally, the asset gate, the accuracy gate |
+| [ci.md](ci.md) | The five workflows, running the gates locally, the asset gate, the accuracy gate |
 
 ## Architecture and design
 
 | Document | Covers |
 |---|---|
-| [architecture.md](architecture.md) | The seven registry seams, the `oasr.layers` narrow waist, data flow, and the extension cookbook — **start here** |
+| [architecture.md](architecture.md) | The nine registry seams, the `oasr.layers` narrow waist, data flow, and the extension cookbook — **start here** |
 | [engine.md](engine.md) | `ASREngine`: step loop, executors, CUDA-graph capture, `EngineConfig` |
 | [scheduler.md](scheduler.md) | Request scheduling, batching and partition policies, starvation bounds |
 | [models.md](models.md) | The model layer: base contracts, capabilities, registry, and the seven built-in architectures |
@@ -55,6 +62,6 @@ components, algorithms, interfaces, usage, configuration concepts, and design
 decisions that stay true across releases.
 
 Anything that would need editing after a re-benchmark, a driver upgrade or a bug
-fix belongs in `.artifacts/` — see its
-[house rules](../.artifacts/README.md#house-rules). Leave a
-one-line pointer behind rather than the numbers themselves.
+fix belongs in the gitignored `.artifacts/` working directory (its own `README.md`
+holds the house rules). Leave a one-line, plain-text pointer behind rather than
+the numbers themselves — not a link: a fresh clone does not have the directory.

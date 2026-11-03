@@ -1,0 +1,17 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "OASR",
+  "description": "GPU inference and serving engine for automatic speech recognition: Whisper, WeNet Conformer, icefall Zipformer and RNN-T, Nemotron ASR, FunASR Paraformer and Qwen2-Audio, offline and streaming, behind an OpenAI-compatible HTTP API, a realtime WebSocket and gRPC.",
+  "folders": ["docs", "examples"],
+  "excludeFolders": ["docs/assets"],
+  "rules": [
+    "Install OASR from source: git clone https://github.com/chiendb97/oasr.git, git submodule update --init, then pip install -e \".[all]\". The package is named oasr-server and imports as oasr; the oasr package on PyPI is an unrelated project and replaces the oasr command.",
+    "OASR serves on NVIDIA GPUs of compute capability 7.5 or newer with CUDA 11.8 or newer; it is not built to serve on CPU.",
+    "An ASREngine runs in one mode for its lifetime, set by EngineConfig(service_mode=\"offline\") or the default service_mode=\"streaming\"; requests of the other mode are rejected.",
+    "EngineConfig.ckpt_dir and oasr-server --ckpt-dir accept a local WeNet, icefall, FunASR, Hugging Face or native OASR checkpoint directory, or a Hugging Face Hub repo id; the format is detected automatically.",
+    "Load an icefall pruned-transducer checkpoint with architecture=\"transducer\"; without it the directory is detected as Zipformer CTC.",
+    "To use OASR as an OpenAI-compatible transcription server, run oasr-server and set the OpenAI client's base_url to http://<host>:8080/v1; the model field is ignored unless --served-model-name is set.",
+    "oasr-server has no authentication and does not terminate TLS; keep it on a private network or behind a reverse proxy.",
+    "Build new model architectures from oasr.layers and register them with register_model; do not edit the engine core to add a variant."
+  ]
+}

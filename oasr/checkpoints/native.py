@@ -148,7 +148,7 @@ def save_native(
     except ImportError as exc:  # pragma: no cover - optional dep
         raise ImportError(
             "safetensors is required to write native checkpoints; install it "
-            "with `pip install oasr[hub]` or `pip install safetensors`"
+            "with `pip install oasr-server[hub]` or `pip install safetensors`"
         ) from exc
 
     from dataclasses import asdict
@@ -205,7 +205,7 @@ def load_native(ckpt_dir: Path, map_location: Any = "cpu") -> ConvertedCheckpoin
     except ImportError as exc:  # pragma: no cover - optional dep
         raise ImportError(
             "safetensors is required to read native checkpoints; install it "
-            "with `pip install oasr[hub]` or `pip install safetensors`"
+            "with `pip install oasr-server[hub]` or `pip install safetensors`"
         ) from exc
 
     from oasr.models.registry import get_model_entry

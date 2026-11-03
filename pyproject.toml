@@ -10,9 +10,9 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "oasr"
+name = "oasr-server"
 version = "0.1.0"
-description = "Open Automatic Speech Recognition - High-performance ASR inference framework"
+description = "High-performance CUDA inference and serving engine for speech recognition: Whisper, Conformer, Zipformer, RNN-T, Paraformer and speech-LLMs behind an OpenAI-compatible API"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 # 3.10 is the real floor, not an aspiration: oasr/decoder/wfst/graph_image.py
@@ -25,24 +25,42 @@ authors = [
 ]
 keywords = [
     "asr",
+    "automatic-speech-recognition",
     "speech-recognition",
-    "deep-learning",
+    "speech-to-text",
+    "inference",
+    "serving",
+    "streaming",
     "cuda",
+    "cutlass",
+    "whisper",
     "conformer",
+    "zipformer",
     "paraformer",
-    "transformer",
+    "transducer",
+    "rnnt",
+    "ctc",
+    "wfst",
+    "wenet",
+    "icefall",
+    "funasr",
+    "openai-api",
+    "quantization",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
@@ -98,14 +116,15 @@ wfst = [
     "kaldilm",
 ]
 all = [
-    "oasr[audio,serving,hub,tokenizers,attention]",
+    "oasr-server[audio,serving,hub,tokenizers,attention]",
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/oasr"
-Documentation = "https://oasr.readthedocs.io"
-Repository = "https://github.com/your-org/oasr"
-Issues = "https://github.com/your-org/oasr/issues"
+Homepage = "https://github.com/chiendb97/oasr"
+Documentation = "https://github.com/chiendb97/oasr/tree/main/docs"
+Repository = "https://github.com/chiendb97/oasr"
+Issues = "https://github.com/chiendb97/oasr/issues"
+Changelog = "https://github.com/chiendb97/oasr/releases"
 
 [project.scripts]
 # One command to learn: `oasr transcribe|translate|models|serve|convert`.

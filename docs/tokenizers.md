@@ -21,7 +21,7 @@ resolves the kind through the registry (`register_tokenizer(kind, factory)`).
 | Kind | Assets | Used by | Behaviour |
 |---|---|---|---|
 | `symbol_table` | `units.txt` / `tokens.txt` | WeNet CTC, icefall CTC | id→piece join, `▁` = word boundary; default `special_ids={0,1,2}` — **bit-compatible** with the legacy `Detokenizer` |
-| `sentencepiece` | `bpe.model` | icefall BPE | ids == SentencePiece piece ids (`oasr[tokenizers]` extra) |
+| `sentencepiece` | `bpe.model` | icefall BPE | ids == SentencePiece piece ids (`oasr-server[tokenizers]` extra) |
 | `huggingface` | `tokenizer.json` (+ `tokenizer_config.json`) | Qwen2-Audio (speech-LLM) | wraps the `tokenizers` fast runtime; see the added-token merge below |
 | `whisper` | `tokenizer.json` | HF Whisper | HF fast tokenizer + control-token stripping above `eot_id` |
 | `funasr_char` | `tokens.json` | Paraformer | ports FunASR's `sentence_postprocess` (CJK join, `@@` subword merge, abbreviation join) |

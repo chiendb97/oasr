@@ -126,7 +126,7 @@ async with AsyncOASRClient("http://127.0.0.1:8080") as client:
 ```
 
 `chunks` is any (async) iterable of raw PCM; frames go out as binary, skipping
-base64. Both clients need the `serving` extra (`pip install "oasr[serving]"`).
+base64. Both clients need the `serving` extra (`pip install "oasr-server[serving]"`).
 
 An existing **OpenAI client** works too — see
 [`POST /v1/audio/transcriptions`](#post-v1audiotranscriptions).

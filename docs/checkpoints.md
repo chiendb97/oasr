@@ -2,7 +2,7 @@
 
 How OASR loads models: `oasr.from_pretrained(id_or_path)` accepts a local
 checkpoint directory or a HuggingFace Hub repo id (downloaded via
-`snapshot_download`, `oasr[hub]` extra) and resolves it to a registered model
+`snapshot_download`, `oasr-server[hub]` extra) and resolves it to a registered model
 architecture plus a **complete bundle** — weights, model config, tokenizer
 spec, feature spec, and decoding defaults all travel together, so the engine
 never sniffs paths or applies engine-side defaults that fight the checkpoint.

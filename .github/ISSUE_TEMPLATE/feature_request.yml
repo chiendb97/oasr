@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a new capability for the engine, the server, the decoders or the kernels.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what stops you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        How you would like it to work. If it adds a variant (a model, decode family,
+        tokenizer, frontend, speech detector, quantization scheme, ...), say which
+        registry it would extend. See docs/architecture.md.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to implement this myself.
