@@ -773,7 +773,9 @@ the allocator keeps what it takes, so it is bounded twice:
   `--max-concurrent-requests`.
 
 A request past either cap, or a `0`, falls back to ordinary heap buffers, which
-is the older path and still correct. An idle engine also returns the host
+is the older path and still correct. So does a request whose page-lock fails
+(`cudaHostAlloc` out of memory, or any error from the engine's offer), and only
+that request: the next one is offered pinned memory again. An idle engine also returns the host
 cache's pages once they exceed what the total cap could need.
 
 **Memory sizing.** `--max-num-blocks 0` hands the paged KV pool to the engine,
@@ -993,7 +995,7 @@ the server's problem to see.
 | `oasr_engine_step_failures_total` | counter | `step()` raised. Three consecutive failures stop the readiness heartbeat, so `/readyz` and the gRPC health check go NotServing and a load balancer drains the process. |
 | `oasr_requests_cancelled_total` | counter | Requests aborted before completion — almost always a client disconnect. A rising count next to a flat `oasr_engine_outputs_total` means clients are giving up before the engine answers. |
 | `oasr_requests_failed_total{stage}` | counter | Requests the engine finished with an error, labelled by the stage that failed (`offline_forward`, `offline_oom`, `prefill_oom`, `decode_step`, `decode_oom`, `streaming_forward`, `streaming_features`). Distinct from `oasr_engine_step_failures_total`: this one means the executor *contained* the failure to the requests responsible and kept ticking, so a rising count here with a flat step-failure count is isolation working, not an outage. |
-| `oasr_events_{dropped,deferred}_total` | counter | Per-request channel was full: a partial was dropped (harmless — the next one supersedes it) or a **terminal** event was handed to a background task rather than lost. Sustained non-zero here means clients are reading slower than the engine emits. |
+| `oasr_events_{dropped,deferred}_total` | counter | Per-request channel was full. *Dropped*: a partial with no speech transition, which is harmless because the next one supersedes it (also counted when a queued partial is folded into a newer one). *Deferred*: an event that must still arrive — the **terminal**, or a partial carrying `speech_started` / `speech_stopped` — queued for in-order delivery, with everything after it queued behind it. Sustained non-zero here means clients are reading slower than the engine emits. |
 
 ### Engine internals
 
@@ -1087,8 +1089,8 @@ sum(rate(oasr_engine_kv_exhausted_total[5m]))                     > 0
 # The engine is wedged. Three in a row already flips /readyz; alert before that.
 sum(rate(oasr_engine_step_failures_total[5m]))                    > 0
 
-# Clients cannot keep up with the engine, and a *terminal* event needed
-# out-of-band delivery.
+# Clients cannot keep up with the engine, and an event that must arrive (a
+# terminal, or a speech transition) waited in a request's backlog.
 sum(rate(oasr_events_deferred_total[5m]))                         > 0
 
 # The metrics themselves are lying: a histogram above is truncated because the

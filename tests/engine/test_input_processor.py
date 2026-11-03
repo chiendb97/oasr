@@ -884,6 +884,33 @@ class TestPinnedAudioBuffers:
         assert p.new_audio_buffer(0) is None
         assert p.new_audio_buffer(-1) is None
 
+    # -- a failed allocation (audit L9, G15) -----------------------------------
+
+    @pytest.mark.cuda
+    def test_a_failed_allocation_declines_only_its_own_request(self, device, caplog):
+        """``cudaHostAlloc`` running out fails one allocation, not the next.
+
+        A real failure, not a mock: 32 TiB is refused at once and page-locks
+        nothing.  The failure used to set the per-request cap to zero, so every
+        later request in the process lost the pinned path.
+        """
+        import logging
+
+        huge = 1 << 43
+        p = self._proc(
+            device="cuda", max_pinned_audio_seconds=1e9, max_pinned_audio_total_seconds=1e9
+        )
+        with caplog.at_level(logging.INFO, logger="oasr.engine.input_processor"):
+            assert p.new_audio_buffer(huge) is None
+            assert p.new_audio_buffer(huge) is None
+            assert p.pinned_audio_samples == 0, "a failed request kept its share"
+            buf = p.new_audio_buffer(16000)
+            assert buf is not None, "one failure turned pinned audio off for good"
+            assert buf.is_pinned()
+        messages = [r.getMessage() for r in caplog.records]
+        assert sum("cannot page-lock" in m for m in messages) == 1, messages
+        assert sum("available again" in m for m in messages) == 1, messages
+
     # -- the total, across requests (audit M6) -------------------------------
 
     @pytest.mark.cuda
