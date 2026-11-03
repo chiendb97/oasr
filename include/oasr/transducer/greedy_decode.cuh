@@ -89,7 +89,8 @@ struct StatelessGreedyParams {
     const T* enc_proj;  // (B, T, J), last dim contiguous: encoder already in joiner space
     int64_t enc_stride_b;
     int64_t enc_stride_t;
-    const int64_t* lengths;    // (B,) valid frames per row
+    int num_frames;            // T: frames per row of enc_proj
+    const int64_t* lengths;    // (B,) valid frames per row, clamped to [0, num_frames]
     const int64_t* window_in;  // (B, ctx) label window the predictor state is
     const T* dec_proj_in;      // (B, J) decoder projection of that window
     // ---- weights ----
@@ -319,7 +320,11 @@ __global__ void __launch_bounds__(kThreads, 1)
         s_sym[tid] = 0;
         s_cnt[tid] = 0;
         s_buf[tid] = 0;
-        s_len[tid] = valid ? static_cast<int>(p.lengths[b]) : 0;
+        // Clamped as the beam kernel clamps: a length past T would gather
+        // frames beyond the row (the next row's, or past the tensor), and the
+        // host cannot check a device-side length without a sync.
+        const int64_t len = valid ? p.lengths[b] : 0;
+        s_len[tid] = len < 0 ? 0 : (len > p.num_frames ? p.num_frames : static_cast<int>(len));
         for (int i = 0; i < ctx; ++i) {
             s_win[tid][i] = valid ? p.window_in[static_cast<int64_t>(b) * ctx + i]
                                   : static_cast<int64_t>(p.blank);
@@ -574,18 +579,62 @@ __global__ void __launch_bounds__(kThreads, 1)
 //! two once it does not, so a wide batch runs in fewer waves.
 inline int statelessGreedyRowsPerCta(int batch, int num_sms) { return batch <= num_sms ? 1 : 2; }
 
+// Whether one CTA's working set -- the dynamic shared memory above plus the
+// kernel's static shared memory, returned in `static_bytes` -- fits the
+// current device's opt-in limit.  As `statelessBeamFitsRows`.
+template <typename T, int R, bool kTrack>
+cudaError_t statelessGreedyFitsRows(int J, int D, bool* fits, size_t* static_bytes = nullptr) {
+    cudaFuncAttributes attr;
+    cudaError_t st = cudaFuncGetAttributes(&attr, statelessGreedyKernel<T, R, kTrack>);
+    if (st != cudaSuccess) return st;
+    int dev = 0, optin = 0;
+    st = cudaGetDevice(&dev);
+    if (st != cudaSuccess) return st;
+    st = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (st != cudaSuccess) return st;
+    *fits = statelessGreedySmemBytes<T, R>(J, D) + attr.sharedSizeBytes <=
+            static_cast<size_t>(optin);
+    if (static_bytes != nullptr) *static_bytes = attr.sharedSizeBytes;
+    return cudaSuccess;
+}
+
 template <typename T, int R, bool kTrack>
 cudaError_t launchStatelessGreedy(const StatelessGreedyParams<T>& p, cudaStream_t stream) {
+    bool fits = false;
+    size_t static_bytes = 0;
+    cudaError_t st = statelessGreedyFitsRows<T, R, kTrack>(p.J, p.D, &fits, &static_bytes);
+    if (st != cudaSuccess) return st;
+    if (!fits) return cudaErrorInvalidConfiguration;
     const size_t smem = statelessGreedySmemBytes<T, R>(p.J, p.D);
     auto kernel = statelessGreedyKernel<T, R, kTrack>;
-    if (smem > 48 * 1024) {
-        cudaError_t st = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              static_cast<int>(smem));
-        if (st != cudaSuccess) return st;
+    // Past 48 KB in all -- static included -- a block needs the opt-in.  On the
+    // dynamic size alone, a dynamic part within the static arrays (about 100 B)
+    // of 48 KB launched without it and failed ("invalid argument"): one row of
+    // a joiner dim 1600, decoder dim 64 model is exactly 48 KB.
+    if (smem + static_bytes > 48 * 1024) {
+        st = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  static_cast<int>(smem));
+        if (st != cudaSuccess) {
+            cudaGetLastError();  // not sticky: do not hand it to the next launch
+            return st;
+        }
     }
     const int grid = (p.B + R - 1) / R;
     kernel<<<grid, kThreads, smem, stream>>>(p);
     return cudaGetLastError();
+}
+
+//! Whether a `(J, D)` geometry fits every row count the launcher picks from
+//! (two rows need more than one), tracked or not.
+template <typename T>
+cudaError_t StatelessGreedyFits(int J, int D, bool* fits) {
+    bool plain = false, tracked = false;
+    cudaError_t st = statelessGreedyFitsRows<T, 2, false>(J, D, &plain);
+    if (st != cudaSuccess) return st;
+    st = statelessGreedyFitsRows<T, 2, true>(J, D, &tracked);
+    if (st != cudaSuccess) return st;
+    *fits = plain && tracked;
+    return cudaSuccess;
 }
 
 //! Launch the fused greedy decode.  `rows_per_cta` <= 0 picks
@@ -598,7 +647,7 @@ cudaError_t StatelessGreedyDecode(const StatelessGreedyParams<T>& p, int rows_pe
     if (p.B == 0) return cudaSuccess;
     if (p.ctx < 1 || p.ctx > kMaxContext || p.J % kStageK != 0 || p.D % kStageK != 0 ||
         p.ld_out % kGemvTile != 0 || p.ld_dp % kGemvTile != 0 || p.ld_out < p.V ||
-        p.ld_dp < p.J) {
+        p.ld_dp < p.J || p.num_frames < 0) {
         return cudaErrorInvalidValue;
     }
     if (rows_per_cta <= 0) {

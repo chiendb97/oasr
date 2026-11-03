@@ -19,6 +19,7 @@ from helpers.transducer import (
     DEC_DIM,
     JOINER_DIM,
     VOCAB,
+    exact_projections,
     exact_transducer,
     integer_frames as _int_frames,
     transducer_strategy,
@@ -281,6 +282,110 @@ class TestStatefulChunks:
         assert torch.equal(res.counts, ref.counts)
         for b, n in enumerate(ref.counts.tolist()):
             assert torch.equal(res.tokens[b, :n], ref.tokens[b, :n])
+
+
+class TestLengths:
+    def test_a_length_past_the_frames_is_clamped(self):
+        """``lengths`` is clamped to ``[0, T]`` on the device, as the beam
+        kernel clamps it (audit L1, G16).
+
+        The greedy kernel read ``lengths[b]`` as given, so a length past ``T``
+        gathered frames beyond the row: the next row's, or past the tensor.
+        Here ``enc_proj`` is a view of a longer buffer, so the frames past ``T``
+        are real and decodable, and a kernel that reads them emits more.
+        """
+        model = _model(torch.bfloat16, seed=3)
+        strat = _strategy(model)
+        weights = _weights(model)
+        T, extra = 12, 6
+        with torch.no_grad():
+            ep_full = model.joiner.encoder_proj(_enc(4, T + extra, torch.bfloat16, seed=3))
+        ep = ep_full[:, :T]
+
+        def run(enc_proj, lengths):
+            state, dec_proj = strat._init_state(4, enc_proj.device)
+            with torch.no_grad():
+                res = transducer_greedy_decode(
+                    enc_proj,
+                    torch.tensor(lengths, device="cuda"),
+                    state,
+                    dec_proj,
+                    weights,
+                    max_sym=strat._max_sym,
+                    capacity=128,
+                )
+            torch.cuda.synchronize()
+            return res
+
+        # The frames past T must change the decode of a row given the long
+        # length, or this proves nothing.
+        long_rows = [T + extra] * 3 + [0]
+        assert not torch.equal(
+            run(ep_full, long_rows).counts, run(ep_full, [T] * 3 + [0]).counts
+        ), "the extra frames emit nothing; nothing under test"
+        got = run(ep, [T + extra] * 3 + [-2])
+        want = run(ep, [T] * 3 + [0])
+        assert got.counts.tolist() == want.counts.tolist()
+        for b, n in enumerate(want.counts.tolist()):
+            assert torch.equal(got.tokens[b, :n], want.tokens[b, :n])
+            assert torch.equal(got.frames[b, :n], want.frames[b, :n])
+        assert torch.equal(got.window, want.window)
+        assert torch.equal(got.dec_proj, want.dec_proj)
+
+
+def _greedy_smem(rows, J, D):
+    """``statelessGreedySmemBytes`` for a half-precision model: the dynamic part."""
+    return 2 * rows * (3 * J + D) + 4 * (rows * J + 16 * 512 + 16 * rows * 4)
+
+
+class TestSharedMemory:
+    def test_static_shared_memory_counts_toward_the_opt_in(self):
+        """At this geometry one row's dynamic shared memory is exactly 48 KiB,
+        so the kernel's static arrays take the block past the default limit.
+        The launcher opted in on the dynamic size alone, and the launch failed
+        (audit L1, G16).  Two rows opt in either way, so they are the control.
+        """
+        J, D = 1600, 64
+        assert _greedy_smem(1, J, D) == 48 * 1024, "not at the edge; nothing under test"
+        model = _model(torch.bfloat16, joiner_dim=J, dec_dim=D, seed=3)
+        strat = _strategy(model)
+        enc = _int_frames(3, 10, torch.bfloat16, seed=3, dim=J)
+        lengths = torch.tensor([10, 6, 9], device="cuda")
+        with exact_projections(model):
+            hyps, marks, state, dec_proj = _loop(strat, enc, lengths, track=True)
+        one, h1, f1 = _fused(strat, enc, lengths, rows_per_cta=1)
+        two, h2, f2 = _fused(strat, enc, lengths, rows_per_cta=2)
+        assert (h1, f1) == (h2, f2)
+        assert h1 == hyps and f1 == [[f for f, _ in row] for row in marks]
+        assert torch.equal(one.window, state) and torch.equal(one.dec_proj, dec_proj)
+
+    def test_a_working_set_past_the_device_limit_is_unsupported(self):
+        """``supports`` asks the kernel, as ``supports_beam`` does, so an
+        oversized model takes the op-by-op loop instead of failing its launch.
+        Two rows of a 12000-wide joiner need ~267 KiB, past every device's limit.
+        """
+        J, D, V = 12000, 64, 37
+
+        def r(*s):
+            return torch.randn(*s, device="cuda", dtype=torch.bfloat16)
+
+        wide = StatelessGreedyWeights.prepare(
+            output_weight=r(V, J),
+            output_bias=None,
+            vocab=V,
+            activation="tanh",
+            embedding=r(V, D),
+            conv_weight=None,
+            context=1,
+            group=1,
+            decoder_proj_weight=r(J, D),
+            decoder_proj_bias=None,
+            blank=0,
+        )
+        optin = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+        assert _greedy_smem(2, J, D) > optin
+        assert not wide.supports(torch.zeros(2, 4, J, device="cuda", dtype=torch.bfloat16))
+        assert _weights(_model(torch.bfloat16)).supports(_enc(2, 4, torch.bfloat16))
 
 
 class TestCapacity:

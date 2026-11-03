@@ -149,11 +149,13 @@ class StatelessGreedyWeights:
         """Whether the kernel can decode ``enc_proj`` with these weights.
 
         Half precision only (the GEMVs multiply packed half-precision pairs),
-        every operand in that one dtype, and both the joiner and decoder dims
-        multiples of :data:`K_STAGE`.
+        every operand in that one dtype, both the joiner and decoder dims
+        multiples of :data:`K_STAGE`, and a working set that fits the device's
+        shared memory -- so an oversized model takes the op-by-op loop rather
+        than failing its launch.
         """
         dtype = enc_proj.dtype
-        return (
+        if not (
             enc_proj.is_cuda
             and dtype in (torch.float16, torch.bfloat16)
             and all(t.dtype == dtype for t in (self.w_out_t, self.emb, self.w_dp_t))
@@ -161,6 +163,13 @@ class StatelessGreedyWeights:
             and int(self.w_out_t.size(0)) % K_STAGE == 0
             and int(self.w_dp_t.size(0)) % K_STAGE == 0
             and 1 <= self.context <= 8
+        ):
+            return False
+        index = enc_proj.device.index
+        return _greedy_fits(
+            torch.cuda.current_device() if index is None else int(index),
+            int(self.w_out_t.size(0)),
+            int(self.w_dp_t.size(0)),
         )
 
     def supports_beam(self, enc_proj: torch.Tensor, beam: int) -> bool:
@@ -187,6 +196,14 @@ class StatelessGreedyWeights:
             int(self.w_dp_t.size(0)),
             self.vocab,
         )
+
+
+@functools.cache
+def _greedy_fits(device: int, J: int, D: int) -> bool:
+    """The kernel's own answer, at both row counts its launcher picks from
+    (``StatelessGreedyFits`` in ``greedy_decode.cuh``)."""
+    with torch.cuda.device(device):
+        return bool(_get_transducer_module().stateless_greedy_fits(J, D))
 
 
 @functools.cache
@@ -247,7 +264,8 @@ def transducer_greedy_decode(
         ``(B, T, J)`` encoder output already projected into joiner space
         (``joiner.encoder_proj(enc_out)``), fp16/bf16/fp32, last dim contiguous.
     lengths : Tensor
-        ``(B,)`` valid frames per row (int64; cast if not).
+        ``(B,)`` valid frames per row (int64; cast if not), clamped to
+        ``[0, T]`` on the device as the beam search clamps them.
     window, dec_proj : Tensor
         The predictor state to start from: the ``(B, context)`` int64 label
         window and its ``(B, J)`` decoder projection.

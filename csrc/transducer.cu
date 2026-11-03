@@ -3,6 +3,7 @@
 //
 // TVM-FFI launcher for the fused stateless-transducer greedy decode.
 
+#include <limits>
 #include <oasr/transducer/beam_decode.cuh>
 #include <oasr/transducer/beam_topk.cuh>
 #include <oasr/transducer/greedy_decode.cuh>
@@ -43,6 +44,8 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(enc_proj);
     const int64_t B = enc_proj.size(0);
     const int64_t J = enc_proj.size(2);
+    TVM_FFI_ICHECK(enc_proj.size(1) <= std::numeric_limits<int>::max())
+        << "enc_proj has more frames than an int counts";
     TVM_FFI_ICHECK(J % transducer::kStageK == 0)
         << "joiner dim must be a multiple of " << transducer::kStageK << "; got " << J;
     TVM_FFI_ICHECK(enc_proj.stride(0) % 8 == 0 && enc_proj.stride(1) % 8 == 0)
@@ -152,6 +155,7 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
         p.enc_proj = static_cast<const c_type*>(enc_proj.data_ptr());
         p.enc_stride_b = enc_proj.stride(0);
         p.enc_stride_t = enc_proj.stride(1);
+        p.num_frames = static_cast<int>(enc_proj.size(1));
         p.lengths = static_cast<const int64_t*>(lengths.data_ptr());
         p.window_in = static_cast<const int64_t*>(window_in.data_ptr());
         p.dec_proj_in = static_cast<const c_type*>(dec_proj_in.data_ptr());
@@ -445,5 +449,17 @@ bool stateless_beam_fits(int64_t beam, int64_t J, int64_t D, int64_t vocab) {
         &fits);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "stateless beam fit query failed: " << cudaGetErrorString(status);
+    return fits;
+}
+
+// Whether the fused greedy decode can run these dims on the current device at
+// every row count its launcher picks from: static and dynamic shared memory
+// against the opt-in limit.  Shared memory is the same for fp16 and bf16.
+bool stateless_greedy_fits(int64_t J, int64_t D) {
+    bool fits = false;
+    cudaError_t status = transducer::StatelessGreedyFits<__nv_bfloat16>(static_cast<int>(J),
+                                                                        static_cast<int>(D), &fits);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "stateless greedy fit query failed: " << cudaGetErrorString(status);
     return fits;
 }

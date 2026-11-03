@@ -151,6 +151,17 @@ this costs one extra launch but is mathematically safe and can expose more SM
 parallelism for a thin M and large K. Vanilla RNN excludes serial Split-K
 because applying tanh/ReLU to an intermediate K partition is incorrect.
 
+**The new state is never written over the old.** At one timestep a single
+launch reads `initial_h` while other CTAs of it already store `final_h`, so an
+in-place call (`final_h=initial_h`) returns half-updated state: on an RTX 5090
+the scalar LSTM and RNN, the tensor-core LSTM and the fused step all did. Every
+recurrent launcher therefore refuses an output that shares storage with an input
+(`oasr::StorageOverlaps` in `csrc/tvm_ffi_utils.h`, exact for row-strided
+views, so two column halves of one buffer are fine). Outputs may share storage
+with each other: the single-timestep cell ring *is* `final_c`. The CuTeDSL step
+checks nothing on the host, so the fused path leaves it for the decomposed one
+when the state overlaps.
+
 The direct kernel remains the default for decode-sized and moderate hidden
 states. This is intentional: a tensor-core GEMM can underfill the device at
 small M, and packing/projection plus dependent GEMM launches may cost more than

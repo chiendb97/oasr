@@ -33,3 +33,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_beam_decode, stateless_beam_decode);
 bool stateless_beam_fits(int64_t beam, int64_t J, int64_t D, int64_t vocab);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_beam_fits, stateless_beam_fits);
+
+bool stateless_greedy_fits(int64_t J, int64_t D);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_greedy_fits, stateless_greedy_fits);

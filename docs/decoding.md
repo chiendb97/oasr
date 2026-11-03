@@ -91,7 +91,10 @@ device→host copy at the end. The predictor declares itself through
 conv, as icefall's stateless decoder) and the joiner through
 `Joiner.additive_tensors()` (`output(act(enc_proj + dec_proj))`, tanh or ReLU);
 either returning `None` — an LSTM predictor, a non-additive joint — keeps the
-loop above. Half precision only.
+loop above. Half precision only. `lengths` are clamped to `[0, T]` on the device,
+as the beam kernel clamps them, and `supports()` asks the kernel whether its
+shared memory (static included) fits the device, so an oversized model takes
+the loop instead of failing its launch.
 
 * `TransducerOptions.fused` (default on). Offline, streaming and
   `decode_offline_async` all take it; a batch whose emissions overflow the

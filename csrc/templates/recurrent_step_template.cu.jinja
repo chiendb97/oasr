@@ -102,6 +102,27 @@ void {{ func_name }}(TensorView h, Optional c, TensorView previous_h, TensorView
     TVM_FFI_ICHECK_EQ(K % oasr::recurrent::kRecurrentStepAlignment, 0)
         << "K must be a multiple of " << oasr::recurrent::kRecurrentStepAlignment;
 
+    // No output may share storage with an input, or with the other output.
+    // The grid tiles N, so several CTAs read the same previous_h rows across
+    // the whole K loop while others are already storing h for them: an h over
+    // previous_h is read half-updated (measured: 19 of 20 in-place steps wrong
+    // at batch 64, hidden 1024), and the same holds for any operand another
+    // CTA still reads.  A c over previous_c alone would be safe (one thread
+    // reads and writes each element), but h cannot be in place anyway, so the
+    // rule stays the one every recurrent launcher applies.  Nor may an
+    // output's own rows overlap, which an expanded or narrow-strided view
+    // would make them.
+    auto const refuse_overlap = [](TensorView const& out, char const* out_name,
+                                   TensorView const& in, char const* in_name) {
+        TVM_FFI_ICHECK(!oasr::StorageOverlaps(out, in))
+            << out_name << " must not share storage with " << in_name
+            << "; write the new state into a separate buffer";
+    };
+    TVM_FFI_ICHECK(M == 1 || h.stride(0) >= H) << "h's rows overlap each other";
+    refuse_overlap(h, "h", previous_h, "previous_h");
+    refuse_overlap(h, "h", weight_hh, "weight_hh");
+    refuse_overlap(h, "h", input_gates, "input_gates");
+
     cudaStream_t stream = oasr::get_stream(previous_h.device());
 
     RecurrentStepArguments<Element> args{};
@@ -132,6 +153,13 @@ void {{ func_name }}(TensorView h, Optional c, TensorView previous_h, TensorView
         TVM_FFI_ICHECK_EQ(int(out_c.size(1)), H) << "c must be (M, H)";
         TVM_FFI_ICHECK_EQ(int(in_c.size(0)), M) << "previous_c must be (M, H)";
         TVM_FFI_ICHECK_EQ(int(in_c.size(1)), H) << "previous_c must be (M, H)";
+        TVM_FFI_ICHECK(M == 1 || out_c.stride(0) >= H) << "c's rows overlap each other";
+        refuse_overlap(h, "h", in_c, "previous_c");
+        refuse_overlap(out_c, "c", previous_h, "previous_h");
+        refuse_overlap(out_c, "c", weight_hh, "weight_hh");
+        refuse_overlap(out_c, "c", input_gates, "input_gates");
+        refuse_overlap(out_c, "c", in_c, "previous_c");
+        refuse_overlap(out_c, "c", h, "h");
         args.ptr_c = static_cast<Element*>(out_c.data_ptr());
         args.ptr_prev_c = static_cast<Element const*>(in_c.data_ptr());
         args.stride_c = out_c.stride(0);

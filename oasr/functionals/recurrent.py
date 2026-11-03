@@ -236,6 +236,11 @@ def lstm_layer(
     TBC by default or BTC with ``batch_first=True``; initial and final states
     are always ``(batch, hidden)``.  CUDA FP16/BF16 is the intended serving
     scope.  The higher-level :class:`oasr.layers.LSTM` owns CPU/fp32 fallback.
+
+    ``out``, ``final_h`` and ``final_c`` must not share storage with an input:
+    at a single timestep one launch reads ``initial_h`` while it stores
+    ``final_h``, so the launcher refuses an in-place state update rather than
+    return half-updated state.
     """
     sequence_length, batch_size, hidden_size = _check_layer_inputs(
         input, initial_h, weight_ih, weight_hh, bias_ih, bias_hh, 4, batch_first
@@ -287,7 +292,8 @@ def rnn_layer(
     """Run one unidirectional vanilla RNN layer.
 
     ``nonlinearity`` is ``"tanh"`` or ``"relu"`` and parameter semantics
-    match :class:`torch.nn.RNN`.
+    match :class:`torch.nn.RNN`.  ``out`` and ``final_h`` must not share storage
+    with an input, as in :func:`lstm_layer`.
     """
     if nonlinearity not in ("tanh", "relu"):
         raise ValueError(f"nonlinearity must be 'tanh' or 'relu', got {nonlinearity!r}")
@@ -314,6 +320,32 @@ def rnn_layer(
     return out, final_h
 
 
+def _state_spans_overlap(
+    outputs: Tuple[torch.Tensor, ...], inputs: Tuple[torch.Tensor, ...]
+) -> bool:
+    """Whether any output's storage span meets an input's, or the other output's.
+
+    Spans, not elements, so two interleaved views of one buffer count as
+    overlapping: it only decides whether to leave the CuTeDSL lane, and the
+    launchers then apply the exact rule (``oasr::StorageOverlaps``).
+    """
+
+    def span(t: torch.Tensor) -> Tuple[int, int]:
+        if t.numel() == 0:
+            return (0, 0)
+        reach = sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+        start = t.data_ptr()
+        return (start, start + (reach + 1) * t.element_size())
+
+    out_spans = [span(t) for t in outputs]
+    others = out_spans[1:] + [span(t) for t in inputs]
+    for i, (a0, a1) in enumerate(out_spans):
+        for b0, b1 in others[i:]:
+            if a0 < b1 and b0 < a1 and a1 > a0 and b1 > b0:
+                return True
+    return False
+
+
 def _lstm_step_fused(
     input_gates: torch.Tensor,
     previous_h: torch.Tensor,
@@ -321,8 +353,12 @@ def _lstm_step_fused(
     packed_weight_hh: torch.Tensor,
     out_h: torch.Tensor,
     out_c: torch.Tensor,
+    outputs_are_fresh: bool = False,
 ) -> bool:
     """Run one timestep on the fused recurrent step.  ``False`` if it declined.
+
+    ``outputs_are_fresh`` says ``out_h`` / ``out_c`` were just allocated, so they
+    cannot overlap the inputs and the CuTeDSL lane need not test them.
 
     ``oasr.jit.recurrent_cute`` arbitrates between the two lanes and hands back
     ``(backend, callable)``; the two have different signatures, so the name
@@ -350,8 +386,18 @@ def _lstm_step_fused(
         return False
     backend, step = routed
     if backend == "cxx":
+        # The launcher refuses outputs that share storage with its inputs.
         step(out_h, out_c, previous_h, packed_weight_hh, input_gates, previous_c)
     else:
+        # The CuTeDSL callable checks nothing on the host, and the step is
+        # wrong when the new state overlaps the old (several CTAs read each
+        # previous_h row while others store h).  Decline, so the caller's
+        # decomposed path -- whose launcher refuses it by name -- answers.
+        # Only for buffers the caller supplied: the test costs ~3-5 us in
+        # Python, on a lane that is the default fused step where the C++ one is
+        # not compiled (sm_90, sm_100).
+        if not outputs_are_fresh and _state_spans_overlap((out_h, out_c), (previous_h, previous_c)):
+            return False
         step(
             previous_h,
             packed_weight_hh,
@@ -384,6 +430,7 @@ def lstm_gemm_layer(
     final_c: Optional[torch.Tensor] = None,
     _packed_parameters: Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = None,
     _tactic: Optional[Tuple[int, int]] = None,
+    _outputs_are_fresh: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tensor-core LSTM layer for large cohorts and wide hidden states.
 
@@ -391,7 +438,8 @@ def lstm_gemm_layer(
     are packed so each cell's four gates are adjacent.  CUTLASS evaluates each
     dependent recurrent affine, and its custom epilogue writes hidden/cell
     state directly.  Output is deliberately TBC so every preceding timestep
-    is a contiguous GEMM operand.
+    is a contiguous GEMM operand.  ``final_h`` and ``final_c`` must not share
+    storage with an input, as in :func:`lstm_layer`.
     """
     sequence_length, batch_size, hidden_size = _check_layer_inputs(
         input, initial_h, weight_ih, weight_hh, bias_ih, bias_hh, 4, batch_first
@@ -410,6 +458,9 @@ def lstm_gemm_layer(
     else:
         packed_weight_ih, packed_weight_hh, combined_bias = _packed_parameters
     input_gates = gemm(input, packed_weight_ih, combined_bias)
+    # Buffers this call allocates cannot overlap its inputs; ``oasr.layers.LSTM``
+    # says the same of the ones it passes (``_outputs_are_fresh``).
+    fresh = _outputs_are_fresh or (final_h is None and final_c is None)
     if final_h is None:
         final_h = input.new_empty(batch_size, hidden_size)
     if final_c is None:
@@ -443,6 +494,7 @@ def lstm_gemm_layer(
             packed_weight_hh,
             final_h,
             final_c,
+            outputs_are_fresh=fresh,
         ):
             # h was written straight into final_h, so the (1, B, H) layer output
             # is a view of it rather than a copy.
@@ -491,7 +543,10 @@ def rnn_gemm_layer(
     _combined_input_bias: Optional[torch.Tensor] = None,
     _tactic: Optional[Tuple[int, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Tensor-core vanilla-RNN layer; output is time-major and contiguous."""
+    """Tensor-core vanilla-RNN layer; output is time-major and contiguous.
+
+    ``final_h`` must not share storage with an input, as in :func:`lstm_layer`.
+    """
     if nonlinearity not in ("tanh", "relu"):
         raise ValueError(f"nonlinearity must be 'tanh' or 'relu', got {nonlinearity!r}")
     sequence_length, batch_size, hidden_size = _check_layer_inputs(

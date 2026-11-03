@@ -599,6 +599,8 @@ class LSTM(_RecurrentBase):
                     final_h=tensor_h[layer],
                     final_c=tensor_c[layer],
                     _packed_parameters=self._packed_lstm_parameters(layer),
+                    # Allocated above, so they cannot overlap the inputs.
+                    _outputs_are_fresh=True,
                 )
                 current_batch_first = False
             elif kernel:
