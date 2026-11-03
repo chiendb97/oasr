@@ -4,6 +4,7 @@
 // TVM-FFI launcher layer for fused recurrent kernels.
 
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <oasr/gemm/gemm.cuh>
 #include <oasr/recurrent/recurrent.cuh>
@@ -50,6 +51,39 @@ void CheckTensorLike(const TensorView& tensor, const TensorView& reference, cons
     CHECK_DEVICE(tensor, reference);
     CHECK_CONTIGUOUS_INPUT(tensor);
     TVM_FFI_ICHECK(SameDtype(tensor, reference)) << name << " dtype must match input";
+}
+
+// One named operand of a launcher, for CheckNoAliasing; a null tensor is an
+// absent optional.
+struct Operand {
+    const TensorView* tensor;
+    const char* name;
+};
+
+// No output may share storage with an input.  At one timestep a launch reads
+// the initial state while other CTAs of the same launch store the final one,
+// so a final_h over initial_h is read half-updated: measured 20 of 20 wrong for
+// lstm_layer and rnn_layer at batch 64, hidden 256, and likewise for the
+// tensor-core LSTM and the fused step.  Longer sequences, and the RNN GEMM
+// path (which copies the final state after its loop), happen to be safe, but
+// one rule for every recurrent launcher is simpler to hold to than a rule per
+// path and sequence length.  Outputs may share storage with each other: the
+// single-timestep cell ring *is* final_c.
+void CheckNoAliasing(std::initializer_list<Operand> outputs,
+                     std::initializer_list<Operand> inputs) {
+    for (const Operand& out : outputs) {
+        for (const Operand& in : inputs) {
+            if (out.tensor == nullptr || in.tensor == nullptr)
+                continue;
+            TVM_FFI_ICHECK(!StorageOverlaps(*out.tensor, *in.tensor))
+                << out.name << " must not share storage with " << in.name
+                << "; write the new state into a separate buffer";
+        }
+    }
+}
+
+const TensorView* OptionalTensor(const Optional& t) {
+    return t.has_value() ? &t.value() : nullptr;
 }
 
 // Only cell[t-1] is ever read, so the cell history is a two-slice ring (one
@@ -375,6 +409,15 @@ void lstm_layer(TensorView output, TensorView final_h, TensorView final_c, Tenso
                                              weight_hh, bias_ih, bias_hh, 4, batch_first);
     CheckCellBuffers(cells, initial_c, final_c, input, shape.sequence_length, shape.batch_size,
                      shape.hidden_size);
+    CheckNoAliasing(
+        {{&output, "output"}, {&final_h, "final_h"}, {&final_c, "final_c"}, {&cells, "cells"}},
+        {{&input, "input"},
+         {&initial_h, "initial_h"},
+         {&initial_c, "initial_c"},
+         {&weight_ih, "weight_ih"},
+         {&weight_hh, "weight_hh"},
+         {OptionalTensor(bias_ih), "bias_ih"},
+         {OptionalTensor(bias_hh), "bias_hh"}});
 
     cudaStream_t stream = get_stream(input.device());
     DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
@@ -406,6 +449,13 @@ void rnn_layer(TensorView output, TensorView final_h, TensorView input, TensorVi
         << "RNN activation must be 0 (tanh) or 1 (relu), got " << activation;
     const RecurrentShape shape = CheckCommon(output, final_h, input, initial_h, weight_ih,
                                              weight_hh, bias_ih, bias_hh, 1, batch_first);
+    CheckNoAliasing({{&output, "output"}, {&final_h, "final_h"}},
+                    {{&input, "input"},
+                     {&initial_h, "initial_h"},
+                     {&weight_ih, "weight_ih"},
+                     {&weight_hh, "weight_hh"},
+                     {OptionalTensor(bias_ih), "bias_ih"},
+                     {OptionalTensor(bias_hh), "bias_hh"}});
     cudaStream_t stream = get_stream(input.device());
     DISPATCH_DLPACK_HALF_DTYPE(input.dtype(), c_type, [&] {
         const c_type* bias_ih_ptr =
@@ -447,6 +497,15 @@ void lstm_gemm_layer(TensorView output, TensorView final_h, TensorView final_c, 
                    workspace.size(1) == 4 * shape.hidden_size)
         << "workspace must have shape (" << shape.batch_size << ", " << 4 * shape.hidden_size
         << ")";
+    CheckNoAliasing({{&output, "output"},
+                     {&final_h, "final_h"},
+                     {&final_c, "final_c"},
+                     {&cells, "cells"},
+                     {&workspace, "workspace"}},
+                    {{&input_gates, "input_gates"},
+                     {&initial_h, "initial_h"},
+                     {&initial_c, "initial_c"},
+                     {&weight_hh, "weight_hh"}});
 
     cudaStream_t stream = get_stream(input_gates.device());
     const int cell_ring = CellRing(shape.sequence_length);
@@ -600,6 +659,9 @@ void rnn_gemm_layer(TensorView output, TensorView final_h, TensorView input_gate
         << "RNN activation must be 0 (tanh) or 1 (relu), got " << activation;
     const GemmRecurrentShape shape = CheckGemmCommon(output, final_h, input_gates, initial_h,
                                                      weight_hh, bias_hh, 1, input_batch_first);
+    CheckNoAliasing(
+        {{&output, "output"}, {&final_h, "final_h"}},
+        {{&input_gates, "input_gates"}, {&initial_h, "initial_h"}, {&weight_hh, "weight_hh"}});
     cudaStream_t stream = get_stream(input_gates.device());
     DISPATCH_DLPACK_HALF_DTYPE(input_gates.dtype(), c_type, [&] {
         using CutlassType = typename ToCutlassType<c_type>::type;

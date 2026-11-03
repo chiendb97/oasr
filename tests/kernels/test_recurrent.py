@@ -729,6 +729,73 @@ class TestRecurrentValidation:
             LSTM(8, 16)(torch.randn(3, 2, 7))
 
 
+class TestOverlappingState:
+    """A final state over the initial state is refused on every path (audit L1, G16).
+
+    At one timestep a single launch reads ``initial_h`` while other CTAs of it
+    store ``final_h``, so an in-place call read half-written state.  Measured
+    before the refusal, fp16 with a GEMM congesting another stream, 20 trials:
+    ``lstm_layer`` and ``rnn_layer`` 20 of 20 wrong at B=64, H=256; the
+    tensor-core LSTM 20 of 20 at B=256, H=1024; the fused step 13 of 20 at B=64,
+    H=1024.  Longer sequences and the RNN GEMM path happened to be right, but
+    one rule holds for every path, as an ``out=`` does in torch.
+    """
+
+    B, H = 64, 256
+
+    def _call(self, fn, *, alias_h, alias_c, T=1):
+        g = torch.Generator(device="cuda").manual_seed(3)
+        lstm = fn.startswith("lstm")
+        gates = (4 if lstm else 1) * self.H
+        r = lambda *s, scale=1.0: (  # noqa: E731
+            torch.randn(*s, device="cuda", dtype=torch.float16, generator=g) * scale
+        )
+        x = r(T, self.B, self.H, scale=0.5)
+        w_ih, w_hh = r(gates, self.H, scale=self.H**-0.5), r(gates, self.H, scale=self.H**-0.5)
+        h0, c0 = r(self.B, self.H), r(self.B, self.H)
+        kw = {}
+        if alias_h:
+            kw["final_h"] = h0
+        if alias_c:
+            kw["final_c"] = c0
+        f = getattr(oasr, fn)
+        if lstm:
+            return f(x, h0, c0, w_ih, w_hh, **kw)
+        return f(x, h0, w_ih, w_hh, **kw)
+
+    @pytest.mark.parametrize("T", [1, 3])
+    @pytest.mark.parametrize("fn", ["lstm_layer", "rnn_layer", "lstm_gemm_layer", "rnn_gemm_layer"])
+    def test_a_final_h_over_initial_h_is_refused(self, device, fn, T):
+        with pytest.raises(Exception, match="must not share storage"):
+            self._call(fn, alias_h=True, alias_c=False, T=T)
+
+    @pytest.mark.parametrize("fn", ["lstm_layer", "lstm_gemm_layer"])
+    def test_a_final_c_over_initial_c_is_refused(self, device, fn):
+        with pytest.raises(Exception, match="must not share storage"):
+            self._call(fn, alias_h=False, alias_c=True)
+
+    def test_the_cutedsl_lane_is_left_rather_than_run_in_place(self, device):
+        """That lane's callable checks nothing on the host; the step declines it,
+        and the decomposed path's launcher refuses by name."""
+        from oasr.jit import recurrent_cute as rc
+
+        before = (rc.get_mode(), rc.get_backend())
+        try:
+            rc.set_mode("always")
+            rc.set_backend("cute")
+            routed = rc.routed_step(
+                dtype_str="float16", gate_count=4, activation="lstm", hidden=self.H, batch=self.B
+            )
+            if routed is None or routed[0] != "cute":
+                pytest.skip(f"the CuTeDSL lane does not serve H={self.H} B={self.B} here")
+            with pytest.raises(Exception, match="final_h must not share storage"):
+                self._call("lstm_gemm_layer", alias_h=True, alias_c=False)
+            self._call("lstm_gemm_layer", alias_h=False, alias_c=False)  # and runs otherwise
+        finally:
+            rc.set_mode(before[0])
+            rc.set_backend(before[1])
+
+
 class TestRecurrentSlotStep:
     """Slot-addressed single timestep -- the continuous-batching primitive.
 

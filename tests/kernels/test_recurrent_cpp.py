@@ -418,6 +418,89 @@ class TestShapeContract:
             _launch(tile)(out_h, out_c, strided, weight, gates, prev_c)
 
 
+class TestOverlappingStorage:
+    """An output that shares storage with an input is refused (audit L1, G16).
+
+    The grid tiles N, so several CTAs read each ``previous_h`` row through the
+    whole K loop while others are already storing ``h`` for it: an in-place
+    step reads its own half-written state.  Before the refusal, 19 of 20
+    in-place steps at batch 64, hidden 1024 came back wrong, by up to 0.17.
+    """
+
+    H = 256
+
+    def _step(self):
+        _requires_cxx()
+        from oasr.jit.recurrent_step import select_tile
+
+        return _launch(select_tile(device_sm(), self.H, 16, 2, 4))
+
+    def _fresh(self):
+        return torch.empty(16, self.H, device="cuda", dtype=torch.float16)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "h_is_previous_h",
+            "h_is_previous_c",
+            "h_inside_input_gates",
+            "c_is_previous_c",
+            "c_is_h",
+            "c_one_row_into_previous_h",
+        ],
+    )
+    def test_an_output_over_an_input_is_refused(self, case):
+        step = self._step()
+        prev_h, weight, gates, prev_c = _operands(16, self.H, self.H, "lstm")
+        prev_h, prev_c = prev_h.clone(), prev_c.clone()
+        out_h, out_c = self._fresh(), self._fresh()
+        if case == "h_is_previous_h":
+            out_h = prev_h
+        elif case == "h_is_previous_c":
+            out_h = prev_c
+        elif case == "h_inside_input_gates":
+            gates = gates.clone()
+            out_h = gates[:, : self.H]
+        elif case == "c_is_previous_c":
+            out_c = prev_c
+        elif case == "c_is_h":
+            out_c = out_h
+        else:
+            # The last row of c is the first row of previous_h: one row is enough.
+            buf = torch.empty(31, self.H, device="cuda", dtype=torch.float16)
+            buf[15:] = prev_h
+            out_c, prev_h = buf[:16], buf[15:]
+        with pytest.raises(Exception, match="must not share storage"):
+            step(out_h, out_c, prev_h, weight, gates, prev_c)
+
+    def test_rows_that_overlap_each_other_are_refused(self):
+        """An expanded output has every row at one address: rows race each other."""
+        step = self._step()
+        prev_h, weight, gates, prev_c = _operands(16, self.H, self.H, "lstm")
+        out_h = torch.empty(1, self.H, device="cuda", dtype=torch.float16).expand(16, -1)
+        with pytest.raises(Exception, match="rows overlap each other"):
+            step(out_h, self._fresh(), prev_h, weight, gates, prev_c)
+
+    def test_interleaved_halves_of_one_buffer_do_not_overlap(self):
+        """The test is exact for row-strided views, not a span check.
+
+        ``previous_h`` and ``h`` as the two column halves of one buffer, and
+        ``c`` and ``previous_c`` as the halves of another: every span meets,
+        no element is shared, and the step must run and be right.
+        """
+        step = self._step()
+        _, weight, gates, _ = _operands(16, self.H, self.H, "lstm")
+        g = torch.Generator(device="cuda").manual_seed(5)
+        hs = torch.randn(16, 2 * self.H, device="cuda", dtype=torch.float16, generator=g) * 0.3
+        cs = torch.randn(16, 2 * self.H, device="cuda", dtype=torch.float16, generator=g) * 0.3
+        prev_h, out_h = hs[:, : self.H], hs[:, self.H :]
+        prev_c, out_c = cs[:, : self.H], cs[:, self.H :]
+        step(out_h, out_c, prev_h, weight, gates, prev_c)
+        ref_h, ref_c = _oracle(prev_h, weight, gates, prev_c, "lstm")
+        _assert_close(out_h, ref_h, torch.float16, "h")
+        _assert_close(out_c, ref_c, torch.float16, "c")
+
+
 class TestCellStateIsCompiledIn:
     """A variant that carries no cell state must refuse one, not drop it."""
 

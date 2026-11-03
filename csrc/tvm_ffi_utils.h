@@ -16,6 +16,10 @@
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/optional.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+
 using TensorView = tvm::ffi::TensorView;
 using Optional = tvm::ffi::Optional<TensorView>;
 
@@ -245,6 +249,66 @@ inline cudaStream_t get_stream(DLDevice device) {
 
 inline size_t get_element_size(DLDataType dtype) {
     return (dtype.bits * dtype.lanes + 7) / 8;
+}
+
+// A tensor's storage as `rows` byte intervals of `width` bytes, `pitch` apart:
+// one interval for a contiguous tensor, one per row for a 2-D view whose rows
+// do not overlap each other, and otherwise the whole span (conservative).
+struct StorageRows {
+    int64_t base;
+    int64_t rows;
+    int64_t pitch;
+    int64_t width;
+};
+
+inline StorageRows AsStorageRows(const TensorView& t) {
+    const int64_t esize = static_cast<int64_t>(get_element_size(t.dtype()));
+    const auto base = static_cast<int64_t>(reinterpret_cast<uintptr_t>(t.data_ptr()));
+    if (t.numel() == 0)
+        return {base, 0, 0, 0};
+    if (t.IsContiguous())
+        return {base, 1, 0, t.numel() * esize};
+    if (t.ndim() == 2 && t.stride(1) == 1 && t.stride(0) >= t.size(1)) {
+        return {base, t.size(0), t.stride(0) * esize, t.size(1) * esize};
+    }
+    int64_t lowest = 0, highest = 0;  // element offsets, whatever the strides' signs
+    for (int i = 0; i < t.ndim(); ++i) {
+        const int64_t reach = (t.size(i) - 1) * t.stride(i);
+        (reach < 0 ? lowest : highest) += reach;
+    }
+    return {base + lowest * esize, 1, 0, (highest - lowest + 1) * esize};
+}
+
+// Whether two tensors share any byte of storage.  Exact for contiguous tensors
+// and row-strided 2-D views -- two column halves of one buffer interleave
+// without overlapping -- and conservative for any other layout.  The row walk
+// runs only when the two spans intersect, which separate allocations never do.
+inline bool StorageOverlaps(const TensorView& a, const TensorView& b) {
+    StorageRows x = AsStorageRows(a), y = AsStorageRows(b);
+    if (x.rows == 0 || y.rows == 0)
+        return false;
+    const auto end = [](const StorageRows& s) { return s.base + (s.rows - 1) * s.pitch + s.width; };
+    if (end(x) <= y.base || end(y) <= x.base)
+        return false;
+    if (x.rows > y.rows)
+        std::swap(x, y);
+    const auto floor_div = [](int64_t n, int64_t d) { return n / d - (n % d != 0 && n < 0); };
+    for (int64_t i = 0; i < x.rows; ++i) {
+        // Row i of x, relative to y's base: [lo, hi].  Row k of y is
+        // [k * pitch, k * pitch + width - 1]; they meet iff kmin <= k <= kmax.
+        const int64_t lo = x.base + i * x.pitch - y.base;
+        const int64_t hi = lo + x.width - 1;
+        if (y.rows == 1) {
+            if (hi >= 0 && lo <= y.width - 1)
+                return true;
+            continue;
+        }
+        const int64_t kmax = std::min(floor_div(hi, y.pitch), y.rows - 1);
+        const int64_t kmin = std::max(-floor_div(-(lo - y.width + 1), y.pitch), int64_t{0});
+        if (kmin <= kmax)
+            return true;
+    }
+    return false;
 }
 
 }  // namespace oasr
