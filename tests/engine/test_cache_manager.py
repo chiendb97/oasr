@@ -864,6 +864,66 @@ class TestBlockPoolFreeValidation:
         pool.free(ids)
         assert pool.num_free_blocks == 8
 
+    def test_free_never_scans_the_free_list(self):
+        """The double-free check is one flag per freed id, not a set of the free list.
+
+        Audit L8: building ``set(self._free_list)`` on every call is O(pool) per
+        finished stream. A 16384-block pool measured 1.12x slower than a
+        2048-block one on the same streaming work, with no stream anywhere near
+        either size. A free list that refuses to be iterated catches it coming
+        back.
+        """
+        import collections
+
+        class _Unscannable(collections.deque):
+            def __iter__(self):
+                raise AssertionError("BlockPool.free scanned the whole free list")
+
+            def __contains__(self, item):
+                raise AssertionError("BlockPool.free searched the free list")
+
+        pool = self._pool(n=64)
+        pool._free_list = _Unscannable(range(64))
+        ids = pool.allocate(5)
+        pool.free(ids[:2])
+        pool.free(ids[2:])
+        with pytest.raises(ValueError, match="already free"):
+            pool.free(ids[:1])
+        assert pool.num_free_blocks == 64
+
+    def test_the_free_flags_mirror_the_free_list(self):
+        """The flags are now what the double-free check trusts, so they must agree
+        with the list through any churn, and a rejected call must change neither."""
+        import random
+
+        rng = random.Random(0)
+        pool = self._pool(n=32)
+        held = []
+
+        def assert_mirrored():
+            flagged = sorted(i for i, f in enumerate(pool._is_free) if f)
+            assert flagged == sorted(pool._free_list)
+
+        for _ in range(500):
+            if held and (rng.random() < 0.5 or pool.num_free_blocks == 0):
+                k = rng.randint(1, len(held))
+                rng.shuffle(held)
+                give, held = held[:k], held[k:]
+                pool.free(give)
+            else:
+                held += pool.allocate(rng.randint(1, max(1, pool.num_free_blocks)))
+            assert_mirrored()
+
+        if not held:
+            held += pool.allocate(1)
+        if pool.num_free_blocks == 0:
+            pool.free([held.pop()])
+        free_id = pool._free_list[0]
+        before = (bytes(pool._is_free), list(pool._free_list))
+        with pytest.raises(ValueError, match="already free"):
+            pool.free([held[0], free_id])
+        assert (bytes(pool._is_free), list(pool._free_list)) == before
+
 
 class TestBatchedEviction:
     """M2: eviction must cost a fixed number of kernels, not 4 per stream.

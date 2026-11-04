@@ -695,9 +695,9 @@ def _admission_engine(*, overlap=False):
     ``ASREngine.__init__`` loads a checkpoint, which these tests deliberately
     avoid: bulk admission is pure request-construction + validation.
     """
-    import queue
     import threading
 
+    from oasr.engine.admission_prep import AdmissionPrep
     from oasr.engine.engine import ASREngine
     from oasr.engine.input_processor import InputProcessor
     from oasr.features import FeatureConfig
@@ -716,9 +716,8 @@ def _admission_engine(*, overlap=False):
     eng._input_processor = InputProcessor.__new__(InputProcessor)
     eng._input_processor._feature_config = eng._config.feature_config
     eng._input_processor.check_audio_duration = lambda audio: None
-    eng._prep_in = queue.Queue()
-    eng._admit_inflight = 0
-    eng._admit_inflight_lock = threading.Lock()
+    # Not started: these tests read what was queued for the prep thread.
+    eng._prep = AdmissionPrep(eng._input_processor.prepare_offline) if overlap else None
     return eng
 
 
@@ -766,8 +765,8 @@ def test_overlap_admission_isolates_a_bad_spec():
     assert "error" not in results[0]
     assert "temperature" in results[1]["error"]
     # Only the valid request was queued for prep and counted as in-flight.
-    assert eng._admit_inflight == 1
-    assert eng._prep_in.qsize() == 1
+    assert eng._prep.in_flight == 1
+    assert eng._prep._todo.qsize() == 1
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["direct", "overlap"])
@@ -783,7 +782,7 @@ def test_bulk_admission_clamps_a_negative_priority(overlap):
     results = eng.add_requests_batch_checked(specs)
     assert all("error" not in r for r in results)
     if overlap:
-        admitted = [eng._prep_in.get_nowait() for _ in specs]
+        admitted = [eng._prep._todo.get_nowait() for _ in specs]
     else:
         admitted = eng._executor.requests
     assert [r.priority for r in admitted] == [0, 4]
@@ -866,8 +865,8 @@ def test_overlap_admission_rejects_on_the_callers_thread():
     eng = _admission_engine(overlap=True)
     with pytest.raises(ValueError, match="requires 16000 Hz"):
         eng.add_request(torch.zeros(8000), request_id="r", sample_rate=8000, streaming=False)
-    assert eng._admit_inflight == 0
-    assert eng._prep_in.qsize() == 0
+    assert eng._prep.in_flight == 0
+    assert eng._prep._todo.qsize() == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -911,8 +910,8 @@ def _fan_out_engine(*, overlap=False, window_s=1.0, spans=None):
 def _queued(eng):
     """The ids queued for the prep thread, in order."""
     ids = []
-    while not eng._prep_in.empty():
-        ids.append(eng._prep_in.get_nowait().request_id)
+    while not eng._prep._todo.empty():
+        ids.append(eng._prep._todo.get_nowait().request_id)
     return ids
 
 
@@ -937,7 +936,7 @@ def test_bulk_admission_fans_out_long_audio(overlap):
     assert admitted == children + ["short"]
     assert all(eng._longform.owns(c) for c in children)
     if overlap:
-        assert eng._admit_inflight == 4
+        assert eng._prep.in_flight == 4
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["admit", "overlap_admit"])
@@ -1011,6 +1010,313 @@ def test_a_window_the_executor_refuses_aborts_its_siblings():
     assert "executor refused" in results[0]["error"]
     assert not eng._longform
     assert eng._executor.aborted == [eng._longform.child_id("long", i) for i in range(3)]
+
+
+# --------------------------------------------------------------------------- #
+# Overlapped admission: failures, aborts and the audio count (audit L8)
+# --------------------------------------------------------------------------- #
+
+
+class _PreppedExecutor(_AbortingExecutor):
+    """Finishes every request admitted to it on the next step.
+
+    ``reject_prep`` is the real executor's, so the error output under test is the
+    one a served engine returns.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.prepared = []
+        self._ready = []
+
+    def admit(self, request):  # pragma: no cover - overlap admits through admit_prepared
+        raise AssertionError("an overlapped admission must not prepare a request twice")
+
+    def admit_prepared(self, request):
+        self.prepared.append(request.request_id)
+        self._ready.append(request)
+
+    def reject_prep(self, request, exc):
+        from oasr.engine.executor.offline import OfflineExecutor
+
+        return OfflineExecutor.reject_prep(self, request, exc)
+
+    def _reject(self, request, reason, stage="unknown"):
+        from oasr.engine.executor.offline import OfflineExecutor
+
+        return OfflineExecutor._reject(self, request, reason, stage)
+
+    def abort(self, request_id):
+        super().abort(request_id)
+        self._ready = [r for r in self._ready if r.request_id != request_id]
+
+    def step(self):
+        from oasr.engine.request import RequestOutput
+
+        done, self._ready = self._ready, []
+        return [
+            RequestOutput(request_id=r.request_id, text="ok", tokens=[[1]], finished=True)
+            for r in done
+        ]
+
+    def num_waiting(self):
+        return 0
+
+    def has_pending(self):
+        return bool(self._ready)
+
+
+def _overlap_engine(prepare, *, window_s=None):
+    """An overlapped-admission engine whose prep thread runs ``prepare``.
+
+    ``window_s`` adds a long-form splitter, so a request fans out into windows.
+    """
+    from oasr.engine.admission_prep import AdmissionPrep
+    from oasr.engine.longform import LongFormTracker
+    from oasr.engine.metrics import EngineMetrics
+
+    eng = _admission_engine(overlap=True)
+    eng._executor = _PreppedExecutor()
+    eng._metrics = EngineMetrics()
+    eng._input_processor = SimpleNamespace(
+        check_audio_duration=lambda audio: None, wants_pinned_trim=False
+    )
+    eng._prep = AdmissionPrep(prepare)
+    if window_s is not None:
+        eng._longform = LongFormTracker()
+        eng._longform_window_samples = int(16000 * window_s)
+        eng._longform_overlap_samples = 0
+        eng._vad_splitter = None
+        eng._vad_resplit_samples = 0
+    eng._prep.start()
+    return eng
+
+
+def _wait_prepared(eng, n, timeout=5.0):
+    """Block until the prep thread has finished with ``n`` requests."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while eng._prep._done.qsize() < n:
+        assert time.monotonic() < deadline, "the prep thread did not finish"
+        time.sleep(0.001)
+
+
+def _drain(eng, max_steps=50):
+    """``eng.run()``, bounded: a request the engine never lets go fails the test.
+
+    ``run()`` loops until nothing is waiting, so the regressions these tests pin
+    (a count that is never released) would hang it rather than fail.
+    """
+    import time
+
+    outs = []
+    for _ in range(max_steps):
+        outs += [o for o in eng.step() if o.finished]
+        if not eng._executor.has_pending() and eng._prep.in_flight == 0:
+            return outs
+        time.sleep(0.01)  # the prep thread may still be preparing
+    raise AssertionError(f"still waiting after {max_steps} steps: {eng._prep.in_flight} in prep")
+
+
+def _refuse(names):
+    """A ``prepare`` that raises for the request ids in ``names``."""
+
+    def prepare(req):
+        if req.request_id in names:
+            raise TypeError(f"cannot read the audio of {req.request_id}")
+
+    return prepare
+
+
+def test_overlapped_admission_answers_a_failed_prep_with_an_error():
+    """The caller already holds the id, so the failure has to come back as an output.
+
+    Regression: the prep thread logged the exception and dropped the request,
+    so the client waited for its timeout. The request now counts as waiting
+    until a step has delivered its error, or the dispatcher could stop stepping
+    an engine with an answer still to give.
+    """
+    eng = _overlap_engine(_refuse({"bad"}))
+    try:
+        eng.add_request(torch.zeros(160), request_id="bad", streaming=False)
+        eng.add_request(torch.zeros(160), request_id="good", streaming=False)
+        _wait_prepared(eng, 2)
+        assert eng.num_waiting == 2
+        outs = {o.request_id: o for o in eng.step()}
+    finally:
+        eng._prep.stop()
+    assert outs["bad"].finished and outs["bad"].finish_reason == "error"
+    assert outs["bad"].error_stage == "offline_prep"
+    assert outs["good"].finish_reason is None and outs["good"].text == "ok"
+    assert eng._executor.prepared == ["good"]
+    assert eng._prep.in_flight == 0
+
+
+def test_a_window_whose_prep_fails_fails_its_file():
+    """A window's error output is stitched into its parent, like a forward failure."""
+    eng = _overlap_engine(lambda req: None, window_s=1.0)
+    child = eng._longform.child_id("long", 1)
+    eng._prep._prepare = _refuse({child})
+    try:
+        eng.add_request(torch.zeros(40000), request_id="long", streaming=False)
+        _wait_prepared(eng, 3)
+        outs = eng.step()
+    finally:
+        eng._prep.stop()
+    assert [(o.request_id, o.finish_reason, o.error_stage) for o in outs] == [
+        ("long", "error", "offline_prep")
+    ]
+
+
+@pytest.mark.parametrize("stage", ["queued", "prepared"])
+def test_an_abort_during_overlapped_admission_is_not_decoded(stage):
+    """An abort reaches a request the scheduler has not seen yet.
+
+    Regression: only the scheduler was searched, so a request still queued for
+    prep, or prepared and waiting for the next step, was admitted afterwards
+    and decoded for a client that had gone.
+    """
+    eng = _overlap_engine(lambda req: None)
+    if stage == "queued":
+        eng._prep.stop()  # nothing prepares it, so it stays queued
+    try:
+        eng.add_request(torch.zeros(160), request_id="gone", streaming=False)
+        eng.add_request(torch.zeros(160), request_id="kept", streaming=False)
+        if stage == "prepared":
+            _wait_prepared(eng, 2)
+        eng.abort_request("gone")
+        if stage == "queued":
+            eng._prep.start()
+            _wait_prepared(eng, 1)
+        outs = _drain(eng)
+    finally:
+        eng._prep.stop()
+    assert [o.request_id for o in outs] == ["kept"]
+    assert eng._executor.prepared == ["kept"]
+    assert eng._prep.in_flight == 0
+
+
+def test_aborting_a_long_file_withdraws_its_windows_from_prep():
+    """The windows were queued for prep, not admitted; the abort has to find them there.
+
+    On the old path each window was decoded anyway and, its parent gone, came
+    back under a child id the client never saw.
+    """
+    eng = _overlap_engine(lambda req: None, window_s=1.0)
+    try:
+        eng.add_request(torch.zeros(40000), request_id="long", streaming=False)
+        _wait_prepared(eng, 3)
+        eng.abort_request("long")
+        outs = _drain(eng)
+    finally:
+        eng._prep.stop()
+    assert outs == []
+    assert eng._executor.prepared == []
+    assert eng._prep.in_flight == 0
+
+
+def test_an_abort_spares_a_later_request_reusing_the_id():
+    """Withdrawal is by request, not by id: nothing makes ids unique."""
+    import threading
+
+    entered, gate = threading.Event(), threading.Event()
+
+    def prepare(req):
+        entered.set()
+        gate.wait(5.0)
+
+    eng = _overlap_engine(prepare)
+    try:
+        eng.add_request(torch.zeros(160), request_id="r", streaming=False)
+        assert entered.wait(5.0)  # the first one is being prepared
+        eng.abort_request("r")
+        eng.add_request(torch.zeros(160), request_id="r", streaming=False)
+        gate.set()
+        _wait_prepared(eng, 2)
+        outs = _drain(eng)
+    finally:
+        eng._prep.stop()
+    assert [o.request_id for o in outs] == ["r"]
+    assert eng._executor.prepared == ["r"]
+
+
+def test_an_overlapped_admission_counts_its_audio():
+    """The drain admits through the executor, which is where the audio is counted.
+
+    Regression: it went straight into the scheduler, so
+    ``oasr_engine_audio_seconds_total`` stayed at zero under ``--overlap-admit``.
+    """
+    from oasr.engine import metrics as m
+    from oasr.engine.executor.offline import OfflineExecutor
+
+    added = []
+    ex = OfflineExecutor.__new__(OfflineExecutor)
+    ex._metrics = m.EngineMetrics()
+    ex._scheduler = SimpleNamespace(add_request=added.append)
+    req = SimpleNamespace(audio=torch.zeros(24000), sample_rate=16000)
+    ex.admit_prepared(req)
+    assert added == [req]
+    assert ex._metrics.snapshot()["counters"][m.AUDIO_SECONDS] == 1.5
+
+
+@pytest.fixture(scope="class", params=[False, True], ids=["direct", "overlap_admit"])
+def admission_engine(request, device, ckpt_dir):
+    """A real offline engine, with and without ``overlap_admit``, one at a time."""
+    from helpers import make_engine
+
+    eng = make_engine(ckpt_dir, device=str(device), overlap_admit=request.param)
+    yield eng, request.param
+    eng.shutdown()
+
+
+class TestOverlappedAdmissionOnARealEngine:
+    """What a caller sees must not depend on ``overlap_admit`` (audit L8).
+
+    Public API only, so the same tests run unchanged against the old code.
+    """
+
+    def test_audio_that_cannot_be_read_is_reported(self, admission_engine):
+        """Direct admission raises to the caller. Overlapped admission has already
+        returned the id, so it answers with an error output."""
+        import numpy as np
+
+        eng, overlap = admission_engine
+        try:
+            eng.add_request(np.array(["not", "audio"]), request_id="bad", streaming=False)
+        except TypeError:
+            assert not overlap, "overlapped admission defers the read to its prep thread"
+            return
+        outs = eng.run()
+        assert [(o.request_id, o.finish_reason, o.error_stage) for o in outs] == [
+            ("bad", "error", "offline_prep")
+        ]
+
+    def test_an_aborted_request_is_not_decoded(self, admission_engine, wav_dir):
+        eng, _ = admission_engine
+        first, second = waveforms(wav_dir, 2)
+        eng.add_request(first, request_id="gone", streaming=False)
+        eng.abort_request("gone")
+        eng.add_request(second, request_id="kept", streaming=False)
+        outs = eng.run()
+        assert [o.request_id for o in outs] == ["kept"]
+        assert outs[0].text
+
+    def test_the_audio_is_counted(self, admission_engine, wav_dir):
+        from oasr.engine import metrics as m
+
+        eng, _ = admission_engine
+        waves = waveforms(wav_dir, 4)
+
+        def counted():
+            return eng.metrics_snapshot()["counters"].get(m.AUDIO_SECONDS, 0.0)
+
+        before = counted()
+        for i, w in enumerate(waves):
+            eng.add_request(w, request_id=f"count-{i}", streaming=False)
+        assert len(eng.run()) == len(waves)
+        expected = sum(int(w.numel()) for w in waves) / 16000.0
+        assert counted() - before == pytest.approx(expected)
 
 
 # ---------------------------------------------------------------------------

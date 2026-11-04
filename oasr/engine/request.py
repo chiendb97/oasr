@@ -300,9 +300,10 @@ class RequestOutput:
         full audio) and for partial outputs.
     error_stage : str, optional
         Which stage failed, when ``finish_reason == "error"`` — e.g.
-        ``"offline_forward"``, ``"streaming_forward"``, ``"prefill_oom"``, or
+        ``"offline_forward"``, ``"streaming_forward"``, ``"prefill_oom"``,
         ``"decode_step"`` / ``"decode_oom"`` for an AR decode group whose step
-        failed.
+        failed, or ``"offline_prep"`` for a waveform that ``overlap_admit``'s
+        prep thread could not prepare.
         Set alongside ``finish_reason`` rather than folded into it so the
         serving layer's error envelope stays a stable two-value vocabulary
         while ``oasr_requests_failed_total{stage}`` still says *where*.

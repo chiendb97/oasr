@@ -190,6 +190,15 @@ class OfflineExecutor(Executor):
     def admit(self, request: Request) -> None:
         """Prepare an offline request and enqueue it for batching."""
         self._inp.prepare_offline(request)
+        self.admit_prepared(request)
+
+    def admit_prepared(self, request: Request) -> None:
+        """Enqueue a request whose ``prepare_offline`` has already run.
+
+        The ``overlap_admit`` prep thread runs the prep.  It must still come
+        through here rather than straight into the scheduler, or the audio it
+        carries is never counted.
+        """
         if request.audio is not None and request.sample_rate:
             # After ``prepare_offline`` this is a 1-D float32 CPU waveform, so
             # the duration is exact rather than derived from a frame estimate.
@@ -282,6 +291,15 @@ class OfflineExecutor(Executor):
             batch = self._scheduler.schedule_offline(limit=self._admission_limit())
             outputs.extend(self.run(batch))
         return outputs
+
+    def reject_prep(self, request: Request, exc: BaseException) -> RequestOutput:
+        """Terminal output for a request whose ``overlap_admit`` prep raised.
+
+        Without ``overlap_admit`` the same exception reaches the admitting
+        caller.  With it, the caller already holds the id, so this output is the
+        only way to tell them.
+        """
+        return self._reject(request, f"{type(exc).__name__}: {exc}", stage="offline_prep")
 
     def _reject(self, request: Request, reason: str, stage: str = "unknown") -> RequestOutput:
         """Terminal output for a request the executor could not run.

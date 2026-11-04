@@ -342,6 +342,7 @@ prepare_offline                    prepare_streaming
 | `offline_graph_max_captures` | `64` | Live captures. Past this, new shapes run eager and are counted. |
 | `long_form` | `False` | Fan a request longer than a fixed-window frontend's window out into consecutive windows, decode them through the normal batched path **in parallel**, and stitch one output. The caller sees one request id, so HTTP/gRPC need no change. `long_form_overlap_seconds` plus a word-level overlap merge recover most of the boundary accuracy: the words a window's head repeats from the window before are dropped from the text, the word timings, the tokens and their timestamps alike, and speech segments are cut at the middle of the shared audio. Only where windows share audio: a VAD seam, cut in silence, keeps every word on both sides. |
 | `recycle_streaming_history` | `False` | At the streaming cache ceiling, recycle the oldest KV block instead of finalising the request with `finish_reason="length"`. |
+| `overlap_admit` | `False` | Offline only (`oasr-server --overlap-admit`): run each request's admission prep (waveform canonicalisation, frame-count stamp) on a daemon thread, so it overlaps `step()`. The caller gets its id back before the prep runs, so a prep failure comes back as an output with `error_stage="offline_prep"`, and `abort_request` also withdraws requests still being prepared. GIL-bound: it helps only with a deep admission backlog, and can cost a little at low concurrency. |
 | `offline_decode_overlap` | `True` | Collect a micro-batch's queued decode read-back on the next tick, behind that tick's forward ([§9.4b](#9-performance-considerations)). Needs `offline_collate_prefetch`; families without `decode_offline_async` are unaffected. |
 | `gc_freeze` | `True` | Freeze the Python heap after construction so full collections skip it ([§9.4c](#9-performance-considerations)). Process-global and refcounted. |
 
@@ -631,8 +632,11 @@ request, so both executors contain it instead.
 
 Terminal outputs carry `finish_reason="error"` plus `RequestOutput.error_stage`,
 which becomes the `stage` label on the `oasr_requests_failed_total` metric
-(`offline_forward`, `offline_oom`, `prefill_oom`, `decode_step`, `decode_oom`,
-`streaming_forward`, `streaming_features`) — see [serving.md](serving.md).
+(`offline_prep`, `offline_forward`, `offline_oom`, `prefill_oom`, `decode_step`,
+`decode_oom`, `streaming_forward`, `streaming_features`) — see [serving.md](serving.md).
+`offline_prep` is specific to `overlap_admit`. Without it, a waveform that
+cannot be prepared raises to the admitting caller. With it, the caller already
+has the request id, so the failure is answered as an output.
 
 ## 9. Performance Considerations
 
