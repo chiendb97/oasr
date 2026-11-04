@@ -1,16 +1,35 @@
 # Copyright 2024 OASR Authors
 # SPDX-License-Identifier: Apache-2.0
-"""Exceptions a JIT-compiled launcher raises, by their TVM-FFI error kind.
+"""Exceptions the JIT raises: a launcher's, by its TVM-FFI error kind, and a build's.
 
 A launcher throws ``TVM_FFI_THROW(Kind)``; TVM-FFI maps the kind to the Python
 class registered under that name, and to ``RuntimeError`` when none is.  The
-classes here subclass ``RuntimeError``, so a caller that catches that still
-catches them.
+classes here subclass ``RuntimeError`` (or ``TimeoutError``), so a caller that
+catches that still catches them.
 """
 
 from __future__ import annotations
 
-__all__ = ["VariantUnsupportedError", "register"]
+__all__ = ["JitBuildError", "JitBuildLockTimeout", "VariantUnsupportedError", "register"]
+
+
+class JitBuildError(RuntimeError):
+    """A module's build failed, and this one was not retried.
+
+    Raised by :meth:`oasr.jit.core.JitSpec.build_and_load` for a module whose
+    build already failed in this process, and by
+    :func:`oasr.jit.cubin_loader.locked_compile` when the build another process
+    held the lock for failed while this one waited.  The message carries the
+    original failure.  A first, fresh failure is raised as whatever the build
+    raised (``RuntimeError("Ninja build failed. ...")`` for a compile error).
+    """
+
+
+class JitBuildLockTimeout(TimeoutError):
+    """Another process held a module's build lock for longer than the wait allows.
+
+    Not a build failure, so it is not remembered: the next call waits again.
+    """
 
 
 class VariantUnsupportedError(RuntimeError):

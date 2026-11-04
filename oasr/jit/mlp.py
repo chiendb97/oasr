@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import os
 from typing import Optional, Tuple, cast
 
@@ -556,11 +557,41 @@ def get_cxx_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: 
 # Routing
 # ---------------------------------------------------------------------------
 
-#: ``(dtype_str, activation, has_bias, rows, n, k)`` -> ``(backend, callable)``,
-#: or ``None`` when this shape is outside the band or no lane is available.
+#: ``(dtype_str, activation, has_bias, row class, n, k)`` -> ``(backend, callable)``,
+#: or ``None`` when no lane serves the shape.  The row class is
+#: :func:`_row_class`, not the row count: keyed on ``rows`` itself, an offline
+#: caller's ``B * T`` added an entry for every distinct count, forever.
 #: Populated by :func:`routed_gated_mlp`; cleared by :func:`set_gated_mlp_mode`
 #: and :func:`set_gated_mlp_backend`.
 _ROUTE: dict = {}
+
+
+@functools.cache
+def _row_quantum() -> int:
+    """The row granularity every routing decision is a function of.
+
+    Everything :func:`routed_gated_mlp` decides reads ``rows`` through
+    ``ceil(rows / m)`` for some tile height ``m`` -- each lane's grid and wave
+    count, which candidate group covers it -- or through ``rows <= band``.  Every
+    ``m`` in both lanes' lists, and the band, is a multiple of this, so two row
+    counts with the same ``ceil(rows / quantum)`` get the same answer
+    everywhere.  Derived from the lists, so a new tile height moves it.
+    """
+    heights = [m_max for m_max, _ in _CANDIDATES]
+    heights += [tile[0] for _, tiles in _CANDIDATES for tile in tiles]
+    try:
+        from oasr.jit import gated_mlp as _cxx
+
+        heights += [t.block_m for t in _cxx.TILES]
+    except ImportError:  # the C++ lane is optional; the arbiter must still import
+        pass
+    return math.gcd(*heights)
+
+
+def _row_class(rows: int) -> int:
+    """The part of ``rows`` a routing decision depends on: ``ceil(rows / quantum)``."""
+    return -(-rows // _row_quantum()) if rows > 0 else 0
+
 
 #: Lane preference under ``auto``, best first.
 #:
@@ -612,8 +643,15 @@ def routed_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: i
     Deciding *and* compiling under the same key also means a shape whose kernel
     fails to build is remembered as declined rather than retried per step; a
     build failure is a property of the configuration, not of the call.
+
+    Past the band nothing is fused unless the mode says ``always``, so those row
+    counts are answered without an entry -- they are every offline prefill --
+    and the rest are keyed by :func:`_row_class`, which bounds the cache by the
+    shapes a process serves rather than by the row counts it has seen.
     """
-    key = (dtype_str, activation, has_bias, rows, n, k)
+    if rows > _BAND_MAX_ROWS and _GATED_MLP_MODE != "always":
+        return None
+    key = (dtype_str, activation, has_bias, _row_class(rows), n, k)
     try:
         return _ROUTE[key]
     except KeyError:

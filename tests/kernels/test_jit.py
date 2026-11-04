@@ -2069,3 +2069,359 @@ class TestAKilledOrUnfinishedLinkIsNeverLoaded:
         published = list((tmp_path / "jit").glob("*/*/jit_publish_probe.so"))
         assert not published, "a killed link left a library under the cached name"
         self._loaded(self._start(tmp_path, env))
+
+
+# ---------------------------------------------------------------------------
+# A failed build is not repeated (audit G18)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def failing_build(monkeypatch, tmp_path):
+    """A spec whose build fails, with no compiler: returns ``(spec, attempts)``.
+
+    ``attempts`` counts how many times a build actually ran -- what each retry
+    of a real CUTLASS module costs minutes of.
+    """
+    import oasr.jit.core as core
+
+    monkeypatch.setattr(core.env, "OASR_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setattr(core, "require_known_cuda_arch", lambda what: None)
+    monkeypatch.setattr(core, "generate_ninja_build_for_op", lambda **kw: "")
+    attempts = []
+
+    def _ninja(**kw):
+        attempts.append(1)
+        raise RuntimeError("Ninja build failed. Ninja output:\nprobe.cu(1): error: deliberate")
+
+    monkeypatch.setattr(core, "run_ninja", _ninja)
+    monkeypatch.setattr(core, "_FAILED_BUILDS", {}, raising=False)
+    src = tmp_path / "probe.cu"
+    src.write_text("// probe\n")
+    return core.JitSpec(name="g18_probe", sources=[src]), attempts
+
+
+class TestAFailedBuildIsNotRepeatedInProcess:
+    """Every module getter is ``functools.cache``-wrapped, and that remembers a
+    result but not an exception, so a module whose build failed was built again
+    on every call -- minutes per call for a CUTLASS module."""
+
+    def test_the_second_call_raises_the_first_failure_without_building(self, failing_build):
+        spec, attempts = failing_build
+        with pytest.raises(RuntimeError, match="Ninja build failed"):
+            spec.build_and_load()
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="deliberate") as excinfo:
+                spec.build_and_load()
+        assert len(attempts) == 1, f"{len(attempts)} builds for 4 calls"
+        from oasr.jit.errors import JitBuildError
+
+        assert isinstance(excinfo.value, JitBuildError)
+
+    def test_forgetting_re_arms_the_build(self, failing_build):
+        from oasr.jit.core import forget_failed_builds
+
+        spec, attempts = failing_build
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                spec.build_and_load()
+            forget_failed_builds()
+        assert len(attempts) == 2
+
+    def test_a_lock_timeout_is_not_remembered(self, failing_build, monkeypatch):
+        """Another process holding the lock is a transient, not a property of the key."""
+        import oasr.jit.core as core
+        from oasr.jit.errors import JitBuildLockTimeout
+
+        spec, attempts = failing_build
+
+        def _timeout(lib, fn, lock_timeout=600):
+            raise JitBuildLockTimeout("held")
+
+        monkeypatch.setattr(core, "locked_compile", _timeout)
+        for _ in range(2):
+            with pytest.raises(JitBuildLockTimeout):
+                spec.build_and_load()
+        assert core._FAILED_BUILDS == {}
+
+
+_LOCK_CHILD = r"""
+import json, sys, time
+from pathlib import Path
+import oasr.jit.cubin_loader as cl
+
+lib, mode, marker = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+ready = Path(lib + ".waiter_ready")
+cl.WAIT_REPORT_S = 0.2
+
+def compile_fn(path):
+    marker.write_text("building")
+    with open(lib + ".attempts", "a") as f:
+        f.write("x")
+    if mode == "slow_fail":
+        # Fail only once the waiter is waiting: it has to have started its wait
+        # before this attempt's record exists, or it is a later arrival.
+        deadline = time.monotonic() + 60
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        time.sleep(1.0)
+    if mode == "slow_hold":
+        time.sleep(30.0)
+    raise RuntimeError("Ninja build failed. Ninja output:\nprobe.cu(1): error: deliberate")
+
+if mode == "fast_fail":
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text("waiting")
+try:
+    cl.locked_compile(lib, compile_fn, lock_timeout=float(sys.argv[4]) if len(sys.argv) > 4 else 600)
+    print("BUILT")
+except Exception as exc:
+    print(type(exc).__name__ + ": " + str(exc).splitlines()[0])
+"""
+
+
+class TestAFailedBuildIsSharedWithItsWaiters:
+    """Processes that start together wait on one build lock.  When the build
+    they waited for failed, each took the lock in turn and ran the same failing
+    build again: *N* processes, *N* builds back to back, and the later ones
+    out of lock wait before their own turn came."""
+
+    @staticmethod
+    def _child(tmp_path, lib, mode, timeout=None):
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        import oasr
+
+        script = tmp_path / "child.py"
+        script.write_text(_LOCK_CHILD)
+        args = [sys.executable, str(script), str(lib), mode, str(tmp_path / f"{mode}.started")]
+        if timeout is not None:
+            args.append(str(timeout))
+        # The child must import the ``oasr`` under test: a script's own directory
+        # goes on ``sys.path``, not the working directory, so without this a
+        # worktree's run imports the editable install.
+        env = dict(os.environ, PYTHONPATH=str(Path(oasr.__file__).resolve().parents[1]))
+        return subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env
+        )
+
+    @staticmethod
+    def _wait_for(path, proc):
+        import time
+
+        deadline = time.monotonic() + 60
+        while not path.exists():
+            assert proc.poll() is None, proc.communicate()
+            assert time.monotonic() < deadline, "the holder never started building"
+            time.sleep(0.02)
+
+    def _attempts(self, lib):
+        p = lib.with_name(lib.name + ".attempts")
+        return len(p.read_text()) if p.exists() else 0
+
+    def test_a_waiter_raises_the_failure_it_waited_for(self, tmp_path):
+        lib = tmp_path / "jit" / "probe" / "k" / "probe.so"
+        holder = self._child(tmp_path, lib, "slow_fail")
+        self._wait_for(tmp_path / "slow_fail.started", holder)
+        waiter = self._child(tmp_path, lib, "fast_fail")
+        w_out, w_err = waiter.communicate(timeout=120)
+        h_out, _ = holder.communicate(timeout=120)
+        assert h_out.startswith("RuntimeError: Ninja build failed"), h_out
+        assert w_out.startswith("JitBuildError: the build of"), (w_out, w_err)
+        assert self._attempts(lib) == 1, "the waiter built again"
+        assert "waiting" in w_err and f"pid {holder.pid}" in w_err, w_err
+
+    def test_a_process_arriving_after_the_failure_builds_again(self, tmp_path):
+        """The record is for the processes that waited, not a refusal for ever."""
+        lib = tmp_path / "jit" / "probe" / "k" / "probe.so"
+        first = self._child(tmp_path, lib, "fast_fail")
+        assert first.communicate(timeout=120)[0].startswith("RuntimeError")
+        later = self._child(tmp_path, lib, "fast_fail")
+        assert later.communicate(timeout=120)[0].startswith("RuntimeError")
+        assert self._attempts(lib) == 2
+
+    def test_giving_up_on_the_lock_names_the_holder(self, tmp_path):
+        lib = tmp_path / "jit" / "probe" / "k" / "probe.so"
+        holder = self._child(tmp_path, lib, "slow_hold")
+        try:
+            self._wait_for(tmp_path / "slow_hold.started", holder)
+            waiter = self._child(tmp_path, lib, "fast_fail", timeout=0.5)
+            out = waiter.communicate(timeout=120)[0]
+            assert out.startswith("JitBuildLockTimeout: gave up after"), out
+            assert f"pid {holder.pid}" in out, out
+        finally:
+            holder.kill()
+            holder.wait()
+
+
+# ---------------------------------------------------------------------------
+# Pruning the cache (audit G18)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneCache:
+    """Nothing ever removed a key: every header edit, flag or toolchain change
+    left the previous build behind, and so did every one-off module.  One cache
+    measured 17 GiB in 2369 keys across 75 modules."""
+
+    DAY = 86400.0
+
+    @pytest.fixture
+    def cache(self, monkeypatch, tmp_path):
+        import os
+        import time
+
+        import oasr.jit.core as core
+
+        root = tmp_path / "jit"
+        monkeypatch.setattr(core.env, "OASR_JIT_DIR", root)
+        now = time.time()
+
+        def key(module, name, *, built_days, used_days=None, size=1000):
+            d = root / module / name
+            d.mkdir(parents=True)
+            lib = d / f"{module}.so"
+            lib.write_bytes(b"\0" * size)
+            stamp = now - built_days * self.DAY
+            os.utime(lib, (stamp, stamp))
+            if used_days is not None:
+                used = d / core._LAST_USED
+                used.touch()
+                t = now - used_days * self.DAY
+                os.utime(used, (t, t))
+            os.utime(d, (stamp, stamp))
+            return d
+
+        return key
+
+    def test_old_keys_go_and_each_module_keeps_its_newest(self, cache):
+        from oasr.jit.core import prune_cache
+
+        old = cache("gemm", "a", built_days=90)
+        older = cache("gemm", "b", built_days=120)
+        newest = cache("gemm", "c", built_days=60)
+        lone = cache("norm", "a", built_days=400)
+        report = prune_cache(unused_days=30)
+        assert {p for p, _, _ in report.removed} == {old, older}
+        assert newest.exists() and lone.exists() and not old.exists() and not older.exists()
+        assert report.keys == 4 and report.freed_bytes == 2000
+
+    def test_a_key_loaded_recently_is_kept_however_old_its_build(self, cache):
+        from oasr.jit.core import prune_cache
+
+        cache("gemm", "new", built_days=1)
+        stamped = cache("gemm", "stamped", built_days=200, used_days=2)
+        prune_cache(unused_days=30)
+        assert stamped.exists()
+
+    def test_a_dry_run_reports_and_removes_nothing(self, cache):
+        from oasr.jit.core import prune_cache
+
+        cache("gemm", "a", built_days=90)
+        old = cache("gemm", "b", built_days=120)
+        report = prune_cache(unused_days=30, dry_run=True)
+        assert [p for p, _, _ in report.removed] == [old] and old.exists()
+
+    def test_looking_at_a_key_does_not_make_it_look_used(self, cache):
+        """A lock probe that created the lock file moved the key's mtime, so a
+        dry run made the real prune that followed keep everything it listed."""
+        from oasr.jit.core import prune_cache
+
+        cache("gemm", "a", built_days=1)
+        old = cache("gemm", "b", built_days=90)
+        before = old.stat().st_mtime
+        prune_cache(unused_days=30, dry_run=True)
+        assert old.stat().st_mtime == before
+        assert not list(old.glob("*.lock"))
+
+    def test_a_file_written_into_an_old_key_does_not_revive_it(self, cache):
+        """The directory's own mtime is not a use: any file created in it moves it."""
+        from oasr.jit.core import prune_cache
+
+        cache("gemm", "a", built_days=1)
+        old = cache("gemm", "b", built_days=90)
+        (old / "gemm.so.lock").touch()  # what an older filelock left behind
+        prune_cache(unused_days=30)
+        assert not old.exists()
+
+    def test_keep_zero_lets_a_whole_module_go(self, cache):
+        from oasr.jit.core import prune_cache
+
+        lone = cache("transducer_phases_v2", "a", built_days=400)
+        prune_cache(unused_days=30, keep=0)
+        assert not lone.exists()
+
+    def test_a_key_whose_build_holds_the_lock_is_left_alone(self, cache, tmp_path):
+        import os
+        import subprocess
+        import sys
+
+        from oasr.jit.core import prune_cache
+
+        cache("gemm", "a", built_days=1)
+        busy = cache("gemm", "b", built_days=90)
+        hold = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys, time, filelock\n"
+                "l = filelock.FileLock(sys.argv[1]); l.acquire(); print('held', flush=True)\n"
+                "time.sleep(60)",
+                str(busy / "gemm.so.lock"),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert hold.stdout.readline().strip() == "held"
+            # Taking the lock created a file in the key, which moved its mtime.
+            stamp = (busy / "gemm.so").stat().st_mtime
+            os.utime(busy, (stamp, stamp))
+            report = prune_cache(unused_days=30)
+            assert report.in_use == [busy] and busy.exists()
+        finally:
+            hold.kill()
+            hold.wait()
+
+    def test_a_load_stamps_its_key(self, monkeypatch, tmp_path):
+        """The stamp is what tells a prune that an old build is still in use."""
+        import importlib
+        import shutil
+        import sys
+        import types
+
+        import oasr.jit.core as core
+        import oasr.jit.errors as errors
+
+        monkeypatch.setattr(core.env, "OASR_JIT_DIR", tmp_path / "jit")
+        monkeypatch.setattr(errors, "_registered", True)
+        src = tmp_path / "probe.cu"
+        src.write_text("// probe\n")
+        spec = core.JitSpec(name="g18_stamp", sources=[src])
+        lib = spec._get_lib_path()
+        lib.parent.mkdir(parents=True)
+        # Any complete ELF library stands in; the load itself is stubbed.
+        elf = next(
+            m.__file__
+            for m in map(importlib.import_module, ("_json", "_ctypes", "_socket", "select"))
+            if getattr(m, "__file__", "").endswith(".so")
+        )
+        shutil.copy(elf, lib)
+        monkeypatch.setitem(
+            sys.modules, "tvm_ffi", types.SimpleNamespace(load_module=lambda path: "module")
+        )
+        assert spec.build_and_load() == "module"
+        assert (lib.parent / core._LAST_USED).exists()
+
+    def test_the_cli_prunes(self, cache, capsys):
+        from oasr.cli import main
+
+        cache("gemm", "a", built_days=1)
+        old = cache("gemm", "b", built_days=90)
+        assert main(["jit", "prune", "--dry-run"]) == 0
+        assert old.exists() and "would remove 1 keys" in capsys.readouterr().out
+        assert main(["jit", "prune", "--unused-days", "30"]) == 0
+        assert not old.exists() and "removed 1 keys" in capsys.readouterr().out

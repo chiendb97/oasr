@@ -309,6 +309,88 @@ class TestRouting:
             jit_mlp.set_gated_mlp_mode("auto")
 
 
+class TestTheRouteCacheIsBoundedByTheShapes:
+    """``_ROUTE`` was keyed on the exact row count.  An offline prefill's
+    ``B * T`` is a new count almost every batch, so it gained an entry per
+    count for the life of the process -- nearly all of them a declined route,
+    since only the band is fused."""
+
+    @staticmethod
+    def _route(rows, n=2048, k=1024):
+        return jit_mlp.routed_gated_mlp(
+            dtype_str="float16", activation="silu", has_bias=False, rows=rows, n=n, k=k
+        )
+
+    def test_many_row_counts_leave_one_entry_per_row_class(self):
+        jit_mlp.set_gated_mlp_mode("auto")  # clears the caches
+        for rows in range(1, 3001):
+            self._route(rows)
+        classes = -(-jit_mlp._BAND_MAX_ROWS // jit_mlp._row_quantum())
+        assert len(jit_mlp._ROUTE) <= classes, len(jit_mlp._ROUTE)
+
+    def test_past_the_band_is_declined_without_an_entry(self):
+        jit_mlp.set_gated_mlp_mode("auto")
+        assert self._route(jit_mlp._BAND_MAX_ROWS + 1) is None
+        assert self._route(50_000) is None
+        assert jit_mlp._ROUTE == {}
+
+    def test_always_mode_still_keys_past_the_band_by_row_class(self):
+        try:
+            jit_mlp.set_gated_mlp_mode("always")
+            for rows in range(1, 2001):
+                self._route(rows, n=256, k=128)
+            assert len(jit_mlp._ROUTE) == -(-2000 // jit_mlp._row_quantum())
+        finally:
+            jit_mlp.set_gated_mlp_mode("auto")
+
+    @pytest.mark.parametrize("mode", ["auto", "always"])
+    def test_every_decision_is_a_function_of_the_row_class(self, mode):
+        """The claim the key rests on, checked against every function that reads
+        ``rows``: two counts in one class get the same answer from each."""
+        from oasr.jit import gated_mlp as cxx
+
+        def decision(rows, n, k):
+            out = [
+                jit_mlp.should_use_gated_mlp(rows=rows, n=n, k=k),
+                jit_mlp.cxx_config_supported(
+                    dtype_str="float16", activation="silu", rows=rows, n=n, k=k
+                ),
+            ]
+            if device_sm() in cxx.SUPPORTED_SM:
+                out.append(cxx.routed_tile(rows=rows, n=n))
+            if _cutedsl_supported():
+                out.append(jit_mlp.cute_config_supported(rows=rows, n=n, k=k))
+                out.append(jit_mlp.select_gated_mlp_tile(rows, n))
+            return out
+
+        try:
+            jit_mlp.set_gated_mlp_mode(mode)
+            for n, k in ((256, 128), (2048, 1024), (18944, 3584)):
+                seen = {}
+                for rows in range(1, 1025):
+                    answer = decision(rows, n, k)
+                    first = seen.setdefault(jit_mlp._row_class(rows), (rows, answer))
+                    assert answer == first[1], (n, rows, first[0])
+        finally:
+            jit_mlp.set_gated_mlp_mode("auto")
+
+    def test_the_cxx_tile_choice_is_a_function_of_the_row_class_on_every_arch(self):
+        """Including the fallback pool a group with no fitting tile drops to,
+        where every tile height reads ``rows``.  Pure, so every served arch and
+        a spread of SM counts, not only this card."""
+        from oasr.jit import gated_mlp as cxx
+
+        q = jit_mlp._row_quantum()
+        for sm in cxx.SUPPORTED_SM:
+            for num_sms in (28, 46, 84, 108, 132, 170, 188):
+                for n in (64, 256, 2048, 18944):
+                    seen = {}
+                    for rows in range(1, 1025):
+                        tile = cxx.select_tile(sm, num_sms, rows, n)
+                        first = seen.setdefault(-(-rows // q), (rows, tile))
+                        assert tile == first[1], (sm, num_sms, n, rows, first[0])
+
+
 # ---------------------------------------------------------------------------
 # The functional
 # ---------------------------------------------------------------------------

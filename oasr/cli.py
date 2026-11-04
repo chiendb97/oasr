@@ -119,6 +119,29 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     p.set_defaults(func=_cmd_quantize)
+
+    p = sub.add_parser("jit", help="manage the JIT kernel cache (see `oasr jit -h`)")
+    jit = p.add_subparsers(dest="jit_command", required=True)
+    q = jit.add_parser(
+        "prune",
+        help="remove cache keys nothing has used for --unused-days",
+        description=(
+            "Remove the compiled-kernel cache keys (OASR_JIT_DIR, default "
+            "~/.cache/oasr/jit) that no process has loaded for --unused-days. Each "
+            "module keeps its --keep most recently used keys whatever their age. "
+            "Run it when no OASR process is starting up."
+        ),
+    )
+    q.add_argument(
+        "--unused-days", type=float, default=30.0, help="age threshold in days (default: 30)"
+    )
+    q.add_argument(
+        "--keep", type=int, default=1, help="keys kept per module regardless of age (default: 1)"
+    )
+    q.add_argument(
+        "--dry-run", action="store_true", help="list what would be removed and remove nothing"
+    )
+    q.set_defaults(func=_cmd_jit_prune)
     return parser
 
 
@@ -304,6 +327,24 @@ def _cmd_quantize(args: argparse.Namespace) -> int:
     from oasr.quantization.cli import main as quantize_main
 
     return quantize_main(args.rest)
+
+
+def _cmd_jit_prune(args: argparse.Namespace) -> int:
+    from oasr.jit.core import prune_cache
+
+    report = prune_cache(unused_days=args.unused_days, keep=args.keep, dry_run=args.dry_run)
+    gib = float(2**30)
+    if args.dry_run:
+        for path, size, age in report.removed:
+            print(f"would remove {path}  ({size / gib:.2f} GiB, unused {age:.0f} days)")
+    for path in report.in_use:
+        print(f"kept {path}: a build holds its lock")
+    verb = "would remove" if args.dry_run else "removed"
+    print(
+        f"{report.root}: {report.keys} keys, {report.total_bytes / gib:.2f} GiB; "
+        f"{verb} {len(report.removed)} keys, {report.freed_bytes / gib:.2f} GiB"
+    )
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
