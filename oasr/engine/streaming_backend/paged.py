@@ -48,6 +48,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _no_conditioning(options: object) -> Dict[str, float]:
+    """A model without the hook conditions nothing (test doubles, plain encoders)."""
+    del options
+    return {}
+
+
 @register_streaming_backend("paged")
 class PagedStreamingBackend(StreamingEncoderBackend):
     """Paged-KV + slot-CNN streaming runtime with CUDA-graph capture.
@@ -61,6 +67,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
     streaming_kind: ClassVar[str] = "paged"
     #: Owns the shared :class:`BlockPool`, so its size is the engine's to derive.
     allocates_paged_pool: ClassVar[bool] = True
+    carries_encoder_conditioning: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -84,6 +91,7 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         self._chunk_forward = (
             model.encode_chunk_paged if consumes == "hidden" else model.forward_chunk_paged
         )
+        self._stream_conditioning = getattr(model, "stream_conditioning", _no_conditioning)
 
         # Window geometry derived from the *encoder* (not hardcoded): a chunk of
         # ``chunk_size`` encoder frames needs ``(chunk_size-1)*sub + right_context
@@ -474,6 +482,11 @@ class PagedStreamingBackend(StreamingEncoderBackend):
 
         self._att_mgr.allocate_stream(sid, slot_id=slot_id)
         self._state_mgr.allocate_stream(sid, slot_id=slot_id)
+        # The request's encoder conditioning (Nemotron's language prompt) goes
+        # into its persistent slot states, where the chunk forward -- captured or
+        # not -- reads it per row.  ``reset`` keeps it across turns.
+        for name, value in self._stream_conditioning(request.decoding).items():
+            self._state_mgr.fill_slot(slot_id, name, value)
 
         ctx = StreamContext(sid, self._att_mgr, self._state_mgr)
         request.stream_context = ctx

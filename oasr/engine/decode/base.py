@@ -208,6 +208,12 @@ class DecodeStrategy(ABC):
         """
         if options is None:
             return
+        # A model can condition its *encoder* on an option the family itself has
+        # no control for (Nemotron's language prompt under the transducer family);
+        # the model then answers for it, here, at admission.
+        model = getattr(self, "_model", None)
+        encoder_options = tuple(getattr(model, "encoder_options", ()) or ())
+        supported = (*self.selective_options, *encoder_options)
         for name, unset in self._SELECTIVE_UNSET.items():
             if getattr(options, name, unset) == unset:
                 continue
@@ -215,13 +221,15 @@ class DecodeStrategy(ABC):
                 self._require_word_timings(streaming)
             elif name in self._SPEECH_ACTIVITY_OPTIONS:
                 self._require_speech_activity(name, streaming)
-            elif name not in self.selective_options:
+            elif name not in supported:
                 raise ValueError(
                     f"decode_method={self.decode_type!r} cannot honour the "
                     f"per-request {name!r} option (it has no {name} control); "
                     "remove it, or serve a checkpoint whose decode family does "
-                    f"(supported here: {list(self.selective_options) or 'none'})"
+                    f"(supported here: {list(supported) or 'none'})"
                 )
+        if model is not None and encoder_options:
+            model.validate_encoder_options(options)
         self._reject_nbest_across_turns(options, streaming)
 
     def _reject_nbest_across_turns(self, options: "DecodingOptions", streaming: bool) -> None:

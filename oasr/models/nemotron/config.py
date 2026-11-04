@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Dict, Tuple
 
 from ..base import BaseModelConfig
 
@@ -121,6 +121,11 @@ class NemotronModelConfig(BaseModelConfig):
     #: Prompt slot used when the caller names no language; 101 == ``"auto"`` on
     #: the released checkpoint (the model does its own language ID).
     default_prompt_id: int = 101
+    #: Locale → prompt slot (``processor_config.json``'s ``prompt_dictionary``:
+    #: ``"en-US": 0``, ``"vi-VN": 33``, ``"auto": 101``, ...).  What a request's
+    #: ``language`` is resolved against; empty means the checkpoint did not ship
+    #: one, and a per-request language is then refused rather than guessed.
+    prompt_dictionary: Dict[str, int] = field(default_factory=dict)
     encoder: NemotronEncoderConfig = field(default_factory=NemotronEncoderConfig)
 
     @property

@@ -645,7 +645,16 @@
         "now lands on the fp32 rate recorded above. Measured twice, before and",
         "after the finalizer/cell-ring changes in the same branch, with",
         "identical error counts (69S 8D 11I) all four times \u2014 so the 0.03 is the",
-        "accumulation precision and nothing else."
+        "accumulation precision and nothing else.",
+        "",
+        "Re-recorded 2026-11-04 at 2.62 (was 2.59), one more deletion, when the",
+        "language prompt was folded into a per-row bias (W_h h + (W_p[:, id] + b)",
+        "instead of linear_1 over [h, one_hot]). Not bit-identical by",
+        "construction: the GEMM output is rounded before the bias is added, so",
+        "the fused hidden state moves by one fp16 ulp. Two of 200 transcripts",
+        "changed (a misspelt name spelt differently, and 'E.g.,' read as 'E.').",
+        "Bit-stable again at the new rate: 69S 9D 11I at max_batch_size",
+        "1/8/16/32. The streaming row did not move (identical transcripts)."
       ],
       "key": "nemotron",
       "asset": "NEMOTRON_CKPT",
@@ -655,10 +664,10 @@
       "max_batch_size": 16,
       "metric": "wer",
       "normalizer": "english",
-      "error_rate_pct": 2.59,
+      "error_rate_pct": 2.62,
       "ref_units": 3403,
       "substitutions": 69,
-      "deletions": 8,
+      "deletions": 9,
       "insertions": 11
     },
     {

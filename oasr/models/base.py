@@ -40,6 +40,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    Dict,
     List,
     Mapping,
     MutableMapping,
@@ -706,6 +707,54 @@ class BaseAsrModel(nn.Module, ABC):
     def cache_spec(self) -> Optional[CacheSpec]:
         """Streaming cache descriptor, or ``None`` for an offline-only encoder."""
         return self.encoder.cache_spec
+
+    # -- per-request encoder conditioning -----------------------------------
+    #
+    # A request option is normally the decode family's business (Whisper's
+    # ``language`` is a decoder prompt token).  These four hooks are for a model
+    # whose *encoder output* depends on one -- Nemotron's language prompt is fused
+    # into the encoder representation -- so the option has to reach the forward,
+    # per row, offline and streaming.  The defaults declare nothing, and a model
+    # that declares nothing is driven exactly as before.
+
+    @property
+    def encoder_options(self) -> Tuple[str, ...]:
+        """``DecodingOptions`` fields this model conditions its encoder on.
+
+        Read by :meth:`DecodeStrategy.validate_options` as supported beside the
+        family's own ``selective_options``, so a request naming one is admitted
+        on this model and refused on a model without it (rule 9).
+        """
+        return ()
+
+    def validate_encoder_options(self, options: Any) -> None:
+        """Resolve this request's :attr:`encoder_options` now, or raise ``ValueError``.
+
+        Called at admission, so an unknown value is refused for its own request
+        rather than raised from a forward shared with other requests.
+        """
+        del options
+
+    def encoder_conditioning(
+        self, options: Sequence[Any], device: torch.device
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Keyword arguments for :meth:`encode_offline` / :meth:`forward_offline`.
+
+        ``options`` holds one ``DecodingOptions`` (or ``None``) per batch row.
+        ``None`` means every row takes the model's defaults, so the batch is driven
+        with the two-argument call, which is the call an offline graph captures.
+        """
+        del options, device
+        return None
+
+    def stream_conditioning(self, options: Any) -> Dict[str, float]:
+        """A stream's :attr:`StreamStateSpec.persistent` states, written at admission.
+
+        Maps a declared persistent state's name to the value its slot row is
+        filled with; the encoder's chunk forward reads it back from ``states``.
+        """
+        del options
+        return {}
 
     #: The :class:`~oasr.quantization.QuantizationSpec` this instance was
     #: quantized with (set by the loader), or ``None``.

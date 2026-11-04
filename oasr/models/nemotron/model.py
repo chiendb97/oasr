@@ -28,14 +28,35 @@ strategy refuses ``beam_size > 1`` at construction.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 
+from oasr.cache.state import StreamStateSpec
 from oasr.quantization.layout import GemmChain, QuantLayout, SmoothGroup
+from oasr.utils.staging import to_device
 
-from ..base import BaseAsrModel, LoadReport, align_out_features, pad_output_projection
+from ..base import (
+    BaseAsrModel,
+    CacheSpec,
+    LoadReport,
+    align_out_features,
+    pad_output_projection,
+)
 from .config import NemotronEncoderConfig, NemotronModelConfig
 from .encoder import NemotronEncoder, NemotronEncoderLayer
 from .predictor import NemotronPromptProjector, NemotronRnntJoint, NemotronRnntPredictor
@@ -56,6 +77,17 @@ _RENAMES = {
     "encoder_projector.": "joint.encoder_proj.",
     "decoder.decoder_projector.": "joint.decoder_proj.",
 }
+
+#: The per-stream prompt slot, as the streaming backend carries it: one int64 per
+#: slot row, written from the request at admission and kept across a VAD turn
+#: reset (``persistent``), because a turn boundary rewinds what the encoder has
+#: heard, not which language the request asked for.  Read inside the chunk
+#: forward, so a captured graph gathers each replay's rows rather than baking in
+#: the ids it was captured with.
+PROMPT_STATE = "prompt"
+_PROMPT_STATE_SPEC = StreamStateSpec(
+    PROMPT_STATE, (), slot_axis=0, dtype=torch.int64, persistent=True
+)
 
 
 class NemotronModel(BaseAsrModel):
@@ -81,6 +113,7 @@ class NemotronModel(BaseAsrModel):
         *,
         blank_id: int,
         prompt_id: int,
+        prompt_dictionary: Optional[Mapping[str, int]] = None,
     ) -> None:
         super().__init__()
         self.encoder = encoder
@@ -88,12 +121,22 @@ class NemotronModel(BaseAsrModel):
         self.joint = joint
         self.prompt_projector = prompt_projector
         self._blank_id = int(blank_id)
-        #: Language-prompt slot applied to every request.  Settable: the released
-        #: checkpoint's default is the ``"auto"`` slot (its own language ID), and
-        #: naming a language instead is a per-deployment choice.  Per-*request*
-        #: conditioning would need the id to travel with the batch through the
-        #: offline executor, which nothing in the engine does today.
+        #: Language-prompt slot for a request that names no language.  Settable:
+        #: the released checkpoint's default is the ``"auto"`` slot (its own
+        #: language ID), and pinning a deployment to one language is a
+        #: per-deployment choice.  A request's ``language`` overrides it for that
+        #: request (:meth:`resolve_prompt_id`).
         self.prompt_id = int(prompt_id)
+        #: Locale → slot, from the checkpoint's ``processor_config.json``.
+        self.prompt_dictionary: Dict[str, int] = dict(prompt_dictionary or {})
+        if prompt_projector is not None:
+            slots = prompt_projector.num_prompts
+            bad = {k: v for k, v in self.prompt_dictionary.items() if not 0 <= v < slots}
+            if bad or not 0 <= self.prompt_id < slots:
+                raise ValueError(
+                    f"prompt slots must lie in [0, {slots}): default_prompt_id="
+                    f"{self.prompt_id}, out-of-range dictionary entries {bad}"
+                )
         self._joint_out = align_out_features(int(joint.vocab_size))
 
     @property
@@ -150,21 +193,109 @@ class NemotronModel(BaseAsrModel):
             prompt_projector,
             blank_id=config.blank_token_id,
             prompt_id=config.default_prompt_id,
+            prompt_dictionary=config.prompt_dictionary,
         )
+
+    # -- the language prompt ------------------------------------------------
+
+    def resolve_prompt_id(self, language: Optional[str]) -> int:
+        """The prompt slot for a request's ``language`` (``None``: :attr:`prompt_id`).
+
+        ``language`` is a bare ISO-639 subtag (``DecodingOptions`` refuses a
+        region, and the serving layer reduces ``"vi-VN"`` to ``"vi"``), while the
+        checkpoint's table is keyed by locale.  Resolved in the table's own terms,
+        first match wins:
+
+        1. the bare code, when the table lists it (``"en"`` -> 0, ``"pt"`` -> 13);
+        2. the table's ``xx-XX`` form, its spelling of the language without a
+           region (``"zh"`` -> ``"zh-ZH"`` -> 4, as ``"ja-JA"``, ``"ko-KO"``);
+        3. the one slot every ``xx-*`` locale shares (``"vi"`` -> ``"vi-VN"`` -> 33).
+
+        Anything else raises: a code the table does not know, or one whose locales
+        disagree with no generic entry to settle it.  Choosing a region for the
+        caller would decode in a language they did not name, confidently.
+        """
+        if language is None:
+            return self.prompt_id
+        if self.prompt_projector is None or not self.prompt_dictionary:
+            raise ValueError(
+                "this Nemotron checkpoint has no language-prompt dictionary "
+                "(processor_config.json: prompt_dictionary), so a per-request "
+                f"language={language!r} cannot be honoured; drop it"
+            )
+        table = self.prompt_dictionary
+        for key in (language, f"{language}-{language.upper()}"):
+            if key in table:
+                return table[key]
+        slots = {v for k, v in table.items() if k.split("-", 1)[0] == language}
+        if len(slots) == 1:
+            return slots.pop()
+        if slots:
+            locales = sorted(k for k in table if k.split("-", 1)[0] == language)
+            raise ValueError(
+                f"language={language!r} is ambiguous for this checkpoint: its locales "
+                f"{locales} use different prompt slots"
+            )
+        known = sorted({k.split("-", 1)[0] for k in table if k.split("-", 1)[0].islower()})
+        raise ValueError(f"language={language!r} is not one this checkpoint knows: {known}")
+
+    @property
+    def encoder_options(self) -> Tuple[str, ...]:
+        """``("language",)`` when there is a projector and a table to resolve against."""
+        if self.prompt_projector is None or not self.prompt_dictionary:
+            return ()
+        return ("language",)
+
+    def validate_encoder_options(self, options: Any) -> None:
+        self.resolve_prompt_id(getattr(options, "language", None))
+
+    def encoder_conditioning(
+        self, options: Sequence[Any], device: torch.device
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Per-row prompt ids, or ``None`` when no row names a language.
+
+        Staged through pinned memory: a pageable ``torch.tensor(..., device=)``
+        would make the host wait for the forward queued ahead of it.
+        """
+        if self.prompt_projector is None:
+            return None
+        languages = [getattr(o, "language", None) for o in options]
+        if all(lang is None for lang in languages):
+            return None
+        ids = [self.resolve_prompt_id(lang) for lang in languages]
+        return {"prompt_ids": to_device(ids, dtype=torch.int64, device=device)}
+
+    def stream_conditioning(self, options: Any) -> Dict[str, float]:
+        if self.prompt_projector is None:
+            return {}
+        return {PROMPT_STATE: self.resolve_prompt_id(getattr(options, "language", None))}
+
+    @property
+    def cache_spec(self) -> Optional[CacheSpec]:
+        """The encoder's streaming cache plus one per-stream prompt slot."""
+        spec = self.encoder.cache_spec
+        if spec is None or self.prompt_projector is None:
+            return spec
+        return dataclasses.replace(spec, stream_states=(*spec.stream_states, _PROMPT_STATE_SPEC))
 
     # -- engine-facing forward -----------------------------------------------
 
     def encode_offline(
-        self, features: torch.Tensor, lengths: torch.Tensor
+        self,
+        features: torch.Tensor,
+        lengths: torch.Tensor,
+        prompt_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(B, T, n_mels)`` → ``(prompt-fused hidden (B, T', C), out_lengths)``.
 
         The prompt projector runs here, not in the joint, because its output *is*
         the encoder representation from the joint's point of view (upstream's
-        ``get_audio_features``).
+        ``get_audio_features``).  ``prompt_ids (B,)`` conditions each row on its
+        own language (:meth:`encoder_conditioning`); ``None`` uses
+        :attr:`prompt_id` for all of them.
         """
         hidden, masks = self.encoder(features, lengths)
-        return self._fuse_prompt(hidden), self._lengths_from_mask(masks)
+        return self._fuse_prompt(hidden, prompt_ids), self._lengths_from_mask(masks)
 
     def encode_chunk_paged(
         self,
@@ -183,22 +314,32 @@ class NemotronModel(BaseAsrModel):
         representation, and leaving it out of the streaming path would hand the
         joint a differently-conditioned hidden state than the offline path does.
         """
+        prompt_ids = None
+        if states is not None and PROMPT_STATE in states:
+            # Each stream's own slot, gathered here so a captured graph reads the
+            # rows it is replayed with.  The encoder is handed only what it
+            # declared.
+            prompt_ids = states[PROMPT_STATE].gather()
+            states = {k: v for k, v in states.items() if k != PROMPT_STATE}
         hidden = self.encoder.forward_chunk_paged(
             input_features, offset, att_caches, cnn_cache, att_mask, cache_t1, states
         )
-        return self._fuse_prompt(hidden)
+        return self._fuse_prompt(hidden, prompt_ids)
 
-    def _fuse_prompt(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Splice the language prompt onto every frame (upstream ``get_audio_features``).
+    def _fuse_prompt(
+        self, hidden: torch.Tensor, prompt_ids: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Condition every frame on its row's language prompt (upstream ``get_audio_features``).
 
         The prompt projector runs here, not in the joint, because its output *is*
         the encoder representation from the joint's point of view.
         """
         if self.prompt_projector is None:
             return hidden
-        prompt_ids = torch.full(
-            (hidden.size(0),), self.prompt_id, dtype=torch.long, device=hidden.device
-        )
+        if prompt_ids is None:
+            prompt_ids = torch.full(
+                (hidden.size(0),), self.prompt_id, dtype=torch.long, device=hidden.device
+            )
         fused: torch.Tensor = self.prompt_projector(hidden, prompt_ids)
         return fused
 
