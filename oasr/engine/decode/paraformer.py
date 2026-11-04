@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple
 import torch
 
 from ..request import Request, RequestOutput
-from .alignment import TokenAlignment, wants_word_timings
+from .alignment import wants_word_timings
 from .base import DecodeStrategy, register_decode_strategy, wants_speech_activity
 
 if TYPE_CHECKING:
@@ -109,46 +109,56 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         # row's valid tokens (the FunASR greedy hypothesis score).
         best_lp, best_ids = log_probs.float().max(dim=-1)  # (B, U)
 
-        ids_cpu = best_ids.cpu()
+        # One list conversion per tensor for the whole micro-batch, then plain
+        # list work per row. A per-row ``.item()`` / ``.tolist()`` and a
+        # per-token loop that built a ``TokenAlignment`` each were half of a
+        # post-processing tail that was a quarter of the offline wall at batch
+        # 64 (audit L7). The only per-row tensor ops left are the score's sum and
+        # the confidences' ``exp``. They run on the same ``[:n]`` slice as
+        # before, so both are bit-identical: a whole-batch ``exp`` may split
+        # vector and scalar lanes differently.
         lp_cpu = best_lp.cpu()
-        lens_cpu = token_lens.cpu()
-        fires_cpu = fires.cpu()
+        ids_rows = best_ids.cpu().tolist()
+        lens = token_lens.cpu().tolist()
+        fire_rows = self._fire_frames(fires.cpu(), B)
+        filtered = self._filtered_ids
 
         outputs: List[RequestOutput] = []
         for b in range(B):
-            n = int(lens_cpu[b].item())
+            n = lens[b]
             if n <= 0:
                 outputs.append(self._empty_output())
                 continue
-            row_ids = ids_cpu[b, :n].tolist()
-            score = float(lp_cpu[b, :n].sum().item())
-            spans = self._token_spans(fires_cpu[b], n)
-            probs = lp_cpu[b, :n].exp().tolist()
-            kept: List[TokenAlignment] = []
-            for k, tok in enumerate(row_ids):
-                if tok in self._filtered_ids:
-                    continue
-                start, end = spans[k]
-                kept.append(
-                    TokenAlignment(
-                        token=int(tok),
-                        start_frame=start,
-                        end_frame=end,
-                        confidence=float(min(max(probs[k], 0.0), 1.0)),
-                    )
-                )
+            row = ids_rows[b][:n]
+            lp_row = lp_cpu[b, :n]
+            score = float(lp_row.sum())
+            # ``exp`` of a log-probability, clamped: a max log-softmax can round
+            # just above 0.
+            probs = lp_row.exp().clamp_(0.0, 1.0).tolist()
+            starts, ends = self._token_spans(fire_rows[b], n)
+            if not filtered.isdisjoint(row):
+                keep = [k for k, tok in enumerate(row) if tok not in filtered]
+                row = [row[k] for k in keep]
+                starts = [starts[k] for k in keep]
+                ends = [ends[k] for k in keep]
+                probs = [probs[k] for k in keep]
             out = RequestOutput(
                 request_id="",
-                text=self._detok.detokenize([a.token for a in kept]),
-                tokens=[[a.token for a in kept]],
+                text=self._detok.detokenize(row),
+                tokens=[row],
                 scores=[score],
                 finished=True,
             )
             # CIF integration produces the boundaries whether or not anyone
             # asked, so per-token timings and the confidence are always filled;
             # the token→word pass is what the request opts into.
-            self.attach_alignment(
-                out, kept, words=requests is not None and wants_word_timings(requests[b])
+            self.attach_span_alignment(
+                out,
+                row,
+                starts,
+                ends,
+                probs,
+                words=requests is not None and wants_word_timings(requests[b]),
             )
             outputs.append(out)
         if alphas is not None:
@@ -172,30 +182,40 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         """
         self.attach_asr_speech_activity(outputs, alphas, enc_lengths, requests)
 
-    def _token_spans(self, fires_row: torch.Tensor, n_tokens: int) -> List[Tuple[float, float]]:
-        """CIF fire positions → per-token ``(start_frame, end_frame)`` spans.
+    @staticmethod
+    def _fire_frames(fires: torch.Tensor, batch: int) -> List[List[int]]:
+        """Each row's CIF fire frames, ascending, from one ``nonzero`` over the batch.
+
+        ``nonzero`` returns its ``(row, frame)`` pairs in row-major order, so
+        each row's frames arrive ascending, which :meth:`_token_spans` relies on.
+        """
+        rows: List[List[int]] = [[] for _ in range(batch)]
+        for b, t in (fires >= 1.0).nonzero(as_tuple=False).tolist():
+            rows[b].append(t)
+        return rows
+
+    @staticmethod
+    def _token_spans(fire_frames: List[int], n_tokens: int) -> Tuple[List[int], List[int]]:
+        """CIF fire frames → per-token ``(start_frames, end_frames)``.
 
         Token *k* ends at the *k*-th frame whose integrated weight fired and
         starts where the previous token ended (0 for the first).  If the fire
         count disagrees with the token count (rounding at the tail), missing
-        spans reuse the last boundary — timestamps stay monotonic.
+        spans reuse the last boundary — timestamps stay monotonic.  The fire
+        frames ascend, so the ends never decrease and no clamp is needed.
 
         Frames, not seconds: the shared :class:`FrameClock` converts, and for
         this frontend one encoder frame *is* one LFR frame (``subsampling_rate``
         1 × ``lfr_n`` 6 × 10 ms = 60 ms), which is the same number this method
         used to multiply in itself.
         """
-        fire_idx = (fires_row >= 1.0).nonzero(as_tuple=False).reshape(-1).tolist()
-        spans: List[Tuple[float, float]] = []
-        prev = 0.0
-        for k in range(n_tokens):
-            end_frame = fire_idx[k] if k < len(fire_idx) else (fire_idx[-1] if fire_idx else 0)
-            end = float(end_frame)
-            if end < prev:
-                end = prev
-            spans.append((prev, end))
-            prev = end
-        return spans
+        if fire_frames:
+            ends = fire_frames[:n_tokens]
+            if len(ends) < n_tokens:
+                ends = ends + [fire_frames[-1]] * (n_tokens - len(ends))
+        else:
+            ends = [0] * n_tokens
+        return [0] + ends[:-1], ends
 
     @staticmethod
     def _empty_output() -> RequestOutput:

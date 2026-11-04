@@ -16,6 +16,7 @@ not applied.
 
 from __future__ import annotations
 
+import functools
 import json
 from typing import FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -32,8 +33,18 @@ def _is_chinese(ch: str) -> bool:
     return "一" <= ch <= "鿿" or "0" <= ch <= "9" or ch == "@"
 
 
+_JUNK = (" ", "</s>", "<s>", "<unk>", "<OOV>")
+
+
 def _clean(word: str) -> str:
-    for junk in (" ", "</s>", "<s>", "<unk>", "<OOV>"):
+    # Every junk string but the space contains "<", so a word holding neither
+    # has nothing to remove and comes back unchanged.  Nearly every token and
+    # every single character take this exit.  The five ``replace`` calls,
+    # made per token and then again per *character* in the mixed branch, were
+    # most of the decode's time (audit L7).
+    if " " not in word and "<" not in word:
+        return word
+    for junk in _JUNK:
         word = word.replace(junk, "")
     return word
 
@@ -58,6 +69,50 @@ def _is_all_alpha(word: Iterable[str]) -> bool:
         if w.isalpha() and _is_chinese(w):
             return False
     return True
+
+
+# --- the same predicates, cached per token, for the decode path (audit L7) ----
+#
+# ``sentence_postprocess`` classifies each token twice. ``_is_all_chinese`` and
+# ``_is_all_alpha`` run once over the token list, then once more per token in
+# the mixed branch, where a string argument is walked character by character.
+# Both are pure functions of the string, and the strings come from a finite
+# vocabulary, so each answer is computed once per token and then looked up.
+# The ports above stay the reference; ``tests/models/arch/test_paraformer.py``
+# decodes through both and requires the same text.
+
+_TOKEN_CACHE = 1 << 16
+
+
+@functools.lru_cache(maxsize=_TOKEN_CACHE)
+def _chinese_token(token: str) -> bool:
+    """One element of ``_is_all_chinese(list)``: the cleaned token is "Chinese"."""
+    return _is_chinese(_clean(token))
+
+
+@functools.lru_cache(maxsize=_TOKEN_CACHE)
+def _alpha_token(token: str) -> bool:
+    """One element of ``_is_all_alpha(list)``: the cleaned token passes both tests."""
+    w = _clean(token)
+    if not w.isalpha() and w != "'":
+        return False
+    return not (w.isalpha() and _is_chinese(w))
+
+
+def _tokens_all_chinese(tokens: Sequence[str]) -> bool:
+    """``_is_all_chinese`` over a token list."""
+    return bool(tokens) and all(_chinese_token(t) for t in tokens)
+
+
+def _tokens_all_alpha(tokens: Sequence[str]) -> bool:
+    """``_is_all_alpha`` over a token list."""
+    return bool(tokens) and all(_alpha_token(t) for t in tokens)
+
+
+#: ``_is_all_chinese`` / ``_is_all_alpha`` of one token *string*, which they walk
+#: character by character.
+_token_all_chinese = functools.lru_cache(maxsize=_TOKEN_CACHE)(_is_all_chinese)
+_token_all_alpha = functools.lru_cache(maxsize=_TOKEN_CACHE)(_is_all_alpha)
 
 
 def _abbr_spans(words: Sequence[str]) -> Tuple[Set[int], Set[int]]:
@@ -135,9 +190,9 @@ def sentence_postprocess(tokens: Sequence[str]) -> str:
 
     word_lists: List[str] = []
     word_item = ""
-    if _is_all_chinese(middle):
+    if _tokens_all_chinese(middle):
         word_lists = [ch.replace(" ", "") for ch in middle]
-    elif _is_all_alpha(middle):
+    elif _tokens_all_alpha(middle):
         for ch in middle:
             if "@@" in ch:
                 word_item += ch.replace("@@", "")
@@ -149,7 +204,7 @@ def sentence_postprocess(tokens: Sequence[str]) -> str:
     else:
         alpha_blank = False
         for ch in middle:
-            if _is_all_chinese(ch):
+            if _token_all_chinese(ch):
                 if alpha_blank:
                     word_lists.pop()
                 word_lists.append(ch)
@@ -157,7 +212,7 @@ def sentence_postprocess(tokens: Sequence[str]) -> str:
             elif "@@" in ch:
                 word_item += ch.replace("@@", "")
                 alpha_blank = False
-            elif _is_all_alpha(ch):
+            elif _token_all_alpha(ch):
                 word_item += ch
                 word_lists.append(word_item)
                 word_lists.append(" ")
@@ -197,9 +252,9 @@ def sentence_pieces(tokens: Sequence[str]) -> List[str]:
 
     words: List[List[_Fragment]] = []
     item: List[_Fragment] = []
-    if _is_all_chinese(middle):
+    if _tokens_all_chinese(middle):
         words = [[(tokens[i].replace(" ", ""), i)] for i in kept]
-    elif _is_all_alpha(middle):
+    elif _tokens_all_alpha(middle):
         for i in kept:
             ch = tokens[i]
             if "@@" in ch:
@@ -212,7 +267,7 @@ def sentence_pieces(tokens: Sequence[str]) -> List[str]:
         alpha_blank = False
         for i in kept:
             ch = tokens[i]
-            if _is_all_chinese(ch):
+            if _token_all_chinese(ch):
                 if alpha_blank:
                     words.pop()
                 words.append([(ch, i)])
@@ -220,7 +275,7 @@ def sentence_pieces(tokens: Sequence[str]) -> List[str]:
             elif "@@" in ch:
                 item.append((ch.replace("@@", ""), i))
                 alpha_blank = False
-            elif _is_all_alpha(ch):
+            elif _token_all_alpha(ch):
                 item.append((ch, i))
                 words += [item, [(" ", None)]]
                 item = []

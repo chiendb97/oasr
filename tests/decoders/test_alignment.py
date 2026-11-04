@@ -44,6 +44,7 @@ from oasr.engine.decode.alignment import (
     WordTiming,
     alignment_fields,
     emission_fields,
+    span_fields,
     wants_word_timings,
     word_timings,
 )
@@ -509,6 +510,56 @@ class TestEmissionSpans:
 
     def test_offset_rebases_a_streaming_chunk(self):
         assert self._spans([3], [0.5], frame_offset=100) == [(103.0, 104.0)]
+
+
+@requires_cpp
+class TestSpanFields:
+    """:func:`span_fields` is :func:`alignment_fields` without a ``TokenAlignment``
+    per token (audit L7), so it must agree with it exactly on every field."""
+
+    _DETOK = _Detok({1: "今", 2: "天", 3: " world", 4: "@", 5: " ok", 6: ""})
+
+    @pytest.mark.parametrize("want_words", [False, True], ids=["timings", "words"])
+    @pytest.mark.parametrize("offset", [0.0, 12.5])
+    def test_it_agrees_with_the_token_alignment_route(self, want_words, offset):
+        rng = random.Random(7)
+        clock = FrameClock(0.06)
+        for _ in range(300):
+            n = rng.randrange(1, 30)
+            tokens = [rng.randrange(1, 7) for _ in range(n)]
+            ends = sorted(rng.randrange(0, 200) for _ in range(n))
+            starts = [0] + ends[:-1]
+            confs = [rng.random() for _ in range(n)]
+            expected = alignment_fields(
+                [TokenAlignment(*t) for t in zip(tokens, starts, ends, confs)],
+                self._DETOK,
+                clock,
+                offset=offset,
+                want_words=want_words,
+            )
+            got = span_fields(
+                tokens,
+                starts,
+                ends,
+                confs,
+                self._DETOK,
+                clock,
+                offset=offset,
+                want_words=want_words,
+            )
+            assert got == expected
+
+    def test_nothing_to_align_and_no_clock_publish_nothing(self):
+        assert span_fields([], [], [], [], self._DETOK, FrameClock(0.06)) == AlignmentFields(
+            None, None, None
+        )
+        assert span_fields([1], [0], [1], [1.0], self._DETOK, None) == AlignmentFields(
+            None, None, None
+        )
+
+    def test_lists_of_different_lengths_are_refused(self):
+        with pytest.raises(ValueError, match="index each other"):
+            span_fields([1, 2], [0, 1], [1], [1.0, 1.0], self._DETOK, FrameClock(0.06))
 
 
 # ---------------------------------------------------------------------------

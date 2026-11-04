@@ -523,7 +523,7 @@ it decorated**, for information the beam had already had.
 | `ctc_cuda` | the beam **records the emitting frame beside the token** as it decodes (`ctc_decoder.cuh`: `ctime` flat, `time_storage` paged); reading it out is a copy | the frames between two emissions; spans tile |
 | `ctc_aed_rescoring` | the same, indexed at the beam row that **won the fusion** | as above |
 | `transducer` | the encoder frame each label was emitted at, recorded in the greedy loop | as above — the two frame-synchronous families share `emission_fields` so they cannot describe a span differently |
-| `paraformer` | CIF fire boundaries — free, the predictor computes them to produce the acoustic embeddings at all | the integration window that fired that token |
+| `paraformer` | CIF fire boundaries — free, the predictor computes them to produce the acoustic embeddings at all. Handed over as lists through `span_fields`, the span counterpart of `emission_fields`, so no per-token object is built | the integration window that fired that token |
 | `aed` | cross-attention DTW over the checkpoint's published `alignment_heads` (`attention_align.py`) — a label-synchronous decoder has no frame index, so this is the one family where deriving is the only option | where the decoder looked while producing the token |
 | `ctc_wfst`, `llm` | **none**, declared | — |
 
