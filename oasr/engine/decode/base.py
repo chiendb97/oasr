@@ -48,6 +48,7 @@ from .alignment import (
     TokenAlignment,
     alignment_fields,
     emission_fields,
+    span_fields,
 )
 
 if TYPE_CHECKING:
@@ -502,6 +503,38 @@ class DecodeStrategy(ABC):
         self._write_alignment(
             output,
             alignment_fields(alignments, self._detok, self._clock, offset=offset, want_words=words),
+        )
+
+    def attach_span_alignment(
+        self,
+        output: RequestOutput,
+        tokens: Sequence[int],
+        start_frames: Sequence[float],
+        end_frames: Sequence[float],
+        confidences: Sequence[float],
+        *,
+        words: bool = True,
+        offset: float = 0.0,
+    ) -> None:
+        """:meth:`attach_alignment` from parallel lists of spans.
+
+        Same result as building one :class:`TokenAlignment` per token, without
+        building them. The span counterpart of
+        :meth:`attach_emission_alignment`, for a family whose spans are not
+        emission frames but which already holds them as lists (Paraformer).
+        """
+        self._write_alignment(
+            output,
+            span_fields(
+                tokens,
+                start_frames,
+                end_frames,
+                confidences,
+                self._detok,
+                self._clock,
+                offset=offset,
+                want_words=words,
+            ),
         )
 
     def attach_emission_alignment(

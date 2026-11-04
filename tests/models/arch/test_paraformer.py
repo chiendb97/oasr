@@ -11,6 +11,7 @@ transcript for ``example/asr_example.wav``.
 
 import os
 import random
+from types import SimpleNamespace
 
 import assets
 import numpy as np
@@ -276,6 +277,54 @@ class TestSentencePostprocess:
         assert sentence_postprocess(tokens) == expected
 
 
+def _clean_by_replace(word):
+    """FunASR's ``_clean``, as ported: five ``replace`` calls, in this order."""
+    for junk in (" ", "</s>", "<s>", "<unk>", "<OOV>"):
+        word = word.replace(junk, "")
+    return word
+
+
+def _as_ported(monkeypatch):
+    """Put ``funasr_char`` back on FunASR's code path: the five-replace ``_clean``,
+    and the two predicates, uncached, wherever the decode now calls a cached one."""
+    import oasr.tokenizers.funasr_char as fc
+
+    monkeypatch.setattr(fc, "_clean", _clean_by_replace)
+    monkeypatch.setattr(fc, "_tokens_all_chinese", fc._is_all_chinese)
+    monkeypatch.setattr(fc, "_tokens_all_alpha", fc._is_all_alpha)
+    monkeypatch.setattr(fc, "_token_all_chinese", fc._is_all_chinese)
+    monkeypatch.setattr(fc, "_token_all_alpha", fc._is_all_alpha)
+
+
+class TestCleanFastPath:
+    """``_clean`` returns a word with neither ``<`` nor a space untouched (audit L7).
+
+    Exact only because every junk string but the space contains ``<``. Nested
+    junk, where one removal exposes another, still has to come out as the
+    sequential replaces leave it.
+    """
+
+    def test_it_matches_the_five_replaces(self):
+        from oasr.tokenizers.funasr_char import _clean
+
+        cases = ["", " ", "a", "<", ">", "<s>", "</s>", "<unk>", "<OOV>", "a b", "<<s>s>"]
+        cases += ["</</s>s>", "x<unk>y", "你好", "@@", "it's", "<s", "s>", " <s> ", "<un k>"]
+        alphabet = ["<", ">", "/", "s", "u", "n", "k", "O", "V", " ", "a", "好", "<s>", "</s>"]
+        rng = random.Random(3)
+        for _ in range(20000):
+            cases.append("".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 10))))
+        for word in cases:
+            assert _clean(word) == _clean_by_replace(word), word
+
+    @pytest.mark.parametrize("tokens,expected", _POSTPROCESS_CASES)
+    def test_the_ported_path_still_matches_funasr(self, tokens, expected, monkeypatch):
+        """The reference the cached decode is compared against is itself right."""
+        from oasr.tokenizers.funasr_char import sentence_postprocess
+
+        _as_ported(monkeypatch)
+        assert sentence_postprocess(tokens) == expected
+
+
 @needs_ckpt
 class TestFunASRCharTokenizer:
     @pytest.fixture(scope="class")
@@ -308,6 +357,31 @@ class TestFunASRCharTokenizer:
         ids = [tok._ids[t] for t in ("we", "are", "b", "b", "c")]
         assert tok.token_pieces(ids) == ["we", " are", " B", "B", "C"]
         assert tok.decode(ids) == "we are BBC"
+
+    def test_clean_matches_over_the_real_vocabulary(self, tok):
+        """Every token, and every character of every token, as decode cleans them."""
+        from oasr.tokenizers.funasr_char import _clean
+
+        words = list(tok._tokens) + sorted({ch for t in tok._tokens for ch in t})
+        assert all(_clean(w) == _clean_by_replace(w) for w in words)
+
+    def test_the_cached_decode_matches_the_ported_one(self, tok, monkeypatch):
+        """Audit L7 caches the per-token predicates and short-circuits ``_clean``.
+        The text and the pieces must be what FunASR's path, ported as is, gives,
+        on sequences weighted toward the mixed Chinese and English branch, where
+        both are used most."""
+        english = [i for i, t in enumerate(tok._tokens) if t.isascii() and t.isalpha()]
+        pieces_at = [i for i, t in enumerate(tok._tokens) if t.endswith("@@")]
+        pools = (english, pieces_at, range(tok.vocab_size))
+        rng = random.Random(7)
+        seqs = [
+            [rng.choice(rng.choice(pools)) for _ in range(rng.randrange(0, 40))]
+            for _ in range(3000)
+        ]
+        fast = [(tok.decode(ids), tok.token_pieces(ids)) for ids in seqs]
+        _as_ported(monkeypatch)
+        ported = [(tok.decode(ids), tok.token_pieces(ids)) for ids in seqs]
+        assert fast == ported
 
     def test_pieces_join_to_decode_over_the_real_vocabulary(self, tok):
         """Random ids weighted toward the English pieces and single letters,
@@ -478,6 +552,156 @@ class TestStrategySeams:
         cfg = EngineConfig(use_cuda_graphs=False)
         with pytest.raises(ValueError, match="predict"):
             build_decode_strategy("paraformer", cfg, Detokenizer(None, None), model=None)
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: batched list work, exactly the old per-token loop (audit L7)
+# ---------------------------------------------------------------------------
+
+#: blank, sos, eos of the stub model; every one of them is filtered out of a row.
+_FILTERED = (0, 1, 2)
+
+
+class _StubParaformer:
+    """``predict`` / ``nar_decode`` returning fixed tensors, so the strategy's
+    post-processing can be driven over any shape of batch without a model."""
+
+    def __init__(self, log_probs, token_lens, fires):
+        self.config = SimpleNamespace(blank_id=0, sos_id=1, eos_id=2)
+        self._log_probs, self._token_lens, self._fires = log_probs, token_lens, fires
+
+    def predict(self, enc_out, enc_lens, return_alphas=False):
+        B, U = self._log_probs.shape[:2]
+        return torch.zeros(B, U, 4), self._token_lens, self._fires
+
+    def nar_decode(self, enc_out, enc_lens, acoustic_embeds, token_lens):
+        return self._log_probs
+
+
+def _strategy(model, detok):
+    from oasr.engine.decode.alignment import FrameClock
+    from oasr.engine.decode.paraformer import ParaformerDecodeStrategy
+
+    strategy = ParaformerDecodeStrategy.__new__(ParaformerDecodeStrategy)
+    strategy._model, strategy._detok = model, detok
+    strategy._clock = FrameClock(0.06)
+    strategy._filtered_ids = set(_FILTERED)
+    return strategy
+
+
+def _reference_rows(strategy, log_probs, token_lens, fires, requests):
+    """The per-row, per-token post-processing as it was before audit L7, verbatim
+    apart from inlining ``_token_spans``: the oracle the batched code must equal."""
+    from oasr.engine.decode.alignment import TokenAlignment, wants_word_timings
+    from oasr.engine.request import RequestOutput
+
+    best_lp, best_ids = log_probs.float().max(dim=-1)
+    ids_cpu, lp_cpu, lens_cpu, fires_cpu = best_ids, best_lp, token_lens, fires
+    outputs = []
+    for b in range(log_probs.size(0)):
+        n = int(lens_cpu[b].item())
+        if n <= 0:
+            outputs.append(strategy._empty_output())
+            continue
+        row_ids = ids_cpu[b, :n].tolist()
+        score = float(lp_cpu[b, :n].sum().item())
+        fire_idx = (fires_cpu[b] >= 1.0).nonzero(as_tuple=False).reshape(-1).tolist()
+        spans, prev = [], 0.0
+        for k in range(n):
+            end = float(fire_idx[k] if k < len(fire_idx) else (fire_idx[-1] if fire_idx else 0))
+            end = max(end, prev)
+            spans.append((prev, end))
+            prev = end
+        probs = lp_cpu[b, :n].exp().tolist()
+        kept = []
+        for k, tok in enumerate(row_ids):
+            if tok in strategy._filtered_ids:
+                continue
+            start, end = spans[k]
+            kept.append(TokenAlignment(int(tok), start, end, float(min(max(probs[k], 0.0), 1.0))))
+        out = RequestOutput(
+            request_id="",
+            text=strategy._detok.detokenize([a.token for a in kept]),
+            tokens=[[a.token for a in kept]],
+            scores=[score],
+            finished=True,
+        )
+        strategy.attach_alignment(
+            out, kept, words=requests is not None and wants_word_timings(requests[b])
+        )
+        outputs.append(out)
+    return outputs
+
+
+def _published(out):
+    return (
+        out.text,
+        out.tokens,
+        out.scores,
+        out.finished,
+        out.timestamps,
+        out.confidence,
+        out.words,
+    )
+
+
+@pytest.mark.requires_assets("OASR_C")  # the span pass is C++ only
+class TestPostProcessing:
+    def _batch(self, rng, B, U, T, V=12):
+        """Log-probs that put the filtered ids on top now and then, lengths from
+        empty to full, and fire counts below, at and above each row's length."""
+        logits = torch.randn(B, U, V, generator=rng) * 3
+        logits[..., :3] += torch.randn(B, U, 3, generator=rng).clamp(min=0) * 4
+        log_probs = torch.log_softmax(logits, dim=-1)
+        # A max log-softmax can round just above 0, which is what the
+        # confidence clamp is for, so plant a few.
+        hot = torch.rand(B, U, generator=rng) < 0.1
+        top = log_probs.argmax(dim=-1, keepdim=True)
+        log_probs.scatter_(
+            -1, top, torch.where(hot, 3e-7, log_probs.gather(-1, top)[..., 0])[..., None]
+        )
+        token_lens = torch.randint(0, U + 1, (B,), generator=rng, dtype=torch.int32)
+        fires = torch.rand(B, T + 1, generator=rng) * 0.99
+        for b in range(B):
+            k = int(torch.randint(0, T + 1, (1,), generator=rng))
+            frames = torch.randperm(T + 1, generator=rng)[:k]
+            fires[b, frames] += 1.0
+        return log_probs, token_lens, fires
+
+    @pytest.mark.parametrize("words", [False, True], ids=["timings", "words"])
+    def test_every_published_field_matches_the_per_token_loop(self, words):
+        from oasr.engine.decode import Detokenizer
+        from oasr.engine.request import DecodingOptions, Request
+
+        rng = torch.Generator().manual_seed(21)
+        detok = Detokenizer(None, None)
+        for trial in range(60):
+            B, U, T = 1 + trial % 9, 1 + trial % 13, 2 + trial % 17
+            log_probs, token_lens, fires = self._batch(rng, B, U, T)
+            if trial % 10 == 0:
+                token_lens[0] = 0  # an empty row beside full ones
+            requests = [
+                Request(audio=None, decoding=DecodingOptions(word_timestamps=words))
+                for _ in range(B)
+            ]
+            strategy = _strategy(_StubParaformer(log_probs, token_lens, fires), detok)
+            enc = torch.zeros(B, T, 4)
+            got = strategy.decode_offline(enc, torch.full((B,), T), requests)
+            expected = _reference_rows(strategy, log_probs, token_lens, fires, requests)
+            assert [_published(o) for o in got] == [_published(o) for o in expected], trial
+
+    def test_spans_reuse_the_last_fire_when_tokens_outnumber_fires(self):
+        from oasr.engine.decode.paraformer import ParaformerDecodeStrategy as S
+
+        assert S._token_spans([3, 7], 4) == ([0, 3, 7, 7], [3, 7, 7, 7])
+        assert S._token_spans([3, 7, 9], 2) == ([0, 3], [3, 7])
+        assert S._token_spans([], 3) == ([0, 0, 0], [0, 0, 0])
+
+    def test_fire_frames_come_back_ascending_per_row(self):
+        from oasr.engine.decode.paraformer import ParaformerDecodeStrategy as S
+
+        fires = torch.tensor([[0.2, 1.1, 0.5, 1.0], [0.0, 0.3, 0.9, 0.1], [1.4, 0.0, 2.0, 1.0]])
+        assert S._fire_frames(fires, 3) == [[1, 3], [], [0, 2, 3]]
 
 
 # ---------------------------------------------------------------------------

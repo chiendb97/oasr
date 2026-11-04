@@ -25,6 +25,7 @@ __all__ = [
     "AlignmentFields",
     "alignment_fields",
     "emission_fields",
+    "span_fields",
     "wants_word_timings",
     "word_timings",
 ]
@@ -219,6 +220,47 @@ def alignment_fields(
     pieces = _token_pieces([a.token for a in alignments], detok) if want_words else ()
     raw, timestamps, confidence = _CPP.align_spans(
         alignments, pieces, clock.seconds_per_frame, offset, want_words
+    )
+    return AlignmentFields(_words(raw) if want_words else None, timestamps, confidence)
+
+
+def span_fields(
+    tokens: Sequence[int],
+    start_frames: Sequence[float],
+    end_frames: Sequence[float],
+    confidences: Sequence[float],
+    detok: "Detokenizer",
+    clock: Optional[FrameClock],
+    *,
+    offset: float = 0.0,
+    want_words: bool = True,
+) -> "AlignmentFields":
+    """:func:`alignment_fields` from parallel lists, with no per-token object.
+
+    The same pass and the same result as building one :class:`TokenAlignment`
+    per token and handing over the list. ``align_spans`` reads the span
+    fields by position, so plain tuples zipped from the lists cross as well.
+    Paraformer takes this route, because it holds its CIF spans as lists
+    already, and building a ``NamedTuple`` per token cost more than the pass
+    (audit L7).
+
+    The four lists index each other, so they must be the same length.
+    """
+    if clock is None or not tokens:
+        return AlignmentFields(None, None, None)
+    n = len(tokens)
+    if not (len(start_frames) == len(end_frames) == len(confidences) == n):
+        raise ValueError(
+            f"span_fields got {n} tokens, {len(start_frames)} starts, {len(end_frames)} ends "
+            f"and {len(confidences)} confidences; they index each other"
+        )
+    pieces = _token_pieces(tokens, detok) if want_words else ()
+    raw, timestamps, confidence = _CPP.align_spans(
+        list(zip(tokens, start_frames, end_frames, confidences)),
+        pieces,
+        clock.seconds_per_frame,
+        offset,
+        want_words,
     )
     return AlignmentFields(_words(raw) if want_words else None, timestamps, confidence)
 
