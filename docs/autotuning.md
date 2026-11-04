@@ -94,6 +94,21 @@ service and marks it **stale** (`oasr tune status`) — a stale entry can only b
 slower than a fresh tune, because every config is checked against the compiled
 set and the static feasibility predicates at resolve time.
 
+The soft validators describe the entries, not the last writer:
+- **Re-stamping:** a write stamps the file with the writer's validators. Every
+  entry the writer didn't measure keeps the validators it was measured under,
+  as its own `"soft"` field.
+- **Per-entry staleness:** `oasr tune status` reports those entries against
+  their own validators.
+- **Mixed entries:** an entry that gains a point measured under newer
+  validators keeps the older ones, so it stays stale until it's rebuilt.
+
+**Concurrent writers.** The user tier has three writers: `oasr.autotune()`'s
+flush, `oasr tune build --out user` and the engine's `prewarm`. Each takes the
+file's lock, re-reads it and applies only its own changes, so an entry another
+process wrote meanwhile survives. The lock is held for the merge and the write,
+never for the build. `--fresh` still replaces the file.
+
 **Snapshots.** Files are read once per *epoch*; `oasr.tune.database.reload()`
 (or `ASREngine.reload_tuning()`, which also releases every captured graph)
 starts a new one. Nothing else changes a selection inside a process, so a
@@ -310,13 +325,22 @@ with oasr.autotune(cache="oasr_tune.json"):
 ```
 
 - **Dynamic dimensions key by bucket**, not by value (`oasr.tune.shapes`: step 8 to
-  128, ×√2 to 1024, ×2 above), so a new M does not re-profile. Version-1 cache
-  files are re-keyed on load.
+  128, ×√2 to 1024, ×2 above), so a new M does not re-profile every candidate.
+- **A result serves only sizes at or below the one it was measured at.**
+  - **Why the bucket doesn't do this alone:** a call is profiled at its own
+    shape, which is usually below its bucket's upper edge.
+  - **What's recorded:** every result keeps the exact shape it was measured at,
+    and a lookup takes the closest one measured at or above the call.
+  - **A larger size in the same bucket:** it's a miss. Under `autotune(True)`
+    it's measured; otherwise it takes the fallback.
+  - **The cache file:** version 3 records each result's `measured` shape.
+    A version-2 entry has none and still serves its whole bucket. A version-1
+    file's exact shapes become measured results.
 - A cache file tuned on another architecture is **not loaded** (hard validator);
   other environment differences warn.
 - GEMM-family winners are also published to the **user tier** (`publish=True`),
-  so the production path — outside `autotune()` — serves them after the context
-  exits.
+  at the M they were measured at, so the production path serves them after the
+  context exits.
 - Ops that cannot be graph-captured are timed eagerly (`warmup`/`rep` apply only
   there).
 

@@ -385,7 +385,8 @@ def build_scaled_mm(
     if not jsm.lane_available(sm, fmt):
         raise ValueError(f"no {fmt} scaled_mm lane is built for sm{sm}")
     tf = base if base is not None else database.new_file(family, sm, jsm.default_lane(sm, fmt))
-    tf.validators["soft"] = database.current_soft_validators(family)
+    # The base's entries keep the validators they were measured under.
+    database.stamp_current(tf)
     t0 = time.time()
     contended = False
     sigs = {

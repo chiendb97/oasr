@@ -68,18 +68,23 @@ def _json_to_tactic(val):
 def _rebucket_v1_entries(entries: Dict[str, Any]) -> Dict[str, Any]:
     """Re-key a version-1 cache (exact shapes) onto the bucketed keys lookups use.
 
-    Where several exact shapes land in one bucket, the largest measured shape
-    wins: a result is only ever applied at or below the size it was measured at.
+    Every exact shape is kept, as the size its result was measured at: a v1
+    file is the one format that says so, and each result is then applied at and
+    below its own size.  Keeping only the largest per bucket, as this once did,
+    threw the others away and still served the bucket's whole width.
     """
     from .shapes import bucket_shape_sig
 
     out: Dict[str, Any] = {}
-    best_size: Dict[str, Tuple[int, ...]] = {}
     for key_str, value in entries.items():
         try:
             key = ProfileKey.from_str(key_str)
         except (ValueError, TypeError):
             out[key_str] = value
+            continue
+        if isinstance(value, list) and len(value) >= 2:  # FlashInfer [runner, tactic]
+            value = {"backend": str(value[0]), "config": {}}
+        if not isinstance(value, dict) or "backend" not in value:
             continue
         bucketed = ProfileKey(
             op_key=key.op_key,
@@ -87,9 +92,8 @@ def _rebucket_v1_entries(entries: Dict[str, Any]) -> Dict[str, Any]:
             dtype=key.dtype,
             device_sm=key.device_sm,
         ).to_str()
-        if bucketed not in best_size or key.shape_sig > best_size[bucketed]:
-            best_size[bucketed] = key.shape_sig
-            out[bucketed] = value
+        result = {**value, "measured": list(key.shape_sig)}
+        out.setdefault(bucketed, {"results": []})["results"].append(result)
     return out
 
 
@@ -223,6 +227,103 @@ class Tactic:
         """Deserialize from a dict."""
         config = tuple(sorted(d.get("config", {}).items()))
         return cls(backend=d["backend"], config=config)
+
+
+@dataclass(frozen=True)
+class Measured:
+    """A profiling winner and the exact shape it was measured at.
+
+    It is valid at that shape and below it on every dynamic dimension -- never
+    above, which is the whole contract of a bucket that rounds up
+    (:mod:`oasr.tune.shapes`).
+    """
+
+    shape: Tuple[int, ...]
+    tactic: Tactic
+    median_ms: Optional[float] = None
+    profiled_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        out = {**self.tactic.to_dict(), "measured": list(self.shape)}
+        if self.median_ms is not None:
+            out["median_ms"] = round(self.median_ms, 6)
+        if self.profiled_at is not None:
+            out["profiled_at"] = self.profiled_at
+        return out
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Measured":
+        return cls(
+            shape=tuple(int(v) for v in d["measured"]),
+            tactic=Tactic.from_dict(d),
+            median_ms=d.get("median_ms"),
+            profiled_at=d.get("profiled_at"),
+        )
+
+
+def _dynamic_dims(key: "ProfileKey") -> Tuple[int, ...]:
+    from .shapes import DYNAMIC_DIMS
+
+    return DYNAMIC_DIMS.get((key.op_key.family, key.op_key.op), ())
+
+
+def _closest_covering(
+    results: List[Measured], shape: Tuple[int, ...], dyn: Tuple[int, ...]
+) -> Optional[Measured]:
+    """The result measured nearest above *shape*, or ``None`` if none covers it.
+
+    Covering means measured at or above *shape* on every dynamic dimension; of
+    those, the smallest measured size is the closest measurement of *shape*.
+    """
+    best: Optional[Measured] = None
+    best_size = 0
+    for r in results:
+        if len(r.shape) != len(shape) or any(shape[i] > r.shape[i] for i in dyn):
+            continue
+        size = 1
+        for i in dyn:
+            size *= max(1, r.shape[i])
+        if best is None or size < best_size:
+            best, best_size = r, size
+    return best
+
+
+def _add_measured(results: List[Measured], new: Measured) -> None:
+    """Add *new*, replacing a result measured at the same shape."""
+    results[:] = [r for r in results if r.shape != new.shape] + [new]
+
+
+def _parse_entry(entry_data: Any) -> Tuple[Optional[Tactic], List[Measured]]:
+    """``(tactic with no measured size, measured results)`` from one cache-file entry.
+
+    A version-3 entry carries ``"results"``, each with the shape it was measured
+    at.  A version-2 entry is one tactic with no size: it is served across its
+    whole bucket, as it always was, because nothing says where it was measured.
+    """
+    legacy: Optional[Tactic] = None
+    measured: List[Measured] = []
+    if isinstance(entry_data, dict):
+        if "backend" in entry_data:
+            legacy = Tactic.from_dict(entry_data)
+        for r in entry_data.get("results", []):
+            with contextlib.suppress(KeyError, TypeError, ValueError):
+                measured.append(Measured.from_dict(r))
+    elif isinstance(entry_data, list) and len(entry_data) >= 2:
+        # FlashInfer format: [runner_name, tactic_value]
+        legacy = Tactic(
+            backend=str(entry_data[0]),
+            config=(
+                _json_to_tactic(entry_data[1]) if isinstance(entry_data[1], (list, dict)) else ()
+            ),
+        )
+    return legacy, measured
+
+
+def _entry_json(legacy: Optional[Tactic], measured: List[Measured]) -> Dict[str, Any]:
+    out: Dict[str, Any] = legacy.to_dict() if legacy is not None else {}
+    if measured:
+        out["results"] = [m.to_dict() for m in sorted(measured, key=lambda m: m.shape)]
+    return out
 
 
 @dataclass
@@ -392,12 +493,20 @@ def _bench_cuda_events(
     return median, timings[0], timings[-1]
 
 
-def _publish_to_tuning_db(profile_key: "ProfileKey", best: "TuneResult", results) -> None:
+def _publish_to_tuning_db(
+    profile_key: "ProfileKey",
+    best: "TuneResult",
+    results,
+    measured: Optional[Tuple[int, ...]] = None,
+) -> None:
     """Record a GEMM-family winner in the user tier (``oasr.tune.database``).
 
     That is what makes a tuning run pay off outside ``autotune()``: the
     production selector reads the user tier first.  Keyed at the exact dtype it
-    was measured in, at the bucket of M it was measured for.
+    was measured in, at the M it was **measured at** (*measured*, the exact
+    shape).  Not the bucket's upper edge: the user tier's regions round up too,
+    so a point recorded at the edge served the sizes between the measured M and
+    the edge with a winner nobody measured there.
     """
     op_key = profile_key.op_key
     if op_key.family != "gemm" or op_key.op not in (
@@ -418,10 +527,11 @@ def _publish_to_tuning_db(profile_key: "ProfileKey", best: "TuneResult", results
         from oasr.jit.core import _SM_FAMILY
 
         family_sm = _SM_FAMILY.get(sm, sm)
+        shape = measured if measured is not None else profile_key.shape_sig
         if op_key.op == "bmm":
-            _batch, m, n, k = profile_key.shape_sig
+            _batch, m, n, k = shape
         else:
-            m, n, k = profile_key.shape_sig
+            m, n, k = shape
         choice = choice_of(best.tactic, family_sm)
         cid = jg.gemm_config_id(choice)
         dt = "fp16" if profile_key.dtype == "float16" else "bf16"
@@ -479,13 +589,18 @@ class AutoTuner:
         # Reentrant lock protecting all mutable state on this instance.
         self._lock = threading.RLock()
 
-        # In-memory profiling cache: profile_key_str → Tactic
+        # Results this process measured: profile_key_str (bucketed) -> every
+        # winner measured in that bucket, each with the exact shape it was
+        # measured at, and applied only at or below it (:class:`Measured`).
+        self._measured: Dict[str, List[Measured]] = {}
+        # Tactics with no measured size: placed by hand, or loaded from a
+        # version-2 file.  Served across their whole bucket, as they always were.
         self.profiling_cache: Dict[str, Tactic] = {}
-        # Timing data for profiled entries
-        self._timings: Dict[str, float] = {}
-        # User-loaded configs from JSON files
+        # User-loaded configs from JSON files: sized results, and unsized tactics
+        self._file_measured: Dict[str, List[Measured]] = {}
         self._file_configs: Dict[str, Tactic] = {}
         # Bundled default configs
+        self._bundled_measured: Dict[str, List[Measured]] = {}
         self._bundled_configs: Dict[str, Tactic] = {}
         # Track which file config keys have been logged
         self._logged_file_hits: Set[str] = set()
@@ -517,24 +632,35 @@ class AutoTuner:
     # Cache lookup (FlashInfer search_cache pattern)
     # -----------------------------------------------------------------
 
-    def search_cache(self, profile_key: ProfileKey) -> Optional[Tactic]:
+    def search_cache(
+        self, profile_key: ProfileKey, shape_sig: Optional[Tuple[int, ...]] = None
+    ) -> Optional[Tactic]:
         """Search for cached profiling results matching the profile key.
 
-        Searches the following sources in priority order:
-            1. In-memory profiling_cache (from live autotuning)
+        *profile_key* is the bucketed key; *shape_sig* is the exact shape of the
+        call (default: the key's own).  A measured result serves the call only if
+        it was measured at or above *shape_sig* on every dynamic dimension, and
+        the closest such one is taken.  Searches, in priority order:
+            1. This process's measurements (live autotuning), then its unsized tactics
             2. User-loaded configs (via load_configs or autotune(cache=...))
             3. Bundled package configs
             4. None (fallback)
         """
         key_str = profile_key.to_str()
+        shape = profile_key.shape_sig if shape_sig is None else tuple(int(v) for v in shape_sig)
+        dyn = _dynamic_dims(profile_key)
         with self._lock:
             # 1. In-memory cache (from live tuning)
+            hit = _closest_covering(self._measured.get(key_str, []), shape, dyn)
+            if hit is not None:
+                return hit.tactic
             tactic = self.profiling_cache.get(key_str)
             if tactic is not None:
                 return tactic
 
             # 2. User-loaded configs (from load_configs or autotune(cache=...))
-            tactic = self._file_configs.get(key_str)
+            hit = _closest_covering(self._file_measured.get(key_str, []), shape, dyn)
+            tactic = hit.tactic if hit is not None else self._file_configs.get(key_str)
             if tactic is not None:
                 if key_str not in self._logged_file_hits:
                     self._logged_file_hits.add(key_str)
@@ -545,6 +671,9 @@ class AutoTuner:
                 return tactic
 
             # 3. Bundled package configs
+            hit = _closest_covering(self._bundled_measured.get(key_str, []), shape, dyn)
+            if hit is not None:
+                return hit.tactic
             tactic = self._bundled_configs.get(key_str)
             if tactic is not None:
                 return tactic
@@ -584,8 +713,13 @@ class AutoTuner:
 
         # Dynamic dimensions (M for a GEMM, batch and length for a conv) key by
         # bucket, not by value: an exact key re-profiled every candidate for
-        # every new M, on the call path.  The bucket rounds up, so a result is
-        # only applied at or below the size it was measured at.
+        # every new M, on the call path.  A result is measured at the call's own
+        # shape, though, not at the bucket's upper edge, so it is applied only
+        # at or below that shape: a larger size in the same bucket is a miss,
+        # and in tuning mode it is measured too.  This used to say the bucket
+        # alone guaranteed it; it did not, and a winner measured at M=100 served
+        # M=104 unmeasured.
+        exact = tuple(int(v) for v in shape_sig)
         profile_key = ProfileKey(
             op_key=op_key,
             shape_sig=bucket_shape_sig(op_key.family, op_key.op, shape_sig),
@@ -594,7 +728,7 @@ class AutoTuner:
         )
 
         # 1. Cache lookup
-        tactic = self.search_cache(profile_key)
+        tactic = self.search_cache(profile_key, exact)
         if tactic is not None:
             logger.debug("Cache hit for %s -> %s", profile_key.to_str(), tactic.backend)
             self._execute(op_key, tactic, runner_args)
@@ -604,7 +738,7 @@ class AutoTuner:
         self.stats.cache_misses += 1
 
         if self.is_tuning_mode:
-            tactic = self._profile_and_cache(op_key, profile_key, runner_args)
+            tactic = self._profile_and_cache(op_key, profile_key, runner_args, exact)
         else:
             tactic = self._fallback_tactic(op_key, profile_key)
 
@@ -737,14 +871,19 @@ class AutoTuner:
         op_key: OpKey,
         profile_key: ProfileKey,
         runner_args: tuple,
+        shape_sig: Optional[Tuple[int, ...]] = None,
     ) -> Optional[Tactic]:
-        """Profile all candidates and cache the best result.
+        """Profile all candidates on *runner_args* and cache the best result.
+
+        *shape_sig* is the exact shape of *runner_args* -- where the result is
+        measured, and so the largest size it is ever applied to.
 
         Uses double-check locking to handle concurrent profiling requests.
         """
+        shape = profile_key.shape_sig if shape_sig is None else tuple(shape_sig)
         with self._lock:
             # Double-check: another thread may have profiled while we waited.
-            cached = self.search_cache(profile_key)
+            cached = self.search_cache(profile_key, shape)
             if cached is not None:
                 return cached
 
@@ -766,21 +905,29 @@ class AutoTuner:
 
             if best is not None:
                 key_str = profile_key.to_str()
-                self.profiling_cache[key_str] = best.tactic
-                self._timings[key_str] = best.median_ms
+                _add_measured(
+                    self._measured.setdefault(key_str, []),
+                    Measured(
+                        shape=shape,
+                        tactic=best.tactic,
+                        median_ms=best.median_ms,
+                        profiled_at=datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
                 self._dirty = True
                 self._dirty_seq += 1
                 self.stats.tuned_op_successful_configs[op_str] = (
                     self.stats.tuned_op_successful_configs.get(op_str, 0) + 1
                 )
                 logger.info(
-                    "[Autotuner]: Selected %s (%.4f ms) for %s",
+                    "[Autotuner]: Selected %s (%.4f ms) for %s, measured at %s",
                     best.tactic.backend,
                     best.median_ms,
                     profile_key.to_str(),
+                    shape,
                 )
                 if self.publish:
-                    _publish_to_tuning_db(profile_key, best, results)
+                    _publish_to_tuning_db(profile_key, best, results, shape)
                 return best.tactic
 
             logger.warning(
@@ -846,21 +993,22 @@ class AutoTuner:
 
         with self._lock:
             seq_at_snapshot = self._dirty_seq
-            entries: Dict[str, Dict[str, Any]] = {}
+            legacy: Dict[str, Tactic] = dict(self._file_configs)
+            measured: Dict[str, List[Measured]] = {
+                k: list(v) for k, v in self._file_measured.items()
+            }
+            num_previous = len(set(legacy) | set(measured))
 
-            # Include previously loaded file configs as a base
-            for key_str, tactic in self._file_configs.items():
-                entries[key_str] = tactic.to_dict()
-
-            num_previous = len(entries)
-
-            # Overlay in-memory profiling results (take priority)
-            for key_str, tactic in self.profiling_cache.items():
-                entry = tactic.to_dict()
-                if key_str in self._timings:
-                    entry["median_ms"] = round(self._timings[key_str], 6)
-                entry["profiled_at"] = datetime.now(timezone.utc).isoformat()
-                entries[key_str] = entry
+            # Overlay in-memory results (take priority, per measured shape)
+            legacy.update(self.profiling_cache)
+            for key_str, results in self._measured.items():
+                into = measured.setdefault(key_str, [])
+                for r in results:
+                    _add_measured(into, r)
+            entries: Dict[str, Any] = {
+                k: _entry_json(legacy.get(k), measured.get(k, []))
+                for k in set(legacy) | set(measured)
+            }
 
         current_meta = _collect_metadata()
 
@@ -874,9 +1022,21 @@ class AutoTuner:
             # If old format (flat dict), treat entire file as entries
             if "entries" not in disk_data and _METADATA_KEY not in disk_data:
                 disk_entries = disk_data
+            if int(disk_data.get("version", 1)) < 2:
+                disk_entries = _rebucket_v1_entries(disk_entries)
             for k, v in disk_entries.items():
-                if k not in entries and k != _METADATA_KEY:
+                if k == _METADATA_KEY:
+                    continue
+                if k not in entries:
                     entries[k] = v
+                    continue
+                # Both have it: keep what the disk measured at other shapes.
+                disk_legacy, disk_measured = _parse_entry(v)
+                ours_legacy, ours_measured = _parse_entry(entries[k])
+                merged = list(disk_measured)
+                for r in ours_measured:
+                    _add_measured(merged, r)
+                entries[k] = _entry_json(ours_legacy or disk_legacy, merged)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
@@ -888,9 +1048,10 @@ class AutoTuner:
             os.makedirs(dir_name, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp", prefix=".autotuner_")
         try:
+            # Version 3: a measured entry carries the shape it was measured at.
             data = {
                 _METADATA_KEY: original_metadata or current_meta,
-                "version": 2,
+                "version": 3,
                 "entries": dict(sorted(entries.items())),
             }
             with os.fdopen(fd, "w") as f:
@@ -980,20 +1141,14 @@ class AutoTuner:
 
         with self._lock:
             self._file_configs.clear()
+            self._file_measured.clear()
             self._logged_file_hits.clear()
             for key_str, entry_data in entries.items():
-                if isinstance(entry_data, dict):
-                    self._file_configs[key_str] = Tactic.from_dict(entry_data)
-                elif isinstance(entry_data, list) and len(entry_data) >= 2:
-                    # FlashInfer format: [runner_name, tactic_value]
-                    self._file_configs[key_str] = Tactic(
-                        backend=str(entry_data[0]),
-                        config=(
-                            _json_to_tactic(entry_data[1])
-                            if isinstance(entry_data[1], (list, dict))
-                            else ()
-                        ),
-                    )
+                legacy, measured = _parse_entry(entry_data)
+                if legacy is not None:
+                    self._file_configs[key_str] = legacy
+                if measured:
+                    self._file_measured[key_str] = measured
 
         logger.info("[Autotuner]: Loaded %d configs from %s", len(entries), path)
         return True
@@ -1011,8 +1166,11 @@ class AutoTuner:
         entries = data.get("entries", {})
         with self._lock:
             for key_str, entry_data in entries.items():
-                if key_str not in self._bundled_configs:
-                    self._bundled_configs[key_str] = Tactic.from_dict(entry_data)
+                legacy, measured = _parse_entry(entry_data)
+                if legacy is not None and key_str not in self._bundled_configs:
+                    self._bundled_configs[key_str] = legacy
+                if measured and key_str not in self._bundled_measured:
+                    self._bundled_measured[key_str] = measured
 
     # -----------------------------------------------------------------
     # Utilities
@@ -1022,8 +1180,9 @@ class AutoTuner:
         """Clear the profiling cache and user-loaded file configs."""
         with self._lock:
             self.profiling_cache.clear()
-            self._timings.clear()
+            self._measured.clear()
             self._file_configs.clear()
+            self._file_measured.clear()
             self._logged_file_hits.clear()
             self._dirty = False
             self._dirty_seq = 0
@@ -1250,6 +1409,18 @@ def get_selected_config(
     dtype: str,
     device_sm: int,
 ) -> Optional[Tactic]:
-    """Look up the cached tactic for a specific profile, if any."""
-    key = ProfileKey(op_key=op_key, shape_sig=shape_sig, dtype=dtype, device_sm=device_sm)
-    return AutoTuner.get().search_cache(key)
+    """Look up the cached tactic for a call of this exact shape, if any.
+
+    The key is bucketed as :meth:`AutoTuner.dispatch` buckets it (looking up the
+    raw shape found only a call whose size was exactly a bucket edge), and the
+    result must have been measured at or above *shape_sig*.
+    """
+    from .shapes import bucket_shape_sig
+
+    key = ProfileKey(
+        op_key=op_key,
+        shape_sig=bucket_shape_sig(op_key.family, op_key.op, shape_sig),
+        dtype=dtype,
+        device_sm=device_sm,
+    )
+    return AutoTuner.get().search_cache(key, tuple(shape_sig))

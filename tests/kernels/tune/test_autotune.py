@@ -445,7 +445,12 @@ class TestConfigPersistence:
         assert tuner._file_configs
 
     def test_a_version_1_cache_is_rebucketed(self, tmp_path):
-        """v1 files keyed exact shapes; lookups now key the bucket of M."""
+        """v1 files keyed exact shapes; lookups key the bucket of M.
+
+        Both shapes are kept, each as where its result was measured: keeping
+        only the larger, as this once did, threw the other away and still let
+        it serve the bucket's whole width.
+        """
         path = tmp_path / "cache.json"
         path.write_text(
             json.dumps(
@@ -461,9 +466,174 @@ class TestConfigPersistence:
         tuner = AutoTuner(warmup=1, repeat=1)
         tuner._registry = BackendRegistry()
         tuner.load_configs(str(path))
-        # 113 and 120 both round up to the 120 bucket; the larger measured one wins.
-        assert list(tuner._file_configs) == ["gemm|gemm||(120,256,64)|float16|sm80"]
-        assert tuner._file_configs["gemm|gemm||(120,256,64)|float16|sm80"].backend == "cutlass"
+        key = ProfileKey(OpKey("gemm", "gemm"), (120, 256, 64), "float16", 80)
+        assert list(tuner._file_measured) == [key.to_str()] and not tuner._file_configs
+        assert tuner.search_cache(key, (113, 256, 64)) == Tactic("torch")
+        assert tuner.search_cache(key, (116, 256, 64)) == Tactic("cutlass")
+        assert tuner.search_cache(key, (120, 256, 64)) == Tactic("cutlass")
+
+
+# =========================================================================
+# A result serves only up to where it was measured (audit G19)
+# =========================================================================
+
+
+class TestAResultServesOnlyUpToWhereItWasMeasured:
+    """A tuning-mode call profiles at its own shape and keys the bucket, which
+    rounds up -- so a winner measured at M=100 used to serve M=101..104, the rest
+    of its bucket, unmeasured.  The comment beside it claimed the opposite."""
+
+    OP = OpKey("gemm", "gemm")
+
+    @pytest.fixture
+    def tuner(self):
+        """Backends ``small`` (wins at M <= 100), ``big`` (wins above) and the
+        fallback ``default``; ``measured_at`` lists every profiled M."""
+        tuner = AutoTuner(warmup=1, repeat=1)
+        tuner._registry = BackendRegistry()
+        tuner.publish = False
+        ran, measured_at = [], []
+        for name in ("small", "big", "default"):
+            tuner._registry.register(
+                self.OP,
+                BackendEntry(
+                    tactic=Tactic(name),
+                    is_available=lambda: True,
+                    get_runner=lambda name=name: (lambda m: ran.append((name, m))),
+                    is_fallback=(name == "default"),
+                ),
+            )
+
+        def profile(op_key, candidates, args):
+            m = args[0]
+            measured_at.append(m)
+            win, lose = ("small", "big") if m <= 100 else ("big", "small")
+            return [
+                TuneResult(Tactic(win), 1.0, 1.0, 1.0, "ok"),
+                TuneResult(Tactic(lose), 2.0, 2.0, 2.0, "ok"),
+            ]
+
+        tuner._profile_candidates = profile
+        tuner.ran, tuner.measured_at = ran, measured_at
+        with patch("oasr.tune.autotuner._device_sm", return_value=120):
+            yield tuner
+
+    def _call(self, tuner, m):
+        tuner.dispatch(self.OP, (m, 256, 64), torch.float16, torch.device("cpu"), (m,))
+        return tuner.ran[-1][0]
+
+    def test_a_larger_size_in_the_bucket_is_measured_not_borrowed(self, tuner):
+        tuner.is_tuning_mode = True
+        assert self._call(tuner, 100) == "small"
+        assert self._call(tuner, 104) == "big"  # one bucket: 97..104
+        assert tuner.measured_at == [100, 104]
+
+    def test_a_smaller_size_reuses_the_measurement(self, tuner):
+        tuner.is_tuning_mode = True
+        self._call(tuner, 100)
+        assert self._call(tuner, 98) == "small" and tuner.measured_at == [100]
+
+    def test_the_closest_measurement_serves(self, tuner):
+        tuner.is_tuning_mode = True
+        self._call(tuner, 100)
+        self._call(tuner, 104)
+        tuner.is_tuning_mode = False
+        assert [self._call(tuner, m) for m in (99, 100, 101, 104)] == [
+            "small",
+            "small",
+            "big",
+            "big",
+        ]
+        assert tuner.measured_at == [100, 104]
+
+    def test_without_tuning_a_larger_size_takes_the_fallback(self, tuner):
+        tuner.is_tuning_mode = True
+        self._call(tuner, 100)
+        tuner.is_tuning_mode = False
+        assert self._call(tuner, 104) == "default"
+
+    def test_a_saved_cache_carries_where_each_result_was_measured(self, tuner, tmp_path):
+        tuner.is_tuning_mode = True
+        self._call(tuner, 100)
+        path = tmp_path / "cache.json"
+        tuner.save_configs(str(path))
+        data = json.loads(path.read_text())
+        assert data["version"] == 3
+        (entry,) = data["entries"].values()
+        assert [r["measured"] for r in entry["results"]] == [[100, 256, 64]]
+        again = AutoTuner(warmup=1, repeat=1)
+        again._registry = tuner._registry
+        again.load_configs(str(path))
+        again.ran = tuner.ran
+        assert self._call(again, 100) == "small"
+        assert self._call(again, 104) == "default"
+
+    def test_a_version_2_entry_still_serves_its_bucket(self, tuner, tmp_path):
+        """Nothing in a v2 file says where it was measured, so it keeps its meaning."""
+        key = ProfileKey(self.OP, (104, 256, 64), "float16", 120)
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps({"version": 2, "entries": {key.to_str(): {"backend": "small"}}}))
+        tuner.load_configs(str(path))
+        assert self._call(tuner, 103) == "small"
+
+    def test_the_tuning_db_is_told_the_measured_m(self, tuner):
+        """The user tier's regions round up too: a point at the bucket edge
+        served the gap between the measured M and the edge."""
+        from oasr.tune import autotuner as at
+
+        told = []
+
+        def publish(key, best, results, measured=None):
+            told.append(measured[0] if measured is not None else key.shape_sig[0])
+
+        tuner.publish = True
+        tuner.is_tuning_mode = True
+        with patch.object(at, "_publish_to_tuning_db", publish):
+            self._call(tuner, 100)
+        assert told == [100]
+
+    def test_the_published_point_is_at_the_measured_m(self):
+        """The publisher itself, down to ``record_point``: given the bucketed key
+        and the measured shape, the point lands at the measured M."""
+        from oasr.tune import autotuner as at, database
+
+        points = []
+        key = ProfileKey(self.OP, (104, 256, 64), "float16", 120)
+        best = TuneResult(Tactic("torch"), 1.0, 1.0, 1.0, "ok")
+        with patch.object(database, "record_point", lambda *a, **k: points.append(a[4])):
+            at._publish_to_tuning_db(key, best, [best], (100, 256, 64))
+        assert points == [100]
+
+    def test_incomparable_shapes_in_one_bucket_are_both_kept(self, tuner):
+        """``bmm`` buckets batch and M: neither of two such shapes covers the
+        other, and one slot per bucket would re-profile them in turn forever."""
+        op = OpKey("gemm", "bmm")
+        tuner._registry.register(
+            op,
+            BackendEntry(
+                tactic=Tactic("small"),
+                is_available=lambda: True,
+                get_runner=lambda: (lambda m: tuner.ran.append(("small", m))),
+                is_fallback=True,
+            ),
+        )
+        tuner.is_tuning_mode = True
+        for _ in range(3):
+            for shape in ((8, 100, 64, 64), (4, 104, 64, 64)):
+                tuner.dispatch(op, shape, torch.float16, torch.device("cpu"), (shape[1],))
+        assert tuner.measured_at == [100, 104]
+
+    def test_get_selected_config_looks_up_the_bucket(self, tuner):
+        """It keyed the raw shape, so it found only a call whose size was an edge."""
+        from oasr.tune import autotuner as at
+
+        tuner.is_tuning_mode = True
+        self._call(tuner, 100)
+        with patch.object(at.AutoTuner, "get", return_value=tuner):
+            assert at.get_selected_config(self.OP, (100, 256, 64), "float16", 120) == Tactic(
+                "small"
+            )
+            assert at.get_selected_config(self.OP, (104, 256, 64), "float16", 120) is None
 
 
 # =========================================================================
@@ -516,7 +686,7 @@ class TestAutotuneContextManager:
         assert path.exists()
         with open(path) as f:
             data = json.load(f)
-        assert data["version"] == 2
+        assert data["version"] == 3
         assert "_metadata" in data
 
 

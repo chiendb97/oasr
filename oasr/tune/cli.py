@@ -217,10 +217,16 @@ def _cmd_build(args) -> int:
     for family in want:
         out = _resolve_out(args.out, sm, family)
         base = database.load_file(out, family, sm) if (out.is_file() and not args.fresh) else None
+        since = None if base is None else base.to_json()
         tf = builders[family](merged, sm=sm, opts=opts, base=base)
         if args.note:
             tf.provenance["notes"] = list(args.note)
-        database.save_file(tf, out)
+        if args.fresh:
+            database.save_file(tf, out)
+        else:
+            # Merged under the file's lock: a build takes minutes, and whatever
+            # another process wrote to the file meanwhile is kept.
+            tf = database.save_merged(tf, out, since=since)
         print(f"[build] {family}: {len(tf.entries)} entries, {len(tf.configs)} configs -> {out}")
     return 0
 

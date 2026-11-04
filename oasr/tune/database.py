@@ -44,6 +44,23 @@ every time it resolves.  A stale entry can therefore only be *slower* than a
 fresh tune, never invalid -- and dropping it would trade a measured choice for
 the untuned default.  Staleness is reported (:func:`tuning_report`) so it gets
 re-measured rather than trusted forever.
+
+The soft validators describe the *entries*, not the last writer.  A file is
+stamped with the validators of the process that writes it, and an entry that
+process did not measure keeps the validators it was measured under as its own
+(:attr:`Entry.soft`, set by :func:`stamp_current`) -- re-stamping a file used to
+vouch for every entry in it, measured under another kernel version or not.  An
+entry that mixes measurements from two validator sets keeps the older one, so it
+stays reported stale until it is rebuilt.
+
+Writers
+-------
+Every write to a file another process may also write goes through
+:func:`update_file` or :func:`save_merged`: under the file's lock, re-read what
+is on disk, apply this writer's own changes to it, and write it back atomically.
+A build reads its base minutes before it writes, and the JIT tier accumulates
+points for a whole run, so the plain read-modify-write they used lost every
+entry another process wrote in between.
 """
 
 from __future__ import annotations
@@ -62,6 +79,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import filelock
+
 logger = logging.getLogger("oasr.tune")
 
 __all__ = [
@@ -78,6 +97,9 @@ __all__ = [
     "user_path",
     "load_file",
     "save_file",
+    "save_merged",
+    "update_file",
+    "stamp_current",
     "tiers",
     "reload",
     "epoch",
@@ -175,6 +197,10 @@ class Entry:
     source: str = "aot"
     #: Free-text provenance carried with the entry (why a boundary is where it is).
     notes: List[str] = field(default_factory=list)
+    #: The soft validators this entry was measured under, when they are not the
+    #: file's own: ``None`` means the file's.  Set by :func:`stamp_current` when
+    #: a writer re-stamps a file whose entries it did not measure.
+    soft: Optional[Dict[str, Any]] = None
 
     def lookup(self, m: int) -> Optional[str]:
         return region_lookup(self.regions, m)
@@ -196,6 +222,8 @@ class Entry:
             out["notes"] = list(self.notes)
         if self.evidence:
             out["evidence"] = self.evidence
+        if self.soft is not None:
+            out["soft"] = dict(self.soft)
         return out
 
     @classmethod
@@ -213,6 +241,7 @@ class Entry:
             evidence=d.get("evidence", {}),
             source=str(d.get("source", "aot")),
             notes=[str(n) for n in d.get("notes", [])],
+            soft=dict(d["soft"]) if isinstance(d.get("soft"), dict) else None,
         )
 
 
@@ -397,10 +426,28 @@ def _hard_problems(tf: TuningFile, family: str, arch_family: int) -> List[str]:
 
 
 def _stale_reasons(tf: TuningFile) -> List[str]:
-    """Soft-validator mismatches, as human-readable reasons."""
+    """Soft-validator mismatches, as human-readable reasons.
+
+    The file's own stamp covers the entries that carry none; an entry measured
+    under other validators (:attr:`Entry.soft`) is reported against its own.
+    """
     current = current_soft_validators(tf.family)
+    reasons = _soft_mismatches(tf.validators.get("soft", {}), current)
+    own: Dict[str, Tuple[Dict[str, Any], int]] = {}
+    for entry in tf.entries.values():
+        if entry.soft is not None:
+            tag = json.dumps(entry.soft, sort_keys=True)
+            saved, n = own.get(tag, (entry.soft, 0))
+            own[tag] = (saved, n + 1)
+    for saved, n in own.values():
+        for reason in _soft_mismatches(saved, current):
+            reasons.append(f"{n} entr{'y' if n == 1 else 'ies'} measured under {reason}")
+    return reasons
+
+
+def _soft_mismatches(saved_validators: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
     reasons = []
-    for key, saved in sorted(tf.validators.get("soft", {}).items()):
+    for key, saved in sorted(saved_validators.items()):
         now = current.get(key)
         if now is None or saved in (None, "*"):
             continue
@@ -460,6 +507,115 @@ def save_file(tf: TuningFile, path: Path) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def stamp_current(tf: TuningFile, validators: Optional[Dict[str, Any]] = None) -> None:
+    """Stamp *tf* with this process's soft validators, without vouching for its entries.
+
+    Every entry that carries no validators of its own was measured under the
+    file's old stamp, so it is given that stamp before the file's changes: the
+    entries this writer then measures are the ones the new stamp describes.
+    An entry whose own validators equal the new stamp drops them again.
+    """
+    now = dict(current_soft_validators(tf.family) if validators is None else validators)
+    old = dict(tf.validators.get("soft", {}))
+    if old != now:
+        for entry in tf.entries.values():
+            if entry.soft is None:
+                entry.soft = old
+    for entry in tf.entries.values():
+        if entry.soft == now:
+            entry.soft = None
+    tf.validators["soft"] = now
+    tf._stale = None
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path, timeout: float = 60.0):
+    """The lock every writer of *path* takes around its read-merge-write.
+
+    Held for the merge and the write only, never for a build, so a waiter waits
+    milliseconds.  ``filelock.Timeout`` is an ``OSError``.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with filelock.FileLock(f"{path}.lock", timeout=timeout):
+        yield
+
+
+def update_file(
+    path: Path,
+    family: str,
+    arch_family: int,
+    lane: str,
+    apply: Callable[[TuningFile], None],
+) -> TuningFile:
+    """Apply *apply* to the file at *path* as it is now, under its lock, and write it.
+
+    The file is re-read under the lock, so whatever another writer put there
+    since this one last looked survives: *apply* adds this writer's changes to
+    it rather than replacing it.  It is stamped (:func:`stamp_current`) before
+    *apply* runs, so what *apply* adds is what the new stamp describes.
+    """
+    path = Path(path)
+    with _file_lock(path):
+        tf = load_file(path, family, arch_family) if path.is_file() else None
+        if tf is None:
+            tf = new_file(family, arch_family, lane)
+        stamp_current(tf)
+        apply(tf)
+        save_file(tf, path)
+    return tf
+
+
+def _measured_content(entry_json: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in entry_json.items() if k != "soft"}
+
+
+def save_merged(
+    tf: TuningFile, path: Path, *, since: Optional[Dict[str, Any]] = None
+) -> TuningFile:
+    """Write the entries *tf* changed since *since* into the file at *path*.
+
+    For a build: *since* is its base's ``to_json()`` taken when it was loaded,
+    before the build changed it, and *tf* is the build's result.  An entry the
+    build added or re-measured replaces the one on disk; every other entry on
+    disk -- including one another process wrote while this build ran -- is kept
+    as the disk has it, with the validators it was measured under.  An entry the
+    build dropped is dropped from disk too, unless it changed there meanwhile.
+    Configs and the coverage basis are unions, and the build's device model
+    wins.  Under the file's lock, like :func:`update_file`.
+    """
+    path = Path(path)
+    before = (since or {}).get("entries", {})
+    changed = [
+        key
+        for key, entry in tf.entries.items()
+        if key not in before or _measured_content(entry.to_json()) != _measured_content(before[key])
+    ]
+    dropped = [key for key in before if key not in tf.entries]
+    with _file_lock(path):
+        disk = load_file(path, tf.family, tf.arch_family) if path.is_file() else None
+        if disk is None:
+            save_file(tf, path)
+            return tf
+        stamp_current(disk, tf.validators.get("soft", {}))
+        for key in changed:
+            disk.entries[key] = tf.entries[key]
+        for key in dropped:
+            # Only the entry the build started from: one another process
+            # re-measured meanwhile is newer than this build's decision.
+            on_disk = disk.entries.get(key)
+            if on_disk is not None and _measured_content(on_disk.to_json()) == (
+                _measured_content(before[key])
+            ):
+                del disk.entries[key]
+        disk.configs.update(tf.configs)
+        disk.coverage_basis = list(dict.fromkeys(disk.coverage_basis + tf.coverage_basis))
+        if tf.model:
+            disk.model = tf.model
+        disk.provenance.update(tf.provenance)
+        save_file(disk, path)
+    return disk
 
 
 def new_file(family: str, arch_family: int, lane: str) -> TuningFile:
@@ -571,10 +727,12 @@ def register_reload_hook(fn: Callable[[], None]) -> None:
 # The user-tier writer (JIT tuning results)
 # =============================================================================
 
-#: ``(family, arch family) -> the user file being accumulated``, flushed by
-#: :func:`flush_user`.  Writes never touch the snapshot a running selection
-#: reads: they take effect at the next :func:`reload`.
-_PENDING: Dict[Tuple[str, int], TuningFile] = {}
+#: ``(family, arch family) -> (lane, the points recorded since the last flush)``,
+#: flushed by :func:`flush_user`.  Only this process's own points: the file they
+#: go into is read at the flush, under its lock, so the points another process
+#: flushed in between are kept.  Writes never touch the snapshot a running
+#: selection reads: they take effect at the next :func:`reload`.
+_PENDING: Dict[Tuple[str, int], Tuple[str, List[Tuple[Any, ...]]]] = {}
 
 
 def regions_from_points(points: Dict[str, str]) -> List[Tuple[Optional[int], str]]:
@@ -615,33 +773,41 @@ def record_point(
         return False
     key = (family, int(arch_family))
     with _lock:
-        tf = _PENDING.get(key)
-        if tf is None:
-            tf = load_file(path, family, arch_family) or new_file(family, arch_family, lane)
-            _PENDING[key] = tf
-        tf.configs[config_id] = dict(params)
-        entry = tf.entries.setdefault(sig, Entry(source=source))
-        points = entry.evidence.setdefault("points", {})
-        points[str(int(m))] = config_id
-        if timings:
-            entry.evidence.setdefault("timings", {})[f"M={int(m)}"] = timings
-        entry.regions = regions_from_points(points)
-        entry.source = source
+        _lane, points = _PENDING.setdefault(key, (lane, []))
+        points.append((sig, int(m), config_id, dict(params), timings, source))
     return True
 
 
+def _apply_points(tf: TuningFile, points: Sequence[Tuple[Any, ...]]) -> None:
+    for sig, m, config_id, params, timings, source in points:
+        tf.configs[config_id] = params
+        entry = tf.entries.setdefault(sig, Entry(source=source))
+        measured = entry.evidence.setdefault("points", {})
+        measured[str(m)] = config_id
+        if timings:
+            entry.evidence.setdefault("timings", {})[f"M={m}"] = timings
+        entry.regions = regions_from_points(measured)
+        entry.source = source
+
+
 def flush_user(reload_after: bool = True) -> List[Path]:
-    """Write every pending user-tier file; start a new epoch if anything was written."""
+    """Write every pending point into its user-tier file; start a new epoch if any.
+
+    Each file is read and written under its lock (:func:`update_file`), so a
+    point another process flushed meanwhile survives this one's flush.  A point
+    added to an entry measured under other validators leaves that entry stale.
+    """
     with _lock:
         pending = dict(_PENDING)
         _PENDING.clear()
     written = []
-    for (family, arch_family), tf in pending.items():
+    for (family, arch_family), (lane, points) in pending.items():
         path = user_path(arch_family, family)
         if path is None:
             continue
-        tf.validators["soft"] = current_soft_validators(family)
-        save_file(tf, path)
+        update_file(
+            path, family, arch_family, lane, functools.partial(_apply_points, points=points)
+        )
         written.append(path)
     if written and reload_after:
         reload()

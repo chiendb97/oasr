@@ -472,6 +472,29 @@ class TestBuildEndToEnd:
         for _hi, cid in entry.regions:
             assert cid in tf.configs
 
+    def test_a_build_does_not_vouch_for_base_entries_it_did_not_measure(self, user_db, tmp_path):
+        """The builder re-stamped its base with this machine's validators, so an
+        entry measured under an older toolchain read as current after any build."""
+        import oasr.jit.gemm as jg
+        from oasr.tune.build import BuildOptions, build_gemm
+        from oasr.tune.census import ShapePoint, ShapeSet
+
+        sm = jg._get_target_sm()
+        base = db.new_file("gemm", sm, jg.GEMM_LANE_BY_SM[sm])
+        base.validators["soft"] = {"nvcc": "OLD"}
+        base.configs["torch"] = {"kind": "torch"}
+        untouched = jg.gemm_sig_key("gemm", 4096, 1024)
+        base.entries[untouched] = db.Entry(regions=[(64, "torch")], source="jit")
+        pts = [ShapePoint("gemm", 256, 256, "float16", 1, 16, 1.0, 1.0, True)]
+        tf = build_gemm(
+            ShapeSet(pts, 256 * 256 * 2),
+            sm=sm,
+            base=base,
+            opts=BuildOptions(top_k=4, fill=False, log_path=str(tmp_path / "m.jsonl")),
+        )
+        assert any("measured under nvcc: saved 'OLD'" in r for r in tf.stale), tf.stale
+        assert tf.entries[jg.gemm_sig_key("gemm", 256, 256)].soft is None
+
     def test_a_resumed_build_measures_nothing_and_matches(self, user_db, tmp_path, monkeypatch):
         """A checkpoint makes a preempted build resume, not re-measure (and not drift)."""
         import oasr.jit.gemm as jg
@@ -553,3 +576,169 @@ class TestModelTierNumerics:
             if isinstance(c, str) or c is jg.GEMM_DEFAULT:
                 continue
             assert c.split_k == 1 or c.parallel_split_k, (M, N, K, c.name)
+
+
+# ---------------------------------------------------------------------------
+# User-tier writes merge under a lock, and keep what each entry was measured
+# under (audit G19)
+# ---------------------------------------------------------------------------
+
+
+def _sig(n):
+    return f"gemm|op=gemm|dt=fp16|N={n}|K=64"
+
+
+def _file_with(path, entries, soft=None):
+    tf = db.new_file("gemm", 120, "sm80_mma")
+    if soft is not None:
+        tf.validators["soft"] = dict(soft)
+    tf.configs["torch"] = {"kind": "torch"}
+    for n in entries:
+        tf.entries[_sig(n)] = db.Entry(regions=[(64, "torch")], source="jit")
+    db.save_file(tf, path)
+    return tf
+
+
+class TestUserTierWritesMerge:
+    """``save_file`` was atomic, but the read-modify-write around it was not
+    locked: a writer loaded the file, took minutes to measure, and wrote its
+    copy back over whatever another process had written in between."""
+
+    def test_a_flush_keeps_what_another_writer_wrote_meanwhile(self, user_db):
+        path = db.user_path(120, "gemm")
+        db.record_point("gemm", 120, "sm80_mma", _sig(512), 64, "torch", {"kind": "torch"})
+        _file_with(path, [1024])  # another process's write, after this one's snapshot
+        db.flush_user(reload_after=False)
+        back = db.load_file(path, "gemm", 120)
+        assert set(back.entries) == {_sig(512), _sig(1024)}
+
+    def test_writers_flushing_together_all_land(self, user_db, tmp_path):
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        import oasr
+
+        child = tmp_path / "child.py"
+        child.write_text(
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from oasr.tune import database as db\n"
+            "n, go = int(sys.argv[1]), Path(sys.argv[2])\n"
+            "db.record_point('gemm', 120, 'sm80_mma', f'gemm|op=gemm|dt=fp16|N={n}|K=64', 64,"
+            " 'torch', {'kind': 'torch'})\n"
+            "Path(f'{go}.{n}').write_text('ready')\n"
+            "while not go.exists():\n"
+            "    time.sleep(0.002)\n"
+            "db.flush_user(reload_after=False)\n"
+        )
+        # The tree under test, not the editable install a temp script would import.
+        env = dict(
+            os.environ,
+            OASR_TUNE_USER_DB=str(user_db),
+            PYTHONPATH=str(Path(oasr.__file__).resolve().parents[1]),
+        )
+        go = tmp_path / "go"
+        ns = (256, 512, 768, 1024, 1280, 1536)
+        procs = [
+            subprocess.Popen([sys.executable, str(child), str(n), str(go)], env=env) for n in ns
+        ]
+        deadline = time.monotonic() + 120
+        while not all(Path(f"{go}.{n}").exists() for n in ns):
+            assert time.monotonic() < deadline, "the writers never got ready"
+            time.sleep(0.02)
+        go.write_text("go")
+        assert all(p.wait(timeout=120) == 0 for p in procs)
+        back = db.load_file(db.user_path(120, "gemm"), "gemm", 120)
+        assert set(back.entries) == {_sig(n) for n in ns}
+
+    def test_a_merged_build_keeps_entries_written_while_it_ran(self, user_db):
+        path = db.user_path(120, "gemm")
+        base = _file_with(path, [256, 512, 768, 1280])
+        since = base.to_json()
+        built = db.load_file(path, "gemm", 120)
+        built.entries[_sig(256)] = db.Entry(regions=[(128, "torch")], source="aot")  # re-measured
+        del built.entries[_sig(512)]  # nothing beat the default
+        del built.entries[_sig(768)]
+        # 1280: the build left it alone.  Meanwhile another process re-measured
+        # 768 and 1280 and added 1024.
+        other = db.load_file(path, "gemm", 120)
+        other.entries[_sig(768)] = db.Entry(regions=[(32, "torch")], source="jit")
+        other.entries[_sig(1280)] = db.Entry(regions=[(16, "torch")], source="jit")
+        other.entries[_sig(1024)] = db.Entry(regions=[(64, "torch")], source="jit")
+        db.save_file(other, path)
+        db.save_merged(built, path, since=since)
+        back = db.load_file(path, "gemm", 120)
+        assert back.entries[_sig(256)].regions == [(128, "torch")]
+        assert _sig(512) not in back.entries
+        assert back.entries[_sig(768)].regions == [(32, "torch")], "a newer entry was dropped"
+        assert back.entries[_sig(1280)].regions == [
+            (16, "torch")
+        ], "an untouched entry was reverted"
+        assert _sig(1024) in back.entries
+
+
+class TestSoftValidatorsDescribeTheEntries:
+    """A write re-stamped the whole file with the writer's validators, so an
+    entry measured under another kernel version read as current."""
+
+    OLD, NEW = {"nvcc": "OLD"}, {"nvcc": "NEW"}
+
+    @pytest.fixture
+    def now_new(self, monkeypatch):
+        monkeypatch.setattr(db, "current_soft_validators", lambda family: dict(self.NEW))
+
+    def test_a_flush_does_not_vouch_for_entries_it_did_not_measure(self, user_db, now_new):
+        path = db.user_path(120, "gemm")
+        _file_with(path, [1024], soft=self.OLD)
+        db.record_point("gemm", 120, "sm80_mma", _sig(512), 64, "torch", {"kind": "torch"})
+        db.flush_user(reload_after=False)
+        back = db.load_file(path, "gemm", 120)
+        assert back.validators["soft"] == self.NEW
+        assert back.entries[_sig(1024)].soft == self.OLD
+        assert back.entries[_sig(512)].soft is None
+        assert back.stale == ["1 entry measured under nvcc: saved 'OLD', now 'NEW'"]
+
+    def test_an_old_reader_sees_the_new_entry_as_the_stale_one(self, user_db, monkeypatch):
+        path = db.user_path(120, "gemm")
+        _file_with(path, [1024], soft=self.OLD)
+        monkeypatch.setattr(db, "current_soft_validators", lambda family: dict(self.NEW))
+        db.record_point("gemm", 120, "sm80_mma", _sig(512), 64, "torch", {"kind": "torch"})
+        db.flush_user(reload_after=False)
+        monkeypatch.setattr(db, "current_soft_validators", lambda family: dict(self.OLD))
+        back = db.load_file(path, "gemm", 120)
+        # The file's NEW stamp covers the entry just measured, and only that one:
+        # the old entry carries its own OLD, so to this reader it is current.
+        assert back.entries[_sig(1024)].soft == self.OLD
+        assert back.entries[_sig(512)].soft is None
+        assert back.stale == ["nvcc: saved 'NEW', now 'OLD'"]
+
+    def test_a_point_added_to_an_old_entry_leaves_it_stale(self, user_db, now_new):
+        """Its other points are still the old measurements."""
+        path = db.user_path(120, "gemm")
+        _file_with(path, [1024], soft=self.OLD)
+        db.record_point("gemm", 120, "sm80_mma", _sig(1024), 128, "torch", {"kind": "torch"})
+        db.flush_user(reload_after=False)
+        back = db.load_file(path, "gemm", 120)
+        assert back.entries[_sig(1024)].soft == self.OLD
+
+    def test_a_build_restamps_without_vouching(self, tmp_path, now_new):
+        tf = _file_with(tmp_path / "f.json", [256, 512], soft=self.OLD)
+        db.stamp_current(tf)
+        tf.entries[_sig(512)] = db.Entry(regions=[(64, "torch")], source="aot")  # rebuilt
+        assert tf.entries[_sig(256)].soft == self.OLD and tf.entries[_sig(512)].soft is None
+
+    def test_an_entry_back_on_its_own_validators_drops_them(self, tmp_path, monkeypatch):
+        tf = _file_with(tmp_path / "f.json", [256], soft=self.OLD)
+        db.stamp_current(tf, self.NEW)
+        db.stamp_current(tf, self.OLD)
+        assert tf.entries[_sig(256)].soft is None and tf.validators["soft"] == self.OLD
+
+    def test_a_file_without_per_entry_validators_loads_as_before(self, tmp_path):
+        path = tmp_path / "f.json"
+        tf = _file_with(path, [256], soft=self.OLD)
+        assert "soft" not in json.loads(path.read_text())["entries"][_sig(256)]
+        back = db.load_file(path, "gemm", 120)
+        assert back.entries[_sig(256)].soft is None and back.to_json() == tf.to_json()
