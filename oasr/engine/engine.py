@@ -6,11 +6,10 @@ from __future__ import annotations
 
 import functools
 import logging
-import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -20,6 +19,7 @@ from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
 
 from . import gc_freeze
+from .admission_prep import AdmissionPrep
 from .config import EngineConfig
 from .decode import EncodeOutput, get_decode_strategy_class
 from .executor import (
@@ -408,25 +408,18 @@ class ASREngine:
 
         # Admission-prep overlap (offline only): a daemon thread runs the
         # per-request ``prepare_offline`` (waveform normalise + frame-count
-        # stamp) off the caller/step thread so it overlaps the GPU ``step()``.
-        # The thread is lock-free — it only prepares and hands finished
-        # requests to ``step()`` via ``_prep_out``; ``step`` drains that queue
-        # under the engine lock it already holds.  ``_admit_inflight`` counts
-        # requests accepted but not yet in the scheduler so ``num_waiting``
-        # (and the dispatcher's idle check) account for in-flight prep.
+        # stamp) off the caller/step thread so it overlaps the GPU ``step()``,
+        # which admits what it prepared under the engine lock it already holds.
+        # ``AdmissionPrep`` owns the requests in between: it counts them as
+        # waiting, returns a failed prep for an error output, and lets an abort
+        # withdraw them.
         self._overlap_admit: bool = bool(
             getattr(config, "overlap_admit", False) and config.service_mode == "offline"
         )
-        self._prep_in: "queue.Queue[Optional[Request]]" = queue.Queue()
-        self._prep_out: "queue.Queue[Request]" = queue.Queue()
-        self._admit_inflight: int = 0
-        self._admit_inflight_lock = threading.Lock()
-        self._prep_thread: Optional[threading.Thread] = None
+        self._prep: Optional[AdmissionPrep] = None
         if self._overlap_admit:
-            self._prep_thread = threading.Thread(
-                target=self._prep_loop, name="oasr-admit-prep", daemon=True
-            )
-            self._prep_thread.start()
+            self._prep = AdmissionPrep(self._input_processor.prepare_offline)
+            self._prep.start()
 
         # Long-form fan-out is meaningful only for a fixed-window
         # frontend: without one, a long request already decodes end to end and
@@ -1116,16 +1109,13 @@ class ASREngine:
             tracker.register(parent_id, child_ids, starts, ends)
             try:
                 if self._overlap_admit:
-                    with self._admit_inflight_lock:
-                        self._admit_inflight += len(children)
-                    for child in children:
-                        self._prep_in.put(child)
+                    self._admission_prep().submit(children)
                 else:
                     for child in children:
                         self._executor.admit(child)
             except Exception:
                 for cid in tracker.abandon(parent_id):
-                    self._executor.abort(cid)
+                    self._abort_admitted(cid)
                 raise
         return parent_id
 
@@ -1204,9 +1194,7 @@ class ASREngine:
             # Raise on the caller's thread: a fixed-window violation surfaced
             # from the prep thread would only be logged.
             self._input_processor.check_audio_duration(req.audio)
-            with self._admit_inflight_lock:
-                self._admit_inflight += 1
-            self._prep_in.put(req)
+            self._admission_prep().submit([req])
             return req.request_id
         with self._lock:
             self._validate_mode(streaming)
@@ -1335,8 +1323,8 @@ class ASREngine:
         returns their ids immediately, and hands the requests to the prep
         thread.  The ``prepare_offline`` (waveform normalise + frame stamp)
         then runs off the step thread; ``step()`` admits prepared
-        requests to the scheduler.  ``_admit_inflight`` is bumped before
-        queueing so :attr:`num_waiting` reflects work the scheduler can't see
+        requests to the scheduler.  Each is held by :class:`AdmissionPrep` before it
+        is queued, so :attr:`num_waiting` reflects work the scheduler can't see
         yet (otherwise the dispatcher could idle-wait past pending admits).
 
         Per-spec rejections are reported like the non-overlap path: an invalid
@@ -1369,52 +1357,46 @@ class ASREngine:
                 reqs.append(req)
             results.append({"request_id": req.request_id})
         if reqs:
-            with self._admit_inflight_lock:
-                self._admit_inflight += len(reqs)
-            for req in reqs:
-                self._prep_in.put(req)
+            self._admission_prep().submit(reqs)
         return results
 
-    def _prep_loop(self) -> None:
-        """Daemon: prepare queued offline requests off the step thread.
+    def _drain_prepared(self) -> List[RequestOutput]:
+        """Admit every request the prep thread has finished with.
 
-        Runs ``prepare_offline`` (lock-free — touches only the request) then
-        hands the request to ``_prep_out`` for ``step()`` to admit.  Never
-        acquires the engine lock, so it makes progress even while ``run()``
-        holds it across a drain loop.  A ``None`` sentinel stops the thread.
+        Returns an error output for each one whose prep raised.  The caller
+        holds the engine lock (this runs at the head of :meth:`step`), so an
+        abort cannot fall between a request's release and its admission.
+        Admitted through the executor, not straight into the scheduler, so its
+        audio is counted.
         """
-        while True:
-            req = self._prep_in.get()
-            if req is None:
-                return
-            try:
-                self._input_processor.prepare_offline(req)
-                self._prep_out.put(req)
-            except Exception:  # pragma: no cover - defensive
-                logger.exception(
-                    "admit-prep failed for request %s", getattr(req, "request_id", "?")
-                )
-                with self._admit_inflight_lock:
-                    self._admit_inflight -= 1
+        executor = cast(OfflineExecutor, self._executor)
+        rejected: List[RequestOutput] = []
+        for req, exc in self._admission_prep().drain():
+            if exc is None:
+                executor.admit_prepared(req)
+            else:
+                rejected.append(executor.reject_prep(req, exc))
+        return rejected
 
-    def _drain_prepared(self) -> None:
-        """Admit all prepared requests to the scheduler.  Caller holds the
-        engine lock (invoked at the head of :meth:`step`)."""
-        n = 0
-        while True:
-            try:
-                req = self._prep_out.get_nowait()
-            except queue.Empty:
-                break
-            self._scheduler.add_request(req)
-            n += 1
-        if n:
-            with self._admit_inflight_lock:
-                self._admit_inflight -= n
+    def _admission_prep(self) -> AdmissionPrep:
+        prep = self._prep
+        if prep is None:  # pragma: no cover - _overlap_admit is set with it
+            raise RuntimeError("overlap_admit is off; there is no admission prep")
+        return prep
 
     def _num_admit_inflight(self) -> int:
-        with self._admit_inflight_lock:
-            return self._admit_inflight
+        return self._admission_prep().in_flight
+
+    def _abort_admitted(self, request_id: str) -> None:
+        """Abort one executor-level request, wherever admission has got to.
+
+        Under ``overlap_admit`` it may still be held for prep, which the
+        executor cannot see.  The executor is asked as well, since an id can
+        be reused.
+        """
+        if self._overlap_admit:
+            self._admission_prep().withdraw(request_id)
+        self._executor.abort(request_id)
 
     def shutdown(self) -> None:
         """Release engine-held resources (best-effort, idempotent).
@@ -1428,11 +1410,8 @@ class ASREngine:
         the garbage collector never will.  Measured: 3.24 GiB stranded per
         offline Nemotron engine before this released the pools.
         """
-        t = self._prep_thread
-        if t is not None and t.is_alive():
-            self._prep_in.put(None)
-            t.join(timeout=2.0)
-        self._prep_thread = None
+        if self._prep is not None:
+            self._prep.stop()
         try:
             self._executor.shutdown()
         except Exception:  # pragma: no cover - defensive; shutdown must not raise
@@ -1827,15 +1806,18 @@ class ASREngine:
         A long-form parent id is not known to the executor — the windows are —
         so aborting one has to abort every window it fanned out to, or the
         cancelled file keeps decoding and its outputs pile up in the tracker.
+        Under ``overlap_admit`` a request may not have reached the executor
+        yet, so it is withdrawn from admission prep as well; otherwise the next
+        step would admit it and decode it anyway.
         """
         with self._lock:
             if self._longform is not None:
                 children = self._longform.abandon(request_id)
                 if children:
                     for cid in children:
-                        self._executor.abort(cid)
+                        self._abort_admitted(cid)
                     return
-            self._executor.abort(request_id)
+            self._abort_admitted(request_id)
 
     # ------------------------------------------------------------------
     # Internal — checkpoint-derived specs (features + tokenizer)
@@ -1976,13 +1958,16 @@ class ASREngine:
     def step(self) -> List[RequestOutput]:
         """Execute one engine step — one call into the configured executor."""
         with self._lock:
+            rejected: List[RequestOutput] = []
             if self._overlap_admit:
                 # Admit requests the prep thread finished preparing since the
                 # last step (cheap scheduler enqueue under the lock we hold).
-                self._drain_prepared()
+                rejected = self._drain_prepared()
             nvtx_push("engine.step")
             outputs = self._executor.step()
             nvtx_pop()
+            if rejected:
+                outputs = rejected + outputs
             # Counted before long-form absorption, and only on finished
             # outputs.  Before, because the windows are what the decoder
             # actually generated and the stitched parent would report the same
