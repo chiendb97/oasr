@@ -253,11 +253,28 @@ class _CrossAttnCollector:
 
     def __init__(self, heads: Sequence[Tuple[int, int]], max_frames: Optional[int] = None) -> None:
         self._order = [(int(layer), int(head)) for layer, head in heads]
-        self._by_layer: Dict[int, List[int]] = {}
+        by_layer: Dict[int, List[int]] = {}
         for layer, head in self._order:
-            self._by_layer.setdefault(layer, []).append(head)
+            by_layer.setdefault(layer, []).append(head)
+        #: layer -> its requested heads, sorted and unique: the slots of ``probs``.
+        self._by_layer = {layer: sorted(set(hs)) for layer, hs in by_layer.items()}
         self._max_frames = max_frames
         self._got: Dict[Tuple[int, int], torch.Tensor] = {}
+
+    @staticmethod
+    def _heads(x: torch.Tensor, heads: List[int]) -> torch.Tensor:
+        """``x[:, heads]`` for a ``(B, H, ...)`` tensor, with no index tensor.
+
+        ``torch.tensor(heads, device=...)`` per captured layer was a blocking
+        copy from pageable memory: the host waited for every layer queued so far
+        before it could queue the next one.  A run of consecutive heads is a
+        slice; anything else stacks views.  Either way the result is contiguous,
+        as ``index_select``'s is: the heads are a transposed view, and a strided
+        operand takes another GEMM path that moves the scores' last bits.
+        """
+        if heads == list(range(heads[0], heads[-1] + 1)):
+            return x[:, heads[0] : heads[-1] + 1].contiguous()
+        return torch.stack([x[:, h] for h in heads], dim=1)
 
     def capture(
         self,
@@ -269,16 +286,15 @@ class _CrossAttnCollector:
         wanted = self._by_layer.get(layer_idx)
         if not wanted:
             return
-        idx = torch.tensor(sorted(set(wanted)), device=query.device)
-        q = attn.attn.split_heads(attn.q_proj(query)).index_select(1, idx)  # (B, n, T, d_k)
-        k = cross_k.index_select(1, idx).to(q.dtype)
+        q = self._heads(attn.attn.split_heads(attn.q_proj(query)), wanted)  # (B, n, T, d_k)
+        k = self._heads(cross_k, wanted).to(q.dtype)
         scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * attn.attn.softmax_scale
         # Softmax over **all** keys — that is the distribution the model used —
         # then keep only the frames that are real audio rather than 30 s padding.
         probs = scores.softmax(dim=-1)
         if self._max_frames is not None:
             probs = probs[..., : max(1, int(self._max_frames))]
-        for slot, head in enumerate(sorted(set(wanted))):
+        for slot, head in enumerate(wanted):
             self._got[(layer_idx, head)] = probs[:, slot]
 
     def stacked(self) -> torch.Tensor:

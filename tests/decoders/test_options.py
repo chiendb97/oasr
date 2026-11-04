@@ -439,6 +439,82 @@ class TestSelectNextTokens:
         assert len(set(tokens.tolist())) == 2
 
 
+def _old_select_next_tokens(logits, opts_rows):
+    """The sampler as it was: per-row draws read back with ``.item()``.
+
+    The oracle for "the same tokens, draw for draw": the fix moves where the
+    draws land, not how they are made.
+    """
+
+    def row_draw(row, o):
+        row = row / o.temperature
+        if o.top_k > 0 and o.top_k < row.numel():
+            kth = torch.topk(row, o.top_k).values[-1]
+            row = row.masked_fill(row < kth, float("-inf"))
+        if o.top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(row, descending=True)
+            cum = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+            cut = cum >= o.top_p
+            cut[..., 1:] = cut[..., :-1].clone()
+            cut[..., 0] = False
+            row = row.masked_fill(cut.scatter(0, sorted_idx, cut), float("-inf"))
+        return int(torch.multinomial(torch.softmax(row, dim=-1), num_samples=1).item())
+
+    tokens = logits.argmax(dim=-1)
+    for i, o in enumerate(opts_rows):
+        if o is not None and o.sampling:
+            tokens[i] = row_draw(logits[i], o)
+    return tokens
+
+
+_MIXED_OPTS = [
+    DecodingOptions(temperature=0.8, top_k=50, top_p=0.9),
+    None,
+    DecodingOptions(temperature=1.2, top_p=0.95),
+    DecodingOptions(),
+    DecodingOptions(temperature=0.7),
+    None,
+]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+class TestSamplingNeverWaitsForTheDevice:
+    """A sampled row cost up to three host syncs per step -- ``.item()`` on the
+    draw, ``tokens[i] = int`` and ``cut[..., 0] = False`` (a Python scalar into a
+    CUDA tensor is a blocking copy) -- each one stalling the host on the GPU."""
+
+    @staticmethod
+    def _logits(seed=0):
+        g = torch.Generator().manual_seed(seed)
+        return (torch.randn(len(_MIXED_OPTS), 4096, generator=g) * 4).cuda()
+
+    def test_no_sync(self):
+        import warnings
+
+        logits = self._logits()
+        select_next_tokens(logits, _MIXED_OPTS)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                select_next_tokens(logits, _MIXED_OPTS)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        syncs = [w for w in caught if "synchroniz" in str(w.message).lower()]
+        assert not syncs, [str(w.message) for w in syncs]
+
+    @pytest.mark.parametrize("seed", [0, 1, 7])
+    def test_the_same_tokens_draw_for_draw(self, seed):
+        """Per row and per draw, as before: a seeded run still draws what it drew."""
+        logits = self._logits(seed)
+        torch.manual_seed(seed)
+        want = _old_select_next_tokens(logits.clone(), _MIXED_OPTS)
+        torch.manual_seed(seed)
+        got = select_next_tokens(logits, _MIXED_OPTS)
+        assert torch.equal(got, want)
+
+
 class TestNbestTexts:
     def _op(self):
         # Bare facade with only the detokenizer (id-join fallback) — enough

@@ -234,6 +234,79 @@ class TestDecoderIncremental:
             torch.testing.assert_close(grown, prealloc)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+class TestCrossAttentionCollector:
+    """The word-timestamp pass built ``torch.tensor(heads, device=...)`` per
+    captured layer -- a blocking copy, so the host waited out every layer
+    queued so far before queuing the next.  It now picks heads with views."""
+
+    @staticmethod
+    def _pass(heads, collect_old=False):
+        from oasr.models.whisper.model import WhisperDecoder
+
+        torch.manual_seed(0)
+        cfg = _tiny_config(decoder_layers=3, decoder_attention_heads=4, d_model=64)
+        dec = WhisperDecoder(cfg).cuda().half().eval()
+        enc = torch.randn(2, 50, cfg.d_model, device="cuda", dtype=torch.float16)
+        ids = torch.randint(0, 60, (2, 7), device="cuda")
+        return dec, enc, ids
+
+    @pytest.mark.parametrize(
+        "heads",
+        [
+            [(0, 1), (1, 0), (1, 3), (2, 2)],  # non-consecutive within a layer: a stack
+            [(0, 1), (0, 2), (2, 0), (2, 1), (2, 2), (2, 3)],  # runs: slices
+            [(2, 3), (0, 0), (2, 1)],  # out of order across and within layers
+        ],
+    )
+    def test_the_alignment_heads_are_index_selects(self, heads):
+        """Against the reference the collector used to compute."""
+        import oasr.models.whisper.model as wm
+
+        dec, enc, ids = self._pass(heads)
+        with torch.inference_mode():
+            got, logits = dec.cross_attention(enc, ids, heads, max_frames=40)
+
+        def capture(self, layer_idx, attn, query, cross_k):
+            wanted = self._by_layer.get(layer_idx)
+            if not wanted:
+                return
+            idx = torch.tensor(sorted(set(wanted)), device=query.device)
+            q = attn.attn.split_heads(attn.q_proj(query)).index_select(1, idx)
+            k = cross_k.index_select(1, idx).to(q.dtype)
+            scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * attn.attn.softmax_scale
+            probs = scores.softmax(dim=-1)[..., :40]
+            for slot, head in enumerate(sorted(set(wanted))):
+                self._got[(layer_idx, head)] = probs[:, slot]
+
+        old = wm._CrossAttnCollector.capture
+        wm._CrossAttnCollector.capture = capture
+        try:
+            with torch.inference_mode():
+                want, want_logits = dec.cross_attention(enc, ids, heads, max_frames=40)
+        finally:
+            wm._CrossAttnCollector.capture = old
+        assert torch.equal(got, want) and torch.equal(logits, want_logits)
+
+    def test_no_sync(self):
+        import warnings
+
+        heads = [(0, 1), (1, 0), (1, 3), (2, 2)]
+        dec, enc, ids = self._pass(heads)
+        with torch.inference_mode():
+            dec.cross_attention(enc, ids, heads, max_frames=40)
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    dec.cross_attention(enc, ids, heads, max_frames=40)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        syncs = [w for w in caught if "synchroniz" in str(w.message).lower()]
+        assert not syncs, [str(w.message) for w in syncs]
+
+
 class TestDecoderMerge:
     """Two groups at *different* generation offsets sharing one forward.
 
