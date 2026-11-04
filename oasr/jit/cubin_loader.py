@@ -8,14 +8,19 @@
 # Provides file locking, atomic writes, and SHA256 verification.
 
 import hashlib
+import json
 import logging
 import os
+import socket
 import struct
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
 
 import filelock
+
+from .errors import JitBuildError, JitBuildLockTimeout
 
 logger = logging.getLogger("oasr.jit")
 
@@ -152,16 +157,71 @@ def atomic_write_bytes(destination: str, data: bytes) -> None:
             os.remove(temp_path)
 
 
+#: How often a process waiting on another's build says so, in seconds.
+WAIT_REPORT_S = 30.0
+
+#: How much of a failed build's message the failure record keeps.
+_FAILURE_TAIL = 4000
+
+
+def _read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _holder(lock_path: str) -> str:
+    """Who holds *lock_path*, as `` (pid P on H, for N s)``, or ``""`` if unknown."""
+    owner = _read_json(f"{lock_path}.owner")
+    if owner is None:
+        return ""
+    held = time.time() - float(owner.get("since", time.time()))
+    return f" (pid {owner.get('pid')} on {owner.get('host')}, for {held:.0f} s)"
+
+
+def _acquire(lock: filelock.FileLock, lib_path: str, timeout: float) -> None:
+    """Take *lock*, saying so every :data:`WAIT_REPORT_S` while another process builds.
+
+    A bare ``filelock.Timeout`` after ten minutes of silence was what a caller
+    saw before: no word of what it waited for or who held it.
+    """
+    start = time.monotonic()
+    deadline = start + timeout
+    while True:
+        try:
+            lock.acquire(timeout=max(0.0, min(WAIT_REPORT_S, deadline - time.monotonic())))
+            return
+        except filelock.Timeout:
+            waited = time.monotonic() - start
+            holder = _holder(lock.lock_file)
+            if time.monotonic() >= deadline:
+                raise JitBuildLockTimeout(
+                    f"gave up after {waited:.0f} s waiting for another process to finish "
+                    f"building {lib_path}{holder}. A build that long is still running, or "
+                    f"the lock {lock.lock_file} is held by a process that is not building."
+                ) from None
+            logger.warning(
+                "waiting %.0f s for another process to finish building %s%s",
+                waited,
+                lib_path,
+                holder,
+            )
+
+
 def locked_compile(
     lib_path: str,
     compile_fn,
-    lock_timeout: int = 600,
+    lock_timeout: float = 600,
 ) -> str:
     """Compile a shared library with file-lock protection, and publish it atomically.
 
     If another process is already compiling the same library, this
     blocks until the lock is released and then returns the existing
-    artifact.
+    artifact -- or, if that build failed, raises its failure rather than
+    repeating it.
 
     The library is built under a staging name and moved into place with
     ``os.replace`` once it is complete, so *lib_path* never names a partly
@@ -172,6 +232,19 @@ def locked_compile(
     atomic, existence is proof of completeness, which is what lets
     :meth:`~oasr.jit.core.JitSpec.build_and_load` check it without the lock.
 
+    **A failed build is shared with the processes that waited for it.**  The
+    builder records its failure (``<lib>.failed``: an attempt id and the
+    message) before it releases the lock, and a waiter that then finds a record
+    it had not seen before it started waiting raises :class:`JitBuildError`
+    with that message instead of building again.  Without it, *N* processes
+    starting together paid for *N* identical failed builds one after another,
+    and the later ones ran out of lock wait doing it.  A process that arrives
+    after the attempt -- the record was already there when it started waiting
+    -- builds again, so a cause fixed in between (disk space, a toolchain) is
+    picked up, and the record is removed when a build succeeds.  The one window
+    left: a waiter that reads the record in the instant between the builder
+    writing it and releasing the lock repeats the build once.
+
     Parameters
     ----------
     lib_path : str
@@ -180,8 +253,9 @@ def locked_compile(
         ``compile_fn(path)`` compiles the library to exactly ``path`` -- the
         staging name, not *lib_path*.  Called only if *lib_path* does not
         already hold a complete library.
-    lock_timeout : int
-        Maximum seconds to wait for the lock (default 600 = 10 min).
+    lock_timeout : float
+        Maximum seconds to wait for the lock (default 600 = 10 min).  A waiter
+        logs every :data:`WAIT_REPORT_S` and names the holder when it gives up.
 
     Returns
     -------
@@ -190,18 +264,38 @@ def locked_compile(
 
     Raises
     ------
-    filelock.Timeout
+    JitBuildLockTimeout
         If the lock cannot be acquired within *lock_timeout*.
+    JitBuildError
+        If the build this process waited for failed in the process holding the
+        lock.
+    Exception
+        Whatever *compile_fn* raised, when this process's own build failed.
     """
     lock_path = f"{lib_path}.lock"
+    failure_path = f"{lib_path}.failed"
     os.makedirs(os.path.dirname(lib_path), exist_ok=True)
-    lock = filelock.FileLock(lock_path, timeout=lock_timeout)
-
-    with lock:
+    seen = _read_json(failure_path)
+    lock = filelock.FileLock(lock_path)
+    _acquire(lock, lib_path, lock_timeout)
+    try:
         logger.debug("Acquired lock for %s", lib_path)
         if is_complete_shared_object(lib_path):
             logger.debug("Library already exists (compiled by another process): %s", lib_path)
             return lib_path
+        failure = _read_json(failure_path)
+        if failure is not None and failure.get("attempt") != (seen or {}).get("attempt"):
+            raise JitBuildError(
+                f"the build of {lib_path} that this process waited for failed in pid "
+                f"{failure.get('pid')} on {failure.get('host')}; not repeating it:\n"
+                f"{failure.get('error', '')}"
+            )
+        atomic_write_bytes(
+            f"{lock_path}.owner",
+            json.dumps(
+                {"pid": os.getpid(), "host": socket.gethostname(), "since": time.time()}
+            ).encode(),
+        )
         if os.path.exists(lib_path):
             # Only a cache written before the publish was atomic can hold one.
             logger.warning("%s is truncated (a link was killed mid-write); rebuilding", lib_path)
@@ -211,7 +305,22 @@ def locked_compile(
         # between it and being called up to date.
         if os.path.exists(staging):
             os.remove(staging)
-        compile_fn(staging)
+        try:
+            compile_fn(staging)
+        except Exception as exc:
+            atomic_write_bytes(
+                failure_path,
+                json.dumps(
+                    {
+                        "attempt": uuid.uuid4().hex,
+                        "pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "time": time.time(),
+                        "error": str(exc)[-_FAILURE_TAIL:],
+                    }
+                ).encode(),
+            )
+            raise
         # On disk before the final name points at it, so a crash right after the
         # rename cannot leave the name on an empty file.
         fd = os.open(staging, os.O_RDONLY)
@@ -220,5 +329,13 @@ def locked_compile(
         finally:
             os.close(fd)
         os.replace(staging, lib_path)
+        if os.path.exists(failure_path):
+            os.remove(failure_path)
+    finally:
+        try:
+            os.remove(f"{lock_path}.owner")
+        except OSError:
+            pass
+        lock.release()
 
     return lib_path

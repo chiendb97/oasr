@@ -288,6 +288,44 @@ lock instead of loading it, and a build killed mid-link leaves only the
 also checks that every section and segment the ELF headers describe is in the
 file (`is_complete_shared_object`) and rebuilds a library that fails.
 
+A failed build is not repeated:
+- **In one process:** once a module's build fails, later calls raise
+  `oasr.jit.errors.JitBuildError` with the original error, without building.
+  The failure belongs to the key, meaning the same sources, flags and tools.
+  The module getters are `functools.cache`-wrapped, and that caches results but
+  not exceptions, so each call used to pay for the whole compile again.
+  `oasr.jit.core.forget_failed_builds()` re-arms the build once the cause is
+  fixed, and `clear_cache()` does the same.
+- **Across processes:** a process that was waiting on the build lock when the
+  build failed gets that failure too, instead of running the same build after
+  it. The builder records its failure in `<name>.so.failed` before releasing
+  the lock. A process that arrives after the failure builds again, so a fixed
+  cause is picked up.
+- **While waiting:** a waiter logs every 30 s, naming the process that holds
+  the lock. After `lock_timeout` (600 s) it raises `JitBuildLockTimeout`. A
+  timeout is not a build failure and is not remembered.
+
+Nothing removes old keys automatically. Every change to a header, a flag or
+the toolchain leaves the previous key behind, and so does every one-off
+module. `oasr jit prune` removes them explicitly:
+
+```bash
+oasr jit prune --dry-run                 # list what would go
+oasr jit prune --unused-days 30          # remove keys nothing has loaded in 30 days
+oasr jit prune --unused-days 7 --keep 0  # also let a whole unused module go
+```
+
+How the prune decides:
+- **When a key was last used:** every load touches `last_used` in its key's
+  directory. A key built before that stamp existed has only its library's build
+  time to go on.
+- **What it always keeps:** each module's `--keep` most recently used keys
+  (default 1), however old.
+- **What it never touches:** a key whose build holds its lock.
+- **When to run it:** when no OASR process is starting up. A process that has
+  found a library but not yet loaded it would fail if the prune removed it in
+  between. A process that already loaded a library keeps running on it.
+
 The default flags (`core._default_cuda_cflags`) include `-DNDEBUG`, which is
 how CUTLASS's own release builds compile. Without it, CuTe's device-side
 `assert()`s become `__assertfail` calls inside the GEMM mainloop, and ptxas

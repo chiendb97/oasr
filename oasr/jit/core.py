@@ -15,8 +15,11 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import filelock
 
 from . import env
 from .cpp_ext import (
@@ -30,8 +33,34 @@ from .cubin_loader import (
     locked_compile,
     write_if_different,
 )
+from .errors import JitBuildError, JitBuildLockTimeout
 
 logger = logging.getLogger("oasr.jit")
+
+#: Library path -> the message of its build's failure in this process.
+#:
+#: Keyed by the path, so by the cache key: the same sources, flags and tools.
+#: A build that failed under them fails again, and a retry costs the whole
+#: compile -- minutes for a CUTLASS module -- on every call, because the module
+#: getters are ``functools.cache``-wrapped and ``functools.cache`` does not
+#: remember an exception.  See :meth:`JitSpec.build_and_load`.
+_FAILED_BUILDS: Dict[str, str] = {}
+
+#: How much of a failure's message is kept.
+_FAILURE_TAIL = 4000
+
+#: Touched in a key's directory each time its library is loaded, for
+#: :func:`prune_cache`.
+_LAST_USED = "last_used"
+
+
+def forget_failed_builds() -> None:
+    """Retry every module whose build failed in this process, on its next use.
+
+    For a cause fixed without restarting -- disk space freed, a toolchain
+    installed.  :func:`clear_cache` does this too.
+    """
+    _FAILED_BUILDS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -479,16 +508,52 @@ class JitSpec:
         atomic rename, so a library under the final name is a finished one.
         It is still a completeness check, not an existence check, because a
         truncated library kills the process in ``dlopen`` rather than raising.
+
+        A build that failed is **not retried in this process**: the next call
+        raises :class:`~oasr.jit.errors.JitBuildError` carrying the first
+        failure, at once.  The failure is a property of the key -- the same
+        sources, flags and tools -- and every family's module getter is
+        ``functools.cache``-wrapped, which remembers results but not
+        exceptions, so each call used to pay the whole compile again.
+        :func:`forget_failed_builds` re-arms it; a lock-wait timeout is not a
+        build failure and is not remembered.
         """
         lib_path = self._get_lib_path()
+        failed = _FAILED_BUILDS.get(str(lib_path))
+        if failed is not None:
+            raise JitBuildError(
+                f"module {self.name!r} failed to build earlier in this process and is not "
+                f"rebuilt (oasr.jit.core.forget_failed_builds() retries it). The failure:\n"
+                f"{failed}"
+            )
         if not is_complete_shared_object(lib_path):
-            locked_compile(str(lib_path), self._compile)
+            try:
+                locked_compile(str(lib_path), self._compile)
+            except JitBuildLockTimeout:
+                raise
+            except Exception as exc:
+                _FAILED_BUILDS[str(lib_path)] = str(exc)[-_FAILURE_TAIL:]
+                raise
         import tvm_ffi
 
         from .errors import register as register_errors
 
         register_errors()
-        return tvm_ffi.load_module(str(lib_path))
+        module = tvm_ffi.load_module(str(lib_path))
+        _mark_used(lib_path.parent)
+        return module
+
+
+def _mark_used(key_dir: Path) -> None:
+    """Stamp a key directory as used now, for :func:`prune_cache`.  Never raises.
+
+    The library's own mtime is its build time, so a module built months ago and
+    loaded every day would read as unused without this.
+    """
+    try:
+        (key_dir / _LAST_USED).touch()
+    except OSError:  # a read-only cache is still a cache
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +682,128 @@ def gen_jinja_jit_spec(
 
 
 def clear_cache() -> None:
-    """Remove all JIT-compiled artifacts."""
+    """Remove all JIT-compiled artifacts, and forget this process's failed builds."""
     if env.OASR_JIT_DIR.exists():
         shutil.rmtree(env.OASR_JIT_DIR)
+    forget_failed_builds()
+
+
+@dataclasses.dataclass
+class PruneReport:
+    """What :func:`prune_cache` found and did (or, under ``dry_run``, would do)."""
+
+    root: Path
+    #: Key directories scanned.
+    keys: int = 0
+    #: Bytes under the root before the prune.
+    total_bytes: int = 0
+    #: ``(key directory, bytes, days since last use)`` removed.
+    removed: List[Tuple[Path, int, float]] = dataclasses.field(default_factory=list)
+    #: Key directories left alone because a build held their lock.
+    in_use: List[Path] = dataclasses.field(default_factory=list)
+    dry_run: bool = False
+
+    @property
+    def freed_bytes(self) -> int:
+        return sum(b for _, b, _ in self.removed)
+
+
+def _tree_bytes(path: Path) -> int:
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _key_last_used(key_dir: Path, module: str) -> float:
+    """When a key directory was last used: its load stamp, else its library's build time.
+
+    A key built before loads were stamped has only its library's mtime, which is
+    why :func:`prune_cache` keeps each module's newest key whatever its age.  A
+    key with neither -- a build that failed, or never finished -- is as old as
+    the newest file a build wrote in it.  Not the directory's own mtime: that
+    moves whenever any file is created in it, a lock file included, so probing a
+    key would have made it look used.
+    """
+    stamps = []
+    for name in (_LAST_USED, f"{module}.so"):
+        try:
+            stamps.append((key_dir / name).stat().st_mtime)
+        except OSError:
+            pass
+    if stamps:
+        return max(stamps)
+    written = [
+        f.stat().st_mtime
+        for f in key_dir.rglob("*")
+        if f.is_file() and not f.name.endswith((".lock", ".owner"))
+    ]
+    return max(written) if written else key_dir.stat().st_mtime
+
+
+def _build_in_progress(key_dir: Path, module: str) -> bool:
+    """Whether a build holds this key's lock.  Creates no lock file to find out.
+
+    A build creates its lock file before it takes the lock, so a key without one
+    has no build running.
+    """
+    path = key_dir / f"{module}.so.lock"
+    if not path.exists():
+        return False
+    lock = filelock.FileLock(str(path))
+    try:
+        lock.acquire(timeout=0)
+    except filelock.Timeout:
+        return True
+    lock.release()
+    return False
+
+
+def prune_cache(*, unused_days: float = 30.0, keep: int = 1, dry_run: bool = False) -> PruneReport:
+    """Remove the cache keys nothing has used for *unused_days*.
+
+    The cache is ``<OASR_JIT_DIR>/<module>/<key>/``, and nothing ever removed a
+    key: every change to a header, a flag or the toolchain left the previous one
+    behind (one cache measured 17 GiB in 2369 keys across 75 modules), and so
+    did every experiment's one-off module.  This is the explicit half --
+    eviction would mean a process deleting libraries another one may be about
+    to load.
+
+    Each module keeps its *keep* most recently used keys whatever their age, so
+    a module built once long ago and still in use survives a first prune, before
+    its loads have been stamped (:func:`_mark_used`).  A key whose build lock is
+    held is left alone.  A process that already loaded a removed library keeps
+    running on it; the next one to need it rebuilds it.
+
+    Run it when no OASR process is starting up: one that has found a library
+    and not yet loaded it would fail to load it if this removed it in between.
+    """
+    if unused_days < 0 or keep < 0:
+        raise ValueError("unused_days and keep must be non-negative")
+    root = env.OASR_JIT_DIR
+    report = PruneReport(root=root, dry_run=dry_run)
+    if not root.is_dir():
+        return report
+    cutoff = time.time() - unused_days * 86400.0
+    for module_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        keys = [k for k in module_dir.iterdir() if k.is_dir()]
+        used = {k: _key_last_used(k, module_dir.name) for k in keys}
+        sizes = {k: _tree_bytes(k) for k in keys}
+        report.keys += len(keys)
+        report.total_bytes += sum(sizes.values())
+        newest_first = sorted(keys, key=lambda k: used[k], reverse=True)
+        for key_dir in newest_first[keep:]:
+            if used[key_dir] >= cutoff:
+                continue
+            if _build_in_progress(key_dir, module_dir.name):
+                report.in_use.append(key_dir)
+                continue
+            age = (time.time() - used[key_dir]) / 86400.0
+            report.removed.append((key_dir, sizes[key_dir], age))
+            if not dry_run:
+                shutil.rmtree(key_dir, ignore_errors=True)
+    return report
