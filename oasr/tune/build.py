@@ -477,7 +477,9 @@ def build_gemm(
     opts = opts or BuildOptions()
     sm = int(sm if sm is not None else _get_target_sm())
     tf = base if base is not None else database.new_file("gemm", sm, jg.GEMM_LANE_BY_SM[sm])
-    tf.validators["soft"] = database.current_soft_validators("gemm")
+    # The base's entries keep the validators they were measured under; only what
+    # this build measures is described by the new stamp.
+    database.stamp_current(tf)
     t0 = time.time()
     cond_contended = False
     sigs = shapes_.signatures()

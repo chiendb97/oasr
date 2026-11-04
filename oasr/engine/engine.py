@@ -1524,6 +1524,7 @@ class ASREngine:
                     dict(ss.provenance),
                 )
                 base = database.load_file(path, family, sm) if path.is_file() else None
+                since = None if base is None else base.to_json()
                 budget = max(0.0, deadline - time.monotonic())  # one budget for every family
                 logger.info(
                     "tuning %d uncovered %s signature(s) within %.0f s before capture",
@@ -1532,7 +1533,8 @@ class ASREngine:
                     budget,
                 )
                 tf = build(todo, sm=sm, base=base, opts=BuildOptions(budget_s=budget))
-                database.save_file(tf, path)
+                # Another engine worker may be prewarming the same file.
+                database.save_merged(tf, path, since=since)
                 built = True
             if built:
                 database.reload()

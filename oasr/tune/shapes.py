@@ -14,7 +14,11 @@ disagree.  OASR's ladder is finer where ASR lives:
 * ratio 2 above that, to 2**20.
 
 Buckets round **up**: a bucket's value is its upper edge, and a result tuned
-for it is only applied to sizes at or below the size it was measured at.
+for it is only applied to sizes at or below the size it was measured at.  The
+bucket alone does not guarantee that -- a result measured at M=100 keys the 104
+bucket -- so a result carries the shape it was measured at, and a lookup in its
+bucket uses it only at or below that shape (``oasr.tune.autotuner.Measured``).
+A sweep that measures at the edges (``oasr tune build``) covers whole buckets.
 """
 
 from __future__ import annotations
