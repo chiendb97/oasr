@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
@@ -104,6 +104,7 @@ def transcribe(
     batch_size: int,
     *,
     streaming: bool = False,
+    decoding: Optional[Any] = None,
 ) -> Tuple[List[str], List[float]]:
     """Transcribe in batches; returns ``(hypotheses, per_request_ms)``.
 
@@ -121,6 +122,9 @@ def transcribe(
     ``transcribe_offline``.  Same manifest, same denominator, so the two rates are
     directly comparable — which is what makes a streaming accuracy gate meaningful
     rather than a second number nobody can interpret.
+
+    ``decoding`` (a ``DecodingOptions``) applies to every request, a ``language``
+    for instance.
     """
     import time
 
@@ -130,7 +134,7 @@ def transcribe(
     for i in range(0, len(waves), batch_size):
         chunk = list(waves[i : i + batch_size])
         t0 = time.perf_counter()
-        out = go(chunk)
+        out = go(chunk) if decoding is None else go(chunk, decoding=decoding)
         dt_ms = 1000.0 * (time.perf_counter() - t0)
         texts = out if isinstance(out, list) else [out]
         hyps.extend(t if isinstance(t, str) else t.text for t in texts)

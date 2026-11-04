@@ -453,7 +453,7 @@ at the PyO3 boundary.
 | `temperature`, `top_k`, `top_p` | AR families, via `generation/sampling.py::select_next_tokens`; greedy stays a batched argmax fast path. A sampled row is filtered and drawn on the device and lands with one `index_copy_`, so sampling adds no host sync to a step; the draws are made per row, as before, so a seeded run draws the same tokens |
 | `prompt` | LLM only (memoized suffix re-encode); also settable deployment-wide as `EngineConfig.llm_prompt` |
 | `task` (`"transcribe"` / `"translate"`) | families with a task token — AED (Whisper). **Rejected** elsewhere |
-| `language` (ISO-639 primary subtag) | families with a language token — AED (Whisper). **Rejected** elsewhere |
+| `language` (ISO-639 primary subtag) | families with a language token — AED (Whisper) — and models that condition their encoder on it — Nemotron's language prompt, under the transducer family. **Rejected** elsewhere |
 | `word_timestamps` | families that can align, in the mode the request runs in. **Rejected** elsewhere — see [Word timings](#word-timings) |
 
 AR finals carry `RequestOutput.finish_reason` — `"stop"` or `"length"`.
@@ -488,6 +488,17 @@ shared with unrelated requests.
 
 Adding a selective option to a family means listing it and, if the answer depends
 on the checkpoint, overriding `validate_options`. Nothing else changes.
+
+An option can also belong to the *model* rather than the family. Nemotron fuses
+a language prompt into its encoder output, so `language` decides what the
+transducer family is handed rather than anything it does. The model declares it
+in `BaseAsrModel.encoder_options`, and `validate_options` treats that list as
+supported next to `selective_options` and asks the model to resolve the value
+(`validate_encoder_options`). The same family therefore admits `language` on a
+prompted Nemotron checkpoint and refuses it on an icefall transducer. The value
+then reaches the forward per row: through `encoder_conditioning` offline, and
+streaming through a `persistent` slot state the streaming runtime fills at
+admission (`stream_conditioning`).
 
 ## Word timings
 

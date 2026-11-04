@@ -32,6 +32,20 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return loaded
 
 
+def _read_prompt_dictionary(ckpt_dir: Path) -> Dict[str, int]:
+    """``processor_config.json``'s locale → prompt-slot table, or ``{}`` without one.
+
+    Upstream's processor owns it (the model config has only ``num_prompts`` and
+    ``default_prompt_id``), so a checkpoint converted from ``config.json`` alone
+    would serve its default slot and could not honour a per-request language.
+    """
+    path = Path(ckpt_dir) / "processor_config.json"
+    if not path.exists():
+        return {}
+    table = _read_json(path).get("prompt_dictionary") or {}
+    return {str(locale): int(slot) for locale, slot in table.items()}
+
+
 class HFNemotronConverter(BaseCheckpointConverter):
     """Converter for HF ``model_type: "nemotron3_5_asr"`` snapshots."""
 
@@ -119,6 +133,7 @@ class HFNemotronConverter(BaseCheckpointConverter):
                 raw.get("prompt_intermediate_size", model_defaults.prompt_intermediate_size)
             ),
             default_prompt_id=int(raw.get("default_prompt_id", model_defaults.default_prompt_id)),
+            prompt_dictionary=_read_prompt_dictionary(ckpt_dir),
             encoder=encoder,
         )
 

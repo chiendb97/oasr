@@ -976,21 +976,28 @@ class OfflineExecutor(Executor):
         nvtx_push("offline.forward")
         t0 = time.perf_counter()
         consumes = self._op.strategy.consumes
+        # Per-row encoder conditioning (Nemotron's language prompt).  ``None``
+        # when every row takes the model's default, and the forward is then
+        # called exactly as an unconditioned model's is.
+        hook = getattr(self._mr, "encoder_conditioning", None)
+        conditioning = None if hook is None else hook(chunk, features.device)
+        extra = () if conditioning is None else (conditioning,)
         if consumes == "hidden":
             # Autoregressive families (transducer/AED/LLM) consume raw encoder
             # hidden states and own their decoder; CTC consumes the fused-head
             # log-probs (the CUDA-graph fast path).
-            enc_out, output_lengths = self._mr.encode_offline(features, lengths)
+            enc_out, output_lengths = self._mr.encode_offline(features, lengths, *extra)
         elif consumes == "both":
             # CTC+AED rescoring: one encoder pass, then the head applied on the
             # side — the strategy needs the CTC log-probs (n-best) *and* the
             # hidden states (decoder cross-attention memory).
-            hidden, output_lengths = self._mr.encode_offline(features, lengths)
+            hidden, output_lengths = self._mr.encode_offline(features, lengths, *extra)
             enc_out = EncodeOutput(hidden=hidden, log_probs=self._mr.apply_head(hidden))
         elif self._enable_packing:
+            # The engine refuses packing for a model that conditions its encoder.
             enc_out, output_lengths = self._mr.forward_offline_packed(features, lengths)
         else:
-            enc_out, output_lengths = self._mr.forward_offline(features, lengths)
+            enc_out, output_lengths = self._mr.forward_offline(features, lengths, *extra)
         nvtx_pop()
         self._metrics.observe_stage("offline.encode", time.perf_counter() - t0)
         return enc_out, output_lengths

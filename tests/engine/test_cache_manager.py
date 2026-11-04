@@ -1100,6 +1100,38 @@ class TestSlotStateCache:
         cache.allocate_stream(2, slot_id=0)
         assert cache.buffer_of("conv")[:, 0].abs().max() == 0
 
+    def test_a_turn_reset_keeps_a_persistent_state_and_a_new_stream_does_not(self):
+        """A persistent state was written from the *request* (a language prompt), so
+        ``reset_stream`` -- a turn boundary -- keeps it while it rewinds the audio
+        state.  The next request in the slot starts from zero, like every state."""
+        from oasr.cache import StreamStateSpec
+
+        cache = self._cache(
+            specs=[
+                StreamStateSpec("conv", (3, 2, 8), slot_axis=1),
+                StreamStateSpec("prompt", (), dtype=torch.int64, persistent=True),
+            ]
+        )
+        cache.allocate_stream(1, slot_id=2)
+        cache.fill_slot(2, "prompt", 33)
+        cache.buffer_of("conv")[:, 2].fill_(5.0)
+        cache.reset_stream(1)
+        assert cache.buffer_of("conv")[:, 2].abs().max() == 0
+        assert cache.buffer_of("prompt").tolist() == [0, 0, 33, 0]
+        cache.free_stream(1)
+        cache.allocate_stream(2, slot_id=2)
+        assert cache.buffer_of("prompt").tolist() == [0, 0, 0, 0]
+
+    def test_fill_slot_writes_one_row_on_the_declared_axis(self):
+        cache = self._cache()
+        cache.allocate_stream(1, slot_id=1)
+        cache.fill_slot(1, "conv", 2.0)
+        conv = cache.buffer_of("conv")
+        assert (conv[:, 1] == 2.0).all()
+        assert conv[:, 0].abs().max() == 0 and conv[:, 2:].abs().max() == 0
+        with pytest.raises(KeyError, match="declared"):
+            cache.fill_slot(1, "prompt", 1)
+
     def test_an_empty_declaration_allocates_nothing(self):
         cache = self._cache(specs=[])
         assert cache.names == []

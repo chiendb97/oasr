@@ -25,7 +25,6 @@ from __future__ import annotations
 from typing import ClassVar, List, Optional, Sequence, Tuple, cast
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from oasr.layers import (
@@ -33,7 +32,6 @@ from oasr.layers import (
     ColumnParallelLinear,
     Embedding,
     Linear,
-    LinearActivation,
     Relu,
     RowParallelLinear,
 )
@@ -187,25 +185,87 @@ class NemotronRnntJoint(Joiner):
 class NemotronPromptProjector(nn.Module):
     """Language-prompt conditioning: ``linear_2(relu(linear_1([hidden, one_hot])))``.
 
-    A one-hot language slot is concatenated onto **every** encoder frame and the
-    pair is projected back to the encoder width.  Note there is no residual: the
+    Upstream concatenates a one-hot language slot onto **every** encoder frame and
+    projects the pair back to the encoder width.  There is no residual: the
     projector's output *replaces* the encoder hidden state, so this is not an
     optional adapter that can be skipped when no language is named — omitting it
     changes the encoder output entirely.
+
+    **The one-hot is folded, not concatenated.**  ``linear_1`` splits by its input
+    columns into ``W_h (I, C)`` and ``W_p (I, P)``, and a one-hot selects one
+    column of the second, so ``linear_1([h, onehot(id)]) = W_h h + (W_p[:, id] +
+    b)``.  The bracket is a per-prompt bias, precomputed at load as the ``(P, I)``
+    table :attr:`prompt_bias` (in the checkpoint's fp32, rounded once into the
+    model dtype), and each row looks its own up.  That removes the
+    ``(B, T, P)`` one-hot and the ``(B, T, C + P)`` concat a forward otherwise
+    materialises, and shrinks the GEMM's K from ``C + P`` to ``C``.
+
+    It is not bit-identical to the concat: the GEMM's output is rounded before
+    the bias is added, where the concat added it inside the accumulator, so the
+    hidden state moves by about one ulp.  The bias is per *row* because a batch
+    can mix languages; a per-batch scalar would have let it ride in the GEMM's
+    epilogue, at the price of tying every row to one language.
+
+    Upstream's ``linear_1.{weight,bias}`` (and a native checkpoint written before
+    the fold) are split by :meth:`_load_from_state_dict`.
     """
 
     def __init__(self, hidden_size: int, num_prompts: int, intermediate_size: int) -> None:
         super().__init__()
+        self.hidden_size = hidden_size
         self.num_prompts = num_prompts
-        # ReLU folds into the first GEMM's epilogue.
-        self.linear_1 = LinearActivation(
-            hidden_size + num_prompts, intermediate_size, activation_type="relu"
-        )
+        self.intermediate_size = intermediate_size
+        self.linear_h = Linear(hidden_size, intermediate_size, bias=False)
+        #: ``(P, I)``: ``W_p^T + b``, the first projection's prompt columns plus
+        #: its bias, one row per prompt slot.
+        self.prompt_bias = Embedding(num_prompts, intermediate_size)
+        self.relu = Relu()
         self.linear_2 = RowParallelLinear(intermediate_size, hidden_size)
 
     def forward(self, hidden: torch.Tensor, prompt_ids: torch.Tensor) -> torch.Tensor:
-        """``hidden (B, T, C)`` + ``prompt_ids (B,)`` → ``(B, T, C)``."""
-        one_hot = F.one_hot(prompt_ids.long(), num_classes=self.num_prompts).to(hidden.dtype)
-        one_hot = one_hot.unsqueeze(1).expand(-1, hidden.size(1), -1)
-        fused: torch.Tensor = self.linear_2(self.linear_1(torch.cat([hidden, one_hot], dim=-1)))
+        """``hidden (B, T, C)`` + ``prompt_ids (B,)`` int64 → ``(B, T, C)``."""
+        projected = self.linear_h(hidden)
+        projected.add_(self.prompt_bias(prompt_ids).unsqueeze(1))
+        fused: torch.Tensor = self.linear_2(self.relu(projected))
         return fused
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Split an unfolded ``linear_1`` into ``linear_h`` and the prompt-bias table.
+
+        Keyed on the old names rather than a module version, so it is idempotent: a
+        native checkpoint written after the fold has no ``linear_1`` keys, and the
+        native loader stamps the model's own versions onto every state dict, which
+        would hide a version-gated remap from a pre-fold native checkpoint.
+        """
+        weight_key, bias_key = prefix + "linear_1.weight", prefix + "linear_1.bias"
+        weight = state_dict.get(weight_key)
+        expected = (self.intermediate_size, self.hidden_size + self.num_prompts)
+        if isinstance(weight, torch.Tensor) and tuple(weight.shape) == expected:
+            del state_dict[weight_key]
+            bias = state_dict.pop(bias_key, None)
+            c = self.hidden_size
+            # fp32 for the sum, so the table is rounded once, when it is copied
+            # into the model's dtype, not once here and again there.
+            table = weight[:, c:].t().float()
+            if bias is not None:
+                table = table + bias.float()
+            state_dict[prefix + "linear_h.weight"] = weight[:, :c].contiguous()
+            state_dict[prefix + "prompt_bias.weight"] = table.contiguous()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )

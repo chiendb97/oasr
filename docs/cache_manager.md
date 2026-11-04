@@ -496,6 +496,15 @@ Two things carry consequences:
 - **Allocation zeroes the slot, and that is the initial *value*, not hygiene.**
   A zero left-context is precisely the padding an offline pass applies, so a
   stream's first chunk computes what an offline pass would.
+- **`persistent=True` marks a state that describes the request, not the
+  audio.** Nemotron's per-stream language-prompt id is the one: the paged
+  runtime writes it at admission from `BaseAsrModel.stream_conditioning`
+  (`SlotStateCache.fill_slot`, a `fill_` with no host-to-device copy), the chunk
+  forward gathers it like any other state (so a captured graph reads each
+  replay's rows), and `reset_stream` keeps it. A VAD turn reset rewinds what the
+  encoder heard; zeroing the prompt with it would decode the next turn under
+  slot 0, which is a language too. A runtime that does not write it is refused
+  for such a model at construction (`carries_encoder_conditioning`).
 
 ### 10.2 A trained fixed attention window — prefill it
 

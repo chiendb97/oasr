@@ -12,7 +12,7 @@ plug in without touching the runner or the executors.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -156,9 +156,10 @@ class ModelRunner:
     def _offline(
         self,
         name: str,
-        fn: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+        fn: Callable[..., Tuple[torch.Tensor, torch.Tensor]],
         features: torch.Tensor,
         lengths: torch.Tensor,
+        conditioning: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run one offline forward, graph-served when its shape buckets.
 
@@ -168,8 +169,17 @@ class ModelRunner:
         by ~2.5e-1 in bf16 — would otherwise decode an utterance differently
         depending on whether its shape was captured, with a fallback to eager as
         the silent trigger.  See :meth:`GraphedOfflineForward.pad_time`.
+
+        ``conditioning`` (per-row tensors from
+        :meth:`~oasr.models.base.BaseAsrModel.encoder_conditioning`) runs eager,
+        padded the same way: a graph is keyed on ``(B, T)`` alone, so a captured
+        one would replay the values it was captured with.
         """
         cache = self._offline_graphs
+        if conditioning:
+            if cache is not None:
+                features, lengths = cache.pad_time(features, lengths)
+            return fn(features, lengths, **conditioning)
         if cache is None:
             return fn(features, lengths)
         served = cache.run(name, fn, features, lengths)
@@ -184,6 +194,7 @@ class ModelRunner:
         self,
         features: torch.Tensor,
         lengths: torch.Tensor,
+        conditioning: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run a batched offline forward pass.
 
@@ -193,6 +204,8 @@ class ModelRunner:
             ``(B, T, F)`` padded feature tensor on the model device.
         lengths : Tensor
             ``(B,)`` valid feature frame counts.
+        conditioning : mapping, optional
+            Per-row encoder conditioning (see :meth:`_offline`).
 
         Returns
         -------
@@ -204,7 +217,7 @@ class ModelRunner:
         Served from the CUDA-Graph cache when this ``(B, T)`` buckets to a
         captured shape; otherwise run eagerly, which the cache counts.
         """
-        return self._offline(FUSED, self._model.forward_offline, features, lengths)
+        return self._offline(FUSED, self._model.forward_offline, features, lengths, conditioning)
 
     @torch.no_grad()
     def forward_offline_packed(
@@ -224,6 +237,7 @@ class ModelRunner:
         self,
         features: torch.Tensor,
         lengths: torch.Tensor,
+        conditioning: Optional[Mapping[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encoder-only offline forward → ``(hidden (B, T, D), out_lengths)``.
 
@@ -235,7 +249,23 @@ class ModelRunner:
         it as cross-attention memory for the whole decode, long after later
         replays and captures would have invalidated a pool-backed view.
         """
-        return self._offline(ENCODE, self._model.encode_offline, features, lengths)
+        return self._offline(ENCODE, self._model.encode_offline, features, lengths, conditioning)
+
+    def encoder_conditioning(
+        self, requests: Sequence[Request], device: torch.device
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """The batch's per-row encoder conditioning, or ``None`` when every row is default.
+
+        Rows in ``requests`` order, which is the order the features were collated
+        in.  A model without the hook conditions nothing.
+        """
+        hook = getattr(self._model, "encoder_conditioning", None)
+        if hook is None:
+            return None
+        conditioning: Optional[Dict[str, torch.Tensor]] = hook(
+            [r.decoding for r in requests], device
+        )
+        return conditioning
 
     @torch.no_grad()
     def apply_head(self, hidden: torch.Tensor) -> torch.Tensor:

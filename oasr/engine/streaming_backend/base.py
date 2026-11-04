@@ -59,6 +59,14 @@ class StreamingEncoderBackend(ABC):
     #: failure — over a pool nothing will build.
     allocates_paged_pool: ClassVar[bool] = False
 
+    #: Whether :meth:`allocate` writes a request's
+    #: :meth:`~oasr.models.base.BaseAsrModel.stream_conditioning` into the
+    #: stream's slot, which is how a model with ``encoder_options`` (Nemotron's
+    #: ``language``) conditions a stream.  A runtime that does not would decode
+    #: every stream under the model's default, so :func:`build_streaming_backend`
+    #: refuses to pair one with such a model.
+    carries_encoder_conditioning: ClassVar[bool] = False
+
     # -- per-request cache lifecycle ---------------------------------------
     @abstractmethod
     def allocate(self, request: Request) -> None:
@@ -224,7 +232,13 @@ def build_streaming_backend(
     # Called as a factory, not as the ABC: the base class deliberately declares
     # no ``__init__`` (each runtime takes what its cache model needs), so the
     # constructor signature is a convention of this call site.
-    factory = cast(
-        Callable[..., StreamingEncoderBackend], get_streaming_backend_class(streaming_kind)
-    )
+    cls = get_streaming_backend_class(streaming_kind)
+    conditioned = tuple(getattr(model, "encoder_options", ()) or ())
+    if conditioned and streaming_kind != "none" and not cls.carries_encoder_conditioning:
+        raise ValueError(
+            f"{type(model).__name__} conditions its encoder on {list(conditioned)}, but "
+            f"the {streaming_kind!r} streaming runtime cannot carry per-stream "
+            "conditioning; streams would all decode under the model's default"
+        )
+    factory = cast(Callable[..., StreamingEncoderBackend], cls)
     return factory(model, config, cache_config, graph_pool=graph_pool, consumes=consumes)

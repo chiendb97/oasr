@@ -231,6 +231,14 @@ class ASREngine:
                 decode_method,
                 "hidden-states" if consumes == "hidden" else "hidden+log-probs",
             )
+        conditioned = tuple(getattr(model, "encoder_options", ()) or ())
+        if config.enable_sequence_packing and consumes == "log_probs" and conditioned:
+            # The packed forward takes no per-row conditioning, so it would
+            # decode every row under the model's default.
+            raise ValueError(
+                f"enable_sequence_packing cannot serve {type(model).__name__}: it "
+                f"conditions its encoder per request on {list(conditioned)}"
+            )
         # Size the paged KV pool from free VRAM when the operator left it to the
         # engine (``max_num_blocks=None``).  Must happen before the pool is
         # allocated, and after everything else that is already resident, so the

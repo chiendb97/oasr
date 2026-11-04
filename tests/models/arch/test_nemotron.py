@@ -416,9 +416,10 @@ class TestTinyModel:
     def test_cache_spec_declares_everything_a_chunk_carries(self):
         """The engine builds the whole streaming cache from this one descriptor, so
         a missing declaration is a silently reset piece of state rather than an
-        error.  Four things: paged K/V geometry, the conv left-context width, the
-        per-subsampling-stage tails, and the *trained* attention window that makes
-        the engine pre-fill the K/V window instead of growing it."""
+        error.  Five things: paged K/V geometry, the conv left-context width, the
+        per-subsampling-stage tails, the stream's language-prompt slot (kept across
+        a turn reset), and the *trained* attention window that makes the engine
+        pre-fill the K/V window instead of growing it."""
         model = NemotronModel.from_config(_tiny_config())
         spec = model.cache_spec
         assert spec is not None
@@ -428,7 +429,10 @@ class TestTinyModel:
             "subsample.0",
             "subsample.1",
             "subsample.2",
+            "prompt",
         ]
+        assert [s.persistent for s in spec.stream_states] == [False, False, False, True]
+        assert spec.stream_states[-1].dtype == torch.int64
         # sliding_window - 1: part of the trained mask, not a cache preference.
         assert spec.fixed_attention_window == 12
 
@@ -437,6 +441,396 @@ class TestTinyModel:
 
         model = NemotronModel.from_config(_tiny_config())
         assert missing_members(model, "transducer") == []
+
+
+# ---------------------------------------------------------------------------
+# The language prompt: folded into a per-row bias, chosen per request
+# ---------------------------------------------------------------------------
+
+#: A table shaped like the released one: bare codes, regional locales, the
+#: ``xx-XX`` generic spelling, and ``auto``.  Slots fit ``_tiny_config``'s 8.
+_TINY_PROMPTS = {
+    "auto": 1,
+    "en": 0,
+    "en-US": 0,
+    "en-GB": 2,
+    "vi-VN": 3,
+    "zh-CN": 4,
+    "zh-TW": 5,
+    "zh-ZH": 4,
+    "fr-CA": 6,
+    "fr-BE": 7,
+}
+
+
+def _tiny_prompted(**overrides) -> NemotronModel:
+    torch.manual_seed(5)
+    return NemotronModel.from_config(_tiny_config(prompt_dictionary=_TINY_PROMPTS, **overrides))
+
+
+def _unfolded_projector_state(projector) -> dict:
+    """The projector's weights in upstream's layout: one ``linear_1`` over ``[h, onehot]``.
+
+    Built from the folded module by the inverse split, with the bias column
+    chosen so ``W_p^T + b`` reproduces the table exactly in fp32.
+    """
+    sd = projector.state_dict()
+    bias = torch.randn(projector.intermediate_size)
+    prompt_cols = (sd["prompt_bias.weight"] - bias).t()
+    return {
+        "linear_1.weight": torch.cat([sd["linear_h.weight"], prompt_cols], dim=1),
+        "linear_1.bias": bias,
+        "linear_2.weight": sd["linear_2.weight"],
+        "linear_2.bias": sd["linear_2.bias"],
+    }
+
+
+def _concat_reference(state: dict, hidden, prompt_ids, num_prompts):
+    """Upstream's arithmetic, written out: concat the one-hot, two projections."""
+    import torch.nn.functional as F
+
+    one_hot = F.one_hot(prompt_ids, num_prompts).to(hidden.dtype)
+    one_hot = one_hot[:, None, :].expand(-1, hidden.size(1), -1)
+    x = torch.cat([hidden, one_hot], dim=-1)
+    w1, b1 = state["linear_1.weight"].to(hidden), state["linear_1.bias"].to(hidden)
+    w2, b2 = state["linear_2.weight"].to(hidden), state["linear_2.bias"].to(hidden)
+    return F.linear(torch.relu(F.linear(x, w1, b1)), w2, b2)
+
+
+class TestPromptFold:
+    """``linear_1([h, onehot(id)]) == W_h h + (W_p[:, id] + b)``, one table row per prompt."""
+
+    def _projector(self):
+        from oasr.models.nemotron.predictor import NemotronPromptProjector
+
+        torch.manual_seed(11)
+        return NemotronPromptProjector(32, 8, 48).eval()
+
+    def test_an_upstream_linear_1_is_split_on_load(self):
+        projector = self._projector()
+        state = _unfolded_projector_state(projector)
+        fresh = self._projector()
+        fresh.load_state_dict(state, strict=True)  # nothing missing, nothing unexpected
+        w1, b1 = state["linear_1.weight"], state["linear_1.bias"]
+        assert torch.equal(fresh.linear_h.weight, w1[:, :32])
+        assert torch.equal(fresh.prompt_bias.weight, w1[:, 32:].t() + b1)
+
+    def test_the_table_is_summed_in_fp32_and_rounded_once(self):
+        """A bf16 checkpoint loaded into an fp16 model: ``W_p + b`` is summed in fp32
+        and rounded once, at the copy -- not rounded to bf16 as a sum and again to
+        fp16 by the copy."""
+        projector = self._projector()
+        state = {k: v.bfloat16() for k, v in _unfolded_projector_state(projector).items()}
+        half = self._projector().half()
+        half.load_state_dict(state, strict=True)
+        w1, b1 = state["linear_1.weight"].float(), state["linear_1.bias"].float()
+        once = (w1[:, 32:].t() + b1).half()
+        twice = (state["linear_1.weight"][:, 32:].t() + state["linear_1.bias"]).half()
+        assert not torch.equal(once, twice)  # the two orders are distinguishable here
+        assert torch.equal(half.prompt_bias.weight, once)
+
+    def test_a_folded_state_dict_loads_as_is(self):
+        projector = self._projector()
+        fresh = self._projector()
+        torch.nn.init.zeros_(fresh.prompt_bias.weight)
+        fresh.load_state_dict(projector.state_dict(), strict=True)
+        for a, b in zip(fresh.state_dict().values(), projector.state_dict().values()):
+            assert torch.equal(a, b)
+
+    def test_the_fold_equals_the_concat_per_row(self):
+        """fp32 on CPU, where the only difference is summation order."""
+        projector = self._projector()
+        state = _unfolded_projector_state(projector)
+        hidden = torch.randn(3, 20, 32)
+        ids = torch.tensor([0, 5, 2])
+        with torch.no_grad():
+            got = projector(hidden, ids)
+            want = _concat_reference(state, hidden, ids, 8)
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.cuda
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+    def test_the_fold_is_within_rounding_of_the_concat_in_a_served_dtype(self, dtype):
+        """Not bit-identical: the GEMM output is rounded before the bias is added."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA")
+        projector = self._projector()
+        state = _unfolded_projector_state(projector)
+        projector = projector.to("cuda", dtype)
+        hidden = torch.randn(4, 64, 32, device="cuda", dtype=dtype)
+        ids = torch.tensor([0, 7, 3, 3], device="cuda")
+        with torch.no_grad():
+            got = projector(hidden, ids).float()
+            want = _concat_reference(state, hidden.float(), ids, 8)
+        # Against an fp32 oracle: the fold stays at the served dtype's rounding.
+        eps = torch.finfo(dtype).eps
+        torch.testing.assert_close(got, want, atol=8 * eps, rtol=8 * eps)
+
+    def test_a_pre_fold_native_checkpoint_loads_strictly(self):
+        """A native checkpoint converted before the fold has ``linear_1`` keys, and the
+        native loader is strict and stamps the model's own module versions -- which
+        is why the split is keyed on the names, not on a version."""
+        from oasr.checkpoints.native import load_native_weights
+
+        model = _tiny_prompted()
+        sd = {k: v for k, v in model.state_dict().items() if not k.startswith("prompt_projector.")}
+        for key, value in _unfolded_projector_state(model.prompt_projector).items():
+            sd["prompt_projector." + key] = value
+        fresh = _tiny_prompted()
+        torch.nn.init.zeros_(fresh.prompt_projector.prompt_bias.weight)
+        load_native_weights(fresh, sd)
+        w1 = sd["prompt_projector.linear_1.weight"]
+        b1 = sd["prompt_projector.linear_1.bias"]
+        assert torch.equal(fresh.prompt_projector.prompt_bias.weight, w1[:, 32:].t() + b1)
+
+
+class TestRequestLanguage:
+    """A request's ``language`` picks its row's prompt slot, resolved against the table."""
+
+    @pytest.mark.parametrize(
+        "language, slot",
+        [
+            (None, 1),  # the checkpoint default (``auto`` here)
+            ("en", 0),  # listed bare
+            ("auto", 1),
+            ("zh", 4),  # the table's generic ``zh-ZH``, not a region
+            ("vi", 3),  # the one slot its locales share
+        ],
+    )
+    def test_resolution_follows_the_table(self, language, slot):
+        assert _tiny_prompted().resolve_prompt_id(language) == slot
+
+    def test_a_language_whose_locales_disagree_is_refused_with_them_named(self):
+        with pytest.raises(ValueError, match=r"ambiguous.*fr-BE.*fr-CA"):
+            _tiny_prompted().resolve_prompt_id("fr")
+
+    def test_an_unknown_language_is_refused(self):
+        with pytest.raises(ValueError, match="not one this checkpoint knows"):
+            _tiny_prompted().resolve_prompt_id("de")
+
+    def test_without_a_table_nothing_is_declared_and_a_language_is_refused(self):
+        model = NemotronModel.from_config(_tiny_config())
+        assert model.encoder_options == ()
+        with pytest.raises(ValueError, match="no language-prompt dictionary"):
+            model.resolve_prompt_id("en")
+
+    def test_an_out_of_range_slot_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match="prompt slots must lie in"):
+            NemotronModel.from_config(_tiny_config(prompt_dictionary={"en": 8}))
+
+    def test_offline_conditioning_is_per_row_and_absent_when_nobody_asks(self):
+        from oasr.engine.request import DecodingOptions
+
+        model = _tiny_prompted()
+        cpu = torch.device("cpu")
+        assert model.encoder_conditioning([None, DecodingOptions()], cpu) is None
+        got = model.encoder_conditioning(
+            [DecodingOptions(language="vi"), None, DecodingOptions(language="zh")], cpu
+        )
+        assert got is not None and got["prompt_ids"].tolist() == [3, 1, 4]
+        assert model.stream_conditioning(DecodingOptions(language="en")) == {"prompt": 0}
+        assert model.stream_conditioning(None) == {"prompt": 1}
+
+    def test_each_offline_row_is_encoded_under_its_own_prompt(self):
+        model = _tiny_prompted().eval()
+        torch.manual_seed(2)
+        feats = torch.randn(3, 96, 32)
+        lengths = torch.full((3,), 96)
+        ids = torch.tensor([0, 3, 5])
+        with torch.no_grad():
+            mixed, _ = model.encode_offline(feats, lengths, prompt_ids=ids)
+            for row, slot in enumerate(ids.tolist()):
+                alone, _ = model.encode_offline(
+                    feats[row : row + 1], lengths[:1], prompt_ids=torch.tensor([slot])
+                )
+                torch.testing.assert_close(mixed[row : row + 1], alone, atol=1e-5, rtol=1e-5)
+            default, _ = model.encode_offline(feats, lengths)
+            pinned, _ = model.encode_offline(feats, lengths, prompt_ids=torch.full((3,), 1))
+        assert torch.equal(default, pinned)  # ``None`` is the default slot, exactly
+        assert not torch.allclose(mixed[1], default[1])  # and the slot matters
+
+    def _strategy(self, model):
+        from types import SimpleNamespace
+
+        from oasr.engine.decode import Detokenizer
+        from oasr.engine.decode.transducer import TransducerDecodeStrategy
+
+        return TransducerDecodeStrategy(SimpleNamespace(), Detokenizer(None, None), model)
+
+    def test_the_transducer_family_admits_language_on_a_prompted_checkpoint(self):
+        from oasr.engine.request import DecodingOptions
+
+        strategy = self._strategy(_tiny_prompted())
+        strategy.validate_options(DecodingOptions(language="vi"))
+        strategy.validate_options(DecodingOptions(language="vi"), streaming=True)
+        with pytest.raises(ValueError, match="not one this checkpoint knows"):
+            strategy.validate_options(DecodingOptions(language="de"))
+        # ``task`` is still nothing this model can act on.
+        with pytest.raises(ValueError, match="cannot honour the per-request 'task'"):
+            strategy.validate_options(DecodingOptions(task="translate"))
+
+    def test_the_same_family_refuses_language_where_nothing_conditions_on_it(self):
+        """Rule 9: the option is the *model's* here, so a transducer without a
+        language prompt -- an icefall one, or Nemotron without a table -- refuses it
+        instead of decoding in its default language."""
+        from torch import nn
+
+        from oasr.engine.request import DecodingOptions
+        from oasr.models.transducer import StatelessDecoder, TransducerJoiner, TransducerModel
+
+        icefall = TransducerModel(
+            nn.Identity(),
+            StatelessDecoder(16, 8, blank_id=0, context_size=2),
+            TransducerJoiner(8, 8, 8, 16),
+            blank_id=0,
+        ).eval()
+        for model in (icefall, NemotronModel.from_config(_tiny_config())):
+            with pytest.raises(ValueError, match="cannot honour the per-request 'language'"):
+                self._strategy(model).validate_options(DecodingOptions(language="en"))
+
+
+def _tiny_paged_nemotron(*, graphs: bool, dtype=torch.float16, max_batch_size: int = 2):
+    """A tiny prompted Nemotron (random weights) on the paged runtime, on CUDA."""
+    from types import SimpleNamespace
+
+    from oasr.engine.config import EngineConfig
+    from oasr.engine.streaming_backend.paged import PagedStreamingBackend
+
+    enc = NemotronEncoderConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        intermediate_size=128,
+        conv_kernel_size=9,
+        num_mel_bins=32,
+        subsampling_conv_channels=16,
+        sliding_window=13,
+        default_num_lookahead_tokens=3,
+    )
+    model = _tiny_prompted(encoder=enc).eval().to("cuda", dtype)
+    chunk = 4
+    cfg = EngineConfig(
+        chunk_size=chunk,
+        max_batch_size=max_batch_size,
+        max_num_blocks=64,
+        device="cuda",
+        dtype=dtype,
+        use_cuda_graphs=graphs,
+    )
+    cache_cfg = cfg.build_cache_config(model.cache_spec)
+    shim = SimpleNamespace(
+        device="cuda",
+        dtype=dtype,
+        chunk_size=chunk,
+        use_cuda_graphs=graphs,
+        streaming_graph_pad_batch=False,
+    )
+    backend = PagedStreamingBackend(model, shim, cache_cfg, consumes="hidden")
+    return backend, model
+
+
+def _stream_request(stream_id, feats, language=None):
+    from oasr.engine.request import DecodingOptions, Request
+
+    req = Request(
+        None,
+        streaming=True,
+        decoding=None if language is None else DecodingOptions(language=language),
+    )
+    req.stream_id = stream_id
+    req.feature_buffer = feats
+    req.feature_frames = int(feats.size(0))
+    req.feature_cursor = 0
+    req.offset = 0
+    return req
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="OASR kernels require CUDA")
+class TestStreamingPrompt:
+    """Per-stream prompts on the paged runtime: per row, through capture, across resets."""
+
+    @staticmethod
+    def _run(backend, feats, languages, steps, first_id=0):
+        reqs = [_stream_request(first_id + i, feats, lang) for i, lang in enumerate(languages)]
+        for r in reqs:
+            backend.allocate(r)
+        outs = [[] for _ in reqs]
+        for _ in range(steps):
+            got = backend.forward_step(reqs)
+            for i, r in enumerate(reqs):
+                outs[i].append(got[r.request_id].clone())
+        for r in reqs:
+            backend.free(r)
+        return [torch.cat(o, dim=0) for o in outs]
+
+    @pytest.mark.parametrize("graphs", [False, True], ids=["eager", "cuda_graphs"])
+    def test_each_stream_in_a_cohort_keeps_its_own_prompt(self, graphs):
+        """Uniform cohorts first, so with graphs the mixed one *replays* shapes the
+        uniform ones captured: a graph that had baked in the ids it was captured
+        with would hand the second row the first row's prompt."""
+        backend, _ = _tiny_paged_nemotron(graphs=graphs)
+        torch.manual_seed(4)
+        feats = torch.randn(backend.decoding_window * 3, 32, device="cuda", dtype=torch.float16)
+        en = self._run(backend, feats, ["en", "en"], 3, first_id=0)
+        vi = self._run(backend, feats, ["vi", "vi"], 3, first_id=2)
+        captured = dict(getattr(backend._graph_cache, "_captured", {}))  # noqa: SLF001
+        mixed = self._run(backend, feats, ["en", "vi"], 3, first_id=4)
+        if graphs:  # every mixed chunk was a replay of a graph the uniform runs captured
+            assert captured and backend._graph_cache._captured == captured  # noqa: SLF001
+        assert not torch.equal(en[1], vi[1]), "the prompt does not reach the stream"
+        assert torch.equal(mixed[0], en[0])
+        assert torch.equal(mixed[1], vi[1])
+
+    def test_the_prompt_is_written_at_admission(self):
+        backend, model = _tiny_paged_nemotron(graphs=False)
+        feats = torch.zeros(backend.decoding_window, 32, device="cuda", dtype=torch.float16)
+        a, b = _stream_request(0, feats, "zh"), _stream_request(1, feats)
+        backend.allocate(a)
+        backend.allocate(b)
+        rows = backend.state_cache.buffer_of("prompt")
+        assert int(rows[a.slot_id]) == 4
+        assert int(rows[b.slot_id]) == model.prompt_id
+        backend.free(a)
+        backend.free(b)
+
+    @pytest.mark.parametrize("graphs", [False, True], ids=["eager", "cuda_graphs"])
+    def test_a_turn_reset_keeps_the_prompt(self, graphs):
+        """Rule 13's reset rewinds what the encoder heard, not what the request asked
+        for: the turn after a reset must decode as a fresh stream *in the same
+        language*.  Zeroing the prompt with the rest of the slot would hand the next
+        turn slot 0 -- English -- and still produce a plausible transcript."""
+        backend, _ = _tiny_paged_nemotron(graphs=graphs)
+        window = backend.decoding_window
+        torch.manual_seed(21)
+        head = torch.randn(window * 2, 32, device="cuda", dtype=torch.float16)
+        tail = torch.randn(window * 2, 32, device="cuda", dtype=torch.float16)
+
+        reused = _stream_request(0, torch.cat([head, tail]), "vi")
+        backend.allocate(reused)
+        for _ in range(2):
+            backend.forward_step([reused])
+        backend.reset(reused)
+        assert int(backend.state_cache.buffer_of("prompt")[reused.slot_id]) == 3
+        reused.feature_cursor = window * 2
+        got = [backend.forward_step([reused])[reused.request_id].clone() for _ in range(2)]
+
+        fresh = _stream_request(1, tail, "vi")
+        backend.allocate(fresh)
+        want = [backend.forward_step([fresh])[fresh.request_id].clone() for _ in range(2)]
+        if graphs:
+            assert backend._graph_cache._captured  # noqa: SLF001
+        for step, (a, b) in enumerate(zip(got, want)):
+            assert torch.equal(a, b), f"chunk {step} after the reset lost the stream's prompt"
+        for r in (reused, fresh):
+            backend.free(r)
+
+    def test_a_runtime_that_cannot_carry_the_prompt_is_refused(self):
+        from oasr.engine.streaming_backend.base import build_streaming_backend
+
+        with pytest.raises(ValueError, match="cannot carry per-stream conditioning"):
+            build_streaming_backend("slot", _tiny_prompted(), None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1357,36 @@ class TestRealCheckpointParity:
         torch.testing.assert_close(hidden, expected.last_hidden_state, atol=1e-5, rtol=0)
         torch.testing.assert_close(projected, expected.pooler_output, atol=5e-5, rtol=0)
 
+    @pytest.mark.parametrize(
+        "language, locale", [("vi", "vi-VN"), ("zh", "zh-CN"), ("de", "de-DE"), ("auto", "auto")]
+    )
+    def test_a_requested_language_conditions_the_encoder_as_hf_does(
+        self, hf, ours, language, locale
+    ):
+        """The bare code the engine is handed resolves to the slot HF's processor
+        gives the locale, and the folded projector reproduces HF's fused output."""
+        from oasr.engine.request import DecodingOptions
+
+        processor, reference = hf
+        audio = self._audios(1)[0]
+        inputs = processor(audio, sampling_rate=16000, language=locale)
+        lengths = torch.tensor([int(inputs["attention_mask"].sum())])
+        conditioning = ours.model.encoder_conditioning(
+            [DecodingOptions(language=language)], torch.device("cpu")
+        )
+        assert conditioning is not None
+        assert conditioning["prompt_ids"].tolist() == inputs["prompt_ids"].tolist()
+        with torch.no_grad():
+            expected = reference.get_audio_features(
+                input_features=inputs["input_features"],
+                attention_mask=inputs["attention_mask"],
+                prompt_ids=inputs["prompt_ids"],
+                num_lookahead_tokens=inputs["num_lookahead_tokens"],
+            )
+            fused, _ = ours.model.encode_offline(inputs["input_features"], lengths, **conditioning)
+            projected = ours.model.joiner.encoder_proj(fused)
+        torch.testing.assert_close(projected, expected.pooler_output, atol=5e-5, rtol=0)
+
     def test_a_blocked_encoder_pass_matches_hf(self, hf, ours):
         """Past 240 encoder frames (19 s) the offline attention runs in blocks of
         queries; HF masks the whole table, so it is the oracle for the blocking."""
@@ -1037,6 +1461,71 @@ class TestRealCheckpointParity:
         assert [o.tokens[0] for o in batched] == [o.tokens[0] for o in solo]
 
 
+def _assert_rows_follow_their_own_language(engine, audios, *, streaming):
+    from oasr.engine.request import DecodingOptions
+
+    def options(language):
+        return None if language is None else DecodingOptions(language=language)
+
+    languages = [None, "de", "zh", None][: len(audios)]
+    uniform = {
+        lang: engine.transcribe(audios, streaming=streaming, decoding=options(lang))
+        for lang in set(languages)
+    }
+    assert uniform["zh"] != uniform[None], "the language does not reach the encoder"
+    ids = [
+        engine.add_request(a, streaming=streaming, decoding=options(lang))
+        for a, lang in zip(audios, languages)
+    ]
+    by_id = {o.request_id: o.text for o in engine.run()}
+    mixed = [by_id[i] for i in ids]
+    assert mixed == [uniform[lang][i] for i, lang in enumerate(languages)]
+
+
+@pytest.mark.requires_assets("NEMOTRON_CKPT")
+class TestReleasedPromptTable:
+    """The released ``processor_config.json`` table, resolved for bare codes."""
+
+    @pytest.fixture(scope="class")
+    def model(self):
+        from pathlib import Path
+
+        from oasr.models.nemotron.convert import HFNemotronConverter
+
+        cfg = HFNemotronConverter().build_config(Path(assets.require("NEMOTRON_CKPT")))
+        # The real table on a tiny model: only the table is under test.
+        return NemotronModel.from_config(
+            _tiny_config(
+                num_prompts=cfg.num_prompts,
+                default_prompt_id=cfg.default_prompt_id,
+                prompt_dictionary=cfg.prompt_dictionary,
+            )
+        )
+
+    def test_the_converter_reads_the_processor_table(self, model):
+        table = model.prompt_dictionary
+        assert len(table) == 121
+        assert (table["vi-VN"], table["en-US"], table["auto"]) == (33, 0, 101)
+        assert model.prompt_id == 101
+        assert model.encoder_options == ("language",)
+
+    @pytest.mark.parametrize(
+        "language, slot",
+        [("en", 0), ("vi", 33), ("zh", 4), ("ja", 10), ("pt", 13), ("es", 3), ("fr", 8)],
+    )
+    def test_bare_codes(self, model, language, slot):
+        assert model.resolve_prompt_id(language) == slot
+
+    def test_every_language_the_table_lists_resolves_to_one_of_its_locales(self, model):
+        table = model.prompt_dictionary
+        primaries = {k.split("-", 1)[0] for k in table if k.split("-", 1)[0].islower()}
+        for code in sorted(primaries):
+            slot = model.resolve_prompt_id(code)
+            assert slot in {v for k, v in table.items() if k.split("-", 1)[0] == code}, code
+            if code in table:
+                assert slot == table[code], code
+
+
 @pytest.mark.slow
 @pytest.mark.cuda
 @pytest.mark.requires_assets("NEMOTRON_CKPT", "WAV_DIR")
@@ -1090,6 +1579,21 @@ class TestEngineEndToEnd:
     def test_streaming_request_is_refused_by_an_offline_engine(self, engine):
         with pytest.raises(ValueError, match="service_mode"):
             engine.add_streaming_request("nemotron-stream-1")
+
+    def test_each_request_is_decoded_in_its_own_language(self, engine):
+        """One batch, three languages.  The oracle is each language run alone over
+        the same clips; English audio is used because a wrong prompt visibly changes
+        it (``zh`` empties it, ``de`` moves punctuation), so a row decoded under
+        its neighbour's prompt, or under the default, cannot pass."""
+        _assert_rows_follow_their_own_language(engine, self._audios(4), streaming=False)
+
+    def test_an_unknown_language_is_refused_at_admission(self, engine):
+        from oasr.engine.request import DecodingOptions
+
+        with pytest.raises(ValueError, match="not one this checkpoint knows"):
+            engine.add_request(
+                self._audios(1)[0], streaming=False, decoding=DecodingOptions(language="xx")
+            )
 
 
 @pytest.mark.slow
@@ -1197,6 +1701,10 @@ class TestStreamingEngine:
         for a, b in zip(offline, streamed):
             assert words(a) == words(b), f"offline={a!r} streaming={b!r}"
 
+    def test_each_stream_is_decoded_in_its_own_language(self, streaming_engine):
+        """The per-stream prompt slot through the engine, captured graphs included."""
+        _assert_rows_follow_their_own_language(streaming_engine, self._audios(4), streaming=True)
+
     def test_batch_size_does_not_change_the_streaming_transcript(self, streaming_engine):
         audios = self._audios(4)
         wide = self._texts(streaming_engine.transcribe(audios))
@@ -1276,6 +1784,11 @@ def test_native_round_trip_preserves_the_weights(tmp_path):
     assert set(left) == set(right)
     for key in left:
         torch.testing.assert_close(left[key], right[key], msg=f"{key} changed")
+    # The language table travels with the native config, or a converted
+    # checkpoint could no longer honour a request's language.
+    assert len(original.model.prompt_dictionary) > 100
+    assert restored.model.prompt_dictionary == original.model.prompt_dictionary
+    assert restored.model.encoder_options == ("language",)
 
 
 def test_registered_in_the_model_registry():

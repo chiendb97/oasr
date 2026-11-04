@@ -252,10 +252,11 @@ def run_one(
     manifest_name: str,
     save_transcripts: Optional[Path],
     quantization: Union[None, str, Dict[str, Any]] = None,
+    language: Optional[str] = None,
 ) -> Row:
     import torch
 
-    from oasr.engine import ASREngine, EngineConfig
+    from oasr.engine import ASREngine, DecodingOptions, EngineConfig
 
     torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[
         dtype
@@ -318,9 +319,16 @@ def run_one(
         # compilation and graph capture happen on the first use of each batch
         # shape, and only the same batches reach every shape the timed pass
         # will; anything less leaves captures inside wall time and RTFx.
-        warm_hyps, _ = transcribe(engine, waves, max_batch_size, streaming=streaming)
+        # A per-request option, so the engine refuses a language this checkpoint
+        # cannot honour instead of the row measuring its default one.
+        decoding = None if language is None else DecodingOptions(language=language)
+        warm_hyps, _ = transcribe(
+            engine, waves, max_batch_size, streaming=streaming, decoding=decoding
+        )
         t0 = time.perf_counter()
-        hyps, per_request_ms = transcribe(engine, waves, max_batch_size, streaming=streaming)
+        hyps, per_request_ms = transcribe(
+            engine, waves, max_batch_size, streaming=streaming, decoding=decoding
+        )
         wall = time.perf_counter() - t0
         peak_mib = peak_alloc_mib()
     finally:
@@ -365,7 +373,15 @@ def run_one(
         ckpt=Path(ckpt_dir).name,
         architecture=architecture or "(detected)",
         decode_method=decode_method or "(model default)",
-        decode_options=" ".join(f"{k}={v}" for k, v in sorted(decode_options.items())) or "-",
+        # The request's language rides in this cell rather than a column of its
+        # own: it is what was asked of the decode, as the strategy knobs are.
+        decode_options=" ".join(
+            f"{k}={v}"
+            for k, v in sorted(
+                {**decode_options, **({} if language is None else {"language": language})}.items()
+            )
+        )
+        or "-",
         service_mode=service_mode,
         chunk_size=effective_chunk,
         vad_mode=vad_mode,
@@ -440,6 +456,14 @@ def _add_arguments(p: argparse.ArgumentParser) -> None:
         help="Root for relative audio paths in the manifest (default: $AUDIO_DIR)",
     )
     p.add_argument("--limit", type=int, default=None, metavar="N", help="Use only the first N")
+    p.add_argument(
+        "--language",
+        default=None,
+        metavar="CODE",
+        help="Per-request DecodingOptions.language (an ISO-639 code such as `vi`) for every "
+        "utterance: Whisper's language token, Nemotron's language prompt. Refused by a "
+        "decode family that cannot act on it. Recorded in the decode_options column.",
+    )
 
     p.add_argument(
         "--decode-method",
@@ -784,6 +808,7 @@ def _sweep(args: argparse.Namespace):
                                 args.save_transcripts, label, per_row_transcripts
                             ),
                             quantization=quant,
+                            language=args.language,
                         )
                     except Exception as exc:  # noqa: BLE001 — a sweep must not lose earlier rows
                         # Unsupported sweep cells are reported without

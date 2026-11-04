@@ -181,6 +181,9 @@ TINY_CONFIGS = {
         "num_decoder_layers": 1,
         "num_prompts": 8,
         "prompt_intermediate_size": 48,
+        # Within the 8 slots: the dataclass default (101, the release's "auto") is
+        # refused at construction against a narrower prompt table.
+        "default_prompt_id": 1,
         "encoder": {
             "hidden_size": 32,
             "num_hidden_layers": 1,
@@ -424,6 +427,8 @@ def _nemotron_overrides():
         "vocab_size": 4711,
         "blank_token_id": 4710,
         "default_prompt_id": 7,
+        # A ``Dict[str, int]``: JSON keeps it, and the reader must not drop it.
+        "prompt_dictionary": {"en-US": 0, "vi-VN": 33, "auto": 7},
         "encoder": NemotronEncoderConfig(
             hidden_size=64,
             num_hidden_layers=3,

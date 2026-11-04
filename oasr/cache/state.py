@@ -41,12 +41,21 @@ class StreamStateSpec:
         ``None`` uses the cache's dtype (the model's).  Set it for a state that
         must stay fp32 regardless — a counter, or an accumulator whose precision
         is load-bearing.
+    persistent : bool
+        The state describes the *request*, not the audio heard so far — a
+        language prompt id — so it is written once at admission
+        (:meth:`SlotStateCache.fill_slot`) and a turn reset
+        (:meth:`SlotStateCache.reset_stream`) keeps it.  Zeroing it there would
+        rewind the request's conditioning along with the encoder's context, and
+        the next turn would decode under whatever slot ``0`` happens to mean.
+        A new request (:meth:`SlotStateCache.allocate_stream`) still zeroes it.
     """
 
     name: str
     shape: Tuple[int, ...]
     slot_axis: int = 0
     dtype: Optional[torch.dtype] = None
+    persistent: bool = False
 
     def buffer_shape(self, max_batch_size: int) -> Tuple[int, ...]:
         """Persistent buffer shape: :attr:`shape` with the slot axis inserted."""
@@ -214,10 +223,21 @@ class SlotStateCache:
         self.reset_slot(slot_id)
 
     def reset_slot(self, slot_id: int) -> None:
-        """Zero ``slot_id``'s rows in every declared state."""
+        """Zero ``slot_id``'s rows in every declared state, persistent ones included."""
         for spec in self._specs:
             buf = self._buffers[spec.name]
             buf.select(spec.slot_axis, slot_id).zero_()
+
+    def fill_slot(self, slot_id: int, name: str, value: float) -> None:
+        """Set every element of ``slot_id``'s row of state ``name`` to ``value``.
+
+        How a request's conditioning reaches a :attr:`StreamStateSpec.persistent`
+        state.  ``fill_`` takes the scalar as a kernel argument, so a CUDA buffer
+        is written without a host-to-device copy, and the buffer's address — the
+        one a captured graph reads — does not move.
+        """
+        spec = self.spec_of(name)
+        self._buffers[name].select(spec.slot_axis, slot_id).fill_(value)
 
     def reset_stream(self, stream_id: int) -> None:
         """Zero an *allocated* stream's state without releasing its slot.
@@ -230,8 +250,14 @@ class SlotStateCache:
         that too; going through ``free_stream`` + ``allocate_stream`` instead
         would hand the stream a different slot and move buffers a captured graph
         addressed by row.
+
+        A :attr:`StreamStateSpec.persistent` state is kept: it was written from
+        the request, and the request has not changed.
         """
-        self.reset_slot(self.slot_of(stream_id))
+        slot_id = self.slot_of(stream_id)
+        for spec in self._specs:
+            if not spec.persistent:
+                self._buffers[spec.name].select(spec.slot_axis, slot_id).zero_()
 
     def free_stream(self, stream_id: int) -> None:
         """Release the slot mapping for a stream."""

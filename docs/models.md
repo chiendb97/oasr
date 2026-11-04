@@ -351,9 +351,30 @@ sum of encoder and decoder projections before the vocabulary head.
   there.
 - `predictor.py` — 2-layer **LSTM** predictor on `oasr.layers.LSTM`'s fused
   recurrent kernels + additive joint
-  `head(relu(enc_proj + dec_proj))` + the language-prompt projector (a 128-wide
-  one-hot concatenated onto every encoder frame, with **no residual** — its
-  output replaces the hidden state).
+  `head(relu(enc_proj + dec_proj))` + the language-prompt projector, with **no
+  residual** — its output replaces the hidden state. Upstream concatenates a
+  128-wide one-hot onto every encoder frame; here the one-hot's columns of the
+  first projection are folded with its bias into a per-prompt table at load
+  (`W_h h + (W_p[:, id] + b)`), so each row adds its own prompt's row of it. That
+  drops the concat and shrinks the GEMM's K from 1152 to 1024, and is within one
+  rounding of the concat rather than bit-identical (the GEMM output is rounded
+  before the bias is added).
+- **The prompt is per request.** `DecodingOptions.language` (a bare ISO-639 code)
+  resolves against the checkpoint's own `processor_config.json` table: the code
+  if it is listed (`en` → 0), else the table's `xx-XX` spelling (`zh` → `zh-ZH`
+  → 4), else the one slot its locales share (`vi` → `vi-VN` → 33). A code the
+  table does not know, or whose locales disagree, is refused at admission. No
+  language means `default_prompt_id` (`auto`, 101: the model's own language ID).
+  The model declares it through `BaseAsrModel.encoder_options`, so the
+  transducer family admits `language` here and refuses it on a checkpoint that
+  has no prompt. Offline, each batch row carries its id into `encode_offline`
+  (`encoder_conditioning`); a batch where nobody names a language takes the
+  plain call. Streaming, the id is a per-stream `persistent` slot state
+  (`StreamStateSpec.persistent`), written at admission, read inside the chunk
+  forward so captured graphs gather each replay's rows, and kept across a VAD
+  turn reset, which rewinds what the encoder heard but not what the request
+  asked for. `num_lookahead_tokens` is still fixed at construction: it changes
+  the streaming geometry, not a per-row input.
 - `TokenizerSpec(kind="huggingface", special_ids=[blank])` — blank 13087 sits
   *past* the tokenizer's 13087 pieces, so it must be filtered before the backend
   sees it.
@@ -363,7 +384,8 @@ special case: the three subsampling-stage tails (`streaming_state_specs`), the
 per-layer post-GLU conv tail (the engine's existing `"conv"` slot cache —
 `conv_kernel_size - 1` is exactly what this encoder needs), the **prefilled**
 paged K/V window (`fixed_attention_window`), and the frontend frame grid (on the
-extractor, not here).
+extractor, not here). The model adds a fifth slot state, the stream's prompt id,
+which describes the request rather than the audio.
 
 Two alignment preconditions, both silent if violated, both refused at engine
 construction by `streaming_geometry`:
