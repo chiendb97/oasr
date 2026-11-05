@@ -50,13 +50,28 @@ def hiss(seconds: float, amp: float = 1e-4, seed: int = 7, sr: int = SR) -> torc
     return amp * torch.randn(int(sr * seconds), generator=g)
 
 
-def wav_paths(wav_dir: str) -> List[str]:
-    """Every .wav in ``wav_dir``, sorted, so an index means the same file twice."""
-    return sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+def wav_paths(wav_dir: str, need: int = 0) -> List[str]:
+    """Every .wav in ``wav_dir``, sorted, so an index means the same file twice.
+
+    ``need`` gates on the count through ``tests/assets.py``. ``wav_dir`` is the
+    ``WAV_DIR`` asset at every caller, and a directory with too few clips is an
+    incomplete asset: the test is counted and fails under ``--strict-assets``,
+    where a hand-written ``pytest.skip`` was neither (audit L12).
+    """
+    paths = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
+    if need:
+        import assets
+
+        assets.require_contents(
+            "WAV_DIR",
+            len(paths) >= need,
+            f"need {need} .wav file(s) under {wav_dir}, found {len(paths)}",
+        )
+    return paths
 
 
 def wav_path(wav_dir: str, n: int = 0) -> str:
-    return wav_paths(wav_dir)[n]
+    return wav_paths(wav_dir, need=n + 1)[n]
 
 
 def waveform(wav_dir: str, n: int = 0) -> torch.Tensor:
@@ -70,6 +85,7 @@ def waveform(wav_dir: str, n: int = 0) -> torch.Tensor:
 
 
 def waveforms(wav_dir: str, count: int) -> List[torch.Tensor]:
+    wav_paths(wav_dir, need=count)  # gate once, before any is read
     return [waveform(wav_dir, i) for i in range(count)]
 
 
@@ -84,12 +100,9 @@ def speech_corpus(
     is two definitions of the corpus a VAD is scored against.
     """
     import numpy as np
-    import pytest
     import soundfile as sf
 
-    paths = wav_paths(wav_dir)[:n]
-    if len(paths) < n:
-        pytest.skip(f"need {n} wav files in {wav_dir}")
+    paths = wav_paths(wav_dir, need=n)[:n]
     parts: List = []
     spans: List[Tuple[float, float]] = []
     t = 0.0

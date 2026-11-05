@@ -17,13 +17,12 @@ patching the engine's internal helpers.
 
 from __future__ import annotations
 
-import glob
-import os
 import random
 import threading
 from typing import List
 from unittest.mock import MagicMock
 
+import assets
 import numpy as np
 import pytest
 
@@ -235,7 +234,9 @@ def test_e2e_streaming_concurrent_feeders(ckpt_dir: str, wav_dir: str):
     from oasr.engine.config import EngineConfig
     from oasr.engine.engine import ASREngine
 
-    wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))[:4]
+    # Four requests from four threads: a shorter directory used to run with
+    # fewer and still pass.
+    wavs = assets.require_wavs(4)
 
     engine = ASREngine(EngineConfig(ckpt_dir=ckpt_dir, max_batch_size=8))
 

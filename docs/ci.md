@@ -72,11 +72,18 @@ reason string is uniform.
 ```
 external assets:
   CKPT_DIR                 ok       /.../20210610_u2pp_conformer_exp_librispeech
+  WAV_DIR                  ok       /.../wavs  [3 test(s) skipped: incomplete]
   WHISPER_CKPT             MISSING  /.../whisper-tiny  [18 test(s) skipped]
   ...
-  -> 18 test(s) skipped for missing assets. A green run does not cover them;
-     use --strict-assets to make this fatal.
+  -> 21 test(s) skipped for missing or incomplete assets. A green run does not
+     cover them; use --strict-assets to make this fatal.
 ```
+
+An asset can be present and still too small for a test: a `WAV_DIR` with fewer
+clips than the test decodes, a release without the sub-path the test reads, an
+audio file too short to chunk. That is the same gap as a missing asset, so it
+goes through the same gate, is counted against the asset (`incomplete`) and
+fails under `--strict-assets`.
 
 `--strict-assets` makes it fatal, which is what the GPU workflows run. An asset a
 runner genuinely cannot have is named one by one, so the gap sits in the workflow
@@ -106,10 +113,20 @@ or, inside a fixture or body:
 ```python
 path = assets.require("MY_CKPT")
 wavs = assets.require_wavs(4)                # also gates on the file count
+assets.require_contents("MY_CKPT", (Path(path) / "exp").is_dir(), "no exp/ subdir")
 ```
 
-**Never read the environment variable directly** — that is exactly the pattern
-that produced the trap.
+The `tests/helpers/audio.py` readers (`waveforms(wav_dir, n)`, `speech_corpus`)
+gate their own count the same way.
+
+**Never read the environment variable directly**, and never `pytest.skip` on what
+an asset holds. Both are exactly the pattern that produced the trap: the
+variable is unset when the asset resolves through `$OASR_ASSET_ROOT`, and a
+bare skip is not counted and stays green under `--strict-assets`. Taking `[:n]`
+of a listing without the count gate is the quiet version, because the test then
+runs on however many files there are. A skip that splits *valid* assets into
+variants is different: of a causal and a non-causal release, one test of a pair
+must skip whichever is supplied, and that skip stays a plain one.
 
 ### The compiled extension is an asset too
 
