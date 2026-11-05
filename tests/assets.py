@@ -89,6 +89,12 @@ def _has_wavs(root: Path) -> bool:
     return root.is_dir() and any(root.glob("*.wav"))
 
 
+def _is_wenet_dir(root: Path) -> bool:
+    """``final.pt`` is the marker; ``train.yaml`` is what the converter reads the
+    architecture from, so a directory without it cannot serve any test either."""
+    return (root / "train.yaml").is_file()
+
+
 def _built(asset: Asset) -> Optional[str]:
     """The extension's file if it imports with every declared attribute, else ``None``."""
     try:
@@ -107,6 +113,7 @@ _ASSET_LIST: List[Asset] = [
         what="WeNet U2++ conformer checkpoint dir (train.yaml + final.pt)",
         relpath="u2pp_conformer",
         marker="final.pt",
+        probe=_is_wenet_dir,
         how="a WeNet release dir; also settable with --ckpt-dir",
     ),
     Asset(
@@ -306,6 +313,9 @@ class _State:
     allowed_missing: frozenset = frozenset()
     #: env name -> number of tests skipped/failed for want of it.
     gated: Dict[str, int] = field(default_factory=dict)
+    #: The part of ``gated`` that was short *contents* of a present asset (too
+    #: few files, a missing sub-path), which the report shows beside ``ok``.
+    short: Dict[str, int] = field(default_factory=dict)
     #: env names that at least one test actually asked for.
     requested: set = field(default_factory=set)
 
@@ -392,23 +402,49 @@ def require(*names: str) -> str | Tuple[str, ...]:
     return paths[0] if len(paths) == 1 else tuple(paths)
 
 
+def require_contents(name: str, ok: bool, detail: str) -> None:
+    """Gate on what a *present* asset holds: a file count, a sub-path, a layout.
+
+    A directory too small for a test, or missing the part of a release a test
+    reads, is the same class of problem as a missing asset: the test does not
+    run.  So it is counted against the asset and fails under
+    ``--strict-assets`` like one.  A bare ``pytest.skip`` did neither, and a
+    strict run reported the asset ``ok`` (audit L12).
+
+    For a property that splits valid assets into variants (a causal release
+    against a non-causal one, where one test of a pair must skip whichever is
+    supplied), skip directly instead: that skip is by design, not a gap.
+    """
+    if name not in ASSETS:
+        raise KeyError(f"unknown asset {name!r}; declare it in tests/assets.py")
+    STATE.requested.add(name)
+    if ok:
+        return
+    STATE.gated[name] = STATE.gated.get(name, 0) + 1
+    STATE.short[name] = STATE.short.get(name, 0) + 1
+    detail = f"{ASSETS[name].what}: {detail} (set ${ASSETS[name].env})"
+    if STATE.strict and name not in STATE.allowed_missing:
+        pytest.fail(
+            f"--strict-assets: {detail}.\n"
+            f"A test skipped for an incomplete asset is a test that did not run. "
+            f"Supply a complete one, or allow it with --allow-missing-asset "
+            f"{ASSETS[name].env}.",
+            pytrace=False,
+        )
+    pytest.skip(detail)
+
+
 def require_wavs(n: int = 1, env: str = "WAV_DIR") -> List[str]:
     """Return the first *n* ``.wav`` paths under an audio asset.
 
     Gates twice through the same mechanism: on the directory being present, and
-    on it holding enough files.  A directory with too few clips is the same
-    class of problem as a missing one — the test does not run — so
-    ``--strict-assets`` should fail on it rather than let the count slide.
+    on it holding enough files (:func:`require_contents`).  A test that takes
+    ``[:n]`` of a listing without this runs on however many there happen to be.
     """
     root = require(env)
     assert isinstance(root, str)
     wavs = sorted(Path(root).glob("*.wav"))
-    if len(wavs) < n:
-        STATE.gated[env] = STATE.gated.get(env, 0) + 1
-        detail = f"need {n} .wav file(s) under {root}, found {len(wavs)} (set ${env})"
-        if STATE.strict and env not in STATE.allowed_missing:
-            pytest.fail(f"--strict-assets: {detail}", pytrace=False)
-        pytest.skip(detail)
+    require_contents(env, len(wavs) >= n, f"need {n} .wav file(s) under {root}, found {len(wavs)}")
     return [str(p) for p in wavs[:n]]
 
 
@@ -447,6 +483,10 @@ def report_lines() -> List[str]:
         if path is not None:
             status = "ok"
             note = path
+            short = STATE.short.get(name, 0)
+            if short:
+                verb = "failed" if STATE.strict and name not in STATE.allowed_missing else "skipped"
+                note += f"  [{short} test(s) {verb}: incomplete]"
         else:
             status = "MISSING"
             note = _declared(name) or "<unset>"

@@ -15,12 +15,11 @@ where five files used to assert it.
 
 from __future__ import annotations
 
-import glob
-import os
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 
+import assets
 import pytest
 import torch
 from helpers.audio import waveform, waveforms
@@ -158,9 +157,7 @@ class TestOfflineTranscribe:
         assert len(text) > 0
 
     def test_transcribe_batch(self, device, ckpt_dir: str, wav_dir: str):
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 4:
-            pytest.skip(f"Need at least 4 .wav files in WAV directory, found {len(wavs)}")
+        assets.require_wavs(4)  # before an engine is built
         engine = self._make_engine(ckpt_dir, device)
         waves = waveforms(wav_dir, 4)
         texts = engine.transcribe_offline(waves)
@@ -182,9 +179,7 @@ class TestOfflineTranscribe:
         ``engine.new_audio_buffer(n)``, submit the tensor, get the same
         transcript as the heap path — which is what lets ``collate`` skip the
         pack and DMA each row straight into the padded batch."""
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 3:
-            pytest.skip("Need at least 3 .wav files in WAV directory")
+        assets.require_wavs(3)  # before an engine is built
         waves = waveforms(wav_dir, 3)
 
         engine = self._make_engine(ckpt_dir, device)
@@ -231,9 +226,7 @@ class TestASREngine:
         assert len(text) > 0
 
     def test_transcribe_batch(self, device, ckpt_dir: str, wav_dir: str):
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 3:
-            pytest.skip(f"Need at least 3 .wav files in WAV directory, found {len(wavs)}")
+        assets.require_wavs(3)  # before an engine is built
         engine = self._make_engine(ckpt_dir, device)
         waves = waveforms(wav_dir, 3)
         texts = engine.transcribe(waves)
@@ -271,9 +264,7 @@ class TestASREngine:
         """
         from oasr.engine import ASREngine, EngineConfig
 
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 3:
-            pytest.skip("Need at least 3 .wav files in WAV directory")
+        assets.require_wavs(3)  # before an engine is built
 
         waves = waveforms(wav_dir, 3)
 
@@ -318,9 +309,7 @@ class TestASREngine:
         """
         from oasr.engine import ASREngine, EngineConfig
 
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 4:
-            pytest.skip("Need at least 4 .wav files in WAV directory")
+        assets.require_wavs(4)  # before an engine is built
 
         waves = waveforms(wav_dir, 4)
 
@@ -354,7 +343,10 @@ class TestASREngine:
             return dp[len(r)][len(h)] / max(1, len(r))
 
         total = sum(_wer(ref, hyp) for ref, hyp in zip(off_texts, on_texts))
-        avg_wer = total / len(wavs)
+        # Over the utterances decoded. It was divided by every .wav in the
+        # directory (13,100 for LJSpeech), so the 5 % bound was a bound of about
+        # 655 on the summed WER of four utterances, and the test could not fail.
+        avg_wer = total / len(waves)
         # Loose threshold: batched-fp16 vs offline-batched-fp16 typically
         # diverge by <5% WER on a handful of utterances; the drift comes
         # from reordered fp16 reductions in the per-layer matmuls and
@@ -382,9 +374,7 @@ class TestASREngine:
         """
         from oasr.engine import ASREngine, EngineConfig
 
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 2:
-            pytest.skip("Need at least 2 .wav files in WAV directory")
+        assets.require_wavs(2)  # before an engine is built
         waves = waveforms(wav_dir, 2)
 
         cfg = EngineConfig(
@@ -427,9 +417,7 @@ class TestASREngine:
     def test_memory_cleanup_after_streaming(self, device, ckpt_dir: str, wav_dir: str):
         from oasr.engine import ASREngine, EngineConfig
 
-        wavs = sorted(glob.glob(os.path.join(wav_dir, "*.wav")))
-        if len(wavs) < 2:
-            pytest.skip(f"Need at least 2 .wav files in WAV directory, found {len(wavs)}")
+        assets.require_wavs(2)  # before an engine is built
 
         cfg = EngineConfig(
             ckpt_dir=ckpt_dir,

@@ -198,10 +198,8 @@ def test_load_checkpoint_matches_wenet(
     ckpt_dir: str, batch: int, time_in: int, feat_dim: int, dtype: torch.dtype
 ):
     """Encoder inference outputs match between OASR and WeNet for the same checkpoint."""
-    # The `ckpt_dir` fixture gates on CKPT_DIR through tests/assets.py (marker
-    # `final.pt`); `train.yaml` is the WeNet-specific extra this oracle needs.
-    if not (Path(ckpt_dir) / "train.yaml").exists():
-        pytest.skip(f"{ckpt_dir} has no train.yaml — not a WeNet checkpoint dir")
+    # The `ckpt_dir` fixture gates on CKPT_DIR through tests/assets.py, whose
+    # probe requires `train.yaml` beside the `final.pt` marker.
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     oasr_model, _ = load_wenet_checkpoint(str(ckpt_dir), device=device, dtype=dtype)

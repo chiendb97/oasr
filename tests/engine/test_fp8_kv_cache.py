@@ -23,7 +23,7 @@ from dataclasses import replace
 import assets
 import pytest
 import torch
-from helpers import device_sm, tiny_conformer, wav_paths
+from helpers import device_sm, tiny_conformer
 
 from oasr.engine.config import EngineConfig, QuantizationConfig
 
@@ -286,10 +286,7 @@ class TestRealWhisper:
         _requires_lane()
         import soundfile as sf
 
-        audios = [
-            torch.from_numpy(sf.read(p, dtype="float32")[0])
-            for p in wav_paths(assets.declared("WAV_DIR"))[:6]
-        ]
+        audios = [torch.from_numpy(sf.read(p, dtype="float32")[0]) for p in assets.require_wavs(6)]
 
         def run(**kw):
             engine = self._engine(**kw)

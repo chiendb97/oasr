@@ -688,8 +688,7 @@ class TestRealIcefallCheckpoint:
         from oasr.models.registry import load_checkpoint_bundle
 
         exp = Path(ZIPFORMER_CKPT) / "exp"
-        if not exp.is_dir():
-            pytest.skip("release has no exp/ subdir")
+        assets.require_contents("ZIPFORMER_CKPT", exp.is_dir(), f"{exp} is not a directory")
         _arch, b = load_checkpoint_bundle(exp)
         assert b.tokenizer is not None and b.tokenizer.kind == "sentencepiece"
 

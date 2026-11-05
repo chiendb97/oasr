@@ -20,9 +20,9 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 from pathlib import Path
 
+import assets
 import pytest
 import torch
 from helpers import tiny_conformer
@@ -265,8 +265,10 @@ def test_quantize_checkpoint_with_a_bf16_calibration_twin(tmp_path):
     from oasr.models.registry import load_checkpoint_bundle, materialize_model
     from oasr.quantization.export import REPORT_NAME, quantize_checkpoint
 
-    src = os.environ["SPEECH_LLM_TINY"]
-    manifest = Path(os.environ["LIBRISPEECH_DEV_DIR"]) / "manifest.jsonl"
+    # Resolved through the gate, not the environment (rule 7): either asset may
+    # come from $OASR_ASSET_ROOT, where the env var is unset.
+    src, librispeech = assets.require("SPEECH_LLM_TINY", "LIBRISPEECH_DEV_DIR")
+    manifest = Path(librispeech) / "manifest.jsonl"
     out = quantize_checkpoint(
         src,
         str(tmp_path / "q"),

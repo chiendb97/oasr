@@ -40,6 +40,9 @@ model; quantization (W8A8 int8 and fp8, SmoothQuant) is the ninth.
 7. **Never read a gating environment variable directly in a test.** Declare the
    asset in `tests/assets.py` and gate through `assets.require(...)` /
    `@pytest.mark.requires_assets(...)`, so every skip is counted and reported.
+   What a present asset holds (a file count, a sub-path) goes through
+   `assets.require_wavs(n)` / `assets.require_contents(...)`, never a bare
+   `pytest.skip`.
 8. **Run the tests and the benchmarks with the checkpoints exported.** Start every
    session with `set -a; source .env; set +a` (copy `.env.example` if you have no
    `.env`); every command in this file assumes it. The dangerous half is silent:

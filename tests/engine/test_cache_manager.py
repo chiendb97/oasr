@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List, Tuple
 
+import assets
 import pytest
 import torch
 
@@ -1662,9 +1663,10 @@ AUDIO_SCALE = 32768.0
 
 @pytest.fixture(scope="module")
 def model(ckpt_dir: str, device):
-    """Load the U2++ Conformer from the checkpoint supplied via --ckpt-dir."""
-    if not ckpt_dir or not (Path(ckpt_dir) / "final.pt").exists():
-        pytest.skip("Checkpoint not found; pass --ckpt-dir <path> or set CKPT_DIR")
+    """Load the U2++ Conformer from the checkpoint supplied via --ckpt-dir.
+
+    The ``ckpt_dir`` fixture has already gated on the asset.
+    """
     from oasr.models.conformer import load_wenet_checkpoint
 
     m, _ = load_wenet_checkpoint(ckpt_dir, device=str(device), dtype=torch.float16)
@@ -1972,11 +1974,6 @@ class TestCtcDecode:
 # ---------------------------------------------------------------------------
 
 
-def _skip_if_no_audio(audio_path: str) -> None:
-    if not audio_path or not Path(audio_path).exists():
-        pytest.skip("Audio file not found; pass --audio-path <wav> or set AUDIO_PATH")
-
-
 class TestStreamingWithRealAudio:
     """End-to-end paged streaming on real audio.
 
@@ -1990,16 +1987,16 @@ class TestStreamingWithRealAudio:
     def _load_chunks(audio_path: str, device, dtype) -> List[torch.Tensor]:
         feats = _read_audio_and_extract_features(audio_path, device=device, dtype=dtype)
         chunks = _chunk_features(feats)
-        if len(chunks) < 2:
-            pytest.skip(
-                f"Audio at {audio_path!r} is too short "
-                f"(got {feats.size(1)} frames, need ≥ {2 * CHUNK_INPUT_TIME})."
-            )
+        assets.require_contents(
+            "AUDIO_PATH",
+            len(chunks) >= 2,
+            f"{audio_path} is too short: {feats.size(1)} frames, "
+            f"need at least {2 * CHUNK_INPUT_TIME}",
+        )
         return chunks
 
     def test_forward_and_ctc_decode(self, model, ckpt_dir: str, audio_path: str, device):
         """Paged streaming → CTC beam search → non-empty transcript."""
-        _skip_if_no_audio(audio_path)
 
         dtype = torch.float16
         beam_size = 10
@@ -2041,7 +2038,6 @@ class TestStreamingWithRealAudio:
 
     def test_cache_manager_pool_accounting(self, model, audio_path: str, device):
         """Two real-audio paged streams share a pool; freeing one leaves the other intact."""
-        _skip_if_no_audio(audio_path)
 
         from oasr.cache import (
             AttentionCacheManager,

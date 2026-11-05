@@ -553,9 +553,9 @@ class TestVadOffChangesNothing:
     def test_transcripts_are_byte_identical_with_vad_off(self, ckpt_dir, wav_dir):
         import pathlib
 
+        # Four when there are four, but two are enough: counted against WAV_DIR.
+        assets.require_wavs(2)
         wavs = sorted(pathlib.Path(wav_dir).glob("*.wav"))[:4]
-        if len(wavs) < 2:
-            pytest.skip("need at least two wav files")
         # `None` is what every engine had before the axis existed; `mode="off"`
         # is the explicit spelling of the same thing.  They must agree with each
         # other *and* with the observing engine's transcripts, since observing
@@ -567,13 +567,11 @@ class TestVadOffChangesNothing:
         assert sorted(base.values()) == sorted(observing.values())
 
     def test_no_segments_are_attached_unless_the_request_asked(self, ckpt_dir, wav_dir):
-        import pathlib
-
         import soundfile as sf
 
         from oasr.engine import ASREngine, EngineConfig
 
-        wav = sorted(pathlib.Path(wav_dir).glob("*.wav"))[0]
+        wav = assets.require_wavs(1)[0]
         data, _sr = sf.read(str(wav), dtype="float32")
         engine = ASREngine(
             EngineConfig(

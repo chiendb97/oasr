@@ -175,7 +175,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     if assets.STATE.gated and not assets.STATE.strict:
         total = sum(assets.STATE.gated.values())
         write(
-            f"  -> {total} test(s) skipped for missing assets. "
+            f"  -> {total} test(s) skipped for missing or incomplete assets. "
             f"A green run does not cover them; use --strict-assets to make this fatal."
         )
 
