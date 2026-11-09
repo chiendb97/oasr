@@ -320,6 +320,12 @@ class SlotStreamingBackend(StreamingEncoderBackend):
             return None
         return self._capture(batch)
 
+    # Autograd off here, not only in ``forward_step``: ``prewarm`` reaches this
+    # from engine construction, where grad mode is on.  A capture under grad
+    # mode fails on any GEMM routed to cuBLAS's ``addmm(out=)`` (the weights
+    # still require grad), and a failed width runs eager for the life of the
+    # engine -- 2.5x slower streaming on the fp16 Zipformer transducer.
+    @torch.no_grad()
     def _capture(self, batch: int) -> Optional[_Captured]:
         import tvm_ffi
 
