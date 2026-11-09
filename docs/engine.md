@@ -339,7 +339,7 @@ prepare_offline                    prepare_streaming
 | `offline_graph_batch_buckets` | `None` | Batch widths to capture at. `None` takes `preferred_batch_size` when set, else powers of two up to `max_batch_size`. Set it *below* `max_batch_size` to exclude the widest batches, where capture is a small net loss. |
 | `offline_graph_frame_granularity` | `64` | Time-axis rounding, in feature frames. Overridden to `1` — exact, so no padding — for a fixed-window frontend. |
 | `offline_graph_max_frames` | `4096` | Refuse to capture past this padded width; longer requests run eager. |
-| `offline_graph_max_captures` | `64` | Live captures. Past this, new shapes run eager and are counted. |
+| `offline_graph_max_captures` | `64` | Live captures. Past this, new shapes run eager and are counted. This caps the count only. Bytes are bounded separately: a capture is kept only if the device still has `1.5 ×` the largest forward measured so far free afterwards ([§9.7](#9-performance-considerations)). |
 | `long_form` | `False` | Fan a request longer than a fixed-window frontend's window out into consecutive windows, decode them through the normal batched path **in parallel**, and stitch one output. The caller sees one request id, so HTTP/gRPC need no change. `long_form_overlap_seconds` plus a word-level overlap merge recover most of the boundary accuracy: the words a window's head repeats from the window before are dropped from the text, the word timings, the tokens and their timestamps alike, and speech segments are cut at the middle of the shared audio. Only where windows share audio: a VAD seam, cut in silence, keeps every word on both sides. |
 | `recycle_streaming_history` | `False` | At the streaming cache ceiling, recycle the oldest KV block instead of finalising the request with `finish_reason="length"`. |
 | `overlap_admit` | `False` | Offline only (`oasr-server --overlap-admit`): run each request's admission prep (waveform canonicalisation, frame-count stamp) on a daemon thread, so it overlaps `step()`. The caller gets its id back before the prep runs, so a prep failure comes back as an output with `error_stage="offline_prep"`, and `abort_request` also withdraws requests still being prepared. GIL-bound: it helps only with a deep admission backlog, and can cost a little at low concurrency. |
@@ -744,6 +744,26 @@ has the request id, so the failure is answered as an output.
    frame — so if only the graph padded to a bucket, an utterance would decode
    differently depending on whether its shape happened to be captured. See
    `GraphedOfflineForward.pad_time`.
+
+   **Captures are bounded in bytes, not only in count.** An eager forward cannot
+   use a byte of a capture pool, and every shape the cache does not serve runs
+   eager. So a capture is kept only if the device still has `1.5 ×` the largest
+   forward measured so far free afterwards. Otherwise that shape runs eager and
+   is counted under `fallback_budget`, as is every shape at least as wide and as
+   long, without another warm-up. The cost comes from a measurement: the
+   capture's warm-up forward, run from an emptied cache, takes from the driver
+   what the capture then adds to the pool, to 0.01 GiB at the sizes that matter
+   (Nemotron, `B=64`: 6.21 / 7.17 / 9.11 GiB vs 6.21 / 7.17 / 9.10 GiB).
+
+   Without the bound, Nemotron at `max_batch_size=64` on LibriSpeech test-clean
+   grew the pool to 24.3 GiB in four shapes, and the fifth capture ran out of
+   memory. Every eager micro-batch after that was rejected, and 2,229 of 2,620
+   transcripts came back empty. With the bound, the pool stops at 15.3 GiB and
+   nothing is rejected. A capture that runs out of memory anyway turns the cache
+   off, and then releases the captures it already holds, because a cache that is
+   off never replays them. The bound reads free VRAM at capture time. Memory an
+   AR family's decoder-KV budget has promised but not yet allocated therefore
+   looks free to it.
 
 8. **The streaming graph ladder is pre-warmed exhaustively, and that is what
    flattens the tail.** The streaming graph is keyed
