@@ -357,6 +357,30 @@ class TestSlotStreamingBackend:
         stats = backend.stats()
         assert stats["captured"] == (3 if pad else 4) and stats["eager_steps"] == 0
 
+    def test_prewarm_captures_with_autograd_off(self):
+        """``prewarm`` runs from engine construction, where grad mode is on.
+
+        A capture under grad mode fails on any GEMM the selector routes to
+        cuBLAS's ``addmm(out=)`` -- the weights still require grad -- and the
+        failed width then runs eager for the life of the engine.  Which widths
+        hit that route depends on the shape rules, so the property is pinned
+        directly: every step run while capturing sees autograd off."""
+        model = self._build_model()
+        assert any(p.requires_grad for p in model.parameters())
+        backend = build_streaming_backend("slot", model, self._cfg(True, cap=4), None)
+        seen = []
+        forward = backend._chunk_forward  # noqa: SLF001
+
+        def spy(*args, **kwargs):
+            seen.append(torch.is_grad_enabled())
+            return forward(*args, **kwargs)
+
+        backend._chunk_forward = spy  # noqa: SLF001
+        with torch.enable_grad():
+            backend.prewarm([1, 2, 3, 4])
+        assert seen and not any(seen), "a prewarm capture ran with autograd on"
+        assert backend.stats()["captured"] == 4 and not backend._failed  # noqa: SLF001
+
     def test_the_padding_lane_runs_a_ladder_width_and_hands_back_live_rows(self):
         model = self._build_model()
         backend = build_streaming_backend("slot", model, self._cfg(True, cap=6), None)
