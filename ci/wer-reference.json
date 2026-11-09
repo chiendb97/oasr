@@ -43,6 +43,21 @@
       "insertions": 10
     },
     {
+      "key": "conformer_rescoring",
+      "asset": "CKPT_DIR",
+      "architecture": "conformer (WeNet U2++), CTC n-best + bidirectional attention rescoring",
+      "decode_method": "ctc_aed_rescoring",
+      "dtype": "float16",
+      "max_batch_size": 16,
+      "metric": "wer",
+      "normalizer": "english",
+      "error_rate_pct": 3.2,
+      "ref_units": 3403,
+      "substitutions": 87,
+      "deletions": 13,
+      "insertions": 9
+    },
+    {
       "key": "conformer_int8_rtn",
       "asset": "CKPT_DIR",
       "architecture": "conformer (WeNet U2++), int8 W8A8 round-to-nearest (online)",

@@ -372,3 +372,37 @@ class TestAnUnsupportedDecoderIsDropped:
         """YAML 1.1 reads ``1e-5`` as a string."""
         cfg = _config(decoder="bitransformer", decoder_conf={"norm_eps": "1e-5"})
         assert cfg.decoder is not None
+
+
+class TestSosEosFollowTheSpecialTokens:
+    """``<sos>`` / ``<eos>`` are read as WeNet reads them.
+
+    WeNet's ``ASRModel`` takes ``special_tokens.get("<sos>", vocab_size - 1)``.
+    The converter used ``output_dim - 1`` unconditionally, and the re-released
+    LibriSpeech U2++ declares ``<sos/eos>`` at id 2: every rescoring hypothesis
+    was then primed and closed with the BPE piece at id 5001, which rewards a
+    hypothesis cut mid-word -- attention rescoring scored 6.09 % WER on
+    LibriSpeech test-clean against CTC's 3.77 %, and 3.37 % once read from here.
+    """
+
+    _SPECIAL = {
+        "tokenizer_conf": {"special_tokens": {"<blank>": 0, "<unk>": 1, "<sos>": 2, "<eos>": 2}}
+    }
+
+    def test_the_decoder_takes_them_from_special_tokens(self):
+        dec = _config(decoder="bitransformer", **self._SPECIAL).decoder
+        assert (dec.sos_id, dec.eos_id) == (2, 2)
+
+    def test_without_the_table_the_legacy_last_unit_is_kept(self):
+        dec = _config(decoder="bitransformer").decoder
+        assert (dec.sos_id, dec.eos_id) == (31, 31)  # output_dim - 1
+
+    def test_the_decoding_defaults_agree_with_the_decoder(self, tmp_path):
+        import yaml
+
+        from oasr.models.conformer.convert import WenetConverter
+
+        raw = {"input_dim": 80, "output_dim": 32, "decoder": "bitransformer", **self._SPECIAL}
+        (tmp_path / "train.yaml").write_text(yaml.safe_dump(raw))
+        d = WenetConverter().build_decoding_defaults(None, tmp_path)
+        assert (d.sos_id, d.eos_id) == (2, 2)

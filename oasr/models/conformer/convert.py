@@ -46,6 +46,23 @@ def parse_wenet_yaml(yaml_path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def wenet_sos_eos(raw: Dict[str, Any], raw_vocab: int) -> Tuple[int, int]:
+    """The decoder's ``(<sos>, <eos>)`` ids, by WeNet's own rule.
+
+    ``tokenizer_conf.special_tokens`` names them when present -- WeNet's
+    ``ASRModel`` reads ``special_tokens.get("<sos>", vocab_size - 1)`` -- and
+    only a config without that table falls back to the legacy convention, the
+    last unit of the unpadded vocab.  The re-released LibriSpeech U2++ puts
+    ``<sos/eos>`` at id 2; taking ``output_dim - 1`` there primes and closes
+    every rescoring hypothesis with the BPE piece ``ZZ``, which rewards a
+    hypothesis cut mid-word: attention rescoring scored 6.09 % WER on
+    LibriSpeech test-clean, worse than CTC alone (3.77 %), and 3.37 % fixed.
+    """
+    special = (raw.get("tokenizer_conf") or {}).get("special_tokens") or {}
+    last = int(raw_vocab) - 1
+    return int(special.get("<sos>", last)), int(special.get("<eos>", last))
+
+
 #: Every ``encoder_conf`` key WeNet's ``ConformerEncoder`` has taken, v1.0 through
 #: main, by what this converter does with it.  WeNet passes ``encoder_conf`` to
 #: that constructor as keyword arguments, so a key outside these tables comes from
@@ -282,7 +299,7 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
 
     # U2/U2++ AED decoder branch: keep the (bi)transformer decoder for the
     # ``ctc_aed_rescoring`` capability.  The decoder's vocab is the *raw*
-    # (unpadded) output_dim; WeNet's <sos/eos> is the last raw unit.
+    # (unpadded) output_dim; <sos>/<eos> come from ``wenet_sos_eos``.
     decoder_cfg = None
     dec_name = raw.get("decoder")
     dec = raw.get("decoder_conf") or {}
@@ -295,6 +312,7 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
         )
     elif dec_name in ("transformer", "bitransformer") and raw_vocab:
         model_conf = raw.get("model_conf") or {}
+        sos_id, eos_id = wenet_sos_eos(raw, raw_vocab)
         decoder_cfg = TransformerDecoderConfig(
             vocab_size=int(raw_vocab),
             encoder_output_size=encoder_cfg.output_size,
@@ -302,8 +320,8 @@ def build_config_from_wenet(raw: Dict[str, Any]) -> ConformerModelConfig:
             linear_units=dec.get("linear_units", 2048),
             num_blocks=dec.get("num_blocks", 6),
             r_num_blocks=dec.get("r_num_blocks", 0) if dec_name == "bitransformer" else 0,
-            sos_id=int(raw_vocab) - 1,
-            eos_id=int(raw_vocab) - 1,
+            sos_id=sos_id,
+            eos_id=eos_id,
             reverse_weight=float(model_conf.get("reverse_weight", 0.0)),
         )
     elif dec_name:
@@ -435,17 +453,19 @@ class WenetConverter(BaseCheckpointConverter):
     def build_decoding_defaults(self, config, ckpt_dir: Path):
         from oasr.checkpoints import DecodingDefaults
 
-        # WeNet convention: <blank>=0, <unk>=1, <sos/eos> = last unit of the
-        # *unpadded* vocab (output_dim - 1), which only train.yaml knows —
-        # config.vocab_size is 8-padded for the GEMM kernels.
-        raw_vocab = parse_wenet_yaml(str(Path(ckpt_dir) / "train.yaml")).get("output_dim")
-        sos_eos = int(raw_vocab) - 1 if raw_vocab else None
+        # WeNet convention: <blank>=0, <unk>=1; <sos>/<eos> from train.yaml's
+        # special_tokens, else the last unit of the *unpadded* vocab
+        # (output_dim - 1), which only train.yaml knows — config.vocab_size is
+        # 8-padded for the GEMM kernels.
+        raw = parse_wenet_yaml(str(Path(ckpt_dir) / "train.yaml"))
+        raw_vocab = raw.get("output_dim")
+        sos_id, eos_id = wenet_sos_eos(raw, int(raw_vocab)) if raw_vocab else (None, None)
         return DecodingDefaults(
             default_decode_type=self.default_decode_type,
             blank_id=0,
             unk_id=1,
-            sos_id=sos_eos,
-            eos_id=sos_eos,
+            sos_id=sos_id,
+            eos_id=eos_id,
         )
 
 
