@@ -280,6 +280,13 @@ python benchmarks/run.py --family accuracy \
 - `oasr/testing/accuracy.py` holds the manifest and transcribe helpers shared
   with the CI accuracy gate (`tests/accuracy/test_accuracy.py`, reference rates in
   `ci/wer-reference.json`).
+- A request the engine fails (`finish_reason="error"`: an out-of-memory
+  micro-batch, or a prefill that could not reserve its KV) is **counted, not
+  scored**. The row's `requests_failed` column holds the count, the log names
+  the error stages, the error-rate cells stay empty, and the table prints
+  `FAILED` in place of the rate. Scored as empty transcripts, such a batch once read as 94 % WER. Lower
+  `--max-batch-size` and re-run. A request that only the untimed warm-up pass
+  lost is reported as a `[WARN]` line, and the row is still scored.
 - `--decode-option k=v` (repeatable) reaches the decode family's own knobs, and
   the CSV carries them, so two rows that differ only by an option stay tellable
   apart. This is how a storage or capture path is checked *at corpus scale*

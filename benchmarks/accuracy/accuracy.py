@@ -34,7 +34,13 @@ from benchmarks.core.footprint import (  # noqa: E402
 from benchmarks.core.metrics import percentile as _percentile  # noqa: E402
 from benchmarks.core.report import Reporter  # noqa: E402
 from benchmarks.core.schema import WorkloadRow  # noqa: E402
-from oasr.testing.accuracy import Entry, load_audio, load_manifest, transcribe  # noqa: E402
+from oasr.testing.accuracy import (  # noqa: E402
+    Entry,
+    describe_failures,
+    load_audio,
+    load_manifest,
+    transcribe,
+)
 from oasr.testing.wer import Result, compute, normalizer  # noqa: E402
 
 # One row per model, decode method, dtype, and batch size.
@@ -55,6 +61,7 @@ CSV_COLUMNS = [
     "metric",
     "normalizer",
     "utterances",
+    "requests_failed",
     "audio_seconds",
     "error_rate_pct",
     "substitutions",
@@ -89,11 +96,13 @@ class Row:
     normalizer: str
     utterances: int
     audio_seconds: float
-    error_rate_pct: float
-    substitutions: int
-    deletions: int
-    insertions: int
-    ref_units: int
+    #: ``None`` when any request failed (see :attr:`failures`): the rate of the
+    #: requests that survived is over a different reference than the manifest's.
+    error_rate_pct: Optional[float]
+    substitutions: Optional[int]
+    deletions: Optional[int]
+    insertions: Optional[int]
+    ref_units: Optional[int]
     wall_seconds: float
     rtfx: float
     utt_per_second: float
@@ -103,8 +112,17 @@ class Row:
     quantization: str = ""
     weight_mib: Optional[float] = None
     peak_alloc_mib: Optional[float] = None
+    #: Requests of the timed pass the engine failed (``finish_reason == "error"``),
+    #: index -> ``error_stage``.  Not scored: an OOM-rejected micro-batch scored as
+    #: empty hypotheses printed 94 % WER.  Its size is the CSV's ``requests_failed``.
+    failures: Dict[int, str] = field(default_factory=dict)
     #: Not a CSV column — carried so the caller can print the worst utterances.
+    #: ``None`` when the row was not scored.
     result: Optional[Result] = field(default=None, repr=False, compare=False)
+
+    @property
+    def requests_failed(self) -> int:
+        return len(self.failures)
 
 
 # ---------------------------------------------------------------------------
@@ -322,11 +340,9 @@ def run_one(
         # A per-request option, so the engine refuses a language this checkpoint
         # cannot honour instead of the row measuring its default one.
         decoding = None if language is None else DecodingOptions(language=language)
-        warm_hyps, _ = transcribe(
-            engine, waves, max_batch_size, streaming=streaming, decoding=decoding
-        )
+        warm = transcribe(engine, waves, max_batch_size, streaming=streaming, decoding=decoding)
         t0 = time.perf_counter()
-        hyps, per_request_ms = transcribe(
+        hyps, per_request_ms, failures = transcribe(
             engine, waves, max_batch_size, streaming=streaming, decoding=decoding
         )
         wall = time.perf_counter() - t0
@@ -341,30 +357,44 @@ def run_one(
         if _t.cuda.is_available():
             _t.cuda.empty_cache()
 
+    # Only the timed pass is scored, but a request the warm-up lost is still a
+    # request the engine failed to serve -- typically a capture that ran out of
+    # memory -- so it is said rather than absorbed by the warm-up.
+    if warm.failures:
+        print(f"[WARN] warm-up pass: {describe_failures(warm.failures, len(hyps))}")
+
     # The two passes decode the same audio, and only whether a shape had been
     # captured yet differs between them -- the output must not depend on that.
-    changed = sum(a != b for a, b in zip(warm_hyps, hyps))
+    # A failed row has no transcript to compare, and is reported on its own.
+    changed = sum(
+        a != b
+        for i, (a, b) in enumerate(zip(warm.hyps, hyps))
+        if i not in failures and i not in warm.failures
+    )
     if changed:
         print(
             f"[WARN] {changed} of {len(hyps)} transcript(s) differ between the warm-up "
             "and the timed pass; the error rate is the timed pass's"
         )
 
-    result = compute(
-        [e.text for e in entries],
-        hyps,
-        unit="word" if metric == "wer" else "char",
-        normalizer=normalizer(normalizer_kind),
-        uids=[e.uid for e in entries],
-    )
+    result: Optional[Result] = None
+    if not failures:
+        result = compute(
+            [e.text for e in entries],
+            hyps,
+            unit="word" if metric == "wer" else "char",
+            normalizer=normalizer(normalizer_kind),
+            uids=[e.uid for e in entries],
+        )
 
     if save_transcripts:
         save_transcripts.parent.mkdir(parents=True, exist_ok=True)
         with open(save_transcripts, "w", encoding="utf-8") as f:
-            for e, h in zip(entries, hyps):
-                f.write(
-                    json.dumps({"id": e.uid, "ref": e.text, "hyp": h}, ensure_ascii=False) + "\n"
-                )
+            for i, (e, h) in enumerate(zip(entries, hyps)):
+                rec = {"id": e.uid, "ref": e.text, "hyp": h}
+                if i in failures:
+                    rec["error_stage"] = failures[i]
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"[INFO] transcripts written to {save_transcripts}")
 
     ordered = sorted(per_request_ms)
@@ -396,11 +426,11 @@ def run_one(
         normalizer=normalizer_kind,
         utterances=len(entries),
         audio_seconds=round(audio_seconds, 2),
-        error_rate_pct=round(result.percent, 3),
-        substitutions=result.substitutions,
-        deletions=result.deletions,
-        insertions=result.insertions,
-        ref_units=result.counts.ref_len,
+        error_rate_pct=None if result is None else round(result.percent, 3),
+        substitutions=None if result is None else result.substitutions,
+        deletions=None if result is None else result.deletions,
+        insertions=None if result is None else result.insertions,
+        ref_units=None if result is None else result.counts.ref_len,
         wall_seconds=round(wall, 3),
         rtfx=round(audio_seconds / wall, 1) if wall else 0.0,
         utt_per_second=round(len(entries) / wall, 2) if wall else 0.0,
@@ -409,6 +439,7 @@ def run_one(
         quantization=served,
         weight_mib=weight_mib,
         peak_alloc_mib=peak_mib,
+        failures=failures,
         result=result,
     )
 
@@ -655,6 +686,8 @@ def _to_workload_row(r: "Row", repro_command: str) -> WorkloadRow:
         vad_mode=r.vad_mode,
         vad_backend=r.vad_backend,
         vad_options=r.vad_options,
+        requests_ok=r.utterances - r.requests_failed,
+        requests_failed=r.requests_failed,
         utterances=r.utterances,
         audio_s=r.audio_seconds,
         wall_s=r.wall_seconds,
@@ -683,10 +716,11 @@ def run(args: argparse.Namespace, reporter: Reporter, repro_command: str = "") -
     rows = _sweep(args)
     for row in rows:
         reporter.workload_row(_to_workload_row(row, repro_command))
-    if rows:
+    scored = [r for r in rows if r.result is not None]
+    if scored:
         reporter.raw(
             "worst_utterances",
-            {"config": rows[-1].manifest, "lines": rows[-1].result.worst(5)},
+            {"config": scored[-1].manifest, "lines": scored[-1].result.worst(5)},
         )
 
 
@@ -818,10 +852,12 @@ def _sweep(args: argparse.Namespace):
                         failures.append(msg)
                         continue
                     rows.append(row)
-                    print(
-                        f"       {row.result.summary()}  RTFx {row.rtfx}  "
-                        f"p50 {row.latency_p50_ms} ms"
+                    scored = (
+                        row.result.summary()
+                        if row.result is not None
+                        else f"{describe_failures(row.failures, row.utterances)}, not scored"
                     )
+                    print(f"       {scored}  RTFx {row.rtfx}  p50 {row.latency_p50_ms} ms")
 
     _print_table(rows)
     return rows
@@ -833,9 +869,10 @@ def _finish(rows, failures, args):
         for f in failures:
             print("  " + f)
 
-    if args.show_worst and rows:
-        print(f"\nworst {args.show_worst} utterance(s) of the last configuration:")
-        for line in rows[-1].result.worst(args.show_worst):
+    scored = [r for r in rows if r.result is not None]
+    if args.show_worst and scored:
+        print(f"\nworst {args.show_worst} utterance(s) of the last scored configuration:")
+        for line in scored[-1].result.worst(args.show_worst):
             print("  " + line)
 
 
@@ -849,8 +886,9 @@ def _print_table(rows: Sequence[Row]) -> None:
     print("\n" + hdr)
     print("-" * len(hdr))
     for r, cfg in zip(rows, labels):
+        rate = "FAILED" if r.error_rate_pct is None else f"{r.error_rate_pct:.2f}"
         print(
-            f"{cfg:<{width}} {r.metric:>7} {r.error_rate_pct:>8.2f} "
+            f"{cfg:<{width}} {r.metric:>7} {rate:>8} "
             f"{r.rtfx:>8.1f} {r.latency_p50_ms:>8.1f} {r.latency_p99_ms:>8.1f}"
             f" {_mib(r.weight_mib):>8} {_mib(r.peak_alloc_mib):>8}"
         )
@@ -860,6 +898,14 @@ def _print_table(rows: Sequence[Row]) -> None:
         f"{rows[0].utterances if rows else 0} utterances, "
         f"{rows[0].audio_seconds if rows else 0:.0f} s of audio)"
     )
+    for r, cfg in zip(rows, labels):
+        if r.failures:
+            # The speed of a row whose requests partly failed is the speed of less
+            # work, so it is flagged here as well as in the CSV's requests_failed.
+            print(
+                f"[WARN] {cfg}: {describe_failures(r.failures, r.utterances)}; "
+                "no error rate, and its speed covers less work"
+            )
 
 
 def _table_label(r: Row) -> str:
