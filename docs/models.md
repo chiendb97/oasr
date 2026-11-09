@@ -450,6 +450,15 @@ CIF fire positions become per-token `RequestOutput.timestamps`.
 - `convert.py::HFQwen2AudioConverter` — auto-detects `config.json: model_type=qwen2_audio`,
   fills omitted `text_config` fields from `Qwen2Config` defaults (the published 7B
   relies on them), and reads sharded safetensors.
+- `config.py` — the prompt is the **Instruct** checkpoint's ChatML template, and its
+  default user turn is *"Transcribe the audio into text. Output only the
+  transcription, with no extra words."* Qwen2-Audio's own ASR prompt ("Detect the
+  language and recognize the speech.") was written for the *base* model's plain
+  template. The Instruct model answers it as a chat turn ("The speech is in
+  English, and it is a male singing in a neutral mood"), which scored 94.9 % WER on
+  test-clean against 3.19 %. A native bundle exported while that was the default
+  stored it. On load it is replaced, with a warning, by the transcription prompt;
+  `llm_prompt` or the per-request `prompt` overrides either.
 
 Checkpoint bundles load host-side (`map_location="cpu"`) with the dtype cast
 **before** the device move — an 8.4B checkpoint double-books the GPU otherwise.

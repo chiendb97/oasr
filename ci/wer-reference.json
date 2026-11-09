@@ -848,14 +848,14 @@
         "the same number whichever the engine defaults to.",
         "",
         "`prompt` is pinned in the entry rather than inherited. This is the",
-        "*Instruct* checkpoint, and the shipped default is the official Qwen2-",
-        "Audio ASR prompt ('Detect the language and recognize the speech.'),",
-        "which the Instruct variant answers in prose — 76.56% on the first 8",
-        "utterances, almost all of it insertions like 'the language in the",
-        "speech is english and the transcription is ...'. That measures prompt",
-        "following, not recognition, and it would bury a real regression. A",
-        "prompt change is a WER change with no defect behind it, so it belongs",
-        "in the entry with the rest of the decode configuration.",
+        "*Instruct* checkpoint, and until 2026-11-09 the shipped default was the",
+        "official Qwen2-Audio ASR prompt ('Detect the language and recognize the",
+        "speech.'), which the Instruct variant answers in prose — 76.56% on the",
+        "first 8 utterances, almost all of it insertions like 'the language in",
+        "the speech is english and the transcription is ...'. The default is now",
+        "this row's prompt (report D6), and the pin stays: a prompt change is a",
+        "WER change with no defect behind it, so it belongs in the entry with the",
+        "rest of the decode configuration, not in whatever the default becomes.",
         "",
         "bfloat16, unlike every row above, because the checkpoint declares it",
         "(text_config.torch_dtype); fp16 is not what this model is served as.",
@@ -953,13 +953,13 @@
           }
         }
       },
-      "error_rate_pct": 5.52,
+      "error_rate_pct": 5.85,
       "ref_units": 3403,
-      "substitutions": 58,
-      "deletions": 61,
-      "insertions": 69,
+      "substitutions": 62,
+      "deletions": 66,
+      "insertions": 71,
       "recorded_with": "python -m oasr.cli quantize $ASSET /tmp/qwen_sq --recipe smoothquant_w8a8 --calib-manifest $LIBRISPEECH_DEV_DIR/manifest.jsonl --calib-dtype bfloat16 && python benchmarks/run.py --family accuracy --ckpt-dir /tmp/qwen_sq --manifest benchmarks/manifests/ljspeech_200.jsonl --audio-root $WAV_DIR --dtype bfloat16 --max-batch-size 16 --decode-option 'prompt=Transcribe the audio into text. Output only the transcription, with no extra words.'",
-      "_comment": "Recorded 2026-10-21 (RTX 5090), bf16 activations; the bf16 arm measured 5.67 (65S 51D 77I) in the same tree. The fp32 master (33.6 GB) does not fit the GPU: calibration runs a bf16 twin on the device, the folds the fp32 master on the host (5 min, 141 GB host RAM free). Re-recorded 2026-10-26 (was 5.14, S57 D47 I71): the bf16 twin's gated MLP used to take its fused kernel for the rows it serves fused (the decode steps), which never calls gate_proj / up_proj, so their SmoothQuant observers missed those rows while down_proj saw them. A hooked projection is now called, so the post_attention_layernorm groups see every row, as an fp32 calibration would. A/B in the same tree: 5.11 (S57 D49 I68) with the old behaviour, 5.52 with it; still <= the bf16 row + 0.3 and below RTN."
+      "_comment": "Recorded 2026-10-21 (RTX 5090), bf16 activations; the bf16 arm measured 5.67 (65S 51D 77I) in the same tree. The fp32 master (33.6 GB) does not fit the GPU: calibration runs a bf16 twin on the device, the folds the fp32 master on the host (5 min, 141 GB host RAM free). Re-recorded 2026-10-26 (was 5.14, S57 D47 I71): the bf16 twin's gated MLP used to take its fused kernel for the rows it serves fused (the decode steps), which never calls gate_proj / up_proj, so their SmoothQuant observers missed those rows while down_proj saw them. A hooked projection is now called, so the post_attention_layernorm groups see every row, as an fp32 calibration would. A/B in the same tree: 5.11 (S57 D49 I68) with the old behaviour, 5.52 with it; still <= the bf16 row + 0.3 and below RTN. Re-recorded 2026-11-09 (was 5.52, S58 D61 I69): calibration runs the LM over the default user prompt, and the default changed from the base model's ASR prompt, which the Instruct model answered with a description of the audio, to this row's transcription prompt (report D6). The text positions used to be calibrated on a prompt and answers that serving never sees. A/B in the same tree, only the calibration prompt differing and both arms serving this prompt: LJ200 5.52 -> 5.85, LibriSpeech test-clean (Silero VAD segment, batch 16) 3.27 -> 3.32. Still below RTN (5.88) here; on test-clean both arms are above RTN int8 (3.155 in the 2026-11-09 report)."
     }
   ]
 }

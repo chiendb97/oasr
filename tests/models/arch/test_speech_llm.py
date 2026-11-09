@@ -57,6 +57,60 @@ class TestConfig:
         cfg2 = SpeechLlmModelConfig.from_dict(d)
         assert cfg2 == cfg
 
+    def test_the_default_user_turn_asks_for_a_transcript(self):
+        """The template is the Instruct checkpoint's ChatML, which answers the base
+        model's ASR prompt with a description of the audio (94.9 % WER)."""
+        from oasr.models.speech_llm import SpeechLlmModelConfig
+        from oasr.models.speech_llm.config import QWEN2_AUDIO_BASE_ASR_PROMPT
+
+        prompt = SpeechLlmModelConfig().default_user_prompt
+        assert prompt != QWEN2_AUDIO_BASE_ASR_PROMPT
+        assert prompt.lower().startswith("transcribe")
+
+    def test_a_bundle_storing_the_stale_default_loads_the_transcription_prompt(self, caplog):
+        """``asdict`` wrote the old default into every native bundle exported before
+        the fix, so a re-loaded quantized checkpoint would bring the defect back."""
+        import dataclasses
+        import logging
+
+        from oasr.models.speech_llm import SpeechLlmModelConfig
+        from oasr.models.speech_llm.config import (
+            QWEN2_AUDIO_BASE_ASR_PROMPT,
+            QWEN2_AUDIO_DEFAULT_USER_PROMPT,
+        )
+
+        stale = dataclasses.asdict(SpeechLlmModelConfig())
+        stale["default_user_prompt"] = QWEN2_AUDIO_BASE_ASR_PROMPT
+        with caplog.at_level(logging.WARNING):
+            cfg = SpeechLlmModelConfig.from_dict(stale)
+        assert cfg.default_user_prompt == QWEN2_AUDIO_DEFAULT_USER_PROMPT
+        assert "Re-export the bundle" in caplog.text
+
+    def test_a_bundle_storing_any_other_prompt_keeps_it(self):
+        import dataclasses
+
+        from oasr.models.speech_llm import SpeechLlmModelConfig
+        from oasr.models.speech_llm.config import QWEN2_AUDIO_BASE_ASR_PROMPT
+
+        base = dataclasses.asdict(SpeechLlmModelConfig())
+        custom = {**base, "default_user_prompt": "Transcribe in French."}
+        assert SpeechLlmModelConfig.from_dict(custom).default_user_prompt == "Transcribe in French."
+        # The base prompt is only a stale default under the ChatML template it was
+        # never written for; a bundle with its own template keeps it.
+        plain = {
+            **base,
+            "default_user_prompt": QWEN2_AUDIO_BASE_ASR_PROMPT,
+            "prompt_suffix": "<|audio_eos|>{prompt}:",
+        }
+        assert SpeechLlmModelConfig.from_dict(plain).default_user_prompt == (
+            QWEN2_AUDIO_BASE_ASR_PROMPT
+        )
+        # A bundle older than the field gets the class default.
+        legacy = {k: v for k, v in base.items() if k != "default_user_prompt"}
+        assert SpeechLlmModelConfig.from_dict(legacy).default_user_prompt == (
+            SpeechLlmModelConfig().default_user_prompt
+        )
+
     def test_model_metadata(self):
         from oasr.models.speech_llm import SpeechLlmModel, SpeechLlmModelConfig
 
@@ -223,7 +277,13 @@ class TestHFParityTinyFixture:
         return load_pretrained(SPEECH_LLM_TINY, device="cpu", dtype=torch.float32)
 
     @pytest.fixture(scope="class")
-    def prompt_ids(self, loaded):
+    def prompt_ids(self, ref, loaded):
+        """The template around the prompt the reference was generated with.
+
+        Parity is about the template, the tower and the LM under one prompt, so it
+        reads the prompt from the reference rather than from the default.  The
+        default changed (to the transcription prompt) and the reference did not.
+        """
         from oasr.models.speech_llm.config import (
             QWEN2_AUDIO_PROMPT_PREFIX,
             QWEN2_AUDIO_PROMPT_SUFFIX,
@@ -232,9 +292,7 @@ class TestHFParityTinyFixture:
 
         tok = build_tokenizer(loaded.tokenizer_spec)
         prefix = tok.encode(QWEN2_AUDIO_PROMPT_PREFIX)
-        suffix = tok.encode(
-            QWEN2_AUDIO_PROMPT_SUFFIX.format(prompt=loaded.config.default_user_prompt)
-        )
+        suffix = tok.encode(QWEN2_AUDIO_PROMPT_SUFFIX.format(prompt=ref["prompt"]))
         return prefix, suffix
 
     def test_features_match_hf(self, ref, loaded):
@@ -263,7 +321,6 @@ class TestHFParityTinyFixture:
 
     def test_prompt_ids_match_processor(self, ref, loaded, prompt_ids):
         prefix, suffix = prompt_ids
-        assert ref["prompt"] == loaded.config.default_user_prompt
         for row in ref["rows"]:
             hf_ids = row["input_ids"][0].tolist()
             n_audio = sum(1 for t in hf_ids if t == loaded.config.audio_token_id)
@@ -771,13 +828,22 @@ class TestRealCheckpoint:
         cfg = EngineConfig(ckpt_dir=SPEECH_LLM_CKPT, service_mode="offline", max_new_tokens=96)
         eng = ASREngine(cfg)
         texts = eng.transcribe_offline(audios)
-        # LJ001-0001/0002 ground truth inside the model's answer sentence
-        # (exact HF-vs-OASR token match is not asserted in bf16 — greedy
-        # near-ties on filler tokens flip; the recognized content must not).
+        # LJ001-0001/0002 ground truth (exact HF-vs-OASR token match is not
+        # asserted in bf16 -- greedy near-ties on filler tokens flip; the
+        # recognized content must not).
         assert (
             "printing in the only sense with which we are at present concerned" in texts[0].lower()
         )
         assert "in being comparatively modern" in texts[1].lower()
+
+        # With no prompt given, the answer *is* the transcript, sometimes in quotes
+        # (which the WER normalizer strips).  The base model's prompt, the old
+        # default, got "The speech is in English, ..." or a description instead.
+        def bare(text):
+            return text.lower().lstrip("'\" ")
+
+        assert bare(texts[0]).startswith("printing in the only sense"), texts[0]
+        assert bare(texts[1]).startswith("in being comparatively modern"), texts[1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
