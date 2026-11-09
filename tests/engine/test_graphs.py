@@ -421,6 +421,142 @@ class TestFallbackAccounting:
         assert c.pad_overhead == pytest.approx((4 * 128) / (2 * 100))
 
 
+_MIB = 1024**2
+
+
+class _HungryEncoder(_Encoder):
+    """Takes ``bytes_per_frame_row`` of working memory per (row, frame).
+
+    Big enough for the cache to measure, which the plain stub is not: a forward
+    that small fits into segments the process already holds.  Nemotron's
+    subsampling takes ~6 GiB at B=64 x 2048 frames, the same linear shape.
+    ``oom_in_capture`` raises the allocator's error inside a capture after
+    allocating there, the way a capture that outgrows the card does.
+    """
+
+    def __init__(self, *a, bytes_per_frame_row=256 * 1024, **kw):
+        super().__init__(*a, **kw)
+        self.bytes_per_frame_row = bytes_per_frame_row
+        self.oom_in_capture = False
+        self.calls = 0
+
+    def forward_offline(self, features, lengths):
+        self.calls += 1
+        rows, frames = int(features.size(0)), int(features.size(1))
+        scratch = torch.ones(
+            rows * frames * self.bytes_per_frame_row // 4,
+            dtype=torch.float32,
+            device=features.device,
+        )
+        if self.oom_in_capture and torch.cuda.is_current_stream_capturing():
+            raise torch.cuda.OutOfMemoryError("simulated: the capture outgrew the card")
+        out, out_lengths = super().forward_offline(features, lengths)
+        return out * scratch[:1], out_lengths
+
+
+def _batch(rows, frames, dev):
+    return (
+        torch.randn(rows, frames, 16, device=dev),
+        torch.full((rows,), frames, device=dev, dtype=torch.int32),
+    )
+
+
+@pytest.mark.cuda
+class TestTheGraphPoolLeavesRoomForEager:
+    """A capture must not take the memory the eager forwards need.
+
+    An eager forward cannot use a byte of a capture pool, and every shape the
+    cache does not serve runs eager.  Nemotron at ``max_batch_size=64`` showed
+    the failure on LibriSpeech test-clean.  Four captures held 24.3 GiB, the
+    fifth ran out of memory, and the cache switched itself off but kept those
+    graphs resident.  The eager micro-batches left with ~2 GiB were
+    rejected for OOM, and 2,229 of 2,620 transcripts came back empty.
+    """
+
+    def test_the_warm_up_measures_what_the_capture_adds(self):
+        """The bound relies on this: the warm-up's bytes predict the capture's."""
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _HungryEncoder().to(dev).eval()
+        c = _cache(frame_granularity=64, batch_buckets=[4])
+        with torch.no_grad():
+            assert c.run(FUSED, enc.forward_offline, *_batch(4, 128, dev)) is not None
+        scratch = 4 * 128 * enc.bytes_per_frame_row
+        need = int(c.stats()["largest_forward_gib"] * 1024**3)
+        assert need >= scratch and c.pool_bytes >= scratch
+        # The two differ by a fixed amount, not a proportional one, in either
+        # direction.  A fresh pool opens its own small and mid-size segments,
+        # which the warm-up fit into segments the process already held.  A
+        # warm-up can also be the first user of a library workspace, which the
+        # capture then reuses.  The 256 MiB floor on the reserve covers the low
+        # side; reading high only refuses a capture early.
+        assert abs(c.pool_bytes - need) <= 64 * _MIB
+        c.release()
+
+    def test_a_capture_that_would_starve_eager_forwards_runs_eager(self, monkeypatch):
+        import oasr.engine.offline_graph as offline_graph
+
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _HungryEncoder().to(dev).eval()
+        c = _cache(frame_granularity=64, batch_buckets=[2, 4])
+        # The capture needs 128 MiB.  Leaving 256 - 128 MiB is less than the
+        # 256 MiB floor on the reserve.
+        monkeypatch.setattr(offline_graph, "read_device_memory", lambda device: (256 * _MIB, 0))
+        with torch.no_grad():
+            assert c.run(FUSED, enc.forward_offline, *_batch(4, 128, dev)) is None
+        assert c.fallback_budget == 1 and c.fallback_failed == 0
+        assert c.captures == 0 and c.num_captured == 0
+        assert c.enabled, "a refusal is per shape, not the end of capture"
+
+    def test_a_shape_that_dominates_a_refused_one_skips_the_warm_up(self, monkeypatch):
+        """At least as wide and as long needs at least as much: no forward to learn it."""
+        import oasr.engine.offline_graph as offline_graph
+
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _HungryEncoder().to(dev).eval()
+        c = _cache(frame_granularity=64, batch_buckets=[2, 4])
+        real = offline_graph.read_device_memory
+        monkeypatch.setattr(offline_graph, "read_device_memory", lambda device: (256 * _MIB, 0))
+        with torch.no_grad():
+            assert c.run(FUSED, enc.forward_offline, *_batch(4, 128, dev)) is None
+            calls = enc.calls
+            assert c.run(FUSED, enc.forward_offline, *_batch(4, 128, dev)) is None
+            assert c.run(FUSED, enc.forward_offline, *_batch(3, 192, dev)) is None
+            assert enc.calls == calls, "a dominated shape ran a warm-up forward"
+            assert c.fallback_budget == 3
+
+            # Narrower is a different question, asked and answered on its own.
+            monkeypatch.setattr(offline_graph, "read_device_memory", real)
+            assert c.run(FUSED, enc.forward_offline, *_batch(2, 128, dev)) is not None
+        assert c.captures == 1
+        c.release()
+
+    def test_a_capture_that_runs_out_of_memory_releases_the_others(self):
+        """A cache that is off never replays, so holding its graphs only costs memory."""
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _HungryEncoder().to(dev).eval()
+        assert recover_from_failed_capture(dev, None)
+        with torch.no_grad():  # one-time library workspaces are not the cache's
+            enc.forward_offline(*_batch(4, 256, dev))
+        torch.cuda.empty_cache()
+        before = _free_gib(dev)
+        c = _cache(frame_granularity=64, batch_buckets=[4])
+        with torch.no_grad():
+            assert c.run(FUSED, enc.forward_offline, *_batch(4, 128, dev)) is not None
+            assert before - _free_gib(dev) > 0.1, "the capture should hold its pool"
+
+            enc.oom_in_capture = True
+            assert c.run(FUSED, enc.forward_offline, *_batch(4, 256, dev)) is None
+        assert not c.enabled
+        assert c.num_captured == 0 and c.pool_bytes == 0
+        gc.collect()
+        torch.cuda.empty_cache()
+        assert before - _free_gib(dev) < 0.05, "the released captures kept their pool"
+
+
 # --------------------------------------------------------------------------
 # Recovery from a capture that failed halfway through
 # --------------------------------------------------------------------------

@@ -96,10 +96,40 @@ Capture constraints
 * A capture that fails is remembered and never retried.  Retrying costs a
   warm-up forward every call and then runs eager anyway, which is strictly worse
   than never having tried (the ``DecoderStepGraphCache`` lesson).
+
+Memory bound
+------------
+``max_captures`` bounds the *count* of captures, which says nothing about their
+bytes.  An eager forward cannot use a byte of a capture pool, and every shape the
+cache does not serve runs eager, so the pool must never take the memory an eager
+forward needs.  Nemotron at ``max_batch_size=64`` on LibriSpeech test-clean
+showed what happens otherwise.  The construction prewarm and three lazy
+captures grew the pool to 24.3 GiB (2.0 + 6.2 + 7.2 + 9.1 GiB).  Each shape
+arrived longer than the last, so the shared pool reused nothing.  The fifth
+capture ran out of memory, and every eager micro-batch after it was rejected for
+OOM: 2,229 of 2,620 transcripts came back empty.
+
+So each capture first measures what its warm-up forward takes from the driver,
+starting from an emptied cache.  At the sizes that matter, that is what the
+capture then adds to the pool, to 0.01 GiB (Nemotron, B=64, T=2048 / 2368 /
+3008: warm-up 6.21 / 7.17 / 9.11 GiB, capture 6.21 / 7.17 / 9.10 GiB).  The capture is kept only if the
+device would still have :data:`~oasr.engine.memory.ACTIVATION_SAFETY` times the
+largest forward measured so far free afterwards.  Otherwise the shape runs eager
+and is counted under ``fallback_budget``, as is every shape at least as wide and
+as long, without another warm-up.
+
+A capture that *does* run out of memory turns the cache off.  A cache that is
+off never replays, so it also releases what it had already captured instead of
+holding the memory for nothing.
+
+The bound reads free VRAM when it captures.  Memory that another budget has
+promised but not yet allocated therefore looks free to it.  The one such budget
+today is an AR family's decoder KV (``decode_kv_budget_gib``).
 """
 
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -108,6 +138,7 @@ import torch
 import tvm_ffi
 
 from .capture_recovery import recover_from_failed_capture
+from .memory import ACTIVATION_SAFETY, MIN_ACTIVATION_RESERVE_BYTES, read_device_memory
 
 if TYPE_CHECKING:
     from .config import EngineConfig
@@ -192,8 +223,13 @@ class GraphedOfflineForward:
         rare (so a capture rarely pays for itself) and the regime where the GPU
         is genuinely busy (so there is little host overhead left to remove).
     max_captures : int
-        Cap on live captures, bounding graph-pool growth.  Once saturated, new
-        shapes run eager and are counted.
+        Cap on the *number* of live captures.  Once saturated, new shapes run
+        eager and are counted.  Bytes are bounded separately (see
+        ``eager_reserve_factor``).
+    eager_reserve_factor : float
+        A capture is kept only if the device still has this many times the
+        largest measured forward free afterwards.  Below that, the shape runs
+        eager.  See the module's "Memory bound".
     pool : tuple of int, optional
         Shared graph memory-pool handle.  Shared *within* this cache across shape
         buckets -- that is where the fragmentation win is -- but never with the
@@ -209,6 +245,7 @@ class GraphedOfflineForward:
         max_frames: int = 4096,
         max_captures: int = 64,
         max_capture_failures: int = 1,
+        eager_reserve_factor: float = ACTIVATION_SAFETY,
         pool: Optional[Tuple[int, int]] = None,
     ) -> None:
         self._device = device
@@ -217,6 +254,14 @@ class GraphedOfflineForward:
         self._max_frames = int(max_frames)
         self._max_captures = int(max_captures)
         self._max_capture_failures = max(1, int(max_capture_failures))
+        self._eager_reserve_factor = float(eager_reserve_factor)
+        #: Largest number of bytes any measured warm-up forward took from the
+        #: driver.  Shapes the cache refuses run eager at about this size.
+        self._largest_forward_bytes = 0
+        #: Per forward name, the ``(B, T)`` shapes refused for memory.  A shape at
+        #: least as wide and as long as one of these needs at least as much.
+        self._over_budget: Dict[str, List[Tuple[int, int]]] = {}
+        self._logged_budget = False
         self._enabled = device.type == "cuda" and bool(self._buckets)
         # One pool for this cache, shared across its shape buckets -- that is
         # where the fragmentation win is -- and never with the streaming or
@@ -242,6 +287,9 @@ class GraphedOfflineForward:
         self.fallback_saturated = 0  # capture budget spent
         self.fallback_failed = 0  # this shape is not capturable
         self.fallback_disabled = 0  # capture is off for this engine (OOM / uncapturable)
+        self.fallback_budget = 0  # capturing this shape would starve the eager forwards
+        #: Bytes the live captures added to the graph pool, as measured.
+        self.pool_bytes = 0
         self._useful_frames = 0
         self._padded_frames = 0
 
@@ -318,13 +366,21 @@ class GraphedOfflineForward:
         pool -- which is how this was found, as a 42% WER on a 7B checkpoint that
         scored 5.6% on its own.
         """
+        self._release_captures()
+        self._failed.clear()
+        self._over_budget.clear()
+
+    def _release_captures(self) -> int:
+        """Reset every live capture and return how many there were."""
+        n = len(self._captured)
         for state in self._captured.values():
             try:
                 state.graph.reset()
             except Exception:  # pragma: no cover - teardown must not raise
                 logger.debug("offline graph reset failed", exc_info=True)
         self._captured.clear()
-        self._failed.clear()
+        self.pool_bytes = 0
+        return n
 
     def stats(self) -> Dict[str, float]:
         """Counters for the engine's debug log and the benchmark harness."""
@@ -336,7 +392,10 @@ class GraphedOfflineForward:
             "fallback_saturated": float(self.fallback_saturated),
             "fallback_failed": float(self.fallback_failed),
             "fallback_disabled": float(self.fallback_disabled),
+            "fallback_budget": float(self.fallback_budget),
             "capture_failures": float(self.capture_failures),
+            "pool_gib": self.pool_bytes / float(1024**3),
+            "largest_forward_gib": self._largest_forward_bytes / float(1024**3),
             "pad_overhead": self.pad_overhead,
         }
 
@@ -439,6 +498,9 @@ class GraphedOfflineForward:
             if key in self._failed:
                 self.fallback_failed += 1
                 return None
+            if self._is_over_budget(key):
+                self.fallback_budget += 1
+                return None
             if len(self._captured) >= self._max_captures:
                 self.fallback_saturated += 1
                 if not self._refused:
@@ -453,7 +515,10 @@ class GraphedOfflineForward:
                 return None
             state = self._capture(key, fn, features, lengths)
             if state is None:
-                self.fallback_failed += 1
+                if self._is_over_budget(key):
+                    self.fallback_budget += 1
+                else:
+                    self.fallback_failed += 1
                 return None
             self._captured[key] = state
 
@@ -582,34 +647,21 @@ class GraphedOfflineForward:
         lens_buf = torch.full((b_bucket,), t_bucket, dtype=lengths.dtype, device=self._device)
         feats_buf[: features.size(0), : features.size(1)].copy_(features)
 
+        oom: Optional[str] = None
         try:
-            fn(feats_buf, lens_buf)  # warm up workspaces outside the capture
-            torch.cuda.synchronize(self._device)
-            graph = torch.cuda.CUDAGraph()
-            # ``tvm_ffi.use_torch_stream`` is what records a TVM-FFI kernel
-            # launch into the graph rather than letting it escape to the
-            # default stream.
-            # torch types the pool handle as an opaque ``_POOL_HANDLE``; the
-            # engine passes the ``(int, int)`` tuple it actually is.
-            ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
-            with tvm_ffi.use_torch_stream(ctx):
-                out, out_lengths = fn(feats_buf, lens_buf)
-            torch.cuda.synchronize(self._device)
+            # Warms up workspaces outside the capture, and measures the bytes the
+            # capture is about to add to the pool.
+            need = self._forward_bytes(fn, feats_buf, lens_buf)
+            if not self._fits(key, need):
+                return None
+            reserved = torch.cuda.memory_reserved(self._device)
+            graph, out, out_lengths = self._record(fn, feats_buf, lens_buf)
+            grown = max(0, int(torch.cuda.memory_reserved(self._device)) - int(reserved))
         except torch.cuda.OutOfMemoryError as exc:
-            # Capture OOM is a fact about the process, not about this shape.
-            self._disabled = True
-            recover_from_failed_capture(self._device, self._pool)
-            self._pool = None
-            torch.cuda.empty_cache()
-            logger.warning(
-                "offline forward graph capture ran out of memory at %s B=%d T=%d "
-                "(%s); offline graphs are off for this engine and forwards run eager",
-                name,
-                b_bucket,
-                t_bucket,
-                exc,
-            )
-            return None
+            # Kept as text only: the traceback holds the failed graph and every
+            # tensor the capture allocated, and the pool cannot be handed back
+            # while anything does.
+            oom = str(exc)
         except Exception as exc:  # pragma: no cover - capture is best-effort
             # Most often a host read inside the forward (``.item()`` /
             # ``.tolist()``) invalidating the capture stream: a data-dependent
@@ -641,14 +693,22 @@ class GraphedOfflineForward:
                     self.capture_failures,
                 )
             return None
+        if oom is not None:
+            # Past the ``except`` block, so the traceback -- and with it the
+            # failed graph, which only ``_record``'s frame held -- is gone.
+            self._disable_after_oom(key, oom)
+            return None
 
         self.captures += 1
+        self.pool_bytes += grown
         logger.info(
-            "captured offline forward: %s B=%d T=%d (%d shapes live)",
+            "captured offline forward: %s B=%d T=%d (+%.2f GiB; %d shapes live, %.2f GiB)",
             name,
             b_bucket,
             t_bucket,
+            grown / float(1024**3),
             len(self._captured) + 1,
+            self.pool_bytes / float(1024**3),
         )
         return _Captured(
             graph=graph,
@@ -657,6 +717,127 @@ class GraphedOfflineForward:
             out=out,
             out_lengths=out_lengths,
         )
+
+    def _record(
+        self, fn: ForwardFn, features: torch.Tensor, lengths: torch.Tensor
+    ) -> Tuple["torch.cuda.CUDAGraph", torch.Tensor, torch.Tensor]:
+        """Capture one forward into the cache's pool.
+
+        Its own frame, so that when the capture raises, the graph and its
+        context are referenced only by the traceback and die with it.
+        """
+        graph = torch.cuda.CUDAGraph()
+        # ``tvm_ffi.use_torch_stream`` is what records a TVM-FFI kernel launch
+        # into the graph rather than letting it escape to the default stream.
+        # torch types the pool handle as an opaque ``_POOL_HANDLE``; the engine
+        # passes the ``(int, int)`` tuple it actually is.
+        ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
+        with tvm_ffi.use_torch_stream(ctx):
+            out, out_lengths = fn(features, lengths)
+        torch.cuda.synchronize(self._device)
+        return graph, out, out_lengths
+
+    def _disable_after_oom(self, key: Tuple[str, int, int], reason: str) -> None:
+        """Turn the cache off after a capture ran out of memory, and free its pool.
+
+        Capture OOM is a fact about the process, not about this shape.  A cache
+        that is off never replays, so the captures it already holds would only
+        take memory from the eager forwards that now serve every shape.  They
+        used to stay resident: 24.3 GiB on a Nemotron engine, while every
+        ``B=64`` eager micro-batch after it was rejected for OOM.
+        """
+        name, b_bucket, t_bucket = key
+        self._disabled = True
+        recover_from_failed_capture(self._device, self._pool)
+        self._pool = None
+        held_gib = self.pool_bytes / float(1024**3)
+        released = self._release_captures()
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.warning(
+            "offline forward graph capture ran out of memory at %s B=%d T=%d (%s); "
+            "offline graphs are off for this engine, forwards run eager, and the %d "
+            "shape(s) already captured (%.2f GiB) are released",
+            name,
+            b_bucket,
+            t_bucket,
+            reason,
+            released,
+            held_gib,
+        )
+
+    # ------------------------------------------------------------------
+    # Memory bound
+    # ------------------------------------------------------------------
+
+    def _forward_bytes(self, fn: ForwardFn, features: torch.Tensor, lengths: torch.Tensor) -> int:
+        """Run ``fn`` once eagerly; return the bytes it took from the driver.
+
+        The cache is emptied first, so the forward cannot reuse blocks an earlier
+        one left cached and has to reserve all of its working memory.  A capture
+        into a private pool starts from nothing in the same way.  On Nemotron at
+        B=64 the two agree to 0.01 GiB at every length measured.  At small sizes
+        they differ by tens of MiB, in either direction.  A small forward fits
+        part of itself into segments that still hold live tensors, so the figure
+        reads low.  A forward that is the first user of a library workspace (say,
+        cuBLAS on a stream) pays for it here, and the capture then reuses it, so
+        the figure reads high.  :data:`MIN_ACTIVATION_RESERVE_BYTES` covers the
+        low side, and reading high only refuses a capture early.
+        """
+        torch.cuda.synchronize(self._device)
+        torch.cuda.empty_cache()
+        before = int(torch.cuda.memory_reserved(self._device))
+        fn(features, lengths)
+        torch.cuda.synchronize(self._device)
+        return max(0, int(torch.cuda.memory_reserved(self._device)) - before)
+
+    def _fits(self, key: Tuple[str, int, int], need: int) -> bool:
+        """Keep a capture only if the eager forwards keep room to run.
+
+        ``need`` is what the capture adds to the pool (see
+        :meth:`_forward_bytes`).  Any shape the cache does not serve runs eager at
+        up to the size of the largest forward measured so far.  That includes
+        this one, and every shape refused before it.  The reserve is that size
+        times ``eager_reserve_factor``, the same margin
+        :class:`~oasr.engine.memory.MemoryProfile` keeps above its probe.
+        """
+        name, b_bucket, t_bucket = key
+        self._largest_forward_bytes = max(self._largest_forward_bytes, int(need))
+        reserve = max(
+            MIN_ACTIVATION_RESERVE_BYTES,
+            int(self._eager_reserve_factor * self._largest_forward_bytes),
+        )
+        free, _ = read_device_memory(self._device)
+        if free - need >= reserve:
+            return True
+        self._over_budget.setdefault(name, []).append((b_bucket, t_bucket))
+        log = logger.debug if self._logged_budget else logger.info
+        self._logged_budget = True
+        gib = float(1024**3)
+        log(
+            "offline forward graph at %s B=%d T=%d would add %.2f GiB to a %.2f GiB "
+            "pool and leave %.2f GiB free, below the %.2f GiB reserved for eager "
+            "forwards; it and every shape at least as wide and as long run eager",
+            name,
+            b_bucket,
+            t_bucket,
+            need / gib,
+            self.pool_bytes / gib,
+            (free - need) / gib,
+            reserve / gib,
+        )
+        return False
+
+    def _is_over_budget(self, key: Tuple[str, int, int]) -> bool:
+        """Whether a refused shape at most as wide and as long as ``key`` exists.
+
+        Memory a forward needs does not shrink as the batch widens or the
+        utterances get longer.  Once a shape is refused, any shape that dominates
+        it would be refused too.  Answering that here skips the warm-up forward
+        that would otherwise be spent finding out.
+        """
+        name, b_bucket, t_bucket = key
+        return any(b_bucket >= b and t_bucket >= t for b, t in self._over_budget.get(name, ()))
 
     # ------------------------------------------------------------------
     # Pre-warm
@@ -688,7 +869,7 @@ class GraphedOfflineForward:
             if b_bucket is None or t_bucket > self._max_frames:
                 continue
             key = (name, b_bucket, t_bucket)
-            if key in self._captured or key in self._failed:
+            if key in self._captured or key in self._failed or self._is_over_budget(key):
                 continue
             if len(self._captured) >= self._max_captures:
                 break
