@@ -156,6 +156,11 @@ sufficient: a parity oracle feeds identical features to both sides, so a bug in
 fails when a rate exceeds its recorded value in `ci/wer-reference.json` plus a
 tolerance of 0.3 absolute.
 
+A request the engine fails (`finish_reason="error"`, for instance an out-of-memory
+micro-batch) fails the row by name and error stage before any rate is computed.
+Scored as an empty transcript, it would read as a WER regression, or, if only a few
+rows failed, pass inside the tolerance.
+
 **Those rates are for regression detection, not publication.** LJSpeech is
 out-of-domain for every architecture and the subset is 200 utterances. Do not
 quote them as OASR's WER.

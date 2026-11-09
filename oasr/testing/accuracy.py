@@ -18,14 +18,22 @@ of text that can be checked in while the corpus stays on disk.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     import torch
 
-__all__ = ["Entry", "load_manifest", "load_audio", "transcribe"]
+__all__ = [
+    "Entry",
+    "Transcription",
+    "describe_failures",
+    "load_manifest",
+    "load_audio",
+    "transcribe",
+]
 
 
 @dataclass
@@ -98,6 +106,29 @@ def load_audio(entries: Sequence[Entry], target_sample_rate: int) -> Tuple[List,
     return waves, seconds
 
 
+class Transcription(NamedTuple):
+    """What :func:`transcribe` returns: one entry per waveform, in input order.
+
+    ``failures`` maps the index of every request the engine could not run to
+    completion (``finish_reason == "error"``) to its ``error_stage``.  Such a
+    request's ``hyps`` entry is not a transcript -- it is whatever the engine
+    held when it gave up, usually ``""`` -- so a caller must not score it.
+    Scoring rejected requests as empty hypotheses is how an out-of-memory
+    micro-batch printed 94 % WER where the answer was "these requests failed".
+    """
+
+    hyps: List[str]
+    per_request_ms: List[float]
+    failures: Dict[int, str]
+
+
+def describe_failures(failures: Dict[int, str], total: int) -> str:
+    """``"3 of 200 request(s) failed (prefill_oom x2, offline_forward x1)"``."""
+    stages = Counter(failures.values())
+    detail = ", ".join(f"{stage} x{n}" for stage, n in stages.most_common())
+    return f"{len(failures)} of {total} request(s) failed ({detail})"
+
+
 def transcribe(
     engine,
     waves: Sequence["torch.Tensor"],
@@ -105,8 +136,8 @@ def transcribe(
     *,
     streaming: bool = False,
     decoding: Optional[Any] = None,
-) -> Tuple[List[str], List[float]]:
-    """Transcribe in batches; returns ``(hypotheses, per_request_ms)``.
+) -> Transcription:
+    """Transcribe in batches; returns a :class:`Transcription`.
 
     One pass, with no warm-up of its own.  A caller that reports speed runs it
     twice and times the second call: JIT compilation and CUDA-graph capture
@@ -118,25 +149,31 @@ def transcribe(
     row of a batch together, so each one waited for all of it; dividing by the
     batch size reported a latency no request ever saw (16x too low at batch 16).
 
-    ``streaming`` drives ``engine.transcribe`` (chunk by chunk) instead of
-    ``transcribe_offline``.  Same manifest, same denominator, so the two rates are
-    directly comparable — which is what makes a streaming accuracy gate meaningful
-    rather than a second number nobody can interpret.
+    ``streaming`` drives the chunk-by-chunk path instead of the offline one.
+    Same manifest, same denominator, so the two rates are directly comparable --
+    which is what makes a streaming accuracy gate meaningful rather than a second
+    number nobody can interpret.
 
     ``decoding`` (a ``DecodingOptions``) applies to every request, a ``language``
     for instance.
+
+    Reads whole outputs (``transcribe_outputs``), not the strings
+    ``transcribe_offline`` returns, because a string cannot say that the engine
+    rejected the request: see :attr:`Transcription.failures`.
     """
     import time
 
-    go = engine.transcribe if streaming else engine.transcribe_offline
     hyps: List[str] = []
     per_request_ms: List[float] = []
+    failures: Dict[int, str] = {}
     for i in range(0, len(waves), batch_size):
         chunk = list(waves[i : i + batch_size])
         t0 = time.perf_counter()
-        out = go(chunk) if decoding is None else go(chunk, decoding=decoding)
+        outputs = engine.transcribe_outputs(chunk, streaming=streaming, decoding=decoding)
         dt_ms = 1000.0 * (time.perf_counter() - t0)
-        texts = out if isinstance(out, list) else [out]
-        hyps.extend(t if isinstance(t, str) else t.text for t in texts)
+        for j, out in enumerate(outputs):
+            if out.finish_reason == "error":
+                failures[i + j] = out.error_stage or "unknown"
+            hyps.append(out.text)
         per_request_ms.extend([dt_ms] * len(chunk))
-    return hyps, per_request_ms
+    return Transcription(hyps, per_request_ms, failures)

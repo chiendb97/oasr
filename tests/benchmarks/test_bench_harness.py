@@ -537,23 +537,48 @@ class _ShapeEngine:
     the first-use JIT and graph capture a warm-up exists to keep out of the clock.
 
     A cold shape decodes to ``cold_text`` (``None``: the same as warm), so a
-    caller can check which pass its transcripts came from.
+    caller can check which pass its transcripts came from.  A waveform whose
+    length is in ``fail_cold`` / ``fail_warm`` comes back the way the engine
+    returns a rejected request: ``finish_reason="error"`` and an empty text.
     """
 
     sample_rate = 16000
 
-    def __init__(self, clock, cold_s, warm_s, cold_text=None):
+    def __init__(self, clock, cold_s, warm_s, cold_text=None, fail_cold=(), fail_warm=()):
         self.clock, self.cold_s, self.warm_s, self.cold_text = clock, cold_s, warm_s, cold_text
+        self.fail_cold, self.fail_warm = set(fail_cold), set(fail_warm)
         self.seen = set()
 
-    def transcribe_offline(self, waves):
+    def transcribe_outputs(self, waves, streaming=False, decoding=None):
+        from oasr.engine.request import RequestOutput
+
         shape = (len(waves), max(int(w.numel()) for w in waves))
         cold = shape not in self.seen
         self.seen.add(shape)
         self.clock.t += self.cold_s if cold else self.warm_s
-        if cold and self.cold_text is not None:
-            return [self.cold_text for _ in waves]
-        return [f"w{int(w.numel())}" for w in waves]
+        fail = self.fail_cold if cold else self.fail_warm
+        outs = []
+        for i, w in enumerate(waves):
+            n = int(w.numel())
+            if n in fail:
+                outs.append(
+                    RequestOutput(
+                        request_id=str(i),
+                        text="",
+                        tokens=[[]],
+                        finished=True,
+                        finish_reason="error",
+                        error_stage="offline_forward",
+                    )
+                )
+                continue
+            text = self.cold_text if cold and self.cold_text is not None else f"w{n}"
+            outs.append(RequestOutput(request_id=str(i), text=text, tokens=[[]], finished=True))
+        return outs
+
+    def transcribe_offline(self, waves, decoding=None):
+        """The strings-only API, which cannot say a request failed."""
+        return [o.text for o in self.transcribe_outputs(waves, decoding=decoding)]
 
     def shutdown(self):
         pass
@@ -571,9 +596,24 @@ def test_a_batched_request_waits_for_its_whole_batch(monkeypatch):
     clock = _Clock()
     monkeypatch.setattr(time, "perf_counter", clock)
     waves = _waves(6)
-    hyps, latency_ms = transcribe(_ShapeEngine(clock, cold_s=0.1, warm_s=0.1), waves, 4)
+    hyps, latency_ms, failures = transcribe(_ShapeEngine(clock, cold_s=0.1, warm_s=0.1), waves, 4)
     assert hyps == [f"w{int(w.numel())}" for w in waves]
     assert latency_ms == pytest.approx([100.0] * 6)  # a batch of 4, then of 2
+    assert failures == {}
+
+
+def test_transcribe_reports_a_rejected_request_instead_of_an_empty_transcript():
+    """An engine-rejected request carries ``finish_reason="error"`` and no text;
+    the strings API flattened that into ``""``, which then scored as deletions."""
+    from oasr.testing.accuracy import describe_failures, transcribe
+
+    waves = _waves(6)  # lengths 1600 .. 9600
+    engine = _ShapeEngine(_Clock(), cold_s=0.0, warm_s=0.0, fail_cold={3200, 8000})
+    out = transcribe(engine, waves, 4)
+    assert out.failures == {1: "offline_forward", 4: "offline_forward"}
+    assert len(out.hyps) == len(out.per_request_ms) == 6  # still aligned with the input
+    assert out.hyps[0] == "w1600" and out.hyps[1] == ""
+    assert describe_failures(out.failures, 6) == "2 of 6 request(s) failed (offline_forward x2)"
 
 
 def _accuracy_row(accuracy, monkeypatch, engine, waves):
@@ -624,6 +664,46 @@ def test_the_accuracy_row_times_a_warm_pass(monkeypatch):
     assert row.latency_p50_ms == pytest.approx(10.0)
     assert row.latency_p99_ms == pytest.approx(10.0)
     assert row.error_rate_pct == 0.0
+
+
+def test_an_accuracy_row_with_a_rejected_request_has_no_error_rate(monkeypatch, capsys):
+    """Scored as empty hypotheses, an OOM-rejected micro-batch printed 94 % WER.
+    The row now counts the failures and leaves every rate cell empty."""
+    accuracy = registry.get_family("accuracy")
+    clock = _Clock()
+    monkeypatch.setattr(time, "perf_counter", clock)
+    waves = _waves(8)
+    engine = _ShapeEngine(clock, cold_s=1.0, warm_s=0.01, fail_warm={1600, 6400, 8000})
+    row = _accuracy_row(accuracy, monkeypatch, engine, waves)
+    assert row.error_rate_pct is None and row.deletions is None and row.ref_units is None
+    assert row.requests_failed == 3 and row.result is None
+
+    workload = accuracy._to_workload_row(row, "")
+    assert workload.requests_failed == 3 and workload.requests_ok == 5
+    assert workload.error_rate_pct is None
+
+    accuracy._print_table([row])
+    out = capsys.readouterr().out
+    assert "  FAILED " in out
+    assert "3 of 8 request(s) failed (offline_forward x3)" in out
+    # A row the harness emits must not open a line with FAILED: the report's
+    # log reader takes that for a configuration that raised and emitted no row.
+    assert not any(line.strip().startswith("FAILED") for line in out.splitlines())
+
+
+def test_an_accuracy_row_says_what_the_warm_up_lost_and_still_scores_the_timed_pass(
+    monkeypatch, capsys
+):
+    accuracy = registry.get_family("accuracy")
+    clock = _Clock()
+    monkeypatch.setattr(time, "perf_counter", clock)
+    engine = _ShapeEngine(clock, cold_s=1.0, warm_s=0.01, fail_cold={1600})
+    row = _accuracy_row(accuracy, monkeypatch, engine, _waves(8))
+    assert row.requests_failed == 0 and row.error_rate_pct == 0.0
+    out = capsys.readouterr().out
+    assert "[WARN] warm-up pass: 1 of 8 request(s) failed (offline_forward x1)" in out
+    # The lost row has no transcript to compare, so it is not also a difference.
+    assert "differ between the warm-up and the timed pass" not in out
 
 
 def test_the_accuracy_row_scores_the_timed_pass_and_says_when_the_passes_differ(

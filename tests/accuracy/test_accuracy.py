@@ -28,7 +28,7 @@ import pytest
 import torch
 from helpers import REPO_ROOT
 
-from oasr.testing.accuracy import load_audio, load_manifest, transcribe
+from oasr.testing.accuracy import describe_failures, load_audio, load_manifest, transcribe
 from oasr.testing.wer import compute, normalizer
 
 REFERENCE_PATH = REPO_ROOT / "ci" / "wer-reference.json"
@@ -214,10 +214,20 @@ def test_wer_has_not_regressed(spec, device, tmp_path_factory):
         assert served == quant["kv_cache"], f"{spec['key']} measured a {served!r} KV cache"
     try:
         waves, _ = load_audio(entries, engine.sample_rate)
-        hyps, _ = transcribe(engine, waves, spec["max_batch_size"], streaming=mode == "streaming")
+        hyps, _, failures = transcribe(
+            engine, waves, spec["max_batch_size"], streaming=mode == "streaming"
+        )
     finally:
         del engine
         torch.cuda.empty_cache()
+
+    # A request the engine rejected (an OOM micro-batch, a prefill that could not
+    # reserve its KV) has no transcript.  Scored as an empty one it reads as a
+    # WER regression -- or, with a few rows, passes inside the tolerance.
+    assert not failures, (
+        f"{spec['key']}: {describe_failures(failures, len(entries))} at max_batch_size="
+        f"{spec['max_batch_size']}; that is a serving failure, not an error rate"
+    )
 
     result = compute(
         [e.text for e in entries],
