@@ -987,6 +987,131 @@ class TestDecodeKvByteBudget:
         ex._op.strategy.incremental = False
         assert ex._admission_limit() is None
 
+    def test_a_spent_budget_closes_admission_while_rows_are_in_flight(self):
+        """A free slot is not a free row: the byte budget has to close it too.
+
+        ``schedule_offline`` floors any limit at one row, so an open gate with a
+        limit of 0 still admitted a request the pool had no room for.
+        """
+        gib = 1024**3
+        ex = self._executor(budget_gib=1.0, per_row_bytes=gib // 2, pending=2)
+        ex._max_decode_slots = 32
+        assert ex._admission_limit() == 0
+        assert not ex._admission_open()
+
+    def test_room_for_one_more_row_keeps_it_open(self):
+        gib = 1024**3
+        ex = self._executor(budget_gib=1.0, per_row_bytes=gib // 4, pending=3)
+        ex._max_decode_slots = 32
+        assert ex._admission_open()
+
+    def test_an_idle_engine_admits_under_a_budget_below_one_row(self):
+        """Nothing in flight can free a row, so waiting would hold the queue forever."""
+        gib = 1024**3
+        ex = self._executor(budget_gib=0.25, per_row_bytes=gib, pending=0)
+        ex._max_decode_slots = 32
+        assert ex._admission_limit() == 0
+        assert ex._admission_open()
+
+
+class _PooledStrategy(FakeIncrementalStrategy):
+    """A strategy whose decoder KV is a pool of ``pool_rows`` rows.
+
+    ``begin_offline`` refuses what does not fit, the way
+    ``PagedDecoderKv.create`` does, and ``kv_bytes_per_row`` tells admission the
+    same geometry.
+    """
+
+    def __init__(self, target_lens, *, pool_rows: int, per_row_bytes: int):
+        super().__init__(target_lens)
+        self.pool_rows = pool_rows
+        self.per_row_bytes = per_row_bytes
+        self.widest = 0
+
+    def kv_bytes_per_row(self):
+        return self.per_row_bytes
+
+    def begin_offline(self, requests, enc_out, enc_lengths):
+        from oasr.cache import DecoderKvExhausted
+
+        if len(self.states) + len(requests) > self.pool_rows:
+            raise DecoderKvExhausted(
+                f"pool holds {self.pool_rows} rows; {len(self.states)} live, "
+                f"{len(requests)} asked"
+            )
+        super().begin_offline(requests, enc_out, enc_lengths)
+        self.widest = max(self.widest, len(self.states))
+
+
+class _FlooringScheduler(FakeScheduler):
+    """Selects through the real ``_batch_cap``, which floors any limit at one row.
+
+    ``FakeScheduler`` clamps a limit of 0 to an empty batch, which hid the gap
+    below: the production scheduler would have handed the executor a request.
+    """
+
+    def schedule_offline(self, limit=None):
+        from oasr.engine.batching.policies import _batch_cap
+
+        if not self.waiting:
+            return []
+        cap = _batch_cap(SimpleNamespace(max_batch_size=32), limit)
+        batch, self.waiting = self.waiting[:cap], self.waiting[cap:]
+        return batch
+
+
+class TestTheByteBudgetGatesAdmission:
+    """End to end: requests wait for a row instead of being rejected for one.
+
+    Qwen2-Audio with ``long_form`` fanned a 900 s recording out into ~32
+    windows.  The decoder-KV budget held 15 rows, and every tick that had a slot
+    free admitted one more window.  The pool refused each, and the recording
+    came back as an error with 2,011 words instead of a transcript.
+    """
+
+    def _run(self, *, pool_rows, n, slots=8):
+        gib = 1024**3
+        per_row = gib // 16
+        # Long enough that rows are still generating when admission next opens:
+        # a tick that spends its decode budget skips admission, up to
+        # ``_MAX_SKIPPED_ADMITS`` times in a row.
+        strat = _PooledStrategy(
+            {f"r{i}": 4 * _MAX_SKIPPED_ADMITS + i for i in range(n)},
+            pool_rows=pool_rows,
+            per_row_bytes=per_row,
+        )
+        ex = OfflineExecutor(
+            scheduler=_FlooringScheduler(),
+            input_processor=FakeInputProcessor(),
+            model_runner=FakeModelRunner(),
+            output_processor=FakeOutputProcessor(strat),
+            device=torch.device("cpu"),
+            decode_steps_per_tick=1,
+            max_decode_slots=slots,
+            max_batch_size=32,
+            decode_kv_budget_gib=pool_rows * per_row / gib,
+        )
+        for i in range(n):
+            _admit(ex, f"r{i}")
+        outs = []
+        for _ in range(2000):
+            outs.extend(ex.step())
+            if not ex.has_pending():
+                break
+        return outs, strat
+
+    def test_a_full_budget_defers_instead_of_rejecting(self):
+        outs, strat = self._run(pool_rows=3, n=7)
+        finals = {o.request_id: o for o in outs if o.finished}
+        assert set(finals) == {f"r{i}" for i in range(7)}
+        assert [r for r, o in finals.items() if o.finish_reason == "error"] == []
+        assert strat.widest == 3, "admission should fill the pool, and never pass it"
+
+    def test_slots_still_bind_below_the_budget(self):
+        outs, strat = self._run(pool_rows=6, n=7, slots=2)
+        assert all(o.finish_reason != "error" for o in outs if o.finished)
+        assert strat.widest == 2
+
 
 # ---------------------------------------------------------------------------
 # Failure isolation: one bad request must not take down its peers

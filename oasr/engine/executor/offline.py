@@ -754,12 +754,25 @@ class OfflineExecutor(Executor):
         Always true for one-shot strategies.  For incremental strategies the
         pending pool gates admission: a full pool means the tick spends its
         budget advancing in-flight requests instead of prefilling new ones.
+
+        The decoder-KV byte budget closes it as well, while it affords no further
+        row and something is in flight to free one.  A slot check alone was not
+        enough, because ``schedule_offline`` floors any limit at one row.  With
+        the budget spent, a tick with a free slot still admitted one request.
+        The pool refused its prefill, and the request was rejected, although one
+        finished row later it would have fit.  Measured on Qwen2-Audio with
+        ``long_form`` at ``max_batch_size=32``: 15 windows of a 900 s recording
+        filled the pool, and the 16th to 18th were each rejected, failing the
+        recording.  With nothing in flight the gate stays open, and the pool
+        decides.  Otherwise a budget below one row would hold the queue forever.
         """
         if not self._op.strategy.incremental:
             return True
         if self._max_decode_slots is None:
             return not self._pending
-        return len(self._pending) < int(self._max_decode_slots)
+        if len(self._pending) >= int(self._max_decode_slots):
+            return False
+        return not self._pending or self._rows_within_kv_budget(self._op.strategy) != 0
 
     def _advance_pending(self) -> Tuple[List[RequestOutput], bool]:
         """Run one budgeted ``strategy.advance`` pass and finalise what it finished.

@@ -358,7 +358,7 @@ Only read by `incremental` decode families — see [decoding.md](decoding.md).
 | `max_tick_ms` | 25 | Wall-clock cap per tick. **This is the knob that bounds latency**, not the step count. `0` disables. |
 | `max_decode_slots` | `max_batch_size` | In-flight AR requests before admission pauses. |
 | `decode_admit_window_ms` | 0 | Coalesce near-simultaneous arrivals into one decode group. Costs up to one window of first-token latency for an isolated request, so it is off by default. |
-| `decode_kv_budget_gib` | derived | Byte ceiling for AR decoder KV. `0` disables the budget; `None` derives it — see [§6.1](#61-vram-aware-capacity-sizing). |
+| `decode_kv_budget_gib` | derived | Byte ceiling for AR decoder KV. `0` disables the budget; `None` derives it — see [§6.1](#61-vram-aware-capacity-sizing). Admission waits while the budget affords no further row and a row is in flight to free one; with nothing in flight it admits one regardless. |
 
 ### Streaming chunking
 
@@ -398,7 +398,7 @@ engine (`oasr/engine/memory.py`):
 | Left unset | Derived as |
 |---|---|
 | `max_num_blocks=None` (streaming) | `available / bytes_per_block`, capped at `max_batch_size × blocks_per_seq` |
-| `decode_kv_budget_gib=None` (AR families) | `available`, clamped up to one row so a tight card still admits work; a row's bytes follow `quantization.kv_cache` (fp8 + scales ≈ 0.52x of fp16) |
+| `decode_kv_budget_gib=None` (AR families) | `available`, narrowed until the prefill of every row it admits fits beside their KV, and clamped up to one row so a tight card still admits work; a row's bytes follow `quantization.kv_cache` (fp8 + scales ≈ 0.52x of fp16), counted in whole pages when the KV is paged |
 
 where
 
@@ -413,7 +413,28 @@ another process holds — there is no separate "weights" term to get wrong.
 the engine will run (one chunk window at `max_batch_size` in streaming mode; the
 frontend's fixed window, else 30 s, in offline mode), floored at 256 MiB. The
 unspent `1 − utilization` is the headroom for what the probe cannot see: CUDA
-graph capture pools, an AR family's prefill transient, allocator fragmentation.
+graph capture pools and allocator fragmentation.
+
+An AR family's prefill is measured too, because it is the one transient that
+grows with the decoder-KV budget. It is one decoder forward over every row's
+whole prompt, and admission prefills the rows it lets in together, so a budget
+that admits more rows also makes their prefill wider. A second probe prefills
+two rows, takes the decoder KV it wrote off the peak, and charges what is left
+per row (113 MiB on Qwen2-Audio, linear from 1 to 16 rows). The budget for `R`
+rows of `k` bytes, each with a prefill of `p` bytes, then satisfies:
+
+```
+R × k + 1.5 × max(encoder peak, R × p) ≤ total × gpu_memory_utilization − resident
+```
+
+Without it, int8 weights on Qwen2-Audio freed 6.6 GiB, and the budget admitted
+26 rows instead of 15. Their 2.9 GiB prefill no longer fitted. On LibriSpeech
+test-clean at `max_batch_size=32`, the int8 and fp8 runs had 133 prefills
+rejected for OOM between them, and WER read 55 % and 30 %. The prefill reserve
+(115 MiB per row) takes that budget to 23 rows, and nothing is rejected. bf16
+stays at 15, because its prefill already fitted. The cost is concurrency: a
+1,000-request int8 backlog that happened to fit without the reserve runs 2–3 %
+slower at 23 rows.
 
 The derivation is logged in full (`paged KV pool derived from VRAM: … | total=…
 resident=… cap=… activation_reserve=… → available=…`) so the numbers are

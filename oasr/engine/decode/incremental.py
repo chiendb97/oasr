@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from abc import abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -59,6 +59,30 @@ logger = logging.getLogger(__name__)
 #: Sentinel for "the KV pool has not been decided yet" — ``None`` is a real
 #: answer there (dense storage), so it cannot double as "unresolved".
 _UNSET = object()
+
+
+def _held_bytes(obj: Any, seen: Optional[set] = None, depth: int = 0) -> int:
+    """Device bytes held by the tensors in a decoder state, each storage once.
+
+    Walks dicts, sequences and dataclass fields only -- the shapes a decoder
+    state is built from -- so it cannot wander into a module it merely points at.
+    """
+    seen = set() if seen is None else seen
+    if obj is None or depth > 6:
+        return 0
+    if isinstance(obj, torch.Tensor):
+        storage = obj.untyped_storage()
+        if storage.data_ptr() in seen:
+            return 0
+        seen.add(storage.data_ptr())
+        return int(storage.nbytes())
+    if isinstance(obj, dict):
+        return sum(_held_bytes(v, seen, depth + 1) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_held_bytes(v, seen, depth + 1) for v in obj)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return sum(_held_bytes(getattr(obj, f.name, None), seen, depth + 1) for f in fields(obj))
+    return 0
 
 
 @dataclass(eq=False)
@@ -498,6 +522,39 @@ class IncrementalArStrategy(DecodeStrategy):
             return "dense"
         return "paged" if param.device.type == "cuda" else "dense"
 
+    def _pages_kv(self) -> bool:
+        """Whether the decoder KV will be paged, answered without building the pool.
+
+        The pool is sized from ``decode_kv_budget_gib``, which the engine derives
+        *from* :meth:`kv_bytes_per_row`.  So that method has to know the storage
+        before any pool exists.  These are the same conditions
+        :meth:`_build_kv_manager` applies.
+        """
+        if self._kv_manager is not _UNSET:
+            return self._kv_manager is not None
+        decoder = self._decoder()
+        if self._resolve_storage(decoder) != "paged" or self._beam > 1:
+            return False
+        spec = getattr(self._model, "decoder_cache_spec", None)
+        return spec is not None and bool(getattr(decoder, "supports_paged_kv", False))
+
+    def _kv_block_tokens(self) -> int:
+        return int(getattr(self.options, "kv_block_tokens", 16))
+
+    def _pages_per_row(self, spec: Any) -> int:
+        """Pages one row reserves at admission: its ceiling, rounded per slot.
+
+        An AED row holds two slots, its self-attention and its fixed
+        cross-attention window (``decoder_cache_spec.cross_attention_len``), and
+        each rounds up to whole pages on its own.
+        """
+        block_tokens = self._kv_block_tokens()
+        cross_len = int(getattr(spec, "cross_attention_len", 0) or 0)
+        pages = -(-self._position_budget() // block_tokens)
+        if cross_len:
+            pages += -(-cross_len // block_tokens)
+        return pages
+
     def _build_kv_manager(self) -> Optional["DecoderKVCacheManager"]:
         decoder = self._decoder()
         if self._resolve_storage(decoder) != "paged" or self._beam > 1:
@@ -522,7 +579,7 @@ class IncrementalArStrategy(DecodeStrategy):
             param = first_compute_parameter(decoder)
         except StopIteration:  # pragma: no cover - a decoder with no weights
             return None
-        block_tokens = int(getattr(self.options, "kv_block_tokens", 16))
+        block_tokens = self._kv_block_tokens()
         rows = int(self._config.max_decode_slots or self._config.max_batch_size)
         # Two ceilings, and the tighter one wins.  The first is what admission
         # would ever hand the pool: ``max_decode_slots`` rows at their whole
@@ -535,12 +592,11 @@ class IncrementalArStrategy(DecodeStrategy):
         # its self-attention and its fixed cross-attention window (declared as
         # ``decoder_cache_spec.cross_attention_len``).  A token total would
         # under-count both roundings, and a pool one page short per row refuses
-        # the last rows admission already promised.
+        # the last rows admission already promised.  :meth:`kv_bytes_per_row`
+        # counts the same pages, so the executor's byte budget and this pool
+        # agree on how many rows fit.
         cross_len = int(getattr(spec, "cross_attention_len", 0) or 0)
-        pages_per_row = -(-self._position_budget() // block_tokens)
-        if cross_len:
-            pages_per_row += -(-cross_len // block_tokens)
-        blocks = rows * pages_per_row
+        blocks = rows * self._pages_per_row(spec)
         budget_gib = float(self._config.decode_kv_budget_gib or 0.0)
         per_token = self._kv_bytes_per_token(spec)
         if budget_gib > 0:
@@ -672,14 +728,26 @@ class IncrementalArStrategy(DecodeStrategy):
         geometry), dense or paged alike, so that is added: a budget without it
         would admit rows by a fraction of their real footprint.
 
+        Paged storage reserves whole pages, so there a row costs its ceiling
+        rounded up to pages, per slot.  That is the unit the pool is sized in
+        and admits by.  Counted in tokens instead, the executor's byte budget
+        came out one row wider than the pool for budgets in a gap of
+        ``rows x rounding`` tokens below each page boundary.  Qwen2-Audio's rows
+        are 1,242 tokens but 1,248 paged, so the gap is 6 tokens per row: 7 % of
+        budgets at 15 rows, 12 % at 26.  In it, the last row admission promised
+        was refused at prefill and rejected.
+
         ``None`` when the model does not declare ``decoder_cache_spec``; the
         budget then stays off rather than guessing a footprint.
         """
         spec = getattr(self._model, "decoder_cache_spec", None)
         if spec is None:
             return None
+        per_token = self._kv_bytes_per_token(spec)
+        if self._pages_kv():
+            return per_token * self._kv_block_tokens() * self._pages_per_row(spec)
         cross_len = int(getattr(spec, "cross_attention_len", 0) or 0)
-        return self._kv_bytes_per_token(spec) * (int(self._position_budget()) + cross_len)
+        return per_token * (int(self._position_budget()) + cross_len)
 
     def _kv_bytes_per_token(self, spec: Any) -> int:
         """K and V bytes for one position across every decoder layer.
@@ -759,6 +827,25 @@ class IncrementalArStrategy(DecodeStrategy):
     @property
     def _length_penalty(self) -> float:
         return float(getattr(self.options, "length_penalty", 1.0))
+
+    def probe_prefill(self, enc_out: torch.Tensor, enc_lengths: torch.Tensor) -> int:
+        """Prefill ``enc_out``'s rows once, for measurement, and return the KV they held.
+
+        The engine's memory probe calls this to measure the prefill transient:
+        the peak it observes, minus the KV bytes returned here, which the budget
+        charges separately.  Nothing outlives the call.  No group is registered,
+        and the decoder KV is dense and dropped on return.  The paged pool is
+        never touched: it is sized from the budget this measurement feeds, so it
+        must not exist yet.
+        """
+        requests = [Request(streaming=False) for _ in range(int(enc_out.size(0)))]
+        saved = self._kv_manager
+        self._kv_manager = None
+        try:
+            plan = self._prefill(requests, enc_out, enc_lengths)
+            return _held_bytes(plan.state)
+        finally:
+            self._kv_manager = saved
 
     def begin_offline(
         self,
