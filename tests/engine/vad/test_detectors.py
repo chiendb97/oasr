@@ -330,23 +330,99 @@ class TestOfflineSegmenter:
         seg = self.segmenter(speech_pad_ms=2000)
         assert seg.spans(tone(2.0)) is None
 
-    def test_a_capped_run_is_not_cut_into_independent_requests(self):
+    @staticmethod
+    def phrases(pauses, phrase_s=0.7):
+        """Tone phrases separated by the given pauses (seconds), and where each
+        pause lies, in samples.  The pauses are all shorter than the preset's
+        ``min_silence_ms``, so the segmenter reads one continuous run."""
+        parts, where, at = [tone(phrase_s)], [], int(phrase_s * SR)
+        for pause in pauses:
+            parts.append(hiss(pause))
+            where.append((at, at + int(pause * SR)))
+            at += int(pause * SR)
+            parts.append(tone(phrase_s))
+            at += int(phrase_s * SR)
+        return torch.cat(parts), where
+
+    def test_the_cap_is_not_cut_at_the_frame_it_fires(self):
         """``max_speech_s`` closes a run *at the current frame*, not at a
         silence, so the two segments it leaves touch.  Fanning those out decodes
         the word on the boundary as two half-words with no shared context and no
         overlap to dedup against -- measured at +0.94 WER on long-form audio a
-        detector reads as one continuous run.  A boundary with no gap around it
-        drops no audio, so it buys the encoder nothing and is merged away."""
+        detector reads as one continuous run.  So the touching segments are
+        merged, and the merged span is cut again in a pause (below)."""
         seg = self.segmenter(max_speech_s=1.0)
-        wav = tone(5.0)
-        assert len(seg.segments(wav)) > 1, "max_speech_s did not fire"
-        assert seg.spans(wav) is None, "a gapless cut was fanned out"
+        wav, pauses = self.phrases([0.3] * 6)
+        segments = seg.segments(wav)
+        assert len(segments) > 1, "max_speech_s did not fire"
+        fired = [int(round(s.end * SR)) for s in segments[:-1]]
+        cuts = [a for a, _ in seg.spans(wav)[1:]]
+        assert not set(cuts) & set(fired), "a span was cut where the cap fired"
+
+    def test_no_span_is_longer_than_the_cap(self):
+        """The merge alone left a span unbounded.  A 900 s chapter the detector
+        read as one run came back as one span, and a Zipformer handed the whole
+        file ran out of memory (2026-11-09 report, D7)."""
+        seg = self.segmenter(max_speech_s=2.0)
+        wav, _ = self.phrases([0.3] * 10)
+        spans = seg.spans(wav)
+        assert spans is not None and len(spans) > 1
+        assert all(b - a <= 2 * SR for a, b in spans)
+        # The pieces touch: no sample is dropped or decoded twice.
+        assert all(spans[k][1] == spans[k + 1][0] for k in range(len(spans) - 1))
+        assert spans[0][0] == 0 and spans[-1][1] == wav.numel()
+
+    def test_the_cut_lands_in_a_pause(self):
+        seg = self.segmenter(max_speech_s=2.0)
+        wav, pauses = self.phrases([0.3] * 10)
+        for cut, _ in seg.spans(wav)[1:]:
+            assert any(a < cut < b for a, b in pauses), f"cut at {cut / SR:.3f}s is in speech"
+
+    def test_the_longest_pause_in_reach_wins(self):
+        seg = self.segmenter(max_speech_s=2.5)
+        wav, pauses = self.phrases([0.15, 0.45, 0.15])
+        cuts = [a for a, _ in seg.spans(wav)[1:]]
+        assert cuts, "nothing was cut"
+        long_a, long_b = pauses[1]
+        assert long_a < cuts[0] < long_b
+
+    def test_a_long_pause_keeps_only_the_padding_on_each_side(self):
+        """Cut in its middle, a 1.9 s pause left about a second of silence at a
+        piece's edge, and Zipformer CTC filled it with words nobody said ("he
+        said", +0.16 WER on the 150 s long-form set).  A pause longer than twice
+        the padding is cut like a segment boundary instead."""
+        seg = self.segmenter(max_speech_s=3.0)
+        wav, pauses = self.phrases([0.3, 1.5, 0.3], phrase_s=0.9)
+        spans = seg.spans(wav)
+        gaps = [(spans[k][1], spans[k + 1][0]) for k in range(len(spans) - 1)]
+        dropped = [(a, b) for a, b in gaps if a < b]
+        assert len(dropped) == 1, f"expected one trimmed cut, got {gaps}"
+        (left_end, right_start), (pause_a, pause_b) = dropped[0], pauses[1]
+        pad = VadConfig(mode="segment").resolve("offline").speech_pad_seconds
+        frame = 0.05 * SR  # the energy detector's edges move by a few hops
+        assert abs(left_end - (pause_a + pad * SR)) <= frame
+        assert abs(right_start - (pause_b - pad * SR)) <= frame
+
+    def test_audio_with_no_pause_is_still_bounded(self):
+        """With nothing quieter than speech, the bound still holds: the cut goes
+        in the least speech-like frame.  Memory does not wait for a pause."""
+        seg = self.segmenter(max_speech_s=1.0)
+        spans = seg.spans(tone(5.0))
+        assert spans is not None and all(b - a <= SR for a, b in spans)
+
+    def test_a_span_within_the_cap_is_left_whole(self):
+        seg = self.segmenter(max_speech_s=30.0)
+        wav, _ = self.phrases([0.3] * 4)
+        assert seg.spans(wav) is None, "one span covering the audio fanned out"
 
     def test_a_real_gap_still_cuts_after_the_merge(self):
         """The merge must not swallow the cuts the mode exists for."""
         seg = self.segmenter(max_speech_s=1.0)
         spans = seg.spans(torch.cat([tone(2.0), hiss(4.0), tone(2.0)]))
-        assert spans is not None and len(spans) == 2
+        assert spans is not None
+        middle = 4 * SR  # inside the 4 s gap, past either side's padding
+        assert not any(a <= middle < b for a, b in spans), "the gap was not dropped"
+        assert any(b <= 2.5 * SR for _, b in spans) and any(a >= 5.5 * SR for a, _ in spans)
 
 
 @pytest.mark.cuda
@@ -382,6 +458,40 @@ class TestFixedWindowResplit:
         assert engine._vad_resplit_samples == int(
             engine.sample_rate * engine._config.vad.max_speech_s
         )
+
+
+class TestSpanBoundEveryEncoder:
+    """D7 (2026-11-09 report): only fixed-window frontends had a span bound, so
+    a Zipformer was handed a 900 s chapter the detector read as one run."""
+
+    def test_the_default_cap_is_no_longer_than_the_probed_input(self):
+        """The engine's activation probe runs ``max_batch_size`` rows of
+        ``PROBE_AUDIO_SECONDS`` for a frontend without a window.  A default cap
+        above it would let a full batch of spans exceed the shape it measured."""
+        from oasr.engine.memory import PROBE_AUDIO_SECONDS
+
+        resolved = VadConfig(mode="segment", backend="energy").resolve("offline")
+        assert resolved.max_speech_s is not None
+        assert resolved.max_speech_s <= PROBE_AUDIO_SECONDS
+
+    @pytest.mark.cuda
+    def test_an_encoder_without_a_window_gets_the_same_bound(self, ckpt_dir):
+        from oasr.engine import ASREngine, EngineConfig
+
+        engine = ASREngine(
+            EngineConfig(
+                ckpt_dir=ckpt_dir,
+                device="cuda",
+                dtype=torch.float16,
+                service_mode="offline",
+                max_batch_size=2,
+                vad={"mode": "segment", "backend": "energy"},
+            )
+        )
+        assert engine._config.feature_config.fixed_window_seconds is None
+        cap = engine._config.vad.resolve("offline").max_speech_s
+        assert engine._vad_resplit_samples == int(engine.sample_rate * cap) > 0
+        assert engine._vad_splitter.max_span_samples == engine._vad_resplit_samples
 
 
 @pytest.mark.cuda

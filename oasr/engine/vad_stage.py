@@ -30,6 +30,7 @@ Set ``VadConfig.device`` to move it once a detector exists that is worth the tri
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
@@ -71,22 +72,39 @@ class OfflineVadSegmenter:
         self._cfg = config
         self._device = device
         self._detector = build_detector(config, device=device)
+        #: The longest span :meth:`spans` returns, in samples (``0``: unbounded).
+        self._cap_samples = (
+            0
+            if config.max_speech_s is None
+            else max(1, int(float(config.max_speech_s) * int(config.sample_rate)))
+        )
 
     @property
     def detector(self) -> SpeechDetector:
         return self._detector
 
-    def segments(self, waveform: torch.Tensor) -> List[SpeechSegment]:
-        """Speech spans in seconds, request-relative."""
+    @property
+    def max_span_samples(self) -> int:
+        """The longest span :meth:`spans` returns, in samples; ``0`` if unbounded."""
+        return self._cap_samples
+
+    def _probabilities(self, waveform: torch.Tensor) -> List[float]:
+        """The detector's per-frame speech probability over the whole waveform."""
         wav = waveform.reshape(1, -1).to(device=self._device, dtype=torch.float32)
         lengths = torch.tensor([wav.size(1)], dtype=torch.int64, device=self._device)
         probs, frame_lengths = self._detector.detect(wav, lengths)
         rows = as_rows(probs, frame_lengths)
-        if not rows or not rows[0]:
+        return rows[0] if rows else []
+
+    def _segments_from(self, probs: List[float], total_samples: int) -> List[SpeechSegment]:
+        if not probs:
             return []
         segmenter = SpeechSegmenter(self._cfg, self._detector.seconds_per_frame)
-        total = wav.size(1) / float(self._cfg.sample_rate)
-        return segmenter.run(rows[0], total_seconds=total)
+        return segmenter.run(probs, total_seconds=total_samples / float(self._cfg.sample_rate))
+
+    def segments(self, waveform: torch.Tensor) -> List[SpeechSegment]:
+        """Speech spans in seconds, request-relative."""
+        return self._segments_from(self._probabilities(waveform), int(waveform.numel()))
 
     def spans(self, waveform: torch.Tensor) -> Optional[List[Tuple[int, int]]]:
         """Speech spans as ``[start_sample, end_sample)`` pairs, or ``None``.
@@ -108,13 +126,22 @@ class OfflineVadSegmenter:
         reaches the cap *at the current frame* rather than at a silence — and a
         real gap shorter than twice ``speech_pad_ms`` is the other, since the
         padding then meets in the middle.
+
+        The merge alone leaves a span **unbounded**, though: continuous read speech
+        rarely pauses for ``min_silence_ms``, so a 900 s chapter came back as one
+        span covering the file, and an encoder whose memory grows with its input
+        ran out of memory on it.  Every span is therefore cut again to at most
+        ``max_speech_s``, and the cut is placed where the detector heard the
+        longest pause (:meth:`_quietest_cut`).  It is a pause between words
+        rather than the arbitrary frame the segmenter stopped at.
         """
         total_samples = int(waveform.numel())
         if total_samples <= 0:
             return None
         rate = float(self._cfg.sample_rate)
+        probs = self._probabilities(waveform)
         pairs: List[Tuple[int, int]] = []
-        for segment in self.segments(waveform):
+        for segment in self._segments_from(probs, total_samples):
             start = max(0, int(round(segment.start * rate)))
             end = min(total_samples, int(round(segment.end * rate)))
             if end <= start:
@@ -125,9 +152,86 @@ class OfflineVadSegmenter:
             pairs.append((start, end))
         if not pairs:
             return None
+        pairs = self._bounded(pairs, probs)
         if len(pairs) == 1 and pairs[0] == (0, total_samples):
             return None
         return pairs
+
+    def _bounded(
+        self, pairs: List[Tuple[int, int]], probs: Sequence[float]
+    ) -> List[Tuple[int, int]]:
+        """Cut every span longer than the cap into pieces of at most the cap.
+
+        Each cut falls in the second half of the remaining allowance, so a piece
+        is at least half the cap long and the cuts do not multiply.  See
+        :meth:`_cut` for what happens to the pause it lands in.
+        """
+        cap = self._cap_samples
+        if cap <= 1:
+            return pairs
+        out: List[Tuple[int, int]] = []
+        for start, end in pairs:
+            while end - start > cap:
+                left_end, right_start = self._cut(probs, start, end, start + cap // 2, start + cap)
+                out.append((start, left_end))
+                if right_start >= end:
+                    break  # the rest of the span is the pause: nothing to decode
+                start = right_start
+            else:
+                out.append((start, end))
+        return out
+
+    def _cut(
+        self, probs: Sequence[float], start: int, end: int, lo: int, hi: int
+    ) -> Tuple[int, int]:
+        """Where a span ``[start, end)`` is cut, in ``[lo, hi]``: ``(left_end, right_start)``.
+
+        A pause is a run of frames below ``neg_threshold``, the level at which
+        the segmenter would end a run, and the cut goes in the longest pause the
+        window holds (ties to the later one, which keeps pieces longer).  A
+        pause longer than twice ``speech_pad_ms`` is treated as a segment
+        boundary: each side keeps ``speech_pad_ms`` of it and the middle is
+        dropped.  Splitting it in half instead left close to a second of silence
+        at a piece's edge, and Zipformer CTC filled it with words that were
+        never spoken ("he said", 2026-11-09).  A shorter pause is cut in its
+        middle, so the pieces touch.  With no pause in the window, the cut goes
+        in the least speech-like frame, because the bound holds anyway.
+        """
+        frame = float(self._detector.seconds_per_frame) * float(self._cfg.sample_rate)
+        first = max(0, int(math.ceil(lo / frame)))
+        last = min(len(probs), int(hi // frame))  # frames whose start is <= hi
+        if last <= first:
+            return hi, hi
+        neg = float(self._cfg.neg_threshold if self._cfg.neg_threshold is not None else 0.0)
+        best: Optional[Tuple[int, int]] = None
+        run: Optional[int] = None
+        for f in range(first, last):
+            if probs[f] < neg:
+                run = f if run is None else run
+                if best is None or f - run >= best[1] - best[0]:
+                    best = (run, f)
+            else:
+                run = None
+        if best is None:
+            quietest = min(range(first, last), key=lambda f: (probs[f], -f))
+            cut = min(hi, max(lo, int(round((quietest + 0.5) * frame))))
+            return cut, cut
+        # The whole pause, not only the part inside the window: a piece's edge
+        # silence is what matters, and the window clips it.
+        a, b = best
+        while a > 0 and probs[a - 1] < neg and (a - 1) * frame > start:
+            a -= 1
+        while b + 1 < len(probs) and probs[b + 1] < neg and (b + 1) * frame < end:
+            b += 1
+        pause_start, pause_end = a * frame, (b + 1) * frame
+        pad = self._cfg.speech_pad_seconds * float(self._cfg.sample_rate)
+        if pause_end - pause_start > 2.0 * pad:
+            left_end = max(start + 1, min(hi, int(round(pause_start + pad))))
+            if pause_end + pad >= end:
+                return left_end, end  # nothing but the pause follows
+            return left_end, max(left_end, int(round(pause_end - pad)))
+        cut = min(hi, max(lo, int(round((pause_start + pause_end) / 2.0))))
+        return cut, cut
 
 
 class StreamVadState:

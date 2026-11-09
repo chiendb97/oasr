@@ -458,18 +458,23 @@ class ASREngine:
         # splitter differs.  It *supersedes* the fixed-window splitter when both
         # are configured: a cut that lands in silence is strictly better than one
         # at an arbitrary sample count, and it needs no overlap, so the word-level
-        # dedup ``merge_texts`` does at a window seam becomes unnecessary.  That
-        # holds for a cut in a silence and only for one: a boundary with no gap
-        # around it is merged away in ``OfflineVadSegmenter.spans``, and the one
-        # seam that survives without a silence — a merged span too long for a
-        # fixed-window frontend — is re-split *with* the overlap below.
+        # dedup ``merge_texts`` does at a window seam becomes unnecessary.  A
+        # boundary with no gap around it is merged away in
+        # ``OfflineVadSegmenter.spans``, which then cuts any span longer than
+        # ``max_speech_s`` again, at the longest pause it can find.
         self._vad_splitter: Optional[OfflineVadSegmenter] = None
-        #: Width, in samples, to re-split a VAD span that a fixed-window frontend
-        #: cannot take whole.  ``_resolve_vad`` has already pinned
-        #: ``max_speech_s`` to ``window - 2 * speech_pad`` for such a frontend;
-        #: this is that same budget, and using the *full* window instead costs
-        #: real words — measured at +2.2 WER on whisper-tiny, which drops the
-        #: tail of a window with no padding left in it.
+        #: Width, in samples, of the widest piece a VAD fan-out hands the encoder:
+        #: the resolved ``max_speech_s``, for **every** encoder.  It used to be
+        #: set for fixed-window frontends only, so a Zipformer was handed a 900 s
+        #: chapter the detector read as one run and ran out of memory on it.  The
+        #: offline preset's 30 s is the input length the activation probe sizes
+        #: the engine for (``PROBE_AUDIO_SECONDS``), so a full batch of maximal
+        #: spans is the shape the engine planned for.  ``_resolve_vad`` pins it
+        #: to ``window - 2 * speech_pad`` for a fixed-window frontend; using the
+        #: *full* window there costs real words -- measured at +2.2 WER on
+        #: whisper-tiny, which drops the tail of a window with no padding left.
+        #: ``spans`` already returns nothing wider; this width also splits audio
+        #: in which the detector found no speech at all.
         self._vad_resplit_samples = 0
         vad_cfg = config.vad
         if vad_cfg is not None and vad_cfg.mode == "segment" and config.service_mode == "offline":
@@ -481,9 +486,10 @@ class ASREngine:
                 )
             feature_config = config.feature_config
             assert feature_config is not None, "EngineConfig always materialises one"
-            fixed_window_s = feature_config.fixed_window_seconds
-            if fixed_window_s is not None:
-                budget_s = vad_cfg.resolve("offline").max_speech_s or fixed_window_s
+            budget_s = (
+                vad_cfg.resolve("offline").max_speech_s or feature_config.fixed_window_seconds
+            )
+            if budget_s is not None:
                 self._vad_resplit_samples = int(int(feature_config.sample_rate) * float(budget_s))
             logger.info(
                 "vad segmentation enabled: backend=%s on %s (supersedes the "
@@ -1080,10 +1086,11 @@ class ASREngine:
         if self._vad_splitter is not None:
             spans = self._vad_splitter.spans(wave)
             if spans is None and 0 < self._vad_resplit_samples < int(wave.numel()):
-                # The detector found nothing to cut at, but this frontend cannot
-                # take the request whole.  Having asked for segmentation and got
-                # a rejection is the worst of both, so hand the undivided audio
-                # to the fixed-window splitter below.
+                # The detector found no speech, but the audio is wider than any
+                # piece this engine hands its encoder: a fixed-window frontend
+                # cannot take it whole, and another encoder may not have the
+                # memory to.  Having asked for segmentation and got a rejection
+                # is the worst of both, so cut the undivided audio below.
                 spans = [(0, int(wave.numel()))]
 
         # Window starts in samples, so the tracker sees two windows that only
@@ -1095,9 +1102,10 @@ class ASREngine:
             for start, end in spans:
                 piece = wave[start:end]
                 if 0 < self._vad_resplit_samples < int(piece.numel()):
-                    # A span the VAD could find no silence in, longer than the
-                    # frontend's window: it has to be cut somewhere, so cut it at
-                    # the window.  Overlap is *not* added on its own initiative —
+                    # Audio wider than the budget that the detector could not
+                    # divide (it found no speech in it; ``spans`` bounds every
+                    # span it returns): it has to be cut somewhere, so cut it at
+                    # the budget.  Overlap is *not* added on its own initiative —
                     # measured on whisper-tiny over noisy long-form audio, a 1 s
                     # overlap cost +2.26 WER against a clean cut, because
                     # ``merge_texts`` matches a repeated hallucination at the
