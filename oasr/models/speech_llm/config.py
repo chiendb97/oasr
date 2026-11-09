@@ -16,10 +16,13 @@ text inside the template.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, ClassVar, List, Mapping
 
-from ..base import BaseModelConfig
+from ..base import _UNSET, BaseModelConfig
+
+logger = logging.getLogger(__name__)
 
 # The processor-side ChatML template around the audio slot (verbatim from
 # Qwen2AudioProcessor.default_chat_template with one user turn holding one
@@ -31,8 +34,46 @@ QWEN2_AUDIO_PROMPT_PREFIX = (
 )
 QWEN2_AUDIO_PROMPT_SUFFIX = "<|audio_eos|>\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-#: The official Qwen2-Audio ASR prompt (used by its speech-recognition evals).
-QWEN2_AUDIO_DEFAULT_USER_PROMPT = "Detect the language and recognize the speech."
+#: The user turn the template above carries by default: an instruction to transcribe.
+#:
+#: The template is the *Instruct* checkpoint's ChatML, and the Instruct model treats
+#: the user turn as a question to answer.  The previous default, the base model's ASR
+#: eval prompt (:data:`QWEN2_AUDIO_BASE_ASR_PROMPT`), got answers such as "The speech
+#: is in English, and it is a male singing in a neutral mood": 94.9 % WER on
+#: LibriSpeech test-clean (bf16, VAD on), against 3.19 % with this prompt.
+QWEN2_AUDIO_DEFAULT_USER_PROMPT = (
+    "Transcribe the audio into text. Output only the transcription, with no extra words."
+)
+
+#: Qwen2-Audio's own ASR prompt, from its speech-recognition evals.  It was written
+#: for the *base* model and its plain-text template, not for a chat turn.  It is the
+#: default every native bundle exported before 2026-11-09 stored, which
+#: :meth:`SpeechLlmModelConfig.from_dict` reads as the stale default it is.
+QWEN2_AUDIO_BASE_ASR_PROMPT = "Detect the language and recognize the speech."
+
+
+def _user_prompt_from_dict(d: Mapping[str, Any]) -> Any:
+    """``default_user_prompt`` of a native bundle, with the stale default migrated.
+
+    The field is written by ``asdict`` like every other, so a bundle exported before
+    the default changed stores the base model's prompt.  That is a copy of a code
+    default, not a property of the weights, and it is the defect itself: served as a
+    ChatML user turn, it gets a description instead of a transcript.  Only that
+    exact string under the ChatML suffix is replaced.  Any other stored prompt is
+    kept, and a deployment that wants the old one sets ``llm_prompt``.
+    """
+    prompt = d.get("default_user_prompt", _UNSET)
+    suffix = d.get("prompt_suffix", QWEN2_AUDIO_PROMPT_SUFFIX)
+    if prompt == QWEN2_AUDIO_BASE_ASR_PROMPT and suffix == QWEN2_AUDIO_PROMPT_SUFFIX:
+        logger.warning(
+            "this speech-LLM bundle stores the base model's ASR prompt (%r) as its "
+            "default; the Instruct template answers it with a description, so the "
+            "transcription prompt is used instead. Re-export the bundle to store it, "
+            "or set llm_prompt to keep the old one.",
+            prompt,
+        )
+        return QWEN2_AUDIO_DEFAULT_USER_PROMPT
+    return prompt
 
 
 @dataclass
@@ -72,6 +113,10 @@ class SpeechLlmModelConfig(BaseModelConfig):
     prompt_prefix: str = QWEN2_AUDIO_PROMPT_PREFIX
     prompt_suffix: str = QWEN2_AUDIO_PROMPT_SUFFIX
     default_user_prompt: str = QWEN2_AUDIO_DEFAULT_USER_PROMPT
+
+    _from_dict_overrides: ClassVar[Mapping[str, Any]] = {
+        "default_user_prompt": _user_prompt_from_dict,
+    }
 
     @property
     def audio_head_dim(self) -> int:
