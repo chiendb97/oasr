@@ -31,8 +31,10 @@ from .input_processor import InputProcessor
 from .longform import LongFormTracker
 from .memory import (
     MIN_BLOCKS_PER_STREAM,
+    PREFILL_PROBE_ROWS,
     PROBE_AUDIO_SECONDS,
     UNMEASURED_ACTIVATION_FRACTION,
+    KvBudget,
     MemoryProfile,
     bytes_per_kv_block,
     derive_decode_kv_budget,
@@ -115,6 +117,8 @@ class ASREngine:
     #: ``_longform``: the concurrency tests drive a hand-built engine through
     #: ``__new__``, and a read must not depend on construction having run.
     _memory_profile: Optional[MemoryProfile] = None
+    #: The derived decoder-KV budget, with the prefill reserve it took off.
+    _decode_kv_budget: Optional[KvBudget] = None
 
     def __init__(self, config: EngineConfig) -> None:
         # Engine-wide re-entrant lock guarding scheduler queues and per-request
@@ -644,7 +648,11 @@ class ASREngine:
             logger.debug("kv_bytes_per_row failed (%s); budgeting without it", exc)
             per_row = None
         profile = self._profile_device_memory(config, consumes)
-        budget = derive_decode_kv_budget(profile, bytes_per_row=per_row)
+        prefill = self._measure_prefill_per_row(config, consumes) if per_row else None
+        budget = derive_decode_kv_budget(
+            profile, bytes_per_row=per_row, prefill_bytes_per_row=prefill
+        )
+        self._decode_kv_budget = budget
         config.decode_kv_budget_gib = budget.gib
         log = logger.warning if budget.clamped_to_one_row else logger.info
         log(
@@ -704,21 +712,7 @@ class ASREngine:
         than ``ModelRunner``: the pool derivation runs before the runner exists
         (the runner is what allocates the pool), and the runner only delegates.
         """
-        fc = config.feature_config
-        assert fc is not None  # EngineConfig.__post_init__ always materialises one
-        sr = int(fc.sample_rate)
-        if config.service_mode == "streaming":
-            # Feature frames one chunk consumes -> samples, snip_edges geometry.
-            frames = int(config.decoding_window)
-            n = fc.frame_length_samples + max(0, frames - 1) * fc.frame_shift_samples
-        else:
-            window_s = fc.fixed_window_seconds or PROBE_AUDIO_SECONDS
-            n = int(sr * float(window_s))
-        batch = max(1, int(config.max_batch_size))
-        reqs = [
-            Request(audio=torch.zeros(n, dtype=torch.float32), streaming=False, sample_rate=sr)
-            for _ in range(batch)
-        ]
+        reqs = self._probe_requests(config, max(1, int(config.max_batch_size)))
         feats, lengths = self._input_processor.collate(reqs)
         with torch.no_grad():
             if consumes == "hidden":
@@ -733,6 +727,71 @@ class ASREngine:
             # never touch the staging buffers it just grew, so give them back
             # rather than leaving pinned host memory resident for the process.
             self._input_processor.release_staging()
+
+    @staticmethod
+    def _probe_requests(config: EngineConfig, batch: int) -> List[Request]:
+        """``batch`` silent requests at the widest input the engine will run.
+
+        * streaming — one encoder chunk window, the shape ``forward_step``
+          issues at steady state.
+        * offline — the frontend's fixed window if it has one, else
+          :data:`~oasr.engine.memory.PROBE_AUDIO_SECONDS` of audio.
+        """
+        fc = config.feature_config
+        assert fc is not None  # EngineConfig.__post_init__ always materialises one
+        sr = int(fc.sample_rate)
+        if config.service_mode == "streaming":
+            # Feature frames one chunk consumes -> samples, snip_edges geometry.
+            frames = int(config.decoding_window)
+            n = fc.frame_length_samples + max(0, frames - 1) * fc.frame_shift_samples
+        else:
+            window_s = fc.fixed_window_seconds or PROBE_AUDIO_SECONDS
+            n = int(sr * float(window_s))
+        return [
+            Request(audio=torch.zeros(n, dtype=torch.float32), streaming=False, sample_rate=sr)
+            for _ in range(batch)
+        ]
+
+    def _measure_prefill_per_row(self, config: EngineConfig, consumes: str) -> Optional[int]:
+        """An AR family's prefill transient per row, decoder KV excluded.
+
+        ``None`` when the strategy has no prefill to probe, or the probe failed.
+        Then the budget reserves nothing for prefill, as it always had.
+
+        Measured, not modelled.  :data:`~oasr.engine.memory.PREFILL_PROBE_ROWS`
+        silent windows are encoded outside the measurement, then prefilled
+        through the strategy's own path
+        (:meth:`~oasr.engine.decode.incremental.IncrementalArStrategy.probe_prefill`).
+        The decoder KV that prefill leaves in its state is taken off the peak,
+        because the budget charges it already.  What remains is one decoder
+        forward over every row's whole prompt.  It is linear in the rows, so a
+        prefill the executor admits ``R`` rows wide costs ``R`` times this.  On
+        Qwen2-Audio that is 113 MiB per row, and the 26 rows an int8 budget
+        admitted ran out of memory.
+        """
+        probe = getattr(self._output_processor.strategy, "probe_prefill", None)
+        if probe is None or consumes != "hidden":
+            return None
+        rows = max(1, min(PREFILL_PROBE_ROWS, int(config.max_batch_size)))
+        try:
+            feats, lengths = self._input_processor.collate(self._probe_requests(config, rows))
+            with torch.no_grad():
+                enc_out, enc_lengths = self._model.encode_offline(feats, lengths)
+            del feats, lengths
+            held: List[int] = []
+            peak = measure_peak_activation(
+                lambda: held.append(probe(enc_out, enc_lengths)), self._device
+            )
+            return max(0, peak - held[0]) // rows
+        except Exception as exc:
+            logger.warning(
+                "prefill probe failed (%s); the decoder-KV budget reserves nothing for "
+                "prefill, which then has only the utilization headroom",
+                exc,
+            )
+            return None
+        finally:
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Request management

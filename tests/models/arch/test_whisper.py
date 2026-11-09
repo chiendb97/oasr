@@ -868,14 +868,57 @@ class TestTaskAndLanguagePrompt:
         assert spec.cross_attention_len == cfg.max_source_positions
         itemsize = torch.empty((), dtype=strat._config.dtype).element_size()
         per_token = 2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize
-        assert strat.kv_bytes_per_row() == per_token * (
-            strat._position_budget() + cfg.max_source_positions
-        )
-        mgr = strat.kv_manager()
         bt = int(strat.options.kv_block_tokens)
         rows = int(strat._config.max_decode_slots or strat._config.max_batch_size)
         pages = -(-strat._position_budget() // bt) + -(-cfg.max_source_positions // bt)
+        # Paged, a row costs whole pages: the unit the pool is sized in and
+        # admission reserves.  In tokens, the executor's byte budget came out a
+        # row wider than the pool for some budgets, and that row was refused.
+        assert strat.kv_bytes_per_row() == per_token * bt * pages
+        assert strat.kv_bytes_per_row() > per_token * (
+            strat._position_budget() + cfg.max_source_positions
+        ), "this geometry must round, or the test cannot tell pages from tokens"
+        mgr = strat.kv_manager()
         assert mgr.pool.num_blocks == rows * pages
+        assert mgr.pool.num_blocks * bt * per_token == rows * strat.kv_bytes_per_row()
+
+    def test_the_memory_probe_prefill_leaves_nothing_behind(self):
+        """The engine measures a prefill's transient with this, before any budget.
+
+        So it must register no group, and above all must not build the paged
+        pool: the pool is sized from the budget the measurement feeds, and one
+        built now would be sized without it and kept for the engine's life.  The
+        bytes it reports are the dense KV the prefill held, which the probe
+        subtracts from its peak.
+        """
+        from oasr.engine.decode.incremental import _UNSET
+
+        strat = self._paged_strategy()
+        cfg = strat._mcfg
+        spec = strat._model.decoder_cache_spec
+        enc = torch.randn(2, cfg.max_source_positions, cfg.d_model)
+        held = strat.probe_prefill(enc, torch.tensor([enc.size(1)] * 2))
+        assert strat._kv_manager is _UNSET, "the probe built the decoder-KV pool"
+        assert not strat.has_pending()
+        itemsize = torch.empty((), dtype=strat._config.dtype).element_size()
+        per_token = 2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize
+        # At least the cross-attention K/V over the whole window, at most a full
+        # dense row each (this config's decoder caps generation below the
+        # engine's ``max_new_tokens``), plus the per-row length vector.
+        assert held > 2 * per_token * spec.cross_attention_len
+        assert held <= 2 * per_token * (strat._position_budget() + spec.cross_attention_len) + 4096
+        assert strat.kv_manager() is not None, "the strategy still pages afterwards"
+
+    def test_dense_rows_are_counted_in_tokens(self):
+        """A dense row's buffer is exactly its ceiling, with no page to round to."""
+        strat = TestTaskAndLanguagePrompt._strategy()
+        assert strat.kv_manager() is None
+        spec = strat._model.decoder_cache_spec
+        itemsize = torch.empty((), dtype=strat._config.dtype).element_size()
+        per_token = 2 * spec.num_layers * spec.n_kv_head * spec.head_dim * itemsize
+        assert strat.kv_bytes_per_row() == per_token * (
+            strat._position_budget() + spec.cross_attention_len
+        )
 
     def test_finished_rows_hand_their_pages_back(self):
         """Every page a batch took must be free again once it finishes — the

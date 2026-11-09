@@ -26,6 +26,7 @@ from oasr.cache.block_pool import BlockPool
 from oasr.cache.types import CacheConfig
 from oasr.engine.config import EngineConfig
 from oasr.engine.memory import (
+    ACTIVATION_SAFETY,
     MIN_ACTIVATION_RESERVE_BYTES,
     MIN_BLOCKS_PER_STREAM,
     UNMEASURED_ACTIVATION_FRACTION,
@@ -244,6 +245,46 @@ class TestDeriveDecodeKvBudget:
         assert budget.clamped_to_one_row
         assert budget.rows == 1
         assert budget.gib == pytest.approx(4.0)
+
+    def _qwen_int8(self):
+        """Qwen2-Audio-7B with int8 weights on a 32 GB card, as measured.
+
+        Resident 9.84 GiB, encoder probe 1.57 GiB, a paged row of 78 x 16
+        positions at 512 KiB each, and a prefill transient of 113 MiB per row.
+        """
+        p = _profile(total_gib=31.36, free_gib=31.36 - 9.84, activation_gib=1.57)
+        return p, 78 * 16 * 512 * 1024, 113 * 1024**2
+
+    def test_the_prefill_of_every_admitted_row_fits_beside_their_kv(self):
+        """26 rows by the encoder reserve alone, and their prefill did not fit.
+
+        At 113 MiB per row, 26 rows prefilled together need 2.9 GiB more than
+        the encoder pass the reserve was measured on.  On LibriSpeech that ran
+        out of memory 90 times.
+        """
+        p, k, per = self._qwen_int8()
+        assert derive_decode_kv_budget(p, bytes_per_row=k).rows == 26
+        budget = derive_decode_kv_budget(p, bytes_per_row=k, prefill_bytes_per_row=per)
+        assert budget.limited_by_prefill and budget.rows == 23
+        kv = int(budget.gib * GIB)
+        assert kv + ACTIVATION_SAFETY * budget.rows * per <= p.budget_bytes
+        assert kv + ACTIVATION_SAFETY * p.activation_bytes <= p.budget_bytes
+        # Tight, not merely safe: one more row would not have fitted.
+        assert (budget.rows + 1) * (k + ACTIVATION_SAFETY * per) > p.budget_bytes
+        assert "113MiB/row" in budget.describe()
+
+    def test_a_prefill_inside_the_encoder_reserve_changes_nothing(self):
+        p, k, _ = self._qwen_int8()
+        tiny = 1024**2
+        budget = derive_decode_kv_budget(p, bytes_per_row=k, prefill_bytes_per_row=tiny)
+        assert not budget.limited_by_prefill
+        assert budget.gib == pytest.approx(p.available_bytes / GIB)
+
+    def test_an_unmeasured_prefill_reserves_nothing(self):
+        p, k, _ = self._qwen_int8()
+        budget = derive_decode_kv_budget(p, bytes_per_row=k, prefill_bytes_per_row=None)
+        assert budget.gib == pytest.approx(p.available_bytes / GIB)
+        assert budget.prefill_bytes_per_row is None
 
 
 # ---------------------------------------------------------------------------

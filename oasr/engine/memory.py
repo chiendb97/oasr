@@ -26,10 +26,20 @@ The arithmetic is deliberately separated from the torch probes: everything below
 :class:`MemoryProfile` is pure integer maths and is unit-tested on CPU, so the
 formula is pinned without a GPU.
 
-What the probe does **not** cover: an AR family's prefill transient (the audio
-tower plus one LM forward over the whole prompt) is not run by the probe, and
-CUDA-graph capture pools are allocated after it.  Both land inside the
-utilization headroom, which is why the default leaves 10% of the card unspent.
+An AR family's prefill is measured separately (:data:`PREFILL_PROBE_ROWS` rows,
+the decoder KV it writes excluded) and charged per admitted row: the decoder-KV
+budget is narrowed until the widest prefill its rows allow fits in the reserve
+too.  That transient is one LM forward over every row's whole prompt, so it grows
+with the rows admitted together, and an encoder-only probe does not see it.  It
+used to land in the utilization headroom.  On Qwen2-Audio with int8 weights,
+quantization freed 6.6 GiB, and the budget admitted 26 rows instead of 15.  Their
+2.9 GiB prefill no longer fitted.  On LibriSpeech test-clean at
+``max_batch_size=32``, the int8 and fp8 runs had 133 prefills rejected for OOM
+between them.
+
+What the probes do **not** cover: CUDA-graph capture pools are allocated after
+them, and land inside the utilization headroom with allocator fragmentation,
+which is why the default leaves 10% of the card unspent.
 """
 
 from __future__ import annotations
@@ -64,6 +74,11 @@ MIN_BLOCKS_PER_STREAM = 8
 #: Audio length the offline probe forward uses when the frontend has no fixed
 #: window (the Kaldi frontends, whose cost tracks the real utterance length).
 PROBE_AUDIO_SECONDS = 30.0
+
+#: Rows the prefill probe runs.  The transient is linear in the rows: measured
+#: on Qwen2-Audio (int8), 112.8-113.8 MiB per row at every width from 1 to 16.
+#: So two rows measure it, and the probe's own dense decoder KV stays small.
+PREFILL_PROBE_ROWS = 2
 
 _GIB = float(1024**3)
 
@@ -286,10 +301,19 @@ class KvBudget:
     rows: Optional[int]
     #: ``True`` when one row did not fit and the budget was raised to hold it.
     clamped_to_one_row: bool
+    #: Measured prefill transient per row, when the probe ran.
+    prefill_bytes_per_row: Optional[int] = None
+    #: ``True`` when the prefill reserve, not the encoder's, set the budget.
+    limited_by_prefill: bool = False
 
     def describe(self) -> str:
         rows = "unknown" if self.rows is None else str(self.rows)
         note = " (clamped: one row exceeds the available VRAM)" if self.clamped_to_one_row else ""
+        if self.prefill_bytes_per_row is not None:
+            note += (
+                f"; prefill {self.prefill_bytes_per_row / 1024**2:.0f}MiB/row reserved"
+                f"{' (binds)' if self.limited_by_prefill else ''}"
+            )
         return f"{self.gib:.2f}GiB ≈ {rows} in-flight rows{note}"
 
 
@@ -297,19 +321,45 @@ def derive_decode_kv_budget(
     profile: MemoryProfile,
     *,
     bytes_per_row: Optional[int] = None,
+    prefill_bytes_per_row: Optional[int] = None,
 ) -> KvBudget:
     """Size the in-flight decoder-KV ceiling to ``profile.available_bytes``.
 
     ``bytes_per_row`` is the strategy's worst-case footprint for one row
-    (``DecodeStrategy.kv_bytes_per_row``); it only refines the reported row count
-    and the one-row clamp.  The clamp exists so a tight card still admits work:
-    a budget below one row would reject every request, which is worse than
+    (``DecodeStrategy.kv_bytes_per_row``); it refines the reported row count and
+    the one-row clamp.  The clamp exists so a tight card still admits work: a
+    budget below one row would reject every request, which is worse than
     admitting one and letting the allocator be the judge.
+
+    ``prefill_bytes_per_row`` is the measured prefill transient per row.  With
+    both per-row figures known, the budget also has to leave room for the
+    prefill of every row it admits, since admission can prefill them together.
+    For ``R`` rows of ``k`` bytes with a prefill of ``p`` bytes each:
+
+        R * k + ACTIVATION_SAFETY * max(encoder peak, R * p) <= budget_bytes
+
+    The encoder half is ``available_bytes``.  The prefill half caps the decoder
+    KV at ``budget_bytes * k / (k + ACTIVATION_SAFETY * p)``.  The two transients
+    are taken by ``max`` because they do not overlap: an encoder pass's
+    activations are freed before its micro-batch prefills.
     """
     available = profile.available_bytes
+    limited_by_prefill = False
+    if bytes_per_row and prefill_bytes_per_row:
+        k, p = int(bytes_per_row), int(prefill_bytes_per_row)
+        by_prefill = int(profile.budget_bytes * k / (k + ACTIVATION_SAFETY * p))
+        if by_prefill < available:
+            available = by_prefill
+            limited_by_prefill = True
     clamped = False
     if bytes_per_row and available < bytes_per_row:
         available = int(bytes_per_row)
         clamped = True
     rows = int(available // bytes_per_row) if bytes_per_row else None
-    return KvBudget(gib=available / _GIB, rows=rows, clamped_to_one_row=clamped)
+    return KvBudget(
+        gib=available / _GIB,
+        rows=rows,
+        clamped_to_one_row=clamped,
+        prefill_bytes_per_row=None if prefill_bytes_per_row is None else int(prefill_bytes_per_row),
+        limited_by_prefill=limited_by_prefill,
+    )
