@@ -99,6 +99,19 @@ segments.
   so segments that touch are merged back offline, and in streaming such a cut
   does not close the turn. Cutting there would drop no audio and would split a
   word across two contexts.
+* Offline, **no piece is longer than `max_speech_s`**, for every encoder. A
+  merged span longer than that is cut again, in the longest pause the detector
+  heard in the second half of the allowance. That is a pause between words, too
+  short to end a run (`min_silence_ms`) but quieter than `neg_threshold`. A pause
+  longer than twice `speech_pad_ms` is cut like a segment boundary: each side
+  keeps `speech_pad_ms` of it. Splitting it in half left about a second of
+  silence at a piece's edge, and Zipformer CTC filled that with words nobody
+  said. With no pause in reach, the cut goes in the least speech-like frame.
+  Continuous read speech
+  rarely pauses for the preset's 2 s, so before this bound a 900 s chapter came
+  back as one span, and a Zipformer, whose attention grows with the square of its
+  input, ran out of memory on it. The preset's 30 s is also the input length the
+  engine's memory probe uses for a frontend without a fixed window.
 
 **Requires a waveform detector.** Only a detector that runs before the encoder
 can decide what the encoder sees, so `segment` needs a backend declaring
@@ -239,7 +252,7 @@ audio.
 | `min_speech_ms` | drop speech runs shorter than this; in streaming it also delays the `speech_started` event by that much, though the timestamp still marks the true onset |
 | `min_silence_ms` | silence shorter than this does not end a run |
 | `speech_pad_ms` | padding on each side of an emitted segment; inert in `observe` and `endpoint`, where the encoder sees every sample anyway, and load-bearing in `segment`, where audio is dropped |
-| `max_speech_s` | cut a run this long even without a silence. The cut lands at the current frame, not at the quietest one, so it is a bound on segment length rather than a place to split a transcript — see `segment` above |
+| `max_speech_s` | cut a run this long even without a silence. The segmenter cuts at the current frame, and offline those touching pieces are merged back and the result is cut again in the longest pause in reach, so no piece the encoder sees is longer than this. Pinned to `window - 2 * speech_pad` for a fixed-window frontend — see `segment` above |
 
 **Endpointing** (streaming only)
 
