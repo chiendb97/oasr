@@ -879,16 +879,33 @@ class _AbortingExecutor(_FakeExecutor):
         self.aborted.append(request_id)
 
 
-def _fan_out_engine(*, overlap=False, window_s=1.0, spans=None):
-    """:func:`_admission_engine` with a long-form tracker, and optionally a VAD
-    splitter that returns ``spans``."""
+def _grid(window):
+    """A stand-in ``long_form`` splitter: touching pieces of ``window`` samples.
+
+    Where the real one cuts (in pauses) is ``OfflineVadSegmenter.pieces``'s to
+    test; these tests are about what the fan-out does with the pieces.
+    """
+    return SimpleNamespace(
+        pieces=lambda wave: [
+            (s, min(s + window, int(wave.numel()))) for s in range(0, int(wave.numel()), window)
+        ]
+    )
+
+
+def _fan_out_engine(*, overlap=False, window_s=1.0, spans=None, pieces=None):
+    """:func:`_admission_engine` with a long-form tracker and splitter, and
+    optionally a VAD splitter that returns ``spans``."""
     from oasr.engine.longform import LongFormTracker
 
     eng = _admission_engine(overlap=overlap)
     eng._executor = _AbortingExecutor()
     eng._longform = LongFormTracker()
     eng._longform_window_samples = int(16000 * window_s)
-    eng._longform_overlap_samples = 0
+    eng._longform_splitter = (
+        _grid(eng._longform_window_samples)
+        if pieces is None
+        else SimpleNamespace(pieces=lambda wave: pieces)
+    )
     eng._vad_splitter = None if spans is None else SimpleNamespace(spans=lambda wave: spans)
     eng._vad_resplit_samples = 0
     eng._metrics = SimpleNamespace(incr=lambda *a: None)
@@ -940,23 +957,23 @@ def test_bulk_admission_segments_at_the_vad_spans(overlap):
 
 
 @pytest.mark.parametrize(
-    "overlap_samples,spans,expected",
+    "pieces,spans,expected",
     [
-        # Fixed windows of 16000 with no overlap: each ends where the next starts.
-        (0, None, [(0, 16000), (16000, 32000), (32000, 40000)]),
-        # 4000 samples of overlap: stride 12000.
-        (4000, None, [(0, 16000), (12000, 28000), (24000, 40000)]),
+        # ``long_form`` pieces cut in short pauses: each ends where the next starts.
+        (None, None, [(0, 16000), (16000, 32000), (32000, 40000)]),
+        # One cut in a long pause, whose middle is left out.
+        ([(0, 14000), (18000, 32000), (32000, 40000)], None, None),
         # VAD spans, cut in silence: a gap between them.
-        (0, [(0, 8000), (24000, 40000)], [(0, 8000), (24000, 40000)]),
+        (None, [(0, 8000), (24000, 40000)], [(0, 8000), (24000, 40000)]),
     ],
-    ids=["touching", "overlapping", "vad_gap"],
+    ids=["touching", "long_pause", "vad_gap"],
 )
-def test_the_fan_out_registers_where_each_window_ends(overlap_samples, spans, expected):
+def test_the_fan_out_registers_where_each_window_ends(pieces, spans, expected):
     """The merge drops a repeat only where windows share audio, so it is told
     where each one ends -- from sample counts, so windows that only touch
     compare equal rather than overlapping by a rounding error."""
-    eng = _fan_out_engine(spans=spans)
-    eng._longform_overlap_samples = overlap_samples
+    expected = expected or pieces
+    eng = _fan_out_engine(spans=spans, pieces=pieces)
     eng.add_requests_batch_checked(
         [{"request_id": "long", "audio": torch.zeros(40000), "streaming": False}]
     )
@@ -1073,7 +1090,7 @@ def _overlap_engine(prepare, *, window_s=None):
     if window_s is not None:
         eng._longform = LongFormTracker()
         eng._longform_window_samples = int(16000 * window_s)
-        eng._longform_overlap_samples = 0
+        eng._longform_splitter = _grid(eng._longform_window_samples)
         eng._vad_splitter = None
         eng._vad_resplit_samples = 0
     eng._prep.start()

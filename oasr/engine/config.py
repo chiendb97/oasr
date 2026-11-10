@@ -462,12 +462,14 @@ class EngineConfig:
     # Disabled by default because eviction shortens the attention span.
     recycle_streaming_history: bool = False
 
-    # Split overlong fixed-window inputs and stitch parallel window results.
-    # Overlap mitigates boundary errors.
+    # Split overlong fixed-window inputs into windows of at most one window,
+    # each cut in a pause, and stitch the parallel window results.
     long_form: bool = False
-    # Audio shared between adjacent long-form windows.  Overlapping lets the
-    # stitcher drop duplicated words at a cut instead of losing one; 0 disables.
-    long_form_overlap_seconds: float = 1.0
+    # Deprecated and ignored.  Windows used to share this much audio, so the
+    # stitcher could drop the words the next one repeated.  They are now cut in
+    # pauses and share none: a window that starts or ends mid-word is what made
+    # Whisper drop whole windows, and overlapping pause cuts measured worse.
+    long_form_overlap_seconds: Optional[float] = None
     # AR decode time cap per tick.  It prevents new steps after the deadline but
     # cannot preempt one, so the effective bound is this value plus one step.
     # ``0`` disables the time cap.
@@ -551,9 +553,11 @@ class EngineConfig:
             raise ValueError(
                 f"decode_steps_per_tick must be >= 1, got {self.decode_steps_per_tick!r}"
             )
-        if self.long_form_overlap_seconds < 0:
-            raise ValueError(
-                "long_form_overlap_seconds must be >= 0, got " f"{self.long_form_overlap_seconds!r}"
+        if self.long_form_overlap_seconds is not None:
+            logger.warning(
+                "long_form_overlap_seconds=%r is deprecated and ignored: long-form "
+                "windows are cut in pauses and share no audio",
+                self.long_form_overlap_seconds,
             )
         if self.decode_kv_budget_gib is not None and self.decode_kv_budget_gib < 0:
             raise ValueError(

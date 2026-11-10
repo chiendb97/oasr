@@ -132,7 +132,7 @@ class OfflineVadSegmenter:
         span covering the file, and an encoder whose memory grows with its input
         ran out of memory on it.  Every span is therefore cut again to at most
         ``max_speech_s``, and the cut is placed where the detector heard the
-        longest pause (:meth:`_quietest_cut`).  It is a pause between words
+        longest pause (:meth:`_cut`).  It is a pause between words
         rather than the arbitrary frame the segmenter stopped at.
         """
         total_samples = int(waveform.numel())
@@ -156,6 +156,28 @@ class OfflineVadSegmenter:
         if len(pairs) == 1 and pairs[0] == (0, total_samples):
             return None
         return pairs
+
+    def pieces(self, waveform: torch.Tensor) -> List[Tuple[int, int]]:
+        """The whole waveform as ``[start, end)`` pieces of at most ``max_speech_s``.
+
+        The splitter behind ``long_form``, which decodes the whole file, so
+        nothing is classified as non-speech and dropped first.  The waveform is
+        one span, cut by :meth:`_bounded`. Each cut lands in the longest pause
+        in the second half of the allowance, and only the middle of a pause
+        longer than twice ``speech_pad_ms`` is left out.
+
+        ``long_form`` used to cut every ``window`` seconds wherever that fell,
+        so windows started and ended in the middle of words. Whisper large-v3
+        answered some such windows with a word or two: "Ah." for 30 s that hold
+        64 words, which it transcribes in full when the same audio starts and
+        ends in a pause (2026-11-09).
+        """
+        total = int(waveform.numel())
+        if total <= 0:
+            return []
+        if self._cap_samples <= 1 or total <= self._cap_samples:
+            return [(0, total)]
+        return self._bounded([(0, total)], self._probabilities(waveform))
 
     def _bounded(
         self, pairs: List[Tuple[int, int]], probs: Sequence[float]

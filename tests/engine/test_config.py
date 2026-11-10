@@ -123,6 +123,20 @@ class TestEngineConfigSurface:
         with pytest.raises(ValueError, match="derive from free VRAM"):
             cfg.build_cache_config(spec)
 
+    def test_the_long_form_overlap_is_ignored_and_says_so(self, caplog):
+        """``long_form`` windows are cut in pauses and share no audio (report
+        D8), so the overlap knob does nothing.  A config that names it still
+        loads, and is told why its value is not used."""
+        import logging
+
+        assert EngineConfig().long_form_overlap_seconds is None
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.config"):
+            EngineConfig(long_form=True)
+        assert not caplog.records
+        with caplog.at_level(logging.WARNING, logger="oasr.engine.config"):
+            EngineConfig(long_form=True, long_form_overlap_seconds=1.0)
+        assert any("deprecated and ignored" in r.getMessage() for r in caplog.records)
+
     def test_build_cache_config_passes_a_resolved_pool_through(self):
         from oasr.models.base import CacheSpec
 

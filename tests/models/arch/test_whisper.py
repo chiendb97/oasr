@@ -1640,7 +1640,7 @@ class TestLongFormEngine:
         wavs = assets.require_wavs(n_clips)
         return torch.cat([torchaudio.load(w)[0].squeeze(0) for w in wavs])
 
-    def _engine(self, long_form, overlap=1.0):
+    def _engine(self, long_form):
         from oasr.engine import ASREngine, EngineConfig
 
         return ASREngine(
@@ -1650,7 +1650,6 @@ class TestLongFormEngine:
                 max_batch_size=8,
                 decode_steps_per_tick=64,
                 long_form=long_form,
-                long_form_overlap_seconds=overlap,
             )
         )
 
@@ -1734,10 +1733,12 @@ class TestLongFormEngine:
             torch.cuda.empty_cache()
 
     def test_a_seam_repeats_no_word_timing_token_or_timestamp(self):
-        """Each window repeats the last second of the one before.  The merge
-        dropped that repeat from the text and kept it everywhere else: on these
-        12 clips, 198 words of text came with 201 word timings, the extra three
-        a second "the 15th century", and the tokens and timestamps likewise."""
+        """Windows used to repeat the last second of the one before, and the
+        merge dropped that repeat from the text and kept it everywhere else: on
+        these 12 clips, 198 words of text came with 201 word timings, the extra
+        three a second "the 15th century", and the tokens and timestamps
+        likewise.  Windows are now cut in pauses and share no audio; the words,
+        tokens and timestamps must still agree with the text across a seam."""
         from oasr.engine.request import DecodingOptions
 
         eng = self._engine(True)
@@ -1754,6 +1755,37 @@ class TestLongFormEngine:
             del eng
             torch.cuda.empty_cache()
 
+    def test_every_window_starts_and_ends_in_silence(self):
+        """D8 (2026-11-09 report): ``long_form`` cut every 30 s wherever that
+        fell, and Whisper answers a window that starts or ends in the middle of
+        a word with a word or two -- large-v3 said "Ah." for 30 s holding 64
+        words, and lost 1,000 of 13,500 words on 150 s recordings.  The cuts now
+        land in pauses."""
+        import torchaudio
+
+        rate = 16000
+        gap = torch.zeros(rate)  # longer than any pause inside a clip
+        clips = [torchaudio.load(w)[0].squeeze(0) for w in assets.require_wavs(16)]
+        audio = torch.cat([part for clip in clips for part in (clip, gap)])
+        assert audio.numel() > 60 * rate, "fixture must span three windows"
+        frame = rate // 40  # 25 ms
+        rms = audio[: audio.numel() // frame * frame].reshape(-1, frame).pow(2).mean(1).sqrt()
+        quiet = float(rms.max()) / 31.6  # 30 dB below the loudest frame
+
+        eng = self._engine(True)
+        try:
+            eng.add_request(audio=audio, request_id="long", streaming=False)
+            entry = eng._longform._pending["long"]  # noqa: SLF001
+            edges = entry.window_starts_s[1:] + entry.window_ends_s[:-1]
+            assert len(edges) >= 4, "expected three windows or more"
+            for edge in edges:
+                level = float(rms[min(int(edge * rate) // frame, rms.numel() - 1)])
+                assert level < quiet, f"a window edge at {edge:.2f}s is in speech"
+            eng.abort_request("long")
+        finally:
+            del eng
+            torch.cuda.empty_cache()
+
     def test_short_audio_takes_the_normal_path(self):
         """Enabling long-form must not perturb requests that fit a window."""
         import torchaudio
@@ -1765,15 +1797,6 @@ class TestLongFormEngine:
             got = self._drain(eng, audio, rid="short")
             assert set(got) == {"short"}
             assert "printing" in got["short"].text.lower()
-        finally:
-            del eng
-            torch.cuda.empty_cache()
-
-    def test_zero_overlap_also_works(self):
-        eng = self._engine(True, overlap=0.0)
-        try:
-            got = self._drain(eng, self._audio())
-            assert "printing" in got["long"].text.lower()
         finally:
             del eng
             torch.cuda.empty_cache()
