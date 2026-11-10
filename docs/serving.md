@@ -12,6 +12,14 @@ so the front-end ships with the wheel — no separate build step.  The same code
 also builds as a standalone binary (`rust/crates/oasr-server`) for `cargo`-only
 workflows; both share the `oasr-serve` crate.
 
+The core is built with Cargo's release profile, an editable `pip install -e .`
+included (`debug = false` in `pyproject.toml`). Left unset, setuptools-rust
+builds an in-place extension in debug mode, and request ingest — per sample, in
+Rust — then costs time in proportion to the audio: a 10 s request served about
+4× slower. To step through the Rust side, build a debug core explicitly with
+`python setup.py build_rust --inplace --debug`; `oasr-server` logs a warning at
+startup whenever it runs one.
+
 The `oasr` Python package is a **runtime dependency** of the front-end: it must
 be importable by the active interpreter.  There is no Python serving process —
 the former ZMQ worker was replaced by the in-process PyO3 engine.
