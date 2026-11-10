@@ -172,7 +172,7 @@ site-packages.
 | Artifact | Built by | Contains |
 |---|---|---|
 | `oasr/_C.so` | CMake + pybind11 | CPU-side CTC/WFST decoders, the post-decode alignment pass, legacy enums |
-| `oasr/_core.so` | setuptools-rust | `oasr._core` — the Rust serving core |
+| `oasr/_core.so` | setuptools-rust | `oasr._core` — the Rust serving core, in release even for `pip install -e .` (`python setup.py build_rust --inplace --debug` for a debug one) |
 | `oasr-server` | console script | forwards `sys.argv` into `oasr._core.serve` |
 
 CUDA kernels are **not** built here: they JIT-compile on first *call* via TVM-FFI

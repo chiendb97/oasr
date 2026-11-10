@@ -60,12 +60,34 @@ const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// synchronous entry point (`fn main` or an extension-module function).
 pub fn run(cli: Cli) -> Result<()> {
     init_tracing(&cli.log_level, &cli.log_format);
+    warn_if_debug_build();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
     runtime.block_on(serve(cli))
+}
+
+/// Say so when this serving core was compiled without optimisation.
+///
+/// Request ingest runs per sample in Rust, so an unoptimised core costs time in
+/// proportion to the audio (a 10 s request was ~4x slower to serve), and
+/// nothing else about the server looks different. Editable installs used to get
+/// one by default -- setuptools-rust builds in-place extensions in debug mode
+/// unless the extension says otherwise -- and served latency was measured on it.
+/// `cfg!(debug_assertions)` follows the profile the whole build used, so this
+/// covers the extension and a `cargo build` of the standalone binary alike.
+fn warn_if_debug_build() {
+    if cfg!(debug_assertions) {
+        warn!(
+            "this oasr-server is a debug build of the Rust serving core: request \
+             ingest is several times slower, so its served latency is not \
+             representative. Build it in release: `pip install -e .`, \
+             `python setup.py build_rust --inplace --release`, or \
+             `cargo build --release` for the binary"
+        );
+    }
 }
 
 /// Install tracing without replacing an existing host subscriber. `json`
