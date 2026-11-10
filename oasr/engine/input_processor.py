@@ -332,20 +332,30 @@ class InputProcessor:
         (``whisper_logmel``: the 30 s Whisper window, shared by Qwen2-Audio) pad
         *and trim* every utterance to that window, so longer audio would be
         silently dropped and the caller would receive a plausible transcript of
-        the first N seconds only.  Fail loudly at admission instead — long-form
-        decoding needs windowed inference, which is a separate feature.
+        the first N seconds only.  Fail loudly at admission instead, and name
+        the two ways to decode it: ``long_form`` and VAD segmentation, both of
+        which split the audio before this check sees it.
+
+        The duration is rounded *up* to the centisecond and the sample counts
+        are given: rounded to the nearest tenth, a 30.04 s request read "audio
+        is 30.0s ... fixed to a 30s window", a refusal that looked like it
+        contradicted itself.
         """
         window_s = self._feature_config.fixed_window_seconds
         if window_s is None:
             return
-        limit = int(self._feature_config.sample_rate * window_s)
+        sample_rate = int(self._feature_config.sample_rate)
+        limit = int(sample_rate * window_s)
         if num_samples > limit:
-            got_s = num_samples / float(self._feature_config.sample_rate)
+            got_s = -(-num_samples * 100 // sample_rate) / 100  # integer ceil
             raise ValueError(
-                f"audio is {got_s:.1f}s but this checkpoint's frontend "
-                f"({self._feature_config.feature_type}) is fixed to a "
-                f"{window_s:.0f}s window; longer audio would be silently "
-                "truncated. Segment the audio before submitting it."
+                f"audio is {got_s:.2f}s ({num_samples} samples at {sample_rate} Hz), "
+                f"longer than the {window_s:g}s window ({limit} samples) this "
+                f"checkpoint's frontend ({self._feature_config.feature_type}) is "
+                "fixed to; it would be silently truncated. Enable long-form "
+                "decoding (EngineConfig(long_form=True), oasr-server --long-form) "
+                "or VAD segmentation (vad mode 'segment' with the silero or energy "
+                "detector), or split the audio before submitting it."
             )
 
     def prepare_offline(self, request: Request) -> None:

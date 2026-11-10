@@ -445,6 +445,36 @@ class TestCheckSampleRate:
             proc.check_sample_rate(16000)
 
 
+class TestFixedWindowRefusal:
+    """Over-window audio on a fixed-window frontend is refused, legibly."""
+
+    WINDOW = 30 * 16000
+
+    def _proc(self) -> InputProcessor:
+        return _processor(feature_type="whisper_logmel")
+
+    def test_audio_that_fills_the_window_is_accepted(self):
+        self._proc().check_audio_duration(torch.zeros(self.WINDOW))
+
+    def test_the_duration_does_not_round_down_to_the_window(self):
+        """A 30.04 s request read "audio is 30.0s ... fixed to a 30s window"."""
+        with pytest.raises(ValueError) as err:
+            self._proc().check_audio_duration(torch.zeros(self.WINDOW + 640))
+        msg = str(err.value)
+        assert "audio is 30.04s (480640 samples" in msg
+        assert "longer than the 30s window (480000 samples)" in msg
+
+    def test_one_sample_over_rounds_up(self):
+        with pytest.raises(ValueError, match=r"audio is 30\.01s \(480001 samples"):
+            self._proc().check_audio_duration(torch.zeros(self.WINDOW + 1))
+
+    def test_the_refusal_names_the_ways_to_decode_it(self):
+        with pytest.raises(ValueError) as err:
+            self._proc().check_audio_duration(torch.zeros(self.WINDOW + 1))
+        assert "long_form=True" in str(err.value)
+        assert "'segment'" in str(err.value)
+
+
 class TestPreparePaths:
     def test_prepare_offline_accepts_the_model_rate(self):
         proc = _processor()

@@ -156,6 +156,91 @@ class TestStringValuesAreTyped:
         assert coerce_option_value("7", int | None) == 7
 
 
+class TestSubConfigMappings:
+    """A decoder sub-config given as a mapping, as a JSON or YAML caller has it.
+
+    ``asrbench -o decode_options={decoder_config: {...}}`` used to hand the
+    ``dict`` itself to the strategy, which failed at its first attribute access
+    (``'dict' object has no attribute 'wfst_max_streams'``): it was neither
+    coerced, like a string option, nor refused.
+    """
+
+    @staticmethod
+    def _build(family, **cfg):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.decode.base import _REGISTRY
+
+        return build_options(_REGISTRY[family].options_cls, EngineConfig(ckpt_dir="x", **cfg))
+
+    def test_a_mapping_becomes_the_sub_config(self):
+        from oasr.decode import DecoderConfig
+
+        opts = self._build(
+            "ctc_wfst", decode_options={"decoder_config": {"wfst_search_beam": 30.0}}
+        )
+        assert isinstance(opts.decoder_config, DecoderConfig)
+        assert opts.decoder_config.wfst_search_beam == 30.0
+
+    def test_it_overlays_the_familys_default_not_the_bare_dataclass(self):
+        """The WFST family's default is ``DecoderConfig(search_type="wfst")``;
+        building ``DecoderConfig(**mapping)`` would silently switch it to the
+        dataclass's ``"prefix_beam"``."""
+        opts = self._build("ctc_wfst", decode_options={"decoder_config": {"wfst_nbest": 4}})
+        assert opts.decoder_config.search_type == "wfst"
+        assert opts.decoder_config.wfst_nbest == 4
+
+    def test_it_overlays_the_legacy_field_without_mutating_it(self):
+        from oasr.functionals.ctc_decode import GpuDecoderConfig
+
+        legacy = GpuDecoderConfig(beam_size=4)
+        opts = self._build(
+            "ctc_cuda",
+            ctc_decoder_config=legacy,
+            decode_options={"decoder_config": {"blank_id": 3}},
+        )
+        assert (opts.decoder_config.beam_size, opts.decoder_config.blank_id) == (4, 3)
+        assert legacy.blank_id == 0, "the caller's config object was modified"
+
+    def test_a_legacy_field_given_as_a_mapping(self):
+        opts = self._build("ctc_aed_rescoring", ctc_decoder_config={"beam_size": 5})
+        assert opts.decoder_config.beam_size == 5
+
+    def test_string_values_are_typed_from_the_sub_configs_fields(self):
+        opts = self._build(
+            "ctc_cuda",
+            decode_options={
+                "decoder_config": {"beam_size": "8", "max_seq_len": "none", "use_paged_memory": "1"}
+            },
+        )
+        cfg = opts.decoder_config
+        assert (cfg.beam_size, cfg.max_seq_len, cfg.use_paged_memory) == (8, None, True)
+        assert type(cfg.beam_size) is int
+
+    def test_an_instance_is_kept(self):
+        from oasr.functionals.ctc_decode import GpuDecoderConfig
+
+        given = GpuDecoderConfig(beam_size=6)
+        opts = self._build("ctc_cuda", decode_options={"decoder_config": given})
+        assert opts.decoder_config is given
+
+    def test_an_unknown_field_is_refused_naming_the_valid_ones(self):
+        with pytest.raises(ValueError, match=r"unknown DecoderConfig fields \['wfst_beam'\].*"):
+            self._build("ctc_wfst", decode_options={"decoder_config": {"wfst_beam": 30}})
+
+    @pytest.mark.parametrize("value", [[1, 2], 7, None])
+    def test_another_type_is_refused(self, value):
+        with pytest.raises(TypeError, match="must be a GpuDecoderConfig or a mapping"):
+            self._build("ctc_cuda", decode_options={"decoder_config": value})
+
+    def test_the_sub_configs_own_validation_runs(self):
+        with pytest.raises(ValueError, match="beam_size must be in"):
+            self._build("ctc_cuda", decode_options={"decoder_config": {"beam_size": 0}})
+
+    def test_a_bad_string_names_the_field(self):
+        with pytest.raises(ValueError, match="decoder_config: beam_size='x'"):
+            self._build("ctc_cuda", decode_options={"decoder_config": {"beam_size": "x"}})
+
+
 class TestCliParsing:
     def test_pairs_are_typed_and_validated(self):
         got = parse_decode_options(["width=8", "ratio=0.1", "limit=3"], _Opts)
