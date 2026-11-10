@@ -1668,7 +1668,7 @@ class TestLongFormEngine:
         """C5's guard must survive: opting out means rejection, not truncation."""
         eng = self._engine(False)
         try:
-            with pytest.raises(ValueError, match="fixed to a 30s window"):
+            with pytest.raises(ValueError, match="longer than the 30s window"):
                 eng.add_request(audio=self._audio(), streaming=False)
         finally:
             del eng

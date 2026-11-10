@@ -138,7 +138,14 @@ typed from the field's declared type, so a new family needs no new flag. The
 annotation, not the default, decides: `nbest: Optional[int] = None` takes
 `nbest=4` as the int 4 (it used to stay the string `"4"`), and `none` / `null`
 as `None`. A field a string cannot spell, such as a decoder sub-config, is
-refused by name. This is what
+refused by name. From Python, JSON or YAML, a sub-config is given as an instance
+or as a mapping of the fields to change —
+`decode_options={"decoder_config": {"wfst_search_beam": 30.0}}`, or
+`asrbench -o 'decode_options={decoder_config: {wfst_search_beam: 30}}'`. The
+mapping overlays the legacy field if one was set, else the family's own default
+(so `ctc_wfst` keeps `search_type="wfst"`). Its string values are typed the way
+`--decode-option` values are, and an unknown field, or a value that is neither
+an instance nor a mapping, raises at engine construction. This is what
 stopped `EngineConfig` growing a field per family, and what stopped a Whisper
 engine constructing a CTC beam config and a WFST config it would never read.
 

@@ -9,9 +9,10 @@ Values resolve from dataclass defaults, compatible legacy fields, then generic
 from __future__ import annotations
 
 import dataclasses
+import functools
 import types
 import typing
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 
 def option(default: Any, *, legacy: Optional[str] = None, doc: str = "") -> Any:
@@ -73,8 +74,10 @@ def build_options(options_cls: Optional[type], config: Any) -> Any:
             f"valid keys: {sorted(names)}"
         )
 
+    option_types = _option_types(options_cls)
     kwargs: Dict[str, Any] = {}
     for f in dataclasses.fields(options_cls):
+        annotation = option_types[f.name]
         legacy_name = f.metadata.get("legacy")
         if legacy_name is not None and hasattr(config, legacy_name):
             value = getattr(config, legacy_name)
@@ -82,7 +85,9 @@ def build_options(options_cls: Optional[type], config: Any) -> Any:
             # that have a non-None default (a lazily-built sub-config); for
             # options whose own default is None it is the value.
             if value is not None:
-                kwargs[f.name] = value
+                kwargs[f.name] = _as_sub_config(
+                    value, annotation, functools.partial(_field_default, f), legacy_name
+                )
         if f.name in overrides:
             raw = overrides[f.name]
             # ``--decode-option k=v`` can only carry strings.  Type them here,
@@ -90,11 +95,87 @@ def build_options(options_cls: Optional[type], config: Any) -> Any:
             # need a copy of every family's option table to do it.
             if isinstance(raw, str):
                 try:
-                    raw = coerce_option_value(raw, _option_types(options_cls)[f.name])
+                    raw = coerce_option_value(raw, annotation)
                 except ValueError as exc:
                     raise ValueError(f"decode option {f.name}={raw!r}: {exc}") from exc
-            kwargs[f.name] = raw
+            # A mapping overlays what the legacy field resolved to, else the
+            # option's own default -- so ``{"wfst_search_beam": 30}`` keeps the
+            # WFST family's ``search_type="wfst"`` rather than the bare
+            # dataclass's ``"prefix_beam"``.
+            kwargs[f.name] = _as_sub_config(
+                raw,
+                annotation,
+                functools.partial(_resolved_or_default, kwargs, f),
+                f"decode option {f.name}",
+            )
     return options_cls(**kwargs)
+
+
+def _field_default(f: "dataclasses.Field[Any]") -> Any:
+    """A fresh copy of one option field's default (its factory runs per call)."""
+    if f.default_factory is not dataclasses.MISSING:
+        return f.default_factory()
+    return f.default
+
+
+def _resolved_or_default(kwargs: Mapping[str, Any], f: "dataclasses.Field[Any]") -> Any:
+    """What the legacy field already resolved this option to, else its default."""
+    return kwargs[f.name] if f.name in kwargs else _field_default(f)
+
+
+def _sub_config_class(annotation: Any) -> Optional[type]:
+    """The dataclass an option is declared as (``T`` or ``Optional[T]``), else ``None``."""
+    target, _ = _unwrap_optional(annotation)
+    if isinstance(target, type) and dataclasses.is_dataclass(target):
+        return target
+    return None
+
+
+def _as_sub_config(value: Any, annotation: Any, base: Callable[[], Any], where: str) -> Any:
+    """Resolve a value for an option declared as a dataclass (a decoder sub-config).
+
+    An instance is kept.  A mapping -- what a JSON or YAML caller has, such as
+    ``asrbench -o decode_options={decoder_config: {...}}`` -- names fields to
+    change on ``base()``; its string values are typed against the
+    sub-config's own annotations, the same way ``--decode-option`` strings are.
+    Anything else is refused here.  Handed over as-is, a mapping used to reach
+    the decoder and fail at its first attribute access (``'dict' object has no
+    attribute 'wfst_max_streams'``), far from the option that caused it.
+    Options that are not dataclasses pass through untouched.
+    """
+    cls = _sub_config_class(annotation)
+    if cls is None or isinstance(value, cls):
+        return value
+    if value is None and _unwrap_optional(annotation)[1]:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"{where} must be a {cls.__name__} or a mapping of its fields, "
+            f"got {type(value).__name__}"
+        )
+    start = base()
+    if not isinstance(start, cls):
+        start = cls()
+    names = {f.name for f in dataclasses.fields(cls)}
+    unknown = sorted(set(value) - names)
+    if unknown:
+        raise ValueError(
+            f"unknown {cls.__name__} fields {unknown} in {where}; valid fields: {sorted(names)}"
+        )
+    types_ = typing.get_type_hints(cls)
+    changes: Dict[str, Any] = {}
+    for key, raw in value.items():
+        if isinstance(raw, str):
+            try:
+                raw = coerce_option_value(raw, types_[key])
+            except ValueError as exc:
+                raise ValueError(f"{where}: {key}={raw!r}: {exc}") from exc
+        changes[key] = _as_sub_config(
+            raw, types_[key], functools.partial(getattr, start, key), f"{where}.{key}"
+        )
+    # ``replace`` builds a new object (a caller's legacy instance is not
+    # mutated) and runs the sub-config's own ``__post_init__`` range checks.
+    return dataclasses.replace(start, **changes)
 
 
 def _option_types(options_cls: type) -> Dict[str, Any]:
