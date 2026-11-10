@@ -16,10 +16,15 @@ plausible, truncated transcript, never as a slightly worse number:
 
 So this joins the same manifest's utterances, in order, into one recording past
 the first two (``TARGET_S``), decodes it as one request, and requires a whole
-transcript: no ``finish_reason``, and an error rate a cut or an empty output
-cannot reach.  The ceiling is loose on purpose -- ``test_accuracy.py`` owns
-accuracy; this owns completeness.  Whisper and the speech-LLM are absent: their
-frontend is a fixed 30 s window, and long audio there is ``long_form``.
+transcript: no ``finish_reason`` but ``stop``, and an error rate a cut or an
+empty output cannot reach.  The ceiling is loose on purpose --
+``test_accuracy.py`` owns accuracy; this owns completeness.
+
+Whisper and the speech-LLM take a fixed 30 s window, so long audio there is
+``long_form``: the file is fanned out into windows and stitched back.  Those
+windows were cut every 30 s wherever that fell, and Whisper answers a window
+that starts or ends mid-word with a word or two (2026-11-09 report, D8): the
+same plausible, short transcript, from a different cause.
 """
 
 from __future__ import annotations
@@ -57,15 +62,24 @@ CASES = {
     "zipformer_streaming": ("zipformer_streaming", {}),
     "nemotron": ("nemotron", {}),
     "nemotron_streaming": ("nemotron_streaming", {}),
+    "whisper_long_form": ("whisper", {"long_form": True}),
+    "llm_long_form": ("llm", {"long_form": True}),
 }
 
+#: Pauses that reproduce D8.  Cut every 30 s, a window of this recording that
+#: started or ended mid-word came back with a few words: 15.8 % for whisper-tiny,
+#: 57 of 608 words deleted, against 3.5 % cut in pauses.  The speech-LLM keeps the
+#: default: given two sentences 2 s of digital silence apart, Qwen2-Audio often
+#: transcribes one of them, wherever the window starts.
+GAPS = {"whisper_long_form": 2.0}
 
-def _joined(sample_rate: int):
+
+def _joined(sample_rate: int, gap_s: float = GAP_S):
     """The manifest's utterances end to end until ``TARGET_S``: ``(wave, reference)``."""
     audio_root = Path(assets.resolve(REFERENCE["audio_asset"]))
     entries = load_manifest(REPO_ROOT / REFERENCE["manifest"], audio_root)
     waves, _ = load_audio(entries, sample_rate)
-    gap = torch.zeros(int(GAP_S * sample_rate))
+    gap = torch.zeros(int(gap_s * sample_rate))
     pieces, texts, total = [], [], 0
     for entry, wave in zip(entries, waves):
         if total >= TARGET_S * sample_rate:
@@ -106,7 +120,7 @@ def test_long_audio_is_decoded_whole(case, device):
     engine = ASREngine(EngineConfig(**cfg_kwargs))
     sample_rate = int(engine.sample_rate)
     try:
-        wave, reference = _joined(sample_rate)
+        wave, reference = _joined(sample_rate, GAPS.get(case, GAP_S))
         (out,) = engine.transcribe_outputs(
             [wave], streaming=cfg_kwargs["service_mode"] == "streaming"
         )
@@ -116,7 +130,9 @@ def test_long_audio_is_decoded_whole(case, device):
 
     result = compute([reference], [out.text], normalizer=normalizer(spec["normalizer"]))
     seconds = wave.numel() / sample_rate
-    assert out.finish_reason is None, (
+    # ``stop`` is an end-of-text token: a whole transcript from a family that
+    # has one.  ``length`` is a cap that bound, ``error`` a failed window.
+    assert out.finish_reason in (None, "stop"), (
         f"{case}: a {seconds:.0f}s request finished with {out.finish_reason!r} "
         f"({out.error_stage or 'no stage'}); {result.summary()}"
     )

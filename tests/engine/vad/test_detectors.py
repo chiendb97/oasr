@@ -425,6 +425,61 @@ class TestOfflineSegmenter:
         assert any(b <= 2.5 * SR for _, b in spans) and any(a >= 5.5 * SR for a, _ in spans)
 
 
+class TestLongFormPieces:
+    """``OfflineVadSegmenter.pieces``: where ``long_form`` cuts a file.
+
+    D8 (2026-11-09 report): ``long_form`` cut every 30 s wherever that fell, so
+    windows started and ended in the middle of words, and Whisper answered some
+    of them with a word or two.  Whisper large-v3 lost 1,000 of 13,500 words on
+    150 s recordings, and whisper-tiny 1,365.
+    """
+
+    def segmenter(self, **kw):
+        from oasr.engine.vad_stage import OfflineVadSegmenter
+
+        cfg = VadConfig(backend="energy", mode="segment", sample_rate=SR, **kw).resolve("offline")
+        return OfflineVadSegmenter(cfg, torch.device("cpu"))
+
+    phrases = staticmethod(TestOfflineSegmenter.phrases)
+
+    def test_audio_that_fits_is_one_piece(self):
+        seg = self.segmenter(max_speech_s=30.0)
+        wav, _ = self.phrases([0.3] * 4)
+        assert seg.pieces(wav) == [(0, wav.numel())]
+
+    def test_nothing_is_dropped_as_non_speech(self):
+        """``long_form`` decodes the whole file.  The gaps :meth:`spans` drops
+        stay in, unless a cut lands in one."""
+        seg = self.segmenter(max_speech_s=30.0)
+        wav = torch.cat([hiss(1.0), tone(2.5), hiss(3.0), tone(1.8), hiss(0.7)])
+        assert seg.spans(wav) is not None, "the detector found no gap to drop"
+        assert seg.pieces(wav) == [(0, wav.numel())]
+
+    def test_every_piece_fits_and_every_cut_lands_in_a_pause(self):
+        seg = self.segmenter(max_speech_s=2.0)
+        wav, pauses = self.phrases([0.3] * 10)
+        pieces = seg.pieces(wav)
+        assert len(pieces) > 1 and all(b - a <= 2 * SR for a, b in pieces)
+        assert pieces[0][0] == 0 and pieces[-1][1] == wav.numel()
+        for (_, end), (start, _) in zip(pieces, pieces[1:]):
+            assert end == start, "a short pause is cut in its middle: the pieces touch"
+            assert any(a < end < b for a, b in pauses), f"cut at {end / SR:.3f}s is in speech"
+
+    def test_only_the_middle_of_a_long_pause_is_left_out(self):
+        seg = self.segmenter(max_speech_s=3.0)
+        wav, pauses = self.phrases([0.3, 1.5, 0.3], phrase_s=0.9)
+        pieces = seg.pieces(wav)
+        gaps = [(pieces[k][1], pieces[k + 1][0]) for k in range(len(pieces) - 1)]
+        dropped = [(a, b) for a, b in gaps if a < b]
+        assert len(dropped) == 1 and pauses[1][0] < dropped[0][0] < dropped[0][1] < pauses[1][1]
+
+    def test_sound_with_no_pause_is_still_cut_to_fit(self):
+        seg = self.segmenter(max_speech_s=1.0)
+        pieces = seg.pieces(tone(5.0))
+        assert len(pieces) > 1 and all(b - a <= SR for a, b in pieces)
+        assert pieces[0][0] == 0 and pieces[-1][1] == 5 * SR
+
+
 @pytest.mark.cuda
 @pytest.mark.requires_assets("WHISPER_CKPT")
 class TestFixedWindowResplit:

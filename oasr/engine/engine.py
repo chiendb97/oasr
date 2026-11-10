@@ -17,6 +17,7 @@ import torch
 from oasr.jit.core import require_device_family
 from oasr.models import PretrainedModel, load_pretrained
 from oasr.utils.nvtx import nvtx_pop, nvtx_push
+from oasr.vad import VadConfig
 
 from . import gc_freeze
 from .admission_prep import AdmissionPrep
@@ -430,7 +431,13 @@ class ASREngine:
         # segmenting it would only cost accuracy.
         self._longform: Optional[LongFormTracker] = None
         self._longform_window_samples = 0
-        self._longform_overlap_samples = 0
+        #: Where ``long_form`` cuts: pieces of at most one window, each cut in the
+        #: longest pause in the second half of the window, heard by the energy
+        #: detector (no weights, so ``long_form`` needs nothing it did not
+        #: before).  A cut every ``window`` seconds started and ended windows in
+        #: the middle of words, and Whisper answers some of those with a word or
+        #: two: Whisper large-v3 lost 1,000 of 13,500 words on 150 s recordings.
+        self._longform_splitter: Optional[OfflineVadSegmenter] = None
         window_s = config.feature_config.fixed_window_seconds
         if getattr(config, "long_form", False):
             if window_s is None:
@@ -445,20 +452,21 @@ class ASREngine:
                     self._output_processor.strategy.detokenizer.token_pieces
                 )
                 self._longform_window_samples = int(sr * window_s)
-                self._longform_overlap_samples = int(
-                    sr * min(float(config.long_form_overlap_seconds), window_s / 2.0)
+                self._longform_splitter = OfflineVadSegmenter(
+                    VadConfig(
+                        mode="segment", backend="energy", sample_rate=sr, max_speech_s=window_s
+                    ).resolve("offline"),
+                    torch.device("cpu"),
                 )
                 logger.info(
-                    "long-form decoding enabled: %.0fs windows, %.2fs overlap",
+                    "long-form decoding enabled: windows of at most %.0fs, cut in pauses",
                     window_s,
-                    self._longform_overlap_samples / sr,
                 )
 
         # VAD segmentation reuses the same fan-out and the same fan-in; only the
-        # splitter differs.  It *supersedes* the fixed-window splitter when both
-        # are configured: a cut that lands in silence is strictly better than one
-        # at an arbitrary sample count, and it needs no overlap, so the word-level
-        # dedup ``merge_texts`` does at a window seam becomes unnecessary.  A
+        # splitter differs.  It *supersedes* the ``long_form`` splitter when both
+        # are configured: both cut in pauses, and VAD also leaves out the audio
+        # it reads as non-speech, which is what ``segment`` asks for.  A
         # boundary with no gap around it is merged away in
         # ``OfflineVadSegmenter.spans``, which then cuts any span longer than
         # ``max_speech_s`` again, at the longest pause it can find.
@@ -1105,37 +1113,29 @@ class ASREngine:
                     # Audio wider than the budget that the detector could not
                     # divide (it found no speech in it; ``spans`` bounds every
                     # span it returns): it has to be cut somewhere, so cut it at
-                    # the budget.  Overlap is *not* added on its own initiative —
-                    # measured on whisper-tiny over noisy long-form audio, a 1 s
-                    # overlap cost +2.26 WER against a clean cut, because
-                    # ``merge_texts`` matches a repeated hallucination at the
-                    # seam and drops real words with it.  ``long_form`` is how a
-                    # caller opts into that trade.
-                    overlap = min(
-                        max(0, self._longform_overlap_samples), self._vad_resplit_samples - 1
-                    )
-                    stride = self._vad_resplit_samples - overlap
-                    subs = split_windows(piece, self._vad_resplit_samples, overlap)
+                    # the budget.  With no overlap: measured on whisper-tiny over
+                    # noisy long-form audio, a 1 s overlap cost +2.26 WER against
+                    # a clean cut, because ``merge_texts`` matches a repeated
+                    # hallucination at the seam and drops real words with it.
+                    subs = split_windows(piece, self._vad_resplit_samples)
                     windows.extend(subs)
-                    first.extend(start + k * stride for k in range(len(subs)))
+                    first.extend(start + k * self._vad_resplit_samples for k in range(len(subs)))
                     continue
                 windows.append(piece)
                 first.append(start)
         else:
             # No VAD, or VAD found nothing worth cutting at — fall back to the
-            # fixed-window splitter, which is a no-op for audio that already
+            # ``long_form`` splitter, which is a no-op for audio that already
             # fits.  Returning here rather than fanning out a single child keeps
             # "VAD found one span covering everything" identical to "VAD off".
             if (
-                self._longform_window_samples <= 0
+                self._longform_splitter is None
                 or int(wave.numel()) <= self._longform_window_samples
             ):
                 return None
-            windows = split_windows(
-                wave, self._longform_window_samples, self._longform_overlap_samples
-            )
-            stride = self._longform_window_samples - self._longform_overlap_samples
-            first = [i * stride for i in range(len(windows))]
+            pieces = self._longform_splitter.pieces(wave)
+            windows = [wave[start:end] for start, end in pieces]
+            first = [start for start, _ in pieces]
         starts = [s / float(sample_rate) for s in first]
         ends = [(s + int(w.numel())) / float(sample_rate) for s, w in zip(first, windows)]
 

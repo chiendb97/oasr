@@ -3,8 +3,11 @@
 """Parallel long-form decoding for fixed-window frontends.
 
 Long requests are split into ordinary batched requests and merged at the engine
-boundary. Independent windows preserve batching but may lose or duplicate text
-at cuts; overlap and text deduplication reduce that boundary error.
+boundary. Independent windows preserve batching at the cost of context across a
+cut, so the engine cuts in pauses (``OfflineVadSegmenter.pieces``) and the
+windows share no audio.  :class:`LongFormTracker` still stitches windows that
+do overlap, dropping the words the later one repeats, wherever a caller
+registers such windows.
 """
 
 from __future__ import annotations

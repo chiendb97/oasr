@@ -129,13 +129,14 @@ pub struct Cli {
     /// it into windows and stitching the transcripts instead of rejecting it.
     ///
     /// Windows decode in parallel, so a long file costs about one window of
-    /// wall clock rather than N sequential decodes; the price is boundary
-    /// accuracy, which `--long-form-overlap-seconds` mitigates.
+    /// wall clock rather than N sequential decodes.  Each window is at most
+    /// the frontend's window long and is cut in a pause, so no window starts
+    /// or ends in the middle of a word.
     #[arg(long, default_value_t = false)]
     pub long_form: bool,
-    /// Audio shared between adjacent long-form windows, in seconds.  Overlapping
-    /// lets the stitcher drop words duplicated at a cut instead of losing one.
-    /// Engine default 1.0; 0 disables.
+    /// Deprecated and ignored: long-form windows are cut in pauses and share
+    /// no audio.  Still accepted, so an existing command line keeps working;
+    /// the engine logs a warning when it is given.
     #[arg(long)]
     pub long_form_overlap_seconds: Option<f64>,
     /// Repeatable `--decode-option k=v`, typed and validated against the active
