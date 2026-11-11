@@ -392,13 +392,28 @@ def _apply_budget_and_basis(tf, matrices, fallbacks, payloads, opts) -> None:
     import oasr.jit.gemm as jg
     from oasr.tune import partition
 
+    def compiles(cid: str) -> bool:
+        """Is *cid* a CUTLASS variant -- a JIT build and a production compile slot?"""
+        if cid in ("default", "fused", "torch"):
+            return False
+        if cid in payloads:
+            return jg.is_kernel_variant(payloads[cid])
+        return tf.configs.get(cid, {}).get("kind") == "cutlass"
+
     if opts.compile_budget is not None and matrices:
         chosen = {k: tf.entries[k].regions for k in matrices if k in tf.entries}
+        # Only compiled variants count against the budget; a runner's own
+        # kernels cost no build, so they are never dropped to make room.
+        named = {cid for regions in chosen.values() for _hi, cid in regions}
+        named.update(c for mat in matrices.values() for row in mat.T for c in row)
         chosen = partition.apply_compile_budget(
             {k: matrices[k] for k in chosen},
             chosen,
             opts.compile_budget,
             {k: fallbacks[k] for k in chosen},
+            keep=tuple(
+                sorted({"default", "fused", "torch"} | {c for c in named if not compiles(c)})
+            ),
         )
         for k, regions in chosen.items():
             tf.entries[k].regions = regions
@@ -413,7 +428,7 @@ def _apply_budget_and_basis(tf, matrices, fallbacks, payloads, opts) -> None:
             merged.w += [1.0] * len(mat.ms)  # every measured point counts once
             merged.T += mat.T
         cover = partition.config_cover(merged, opts.cover_eps)
-        basis = [c for c in cover if c not in ("default", "fused", "torch")][: opts.basis_size]
+        basis = [c for c in cover if compiles(c)][: opts.basis_size]
         for cid in basis:
             if cid not in tf.configs and cid in payloads:
                 tf.configs[cid] = jg.gemm_config_to_params(payloads[cid])
@@ -574,7 +589,10 @@ def build_gemm(
                 )
                 fallbacks[k] = str(rec["fallback"])
                 payloads_all.update(
-                    {n: jg.gemm_config_from_params(p, sm) for n, p in rec["payloads"].items()}
+                    {
+                        n: jg.gemm_config_from_params(p, sm, config_id=n)
+                        for n, p in rec["payloads"].items()
+                    }
                 )
                 tf.configs.update(rec["configs"])
                 if rec["entry"] is None:

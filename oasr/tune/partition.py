@@ -59,24 +59,24 @@ def matrix_from_points(results: Sequence, alpha_issue: bool = True) -> Matrix:
 
     The objective per cell is ``GPU time + alpha x issue time``.  Issue time is
     measured for the arms that reached the last halving stage; the others take
-    the median issue time of their backend class at that point (every CUTLASS
-    variant shares one launcher, cuBLAS has its own).
+    the median issue time of their launch class at that point
+    (:attr:`oasr.tune.runners.Runner.issue_class`: every OASR launcher shares
+    one, cuBLAS through torch has its own, and so does each further runner).
     """
     ms, w, T = [], [], []
     for pr in sorted(results, key=lambda r: r.M):
         row: Dict[str, float] = {}
-        measured = [m for m in pr.case.results.values() if m.issue_us is not None]
-        cls_issue: Dict[str, float] = {}
-        for cls in ("torch", "cutlass"):
-            vals = sorted(m.issue_us for m in measured if _cls(m.name) == cls)
-            if vals:
-                cls_issue[cls] = vals[len(vals) // 2]
+        by_cls: Dict[str, List[float]] = {}
+        for m in pr.case.results.values():
+            if m.issue_us is not None:
+                by_cls.setdefault(_cls(m), []).append(m.issue_us)
+        cls_issue = {c: sorted(v)[len(v) // 2] for c, v in by_cls.items()}
         for name, m in pr.case.results.items():
             if m.status != "ok" or not math.isfinite(m.median_ms):
                 continue
             t = m.median_ms
             if alpha_issue and pr.alpha:
-                issue = m.issue_us if m.issue_us is not None else cls_issue.get(_cls(name), 0.0)
+                issue = m.issue_us if m.issue_us is not None else cls_issue.get(_cls(m), 0.0)
                 t += pr.alpha * issue / 1000.0
             row[name] = t
         ms.append(int(pr.M))
@@ -85,8 +85,14 @@ def matrix_from_points(results: Sequence, alpha_issue: bool = True) -> Matrix:
     return Matrix(ms, w, T)
 
 
-def _cls(name: str) -> str:
-    return "torch" if name == "torch" else "cutlass"
+def _cls(m) -> str:
+    """The launch class whose issue cost measurement *m* shares (see above)."""
+    from oasr.tune.runners import runner_of
+
+    runner = None if m.payload is None else runner_of("gemm", m.payload)
+    if runner is not None:
+        return runner.issue_group
+    return "torch" if m.name == "torch" else "oasr_launcher"
 
 
 def config_cover(mat: Matrix, eps: float = 0.03, always: Sequence[str] = ()) -> List[str]:

@@ -220,9 +220,15 @@ def _tune_bmm_fn(compile_name: str):
 # than an ``id()``) also rules out address reuse after a patched lambda is
 # collected.
 _PLAN_CUTLASS = 0
-_PLAN_TORCH = 1
+#: A runner (``oasr.tune.runners``) bound for this shape: ``fn`` takes the op's
+#: ``oasr.functionals.gemm_torch`` calling convention, output first.  cuBLAS --
+#: the tuning file's ``"torch"`` kind -- is one; every further runner is another.
+_PLAN_RUNNER = 1
 _PLAN_FUSED = 2
 _PLAN_DEFAULT = 3
+
+#: The runner each plan kind dispatches to, for :func:`_record_runner`.
+_KIND_RUNNER = {_PLAN_CUTLASS: "oasr_cutlass", _PLAN_FUSED: "oasr_fused"}
 
 #: ``(op, activation, M, N, K, dtype)`` -> ``(resolver, kind, fn, split_k)``.
 _PLANS: dict = {}
@@ -253,20 +259,30 @@ def _plan(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tuple:
     """Resolve — and memoise — the dispatch decision for one shape.
 
     Returns ``(resolver, kind, fn, split_k)``.  ``kind`` is one of the
-    ``_PLAN_*`` constants; ``fn`` is the compiled variant for ``_PLAN_CUTLASS``
-    and ``None`` otherwise.
+    ``_PLAN_*`` constants; ``fn`` is the compiled variant for ``_PLAN_CUTLASS``,
+    the runner's bound callable for ``_PLAN_RUNNER``, and ``None`` otherwise.
     """
     resolver = _jit_gemm.select_default_config
     key = (op, activation, M, N, K, dtype)
     plan: Optional[tuple] = _PLANS.get(key)
     if plan is not None and plan[0] is resolver:
         return plan
+    runner: Optional[str] = None
     try:
         from oasr.jit.gemm import GEMM_DEFAULT
 
         choice = resolver(op, M, N, K, dtype, _target_sm())
-        if choice == "torch":
-            plan = (resolver, _PLAN_TORCH, None, 1)
+        from oasr.tune.runners import RunnerChoice, runner_of
+
+        if choice == "torch" or isinstance(choice, RunnerChoice):
+            # cuBLAS and every other runner: bound once per shape, when it is
+            # first planned -- the call path only invokes ``fn``.
+
+            r = runner_of("gemm", choice)
+            if r is None:
+                raise LookupError(f"no GEMM runner serves {choice!r}")
+            plan = (resolver, _PLAN_RUNNER, r.bind(op, choice), 1)
+            runner = r.name
         elif choice == "fused":
             plan = (resolver, _PLAN_FUSED, None, 1)
         elif choice is GEMM_DEFAULT and op == "gemm_log_softmax":
@@ -298,10 +314,32 @@ def _plan(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tuple:
                 K,
                 exc_info=True,
             )
+    _record_runner(op, plan[1], runner)
     if len(_PLANS) >= _PLAN_CACHE_MAX:
         _PLANS.clear()
     _PLANS[key] = plan
     return plan
+
+
+def _record_runner(op: str, kind: int, runner: Optional[str] = None) -> None:
+    """Count the runner a new plan dispatches to (``oasr.tune.database.runner_counts``).
+
+    The default kind is the fused launcher for the CTC head and the default
+    CUTLASS variant everywhere else.  Never lets accounting break a dispatch.
+    """
+    if runner is None:
+        if kind == _PLAN_DEFAULT:
+            runner = "oasr_fused" if op == "gemm_log_softmax" else "oasr_cutlass"
+        else:
+            runner = _KIND_RUNNER.get(kind)
+    if runner is None:
+        return
+    try:
+        from oasr.tune.database import record_runner
+
+        record_runner("gemm", op, runner)
+    except Exception:  # noqa: BLE001
+        logger.debug("could not record the GEMM runner for %s", op, exc_info=True)
 
 
 def _downgrade(key: tuple, plan: tuple, exc: VariantUnsupportedError) -> None:
@@ -385,6 +423,7 @@ def _plan_pinned(op: str, activation: bool, M: int, N: int, K: int, dtype) -> tu
                 K,
                 exc_info=True,
             )
+    _record_runner(op, plan[2])
     if len(_PLANS) >= _PLAN_CACHE_MAX:
         _PLANS.clear()
     _PLANS[key] = plan
@@ -470,10 +509,8 @@ def _dispatch_gemm(out, A, B, C, N, K, M) -> None:
             return
         except VariantUnsupportedError as exc:
             _downgrade(("gemm", False, M, N, K, A.dtype), (plan[0], _PLAN_DEFAULT, None, 1), exc)
-    elif kind == _PLAN_TORCH:
-        from oasr.functionals.gemm_torch import torch_gemm
-
-        torch_gemm(out.view(M, N), A.view(M, K), B, C, 1)
+    elif kind == _PLAN_RUNNER:
+        fn(out.view(M, N), A.view(M, K), B, C, 1)
         return
     _default_gemm_fn()(out, A, B, C, 1)
 
@@ -489,10 +526,8 @@ def _dispatch_gemm_activation(out, A, B, C, activation_type, N, K, M) -> None:
         except VariantUnsupportedError as exc:
             key = ("gemm_activation", True, M, N, K, A.dtype)
             _downgrade(key, (plan[0], _PLAN_DEFAULT, None, 1), exc)
-    elif kind == _PLAN_TORCH:
-        from oasr.functionals.gemm_torch import torch_gemm_activation
-
-        torch_gemm_activation(out.view(M, N), A.view(M, K), B, C, activation_type, 1)
+    elif kind == _PLAN_RUNNER:
+        fn(out.view(M, N), A.view(M, K), B, C, activation_type, 1)
         return
     _default_gemm_activation_fn()(out, A, B, C, activation_type, 1)
 
@@ -565,10 +600,8 @@ def _dispatch_bmm(out, A, B, N, K) -> None:
             return
         except VariantUnsupportedError as exc:
             _downgrade(("bmm", False, M, N, K, A.dtype), (plan[0], _PLAN_DEFAULT, None, 1), exc)
-    elif kind == _PLAN_TORCH:
-        from oasr.functionals.gemm_torch import torch_bmm
-
-        torch_bmm(out, A, B)
+    elif kind == _PLAN_RUNNER:
+        fn(out, A, B)
         return
     _default_bmm_fn()(out, A, B)
 
@@ -603,10 +636,8 @@ def _dispatch_gemm_log_softmax(out, A, B, C, N, K, M) -> None:
     """
     plan = _plan("gemm_log_softmax", False, M, N, K, A.dtype)
     _, kind, fn, split_k = plan
-    if kind == _PLAN_TORCH:
-        from oasr.functionals.gemm_torch import torch_gemm_log_softmax
-
-        torch_gemm_log_softmax(out.view(M, N), A.view(M, K), B, C, 1)
+    if kind == _PLAN_RUNNER:
+        fn(out.view(M, N), A.view(M, K), B, C, 1)
         return
     if kind == _PLAN_CUTLASS:
         try:
