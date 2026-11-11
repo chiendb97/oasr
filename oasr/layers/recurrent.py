@@ -22,6 +22,8 @@ import torch.nn.functional as F
 from torch import nn
 
 import oasr
+from oasr.jit.measured import Machine, MeasuredOn, note_extrapolation
+from oasr.jit.recurrent_select import tuned_choice as _tuned_choice
 
 from ._backend import use_recurrent_kernel
 
@@ -121,11 +123,51 @@ _TENSOR_CORE_MIN_BATCH_SEQ = {  # T > 1
 _COHORT_BATCH_FLOOR = 4
 
 
-def _prefer_tensor_core(sequence_length: int, batch: int, hidden: int, gates: int) -> bool:
-    """Should this shape take the tensor-core path rather than the scalar one?"""
-    table = (_TENSOR_CORE_MIN_BATCH_STEP if sequence_length == 1 else _TENSOR_CORE_MIN_BATCH_SEQ)[
-        gates
-    ]
+#: Where the two crossover tables came from.  A fixed ``(hidden, batch)`` cut-off,
+#: like ``oasr.jit.recurrent_cute._LSTM_BANDS``: which side wins at each extreme is
+#: a property of the algorithms, where they meet is a property of the machine.
+_MEASURED = MeasuredOn(
+    table="layers.recurrent._TENSOR_CORE_MIN_BATCH_STEP / _SEQ",
+    machine=Machine(name="NVIDIA GeForce RTX 5090", sm=120, sms=170),
+    bandwidth="1792 GB/s",
+    source="the sweep recorded above (B in [1, 512], H in [256, 2048], CUDA-graph replay)",
+    moves_with="SM count and memory bandwidth -- the scalar path re-reads the recurrent "
+    "weights per row, the tensor-core path pays launches and an input-projection GEMM",
+)
+
+
+def _prefer_tensor_core(
+    sequence_length: int,
+    batch: int,
+    hidden: int,
+    gates: int,
+    *,
+    op: str = "",
+    dtype: Optional[torch.dtype] = None,
+    input_size: int = 0,
+) -> bool:
+    """Should this shape take the tensor-core path rather than the scalar one?
+
+    The measured selection answers first (``oasr.jit.recurrent_select``): a
+    ``recurrent`` file covering the shape names the path, so the hand-timed
+    table below is not consulted and is not an extrapolation.  Otherwise the
+    table answers, counted off the card it was timed on.
+    """
+    dtype_str = ""
+    if op and dtype in (torch.float16, torch.bfloat16):
+        dtype_str = "float16" if dtype is torch.float16 else "bfloat16"
+        choice = _tuned_choice(op, dtype_str, hidden, input_size, sequence_length, batch)
+        if choice is not None:
+            return choice.path != "scalar"
+    return _table_prefers_tensor_core(sequence_length == 1, batch, hidden, gates)
+
+
+@lru_cache(maxsize=4096)
+def _table_prefers_tensor_core(step: bool, batch: int, hidden: int, gates: int) -> bool:
+    """The hand-timed crossover tables, memoised: the device query that counts an
+    extrapolation runs once per shape, not per forward."""
+    note_extrapolation(_MEASURED)
+    table = (_TENSOR_CORE_MIN_BATCH_STEP if step else _TENSOR_CORE_MIN_BATCH_SEQ)[gates]
     for width, min_batch in table:
         if hidden <= width:
             return batch >= min_batch
@@ -569,6 +611,9 @@ class LSTM(_RecurrentBase):
                 batch_size,
                 self.hidden_size,
                 self._gate_count,
+                op="lstm",
+                dtype=input.dtype,
+                input_size=self.input_size,
             )
         )
         current_batch_first = kernel_batch_first
@@ -764,6 +809,9 @@ class RNN(_RecurrentBase):
                 batch_size,
                 self.hidden_size,
                 self._gate_count,
+                op=f"rnn_{self.nonlinearity}",
+                dtype=input.dtype,
+                input_size=self.input_size,
             )
         )
         current_batch_first = kernel_batch_first

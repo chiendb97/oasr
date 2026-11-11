@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import importlib.metadata
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from oasr.tune.runners.base import Runner, RunnerTraits, register_runner
 
@@ -239,6 +239,55 @@ class SdpaFmha(Runner):
         return out
 
 
+# --------------------------------------------------------------------------
+# The recurrent and gated-MLP paths (``oasr.jit.recurrent_select``,
+# ``oasr.jit.mlp_select``): every path is OASR's own, dispatched by the
+# family's functional.
+# --------------------------------------------------------------------------
+
+
+def _cutedsl_version() -> Dict[str, Any]:
+    import cutlass
+
+    return {"cutedsl": str(getattr(cutlass, "__version__", "unknown"))}
+
+
+class _FamilyRunner(Runner):
+    """A path of the recurrent or gated-MLP family, named per family."""
+
+    def __init__(
+        self,
+        family: str,
+        name: str,
+        kinds: Tuple[str, ...],
+        *,
+        compiled: bool = True,
+        issue_class: str = "oasr_launcher",
+        cutedsl: bool = False,
+    ) -> None:
+        self.family = family
+        self.name = name
+        self.kinds = kinds
+        self.traits = RunnerTraits(capturable=True, compiled=compiled)
+        self.issue_class = issue_class
+        self._cutedsl = cutedsl
+
+    def unavailable(self) -> Optional[str]:
+        if not self._cutedsl:
+            return None
+        sm = _device_sm()
+        if sm is None:
+            return "no CUDA device"
+        try:
+            import cutlass  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            return f"CuTeDSL is unavailable: {exc}"
+        return None
+
+    def versions(self) -> Dict[str, Any]:
+        return _cutedsl_version() if self._cutedsl else {}
+
+
 register_runner(OasrCutlassGemm())
 register_runner(OasrFusedGemm())
 register_runner(CublasGemm())
@@ -248,3 +297,14 @@ register_runner(OasrScaledMm("scaled_mm_fp8"))
 register_runner(OasrCuteFmha())
 register_runner(OasrCxxFmha())
 register_runner(SdpaFmha())
+for _runner in (
+    # ``auto`` is today's hand-timed rules; owned by the path they default to.
+    _FamilyRunner("recurrent", "oasr_scalar", ("scalar", "auto"), compiled=False),
+    _FamilyRunner("recurrent", "oasr_gemm", ("gemm",)),
+    _FamilyRunner("recurrent", "oasr_cxx_step", ("cxx",)),
+    _FamilyRunner("recurrent", "oasr_cute_step", ("cute",), issue_class="oasr_cute", cutedsl=True),
+    _FamilyRunner("gated_mlp", "oasr_cxx", ("cxx", "auto")),
+    _FamilyRunner("gated_mlp", "oasr_cute", ("cute",), issue_class="oasr_cute", cutedsl=True),
+    _FamilyRunner("gated_mlp", "oasr_gemm", ("gemm",)),
+):
+    register_runner(_runner)

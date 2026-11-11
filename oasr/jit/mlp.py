@@ -131,6 +131,7 @@ def _clear_all_caches() -> None:
     # so a change that did not clear it would keep serving the old routing --
     # which is exactly what an A/B or a rollback switch is for.
     _ROUTE.clear()
+    _TILE_ROUTES.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +650,21 @@ def routed_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: i
     and the rest are keyed by :func:`_row_class`, which bounds the cache by the
     shapes a process serves rather than by the row counts it has seen.
     """
+    # The measured selection first (``oasr.jit.mlp_select``): a ``gated_mlp``
+    # file covering the shape names the path, lane and tile, past the band
+    # included.  ``None`` -- no file, no covering entry, ``auto`` -- leaves the
+    # rule below in charge.
+    choice = _select.tuned_choice(dtype_str, activation, has_bias, n, k, rows)
+    if choice is not None:
+        if choice.path == "gemm":
+            return None
+        return route_for_tile(
+            lane=choice.path,
+            dtype_str=dtype_str,
+            activation=activation,
+            has_bias=has_bias,
+            tile=choice.tile,
+        )
     if rows > _BAND_MAX_ROWS and _GATED_MLP_MODE != "always":
         return None
     key = (dtype_str, activation, has_bias, _row_class(rows), n, k)
@@ -689,6 +705,54 @@ def routed_gated_mlp(*, dtype_str: str, activation: str, has_bias: bool, rows: i
     return route
 
 
+#: ``(lane, dtype_str, activation, has_bias, tile) -> (lane, callable) | None``.
+_TILE_ROUTES: dict = {}
+
+
+def route_for_tile(*, lane: str, dtype_str: str, activation: str, has_bias: bool, tile: int):
+    """``(lane, callable)`` running shared tile *tile* on *lane*, or ``None`` (declined, said once).
+
+    Both lanes rank the same six tiles in the same order (``kGatedMlpTiles`` /
+    :data:`_CANDIDATES`), so one index names one tile in both.
+    """
+    key = (lane, dtype_str, activation, has_bias, tile)
+    try:
+        return _TILE_ROUTES[key]
+    except KeyError:
+        pass
+    route = None
+    try:
+        if lane == "cxx":
+            sm = _cxx_probe()
+            if sm is None:
+                raise RuntimeError("the C++ gated MLP lane is not available")
+            from oasr.jit import gated_mlp as _cxx
+
+            route = (
+                "cxx",
+                _cxx.get_gated_mlp_fn(
+                    dtype_str=dtype_str,
+                    activation=activation,
+                    has_bias=has_bias,
+                    tile_index=tile,
+                    sm=sm,
+                ),
+            )
+        else:
+            cap = _capability_probe()
+            if cap is None:
+                raise RuntimeError("the CuTeDSL gated MLP is not available")
+            spec = cast(
+                Tuple[int, int, int, int, int, int],
+                tuple([t for _, tiles in _CANDIDATES for t in tiles][tile]),
+            )
+            route = ("cute", _compiled_gated_mlp(cap, dtype_str, activation, has_bias, spec))
+    except Exception as exc:  # unsupported arch, missing toolchain, bad tile
+        logger.warning("the %s gated MLP declined tile %d: %s", lane, tile, exc)
+    _TILE_ROUTES[key] = route
+    return route
+
+
 # ---------------------------------------------------------------------------
 # Warmup helper
 # ---------------------------------------------------------------------------
@@ -701,3 +765,8 @@ def warmup_gated_mlp(
     routed_gated_mlp(
         dtype_str=dtype_str, activation=activation, has_bias=has_bias, rows=rows, n=n, k=k
     )
+
+
+# The measured selection reads this module's lanes, so it is bound last: by the
+# time it imports ``oasr.jit.mlp`` back, everything above exists.
+from . import mlp_select as _select  # noqa: E402

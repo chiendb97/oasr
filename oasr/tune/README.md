@@ -24,3 +24,4 @@ Kernel selection from measured data, per GPU architecture. User documentation:
 | `capture.py` | The GEMM shape recorder (`OASR_CAPTURE_GEMM`) the census probes use |
 | `attention_census.py` | The `fmha` census: replay a manifest through the engine (graphs off), count every attention call shape |
 | `build_fmha.py` | `oasr tune build --family fmha`: every attention lane and tile per shape, partitioned over the key length |
+| `build_fused.py` | The `recurrent` and `gated_mlp` families: census (a model's layer dims × a batch / row ladder) and build (every path, dependent-chain timing for a recurrence) |

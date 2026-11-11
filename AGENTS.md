@@ -775,9 +775,9 @@ Environment variables:
 | `OASR_GEMM_STREAMK`, `OASR_GEMM_SPLITK_PARALLEL` | `0` skips compiling those GEMM variants |
 | `OASR_GEMM_WS_CACHE` | `0` disables the persistent split-K/Stream-K workspace cache |
 | `OASR_CTC_FUSED` | `0` forces the legacy multi-kernel CTC beam-search step (A/B, rollback) |
-| `OASR_GATED_MLP_CUTE` | `auto` (default) / `1` (take the fused gated MLP wherever it fits) / `0` (never) |
+| `OASR_GATED_MLP_CUTE` | `auto` (default: the `gated_mlp` tuning file's path and tile for a covered shape, else the one-m-tile band) / `1` (take the fused gated MLP wherever it fits) / `0` (never). `1` / `0` bypass the tuning file |
 | `OASR_GATED_MLP_BACKEND` | Which fused gated-MLP lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
-| `OASR_RECURRENT_CUTE` | `auto` (default) / `1` / `0` for the fused recurrent step — whether to fuse at all |
+| `OASR_RECURRENT_CUTE` | `auto` (default: the `recurrent` tuning file's path -- scalar, GEMM and its tactic, or a fused lane and tile -- for a covered shape, else the hand-timed bands) / `1` / `0` for the fused recurrent step — whether to fuse at all. `1` / `0`, and a pinned `OASR_RECURRENT_BACKEND`, bypass the tuning file |
 | `OASR_RECURRENT_BACKEND` | Which fused recurrent-step lane: `auto` (default, prefers `cxx`) / `cxx` (the C++ CUTLASS/CuTe kernel) / `cute` (the CuTeDSL one). Separate from the switch above, which decides whether to fuse at all |
 | `OASR_FEATURE_BACKEND` | `torch` forces the reference feature frontend (A/B, parity oracle) |
 | `OASR_SCALED_MM_BACKEND` | Quantized-GEMM lane: `auto` (default: the CUTLASS lanes only, native 3.x first on sm90/sm100 -- what they cannot serve is a declared gap or a refusal, never the torch lane) / `cutlass` (the int8 and fp8 CUTLASS kernels) / `mma_sync` (the CUTLASS 2.x kernels only: the A/B arm for the native lanes) / `torch` (`torch._int_mm` / `torch._scaled_mm` + a torch epilogue). Naming one **requires** it; an unknown value is refused at the first quantized layer's bind |

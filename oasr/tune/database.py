@@ -131,8 +131,11 @@ SCHEMA = 2
 #: may name the ``"heuristic"`` sentinel -- "measured; the shape heuristic's
 #: own pick is the best here".  ``fmha`` is the choice between the attention
 #: lanes and their tiles (``oasr.jit.attention_select``), whose sentinel is
-#: ``"auto"`` -- "measured; today's routing is the best here".
-KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm", "scaled_mm_fp8", "fmha")
+#: ``"auto"`` -- "measured; today's routing is the best here".  ``recurrent``
+#: (``oasr.jit.recurrent_select``) and ``gated_mlp`` (``oasr.jit.mlp_select``)
+#: choose a path -- scalar / GEMM / a fused lane and its tile -- and share that
+#: sentinel.
+KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm", "scaled_mm_fp8", "fmha", "recurrent", "gated_mlp")
 
 _USER_ENV = "OASR_TUNE_USER_DB"
 _OFF_VALUES = ("0", "off", "none", "false", "no")

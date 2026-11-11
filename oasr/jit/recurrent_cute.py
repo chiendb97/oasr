@@ -280,6 +280,7 @@ def _clear_all_caches() -> None:
     # a change that did not clear it would keep serving the old routing --
     # which is exactly what an A/B or a rollback switch is for.
     _ROUTE.clear()
+    _TILE_STEPS.clear()
 
 
 def set_mode(mode: str) -> None:
@@ -659,6 +660,51 @@ def routed_step(*, dtype_str: str, gate_count: int, activation: str, hidden: int
                     exc,
                 )
     _ROUTE[key] = route
+    return route
+
+
+#: ``(lane, dtype_str, gate_count, activation, tile index) -> (lane, callable) | None``:
+#: the measured selection's steps (:mod:`oasr.jit.recurrent_select`), which name
+#: their tile rather than reading it off the ladder.
+_TILE_STEPS: dict = {}
+
+
+def step_for_tile(*, lane: str, dtype_str: str, gate_count: int, activation: str, tile: int):
+    """``(lane, callable)`` running tile *tile* of ``oasr.jit.recurrent_step.TILES``, or ``None``.
+
+    The two lanes share the eight tiles, so one index names the same tile in
+    both.  Declines (``None``, said once) rather than raising -- a build failure
+    is a property of the configuration -- and memoises the answer like
+    :func:`routed_step`.
+    """
+    key = (lane, dtype_str, gate_count, activation, tile)
+    try:
+        return _TILE_STEPS[key]
+    except KeyError:
+        pass
+    from oasr.jit import recurrent_step as _cxx
+
+    route = None
+    try:
+        if lane == "cxx":
+            sm = _cxx_probe()
+            kind = _KIND.get((gate_count, activation))
+            if sm is None or kind is None:
+                raise RuntimeError("the C++ recurrent step lane is not available")
+            route = (
+                "cxx",
+                _cxx.get_recurrent_step_fn(dtype_str=dtype_str, kind=kind, tile_index=tile, sm=sm),
+            )
+        else:
+            cap = _probe()
+            if cap is None:
+                raise RuntimeError("the CuTeDSL recurrent step is not available")
+            t = _cxx.TILES[tile]
+            spec = (t.block_m, t.block_n, t.block_k, t.stages, t.threads, t.warps_n)
+            route = ("cute", _compiled_step(cap, dtype_str, gate_count, activation, spec))
+    except Exception as exc:  # unsupported arch, missing toolchain, bad tile
+        logger.warning("the %s recurrent step declined tile %d: %s", lane, tile, exc)
+    _TILE_STEPS[key] = route
     return route
 
 

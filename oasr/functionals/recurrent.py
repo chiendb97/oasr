@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Tuple, cast
 
 import torch
 
 from oasr.api_logging import oasr_api
+from oasr.jit.recurrent_select import tuned_choice as _tuned_choice
 from oasr.tune import OpKey, get_tuner, is_tuning_enabled
+
+if TYPE_CHECKING:
+    from oasr.jit.recurrent_select import RecChoice
 
 logger = logging.getLogger("oasr.functionals.recurrent")
 
@@ -156,6 +160,19 @@ def _pack_lstm_parameters(
     if bias is not None:
         bias = bias.reshape(4, hidden_size).transpose(0, 1).contiguous().reshape(-1)
     return pack_weight(weight_ih), pack_weight(weight_hh), bias
+
+
+def _dtype_str(x: torch.Tensor) -> str:
+    return "float16" if x.dtype is torch.float16 else "bfloat16"
+
+
+def _tuned(
+    op: str, x: torch.Tensor, seq_len: int, batch: int, hidden: int, input_size: int
+) -> Optional["RecChoice"]:
+    """The measured recurrent path for this call, or ``None`` (``oasr.jit.recurrent_select``)."""
+    if x.dtype not in (torch.float16, torch.bfloat16) or not x.is_cuda:
+        return None
+    return _tuned_choice(op, _dtype_str(x), hidden, input_size, seq_len, batch)
 
 
 def _default_recurrent_tactic(batch_size: int) -> int:
@@ -354,8 +371,13 @@ def _lstm_step_fused(
     out_h: torch.Tensor,
     out_c: torch.Tensor,
     outputs_are_fresh: bool = False,
+    route: Optional[Tuple[str, object]] = None,
 ) -> bool:
     """Run one timestep on the fused recurrent step.  ``False`` if it declined.
+
+    ``route`` is a ``(lane, callable)`` the caller already chose -- the measured
+    selection's lane and tile (``recurrent_cute.step_for_tile``); ``None`` asks
+    the hand-timed band (``recurrent_cute.routed_step``).
 
     ``outputs_are_fresh`` says ``out_h`` / ``out_c`` were just allocated, so they
     cannot overlap the inputs and the CuTeDSL lane need not test them.
@@ -374,17 +396,20 @@ def _lstm_step_fused(
     """
     from oasr.jit import recurrent_cute
 
-    dtype_str = "float16" if input_gates.dtype is torch.float16 else "bfloat16"
-    routed = recurrent_cute.routed_step(
-        dtype_str=dtype_str,
-        gate_count=4,
-        activation="lstm",
-        hidden=out_h.shape[1],
-        batch=out_h.shape[0],
-    )
+    routed = route
+    if routed is None:
+        dtype_str = "float16" if input_gates.dtype is torch.float16 else "bfloat16"
+        routed = recurrent_cute.routed_step(
+            dtype_str=dtype_str,
+            gate_count=4,
+            activation="lstm",
+            hidden=out_h.shape[1],
+            batch=out_h.shape[0],
+        )
     if routed is None:
         return False
     backend, step = routed
+    step = cast(Callable[..., None], step)
     if backend == "cxx":
         # The launcher refuses outputs that share storage with its inputs.
         step(out_h, out_c, previous_h, packed_weight_hh, input_gates, previous_c)
@@ -431,6 +456,7 @@ def lstm_gemm_layer(
     _packed_parameters: Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = None,
     _tactic: Optional[Tuple[int, int]] = None,
     _outputs_are_fresh: bool = False,
+    _step_route: Optional[Tuple[str, object]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Tensor-core LSTM layer for large cohorts and wide hidden states.
 
@@ -458,6 +484,29 @@ def lstm_gemm_layer(
     else:
         packed_weight_ih, packed_weight_hh, combined_bias = _packed_parameters
     input_gates = gemm(input, packed_weight_ih, combined_bias)
+    # The measured selection (``oasr.jit.recurrent_select``): the fused step's
+    # lane and tile, or the decomposed path and its tactic.  ``None`` -- no
+    # ``recurrent`` file covers the shape, or it names ``scalar`` / ``auto`` --
+    # leaves the hand-timed rules in charge.  A caller's ``_tactic`` wins.
+    tuned_route = _step_route
+    skip_fused = False
+    if _tactic is None and _step_route is None:
+        choice = _tuned("lstm", input, sequence_length, batch_size, hidden_size, weight_ih.shape[1])
+        if choice is not None and choice.path in ("cxx", "cute"):
+            from oasr.jit import recurrent_cute
+
+            tuned_route = recurrent_cute.step_for_tile(
+                lane=choice.path,
+                dtype_str=_dtype_str(input),
+                gate_count=4,
+                activation="lstm",
+                tile=choice.tile,
+            )
+            skip_fused = tuned_route is None
+        elif choice is not None and choice.path == "gemm":
+            skip_fused = True
+            if choice.tactic >= 0:
+                _tactic = (choice.tactic, choice.split)
     # Buffers this call allocates cannot overlap its inputs; ``oasr.layers.LSTM``
     # says the same of the ones it passes (``_outputs_are_fresh``).
     fresh = _outputs_are_fresh or (final_h is None and final_c is None)
@@ -476,7 +525,7 @@ def lstm_gemm_layer(
     # `workspace` exist only for the decomposed path, and at these sizes three
     # unused allocations plus the cell ring cost about as much host time as the
     # kernel costs GPU time.
-    if sequence_length == 1 and _tactic is None:
+    if sequence_length == 1 and _tactic is None and not skip_fused:
         # ``_lstm_step_fused`` owns the whole decision now -- band, lane, arch
         # probe and compile all memoise behind one dict lookup in
         # ``recurrent_cute.routed_step``, so asking ``should_use`` here first only
@@ -495,6 +544,7 @@ def lstm_gemm_layer(
             final_h,
             final_c,
             outputs_are_fresh=fresh,
+            route=tuned_route,
         ):
             # h was written straight into final_h, so the (1, B, H) layer output
             # is a view of it rather than a copy.
@@ -558,6 +608,18 @@ def rnn_gemm_layer(
         _combined_bias(bias_ih, bias_hh) if _combined_input_bias is None else _combined_input_bias
     )
     input_gates = gemm(input, weight_ih, combined_bias)
+    if _tactic is None:
+        # The measured selection's tactic (``oasr.jit.recurrent_select``).
+        choice = _tuned(
+            f"rnn_{nonlinearity}",
+            input,
+            sequence_length,
+            batch_size,
+            hidden_size,
+            weight_ih.shape[1],
+        )
+        if choice is not None and choice.path == "gemm" and choice.tactic >= 0:
+            _tactic = (choice.tactic, choice.split)
     output = input.new_empty(sequence_length, batch_size, hidden_size)
     if final_h is None:
         final_h = input.new_empty(batch_size, hidden_size)
