@@ -10,12 +10,13 @@ hot-path callers.
 from __future__ import annotations
 
 import functools
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
 
 from oasr.api_logging import oasr_api
+from oasr.jit import attention as _jit_attention
 from oasr.jit.attention import (
     fmha_backend_for,
     fmha_cxx_supports,
@@ -24,6 +25,7 @@ from oasr.jit.attention import (
     get_compiled_fmha,
     select_backend,
 )
+from oasr.jit.attention_select import AttnChoice as _AttnChoice, tuned_choice as _tuned_choice
 
 __all__ = ["fmha", "fmha_varlen"]
 
@@ -73,6 +75,10 @@ _INT32_MAX = 2**31 - 1
 
 _KERNEL_M_BLOCK = 64
 _KERNEL_N_BLOCK = 64
+
+#: ``(m_block, n_block, num_threads)`` of the CuTeDSL kernel when no tuning
+#: entry names another (``get_compiled_fmha``'s defaults).
+_CUTE_DEFAULT_TILE = (64, 64, 128)
 
 
 def _get_dummy_bias(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -475,7 +481,7 @@ def fmha(
     window_right: int = -1,
     out: Optional[torch.Tensor] = None,
     validate: bool = True,
-    backend: Optional[str] = None,
+    backend: Union[str, _AttnChoice, None] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -538,6 +544,13 @@ def fmha(
         When False, skip shape/dtype validation. Caller takes responsibility
         for input correctness. Used by the engine hot path to shave a few
         microseconds per call.
+    backend : str or AttnChoice, optional
+        ``"cxx"``, ``"cute"`` or ``"sdpa"``, or a lane *with* its configuration
+        (:class:`oasr.jit.attention_select.AttnChoice`: a CuTeDSL tile, a C++
+        split-KV count).  Naming one **requires** it: an unserviceable request
+        raises instead of falling back.  ``None`` takes the measured selection
+        when an ``fmha`` tuning file covers the shape and
+        ``OASR_ATTN_BACKEND=auto``, else the process-wide routing.
     k_scale, v_scale : Tensor, optional
         **FP8 KV.**  When ``k``/``v`` are ``float8_e4m3fn`` (a quantized KV
         cache, :mod:`oasr.functionals.kv_quant`), their fp32 per-(token,
@@ -556,6 +569,11 @@ def fmha(
         ``(B, H, T_q, D)``.
     """
     if k.dtype == torch.float8_e4m3fn or v.dtype == torch.float8_e4m3fn:
+        if isinstance(backend, _AttnChoice):
+            raise ValueError(
+                "fmha: an AttnChoice configures a served-dtype lane; an fp8 KV cache takes "
+                "a lane name (backend='cxx' or 'sdpa')"
+            )
         return _fmha_kv8(
             q,
             k,
@@ -649,22 +667,60 @@ def fmha(
     # flip; this argument is what makes a parametrised test fixture or an
     # interleaved benchmark arm affordable.
     windowed = window_left >= 0 or window_right >= 0
+    # The measured choice's lane configuration, when a tuning file names one.
+    tile: Optional[tuple] = None
+    splits: Optional[int] = None
 
     if backend is None:
-        # Nobody named one, so the shape gets a say: `fmha_backend_for` degrades
-        # to a lane that can serve the call rather than raising.  A *named*
-        # backend skips this deliberately -- naming one means requiring it.
-        backend = (
-            fmha_backend_for(
-                head_dim=D,
-                dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
-                paged=paged,
-                causal=causal,
-                local=windowed,
+        # Nobody named one, so the shape gets a say.  First the measured
+        # selection (`oasr.jit.attention_select`): one global read when no
+        # `fmha` tuning file is loaded, and never consulted when
+        # OASR_ATTN_BACKEND names a lane -- naming one means requiring it.
+        choice = None
+        half = q.dtype in (torch.float16, torch.bfloat16)
+        if half and _jit_attention._BACKEND_MODE == "auto":
+            choice = _tuned_choice(
+                "float16" if q.dtype is torch.float16 else "bfloat16",
+                D,
+                H,
+                H_kv,
+                "window" if windowed else ("causal" if causal else "none"),
+                attn_bias is not None,
+                block_size,
+                cache_seqstarts is not None,
+                B,
+                T_q,
+                T_k,
+                attn_bias is not None and attn_bias.size(-1) % 2 == 0,
             )
-            if windowed and q.dtype in (torch.float16, torch.bfloat16)
-            else select_backend()
-        )
+        if choice is not None:
+            backend = choice.lane
+            if backend == "cute":
+                tile = (choice.m_block, choice.n_block, choice.threads)
+            elif backend == "cxx":
+                splits = choice.splits
+        else:
+            # `fmha_backend_for` degrades to a lane that can serve the call
+            # rather than raising.  A *named* backend skips this deliberately.
+            backend = (
+                fmha_backend_for(
+                    head_dim=D,
+                    dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
+                    paged=paged,
+                    causal=causal,
+                    local=windowed,
+                )
+                if windowed and half
+                else select_backend()
+            )
+    elif isinstance(backend, _AttnChoice):
+        # A lane *and* its configuration, named: what the tuner's arms and the
+        # tests call.  Required like a named lane -- there is no fallback.
+        if backend.lane == "cute":
+            tile = (backend.m_block, backend.n_block, backend.threads)
+        elif backend.lane == "cxx":
+            splits = backend.splits
+        backend = backend.lane
     elif backend not in ("sdpa", "cute", "cxx"):
         raise ValueError(f"fmha: unknown backend {backend!r}")
 
@@ -689,6 +745,7 @@ def fmha(
             causal=causal,
             window_left=window_left,
             window_right=window_right,
+            splits=splits,
         )
 
     # The CuTeDSL kernel has no per-row sliding window -- its `local` axis is
@@ -748,6 +805,7 @@ def fmha(
         cache_seqstarts=cache_seqstarts,
         block_table=block_table,
         causal=causal,
+        tile=tile,
     )
 
 
@@ -1432,6 +1490,25 @@ def _split_count(
     return num_splits(B * H * m_blocks, n_blocks, _multiprocessor_count())
 
 
+def _clamp_splits(splits: int, *, T_k: int, D: int, causal: bool, local: bool) -> int:
+    """A requested split count cut to what this K range can use (1: do not split).
+
+    Split variants are rendered for unmasked attention only, and every split
+    needs at least ``MIN_BLOCKS_PER_SPLIT`` K tiles -- the bound the lane's own
+    rule (``fmhaNumSplits``) observes, so a measured setting applied across a
+    region never hands a split an empty range.
+    """
+    if causal or local:
+        return 1
+    from oasr.jit.fmha import MAX_SPLITS, MIN_BLOCKS_PER_SPLIT, resolve_config
+
+    tile = resolve_config(_target_sm(), 16, D)
+    if not tile.valid:
+        return 1
+    n_blocks = -(-T_k // tile.block_n)
+    return max(1, min(int(splits), MAX_SPLITS, n_blocks // MIN_BLOCKS_PER_SPLIT))
+
+
 @functools.cache
 def _target_sm() -> int:
     from oasr.jit.core import _get_target_sm
@@ -1460,6 +1537,7 @@ def _call_cxx(
     causal: bool,
     window_left: int = -1,
     window_right: int = -1,
+    splits: Optional[int] = None,
 ) -> torch.Tensor:
     """Invoke the C++ CUTLASS/CuTe kernel.
 
@@ -1468,6 +1546,11 @@ def _call_cxx(
     synthesized full-length ``cache_seqlens`` buffer, and no canonical-stride
     copy.  A TVM-FFI call takes the torch tensors as they are and is
     CUDA-graph-capturable for the same reason every other OASR launcher is.
+
+    ``splits`` is a measured split-KV setting (``oasr.jit.attention_select``):
+    ``None`` or 0 takes the lane's own rule, 1 never splits, ``s`` splits up to
+    ``s`` ways -- fewer when the K range is too short to give each split
+    ``MIN_BLOCKS_PER_SPLIT`` tiles, a pure function of the shape again.
     """
     from oasr.jit.fmha import get_fmha_fn
 
@@ -1490,7 +1573,10 @@ def _call_cxx(
     # `_split_count` is a pure function of shape and SM count -- never of
     # capture state (rule 11) -- so eager and a replayed graph take the same
     # path and therefore sum the partials in the same order.
-    splits = _split_count(B=B, H=H, T_q=T_q, T_k=T_k, D=D, causal=causal, local=local)
+    if not splits:
+        splits = _split_count(B=B, H=H, T_q=T_q, T_k=T_k, D=D, causal=causal, local=local)
+    elif splits > 1:
+        splits = _clamp_splits(splits, T_k=T_k, D=D, causal=causal, local=local)
     if splits > 1:
         fn = get_fmha_fn(
             dtype_str=dtype_str,
@@ -1647,8 +1733,13 @@ def _call_cute_dsl(
     block_table: Optional[torch.Tensor],
     causal: bool = False,
     cache_seqstarts: Optional[torch.Tensor] = None,
+    tile: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Invoke the TVM-FFI compiled CuteDSL kernel with raw torch tensors.
+
+    ``tile`` is a measured ``(m_block, n_block, num_threads)``
+    (``oasr.jit.attention_select``); ``None`` is the kernel's default 64x64 on
+    four warps.
 
     ``oasr/jit/attention.py`` builds the callable with
     ``cute.compile(..., options="--enable-tvm-ffi")`` and
@@ -1671,6 +1762,7 @@ def _call_cute_dsl(
     # for odd T_k (e.g. real-world ASR T_k = 33/249 audio frames).
     bias_aligned = attn_bias is not None and (attn_bias.size(-1) % 2 == 0)
 
+    m_block, n_block, num_threads = tile if tile is not None else _CUTE_DEFAULT_TILE
     fn = get_compiled_fmha(
         head_dim=D,
         dtype_str=dtype_str,
@@ -1679,6 +1771,9 @@ def _call_cute_dsl(
         has_bias=(attn_bias is not None),
         paged=paged,
         block_size=block_size,
+        m_block=int(m_block),
+        n_block=int(n_block),
+        num_threads=int(num_threads),
         bias_aligned=bias_aligned,
         causal=causal,
         has_seqstart=(cache_seqstarts is not None),

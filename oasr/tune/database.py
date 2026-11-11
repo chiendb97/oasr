@@ -129,8 +129,10 @@ SCHEMA = 2
 #: rejected on load: an unknown family means a reader older than the writer.
 #: ``scaled_mm`` is the int8 W8A8 GEMM (``oasr.jit.scaled_mm``), whose regions
 #: may name the ``"heuristic"`` sentinel -- "measured; the shape heuristic's
-#: own pick is the best here".
-KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm", "scaled_mm_fp8")
+#: own pick is the best here".  ``fmha`` is the choice between the attention
+#: lanes and their tiles (``oasr.jit.attention_select``), whose sentinel is
+#: ``"auto"`` -- "measured; today's routing is the best here".
+KERNEL_FAMILIES = ("gemm", "conv1d", "scaled_mm", "scaled_mm_fp8", "fmha")
 
 _USER_ENV = "OASR_TUNE_USER_DB"
 _OFF_VALUES = ("0", "off", "none", "false", "no")
@@ -921,8 +923,8 @@ def reset_tier_counts() -> None:
 
 #: The order :func:`tuning_report` lists tiers in: measured first, then each
 #: family's untuned fallback (``default`` for the GEMM family, ``heuristic`` for
-#: ``scaled_mm``).
-_REPORT_TIERS = ("user", "system", "prior", "model", "default", "heuristic")
+#: ``scaled_mm``, ``auto`` for ``fmha``).
+_REPORT_TIERS = ("user", "system", "prior", "model", "default", "heuristic", "auto")
 
 
 def tuning_report(families: Optional[Iterable[str]] = None) -> str:

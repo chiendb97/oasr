@@ -192,6 +192,60 @@ names a tile, or the heuristic (an illustrative entry):
   ends with one line per quantized model: `scaled_mm: 96 quantized layer(s) over
   5 signature(s): 96 with a tuning entry (system=96), 0 on the shape heuristic`.
 
+### Attention lanes and tiles (`fmha`)
+
+`OASR_ATTN_BACKEND=auto` picks one attention lane per process -- the CuTeDSL
+kernel wherever it is built -- and runs it with one tile. Neither lane is right
+everywhere, and neither is its default tile: on an RTX 5090 the C++ lane's
+split-KV is 1.4-3.4x on a Whisper decode step, and inside the CuTeDSL lane a
+32x16 tile is 1.8x the default 64x64 on the U2++ offline encoder. So the choice is
+per shape and joint over `(lane, configuration)`, and it is the `fmha` family of
+the database (`oasr/jit/attention_select.py`):
+
+```json
+"fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=8": {
+  "regions": [[64, "auto"], [null, "cxx_s4"]], ...
+}
+```
+
+- **The signature** is what decides which kernel can run and how it behaves:
+  head dim, heads, KV heads, mask kind (`none` / `causal` / `window`), bias and
+  whether its rows are 4-byte aligned (`ba`: both lanes branch on it, and it flips
+  the winner between neighbouring key lengths), dense or paged KV and the page
+  size, left padding (`ss`), the query-length class (`1`, `16`, `32`, `64` or
+  `L`), and the batch rounded up to a power of two. Regions run over the key
+  length `T_k`.
+- **Configurations.** `cute_m{M}n{N}t{threads}` -- a CuTeDSL tile, seven measured
+  (`CUTE_TILES`); `cxx` -- the C++ lane with its own split rule, `cxx_s{n}` with
+  `n`-way split-KV (`n=1`: never; a split count is cut to what the key range can
+  use, a pure function of the shape); `sdpa` -- torch's SDPA, an external runner;
+  and `auto`, "measured; today's routing is best here". A paged call takes no tile
+  taller than 64 rows (the paged path pads to 64).
+- **Resolution** (`tuned_choice`, called by `oasr.fmha`): only when nobody named
+  a lane -- `OASR_ATTN_BACKEND=auto` and no `backend=` -- and only for fp16 / bf16
+  dense or paged calls; `fmha_varlen` and the fp8 KV cache keep their own routing.
+  User tier, then system; a choice this process cannot serve (a CuTeDSL tile for a
+  windowed call, a lane not built here) is warned about once and falls through.
+  With no `fmha` file the lookup returns at once (an epoch compare). Memoised per `(epoch,
+  shape)`, counted by tier (`auto` = untuned) and by runner; an `sdpa` region is a
+  policy hit (`tuned-sdpa:fmha.fmha`). `oasr.fmha(..., backend=AttnChoice(...))`
+  names a lane *with* its configuration.
+- **Numerics.** The lanes compute in a different order, so a table can change a
+  transcript at the rounding level: gate it with the WER references, as any
+  attention change. Graph and eager agree, because the choice is a function of
+  the shape alone.
+- **Census.** `oasr tune census --family fmha --manifest M --audio-root R` replays
+  the manifest through the engine with every graph off -- an AR family's decoder
+  steps included, with paged decoder KV as served -- because a decode step's shapes
+  depend on what was said. Streaming replays it at a few concurrency levels.
+- **Build.** `oasr tune build --census a.json --family fmha` measures every
+  configuration that can serve each point through `oasr.fmha` itself, under the
+  shared protocol, numerics-gated against an fp32 SDPA reference (within four
+  times torch's own half-precision error), and partitions against the `auto`
+  pseudo-arm. SDPA is always measured and logged; it may win a region only with
+  `--allow-external`. The file's provenance records census-weighted attention
+  time for `auto`, the table, and the table with SDPA.
+
 ## Runners: backends a region selects among
 
 `oasr/tune/runners/`. A **runner** is one backend that can serve a kernel
