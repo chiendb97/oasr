@@ -246,6 +246,61 @@ the database (`oasr/jit/attention_select.py`):
   `--allow-external`. The file's provenance records census-weighted attention
   time for `auto`, the table, and the table with SDPA.
 
+### Recurrent and gated-MLP paths (`recurrent`, `gated_mlp`)
+
+Two more layers chose their kernel by cut-offs timed once on an RTX 5090 --
+counted as extrapolations on any other card (`oasr/jit/measured.py`):
+
+- **An LSTM / RNN layer**: the scalar cohort kernel or the tensor-core path
+  (`_TENSOR_CORE_MIN_BATCH_*` in `oasr/layers/recurrent.py`); at a single timestep,
+  the fused recurrent step or the decomposed GEMM path (`_LSTM_BANDS`); which
+  fused lane (`_AUTO_ORDER`) and tile (`_TILES` / `kRecurrentStepRoutes`); which
+  GEMM tactic (`_default_recurrent_tactic`).
+- **A gated MLP**: fuse only inside one m-tile (`rows <= 64`), on the C++ lane
+  first, at the tile wave arithmetic picks from a hand-chosen candidate list.
+
+Each is now a family whose regions name a *path* (`oasr/jit/recurrent_select.py`,
+`oasr/jit/mlp_select.py`, sharing `oasr/jit/selection.py`):
+
+```json
+"recurrent|op=layer|kind=lstm|dt=half|H=640|I=640|T=step": {
+  "regions": [[1, "auto"], [16, "cxx_t0"], [null, "auto"]], ...
+},
+"gated_mlp|op=gated_mlp|dt=half|act=silu|bias=0|N=11008|K=4096": {
+  "regions": [[64, "auto"], [null, "cxx_t5"]], ...
+}
+```
+
+- **Recurrent signature**: kind (`lstm`, `rnn_tanh`, `rnn_relu`), hidden width,
+  input width, single step (`T=step`) or sequence (`T=seq`); regions over the
+  batch. Configurations: `scalar`; `gemm` (today's tactic rule) or `gemm_t{t}[_s{k}]`;
+  `cxx_t{i}` / `cute_t{i}` -- the fused step on a lane, tile `i` of the eight both
+  lanes share (an LSTM single step only); `auto`.
+- **Gated-MLP signature**: activation, bias, `N`, `K`; regions over rows.
+  Configurations: `gemm` (gate GEMM with its activation, up GEMM, multiply -- each
+  GEMM resolved through the GEMM database); `cxx_t{i}` / `cute_t{i}`, tile `i` of
+  the six both lanes share, **at any row count** (a region may fuse past one
+  m-tile where that measured faster); `auto`.
+- **Resolution**: the layer (`oasr.layers.LSTM` / `RNN`: scalar or tensor cores)
+  and the functionals (`oasr.lstm_gemm_layer` / `rnn_gemm_layer`: fused step, lane,
+  tile, tactic; `oasr.jit.mlp.routed_gated_mlp`, hence `oasr.gated_mlp`) consult
+  the family first, memoised per `(epoch, shape)`; with no file the lookup returns
+  at once. A covered shape never reaches the hand-timed tables, so it is not an
+  extrapolation; an uncovered one runs exactly as before. Not consulted when
+  `OASR_RECURRENT_CUTE` / `OASR_GATED_MLP_CUTE` is `0` or `1`, when a
+  `*_BACKEND` names a lane, or when a caller passes `_tactic`.
+- **Census**: `oasr tune census --family recurrent|gated_mlp --ckpt-dir CKPT`
+  reads the static dims off the model's own `LSTM` / `RNN` / `GatedMLP` modules,
+  built on the CPU (nothing is served), or takes `--dims lstm:640:640` /
+  `--dims silu:11008:4096`, and crosses them with a ladder (`--ladder`; batches
+  1..512, rows 1..2048 by default; `--seq-lens`, default `1 32`). A decode step's
+  batch is the number of live streams, so a ladder is the honest census for it.
+- **Build**: `oasr tune build --census r.json --family recurrent` measures every
+  path through the functionals themselves. A recurrent point is timed as a
+  **dependent chain** -- call `i` reads the state call `i-1` wrote -- the protocol a
+  recurrence imposes. Numerics against an fp32 formula within four times the
+  error of today's path (`auto`, measured to the end); the GEMM build's partition.
+
 ## Runners: backends a region selects among
 
 `oasr/tune/runners/`. A **runner** is one backend that can serve a kernel

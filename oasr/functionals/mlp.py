@@ -139,6 +139,7 @@ def gated_mlp(
     *,
     activation: str = "silu",
     out: Optional[torch.Tensor] = None,
+    _lane_route: Optional[Tuple[str, Any]] = None,
 ) -> torch.Tensor:
     """``activation(x @ w_gateᵀ + bias_gate) * (x @ w_upᵀ + bias_up)``.
 
@@ -171,7 +172,14 @@ def gated_mlp(
     if (bias_gate is None) != (bias_up is None):
         raise ValueError("gated_mlp needs both biases or neither")
     has_bias = bias_gate is not None
-    route, rows, n, k = _route(x, w_gate, activation=activation, has_bias=has_bias)
+    route: Optional[Any]
+    if _lane_route is not None:
+        # A lane and tile chosen by the caller (``oasr.jit.mlp.route_for_tile``):
+        # the tuner's arms and the tests.  Required, like a named lane.
+        route = _lane_route
+        rows, n, k = _shape(x, w_gate)
+    else:
+        route, rows, n, k = _route(x, w_gate, activation=activation, has_bias=has_bias)
     if route is None:
         raise ValueError(
             "oasr.gated_mlp cannot serve this call "

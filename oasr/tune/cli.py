@@ -44,6 +44,10 @@ def _cmd_census(args) -> int:
 
     if args.family == "fmha":
         return _cmd_census_fmha(args)
+    if args.family in ("recurrent", "gated_mlp"):
+        return _cmd_census_fused(args)
+    if not args.ckpt_dir:
+        raise SystemExit("census --family gemm needs --ckpt-dir")
     cfg = _deploy_config(args)
     if args.manifest:
         traffic = C.TrafficModel.from_manifest(args.manifest, args.audio_root)
@@ -94,6 +98,81 @@ def _deploy_config(args, decode_options: Optional[Dict[str, Any]] = None):
     if decode_options:
         kw["decode_options"] = dict(decode_options)
     return EngineConfig(**kw)
+
+
+def _parse_dims(family: str, specs: Sequence[str]) -> List[Dict[str, Any]]:
+    """``--dims``: ``lstm:H:I`` (recurrent) or ``silu:N:K[:bias]`` (gated_mlp)."""
+    out: List[Dict[str, Any]] = []
+    for spec in specs:
+        parts = spec.split(":")
+        if family == "recurrent":
+            op, hidden, width = parts[0], int(parts[1]), int(parts[2])
+            out.append({"op": op, "hidden": hidden, "input_size": width})
+        else:
+            bias = len(parts) > 3 and parts[3] in ("1", "bias", "true")
+            out.append(
+                {"activation": parts[0], "n": int(parts[1]), "k": int(parts[2]), "bias": bias}
+            )
+    return out
+
+
+def _cmd_census_fused(args) -> int:
+    """``census --family recurrent|gated_mlp``: the model's static dims x a dynamic ladder.
+
+    Dims come from ``--dims`` and/or the model's own layers (``--ckpt-dir``,
+    built on the CPU: nothing is served or put on a GPU).
+    """
+    from oasr.tune.build_fused import fused_census, model_dims
+
+    dims = _parse_dims(args.family, args.dims or [])
+    provenance: Dict[str, Any] = {}
+    if args.ckpt_dir:
+        from oasr.models.registry import build_model_from_checkpoint
+        from oasr.tune.census import model_name
+
+        model, _ = build_model_from_checkpoint(
+            args.ckpt_dir, device="cpu", architecture=args.architecture
+        )
+        found = model_dims(model)[args.family]
+        dims.extend(found)
+        provenance["model_name"] = model_name(args.ckpt_dir)
+        del model
+    if not dims:
+        raise SystemExit(f"no {args.family} layers found: pass --ckpt-dir with one, or --dims")
+    uniq = list({json.dumps(d, sort_keys=True): d for d in dims}.values())
+    ss = fused_census(
+        args.family,
+        uniq,
+        dtype=args.dtype,
+        ladder=args.ladder,
+        seq_lens=args.seq_lens,
+        provenance=provenance,
+    )
+    ss.save(args.out)
+    print(
+        f"[census] {args.family}: {len(uniq)} layer shape(s), {len(ss.points)} points -> {args.out}"
+    )
+    return 0
+
+
+def _cmd_build_fused(args, family: str, paths: Sequence[str], sm: int) -> int:
+    from oasr.tune import database
+    from oasr.tune.build_fused import FusedShapeSet, build_gated_mlp, build_recurrent
+
+    merged = FusedShapeSet(family, [], {})
+    sources: List[Dict[str, Any]] = []
+    for path in paths:
+        ss = FusedShapeSet.load(path)
+        sources.append({"path": os.path.basename(path), **ss.provenance})
+        merged.points.extend(ss.points)
+    merged.provenance = sources[0] if len(sources) == 1 else {"censuses": sources}
+    out = _resolve_out(args.out, sm, family)
+    base = database.load_file(out, family, sm) if (out.is_file() and not args.fresh) else None
+    since = None if base is None else base.to_json()
+    builder = build_recurrent if family == "recurrent" else build_gated_mlp
+    tf = builder(merged, sm=sm, opts=_build_options(args), base=base)
+    _write_built(args, tf, out, since)
+    return 0
 
 
 def _cmd_census_fmha(args) -> int:
@@ -264,13 +343,34 @@ def _cmd_build(args) -> int:
     from oasr.tune import database
     from oasr.tune.attention_census import is_attention_census
     from oasr.tune.build import build_gemm
+    from oasr.tune.build_fused import census_family
     from oasr.tune.build_scaled_mm import build_scaled_mm
     from oasr.tune.census import ShapeSet, kernel_family
 
     sm = _get_target_sm()
     attn_paths = [p for p in args.census if is_attention_census(p)]
-    gemm_paths = [p for p in args.census if p not in attn_paths]
+    fused_paths: Dict[str, List[str]] = {}
+    for p in args.census:
+        fam = census_family(p)
+        if fam in ("recurrent", "gated_mlp"):
+            fused_paths.setdefault(fam, []).append(p)
+    gemm_paths = [p for p in args.census if p not in attn_paths and census_family(p) == "gemm"]
+    if args.family in ("recurrent", "gated_mlp"):
+        paths = fused_paths.get(args.family, [])
+        if not paths:
+            print(
+                f"[build] no {args.family} census given (oasr tune census --family {args.family})"
+            )
+            return 1
+        return _cmd_build_fused(args, args.family, paths, sm)
+    if args.family == "auto":
+        for fam, paths in fused_paths.items():
+            rc = _cmd_build_fused(args, fam, paths, sm)
+            if rc:
+                return rc
     if args.family == "fmha" or (args.family == "auto" and not gemm_paths):
+        if args.family == "auto" and not attn_paths:
+            return 0
         return _cmd_build_fmha(args, attn_paths, sm)
     if args.family == "auto" and attn_paths:
         rc = _cmd_build_fmha(args, attn_paths, sm)
@@ -411,7 +511,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     c = sub.add_parser("census", help="derive the shapes to tune from a deployment")
-    c.add_argument("--ckpt-dir", required=True)
+    c.add_argument(
+        "--ckpt-dir",
+        help="the checkpoint (required for gemm / fmha; recurrent / gated_mlp read its layers)",
+    )
     c.add_argument(
         "--architecture",
         help="force a registered architecture (explicit-only ones, e.g. transducer)",
@@ -436,12 +539,29 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--capture", help="also merge an OASR_CAPTURE_GEMM JSON (decode paths)")
     c.add_argument(
         "--family",
-        choices=("gemm", "fmha"),
+        choices=("gemm", "fmha", "recurrent", "gated_mlp"),
         default="gemm",
         help="gemm: the GEMM-family census (probes the engine's keys); fmha: the attention "
-        "census (replays --manifest through the engine, decode steps included)",
+        "census (replays --manifest through the engine, decode steps included); recurrent / "
+        "gated_mlp: the model's layer dims (or --dims) crossed with a batch / row ladder",
     )
     c.add_argument("--limit", type=int, help="fmha: replay at most this many utterances")
+    c.add_argument(
+        "--dims",
+        nargs="+",
+        help="recurrent: KIND:H:I (e.g. lstm:640:640); gated_mlp: ACT:N:K[:bias] "
+        "(e.g. silu:11008:4096)",
+    )
+    c.add_argument(
+        "--ladder",
+        type=int,
+        nargs="+",
+        help="recurrent: batches (default 1..512, powers of two); gated_mlp: row counts",
+    )
+    c.add_argument(
+        "--seq-lens", type=int, nargs="+", help="recurrent: timesteps per class (default 1 32)"
+    )
+    c.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     c.add_argument("--coverage", type=float, default=0.97)
     c.add_argument("--out", required=True)
     c.set_defaults(func=_cmd_census)
@@ -455,7 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument(
         "--family",
-        choices=("auto", "gemm", "scaled_mm", "scaled_mm_fp8", "fmha"),
+        choices=("auto", "gemm", "scaled_mm", "scaled_mm_fp8", "fmha", "recurrent", "gated_mlp"),
         default="auto",
         help="which kernel family's file to build (auto: every family the censuses have points "
         "for -- scaled_mm when one has int8 points, scaled_mm_fp8 when it has fp8 ones, fmha "
