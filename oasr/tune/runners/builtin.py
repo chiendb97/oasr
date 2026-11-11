@@ -6,6 +6,10 @@ Each family's own resolver dispatches its OASR runners through a specialised
 fast path (a compiled variant looked up by name), so those runners describe
 rather than dispatch.  cuBLAS is the exception: its ``"torch"`` kind is served
 through :meth:`CublasGemm.bind`, the path every further runner takes.
+
+The attention family (``fmha``) dispatches all three of its runners -- the
+CuTeDSL kernel, the C++ kernel, torch SDPA -- inside
+:func:`oasr.functionals.attention.fmha`, which already owns every lane.
 """
 
 from __future__ import annotations
@@ -142,9 +146,105 @@ class OasrScaledMm(Runner):
         self.family = family
 
 
+#: The attention family's one operation (``oasr.jit.attention_select.OP``).
+FMHA_OPS = ("fmha",)
+
+
+def _device_sm() -> Optional[int]:
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
+
+
+class OasrCuteFmha(Runner):
+    """The CuTeDSL attention kernel, one tactic per tile.
+
+    Also owns ``"auto"``, the sentinel for "today's routing", which runs this
+    kernel wherever it is built.
+    """
+
+    name = "oasr_cute"
+    family = "fmha"
+    kinds = ("cute", "auto")
+    ops = FMHA_OPS
+    traits = RunnerTraits(capturable=True, compiled=True)
+    issue_class = "oasr_cute"
+
+    def unavailable(self) -> Optional[str]:
+        sm = _device_sm()
+        if sm is None:
+            return "no CUDA device"
+        try:
+            from oasr.jit.attention import _check_cutedsl_version
+            from oasr.kernels.cute.attention.base import pick_arch_cls
+
+            _check_cutedsl_version()
+            pick_arch_cls(sm // 10, sm % 10)
+        except Exception as exc:  # noqa: BLE001 -- any failure means it cannot run here
+            return f"CuTeDSL attention is unavailable on sm{sm}: {exc}"
+        return None
+
+    def versions(self) -> Dict[str, Any]:
+        import cutlass
+
+        return {"cutedsl": str(getattr(cutlass, "__version__", "unknown"))}
+
+
+class OasrCxxFmha(Runner):
+    """The C++ CUTLASS/CuTe attention kernel, one tactic per split-KV setting."""
+
+    name = "oasr_cxx"
+    family = "fmha"
+    kinds = ("cxx",)
+    ops = FMHA_OPS
+    traits = RunnerTraits(capturable=True, compiled=True)
+    issue_class = "oasr_launcher"
+
+    def unavailable(self) -> Optional[str]:
+        from oasr.jit.fmha import SUPPORTED_SM
+
+        sm = _device_sm()
+        if sm is None:
+            return "no CUDA device"
+        from oasr.jit.core import sm_family
+
+        if sm_family(sm // 10, sm % 10) not in SUPPORTED_SM:
+            return f"the C++ attention lane is built for {SUPPORTED_SM}, not sm{sm}"
+        return None
+
+
+class SdpaFmha(Runner):
+    """torch's ``scaled_dot_product_attention`` -- its own backend pick for the call.
+
+    External: a region naming it is a policy hit at dispatch.
+    """
+
+    name = "sdpa"
+    family = "fmha"
+    kinds = ("sdpa",)
+    ops = FMHA_OPS
+    traits = RunnerTraits(capturable=True, external=True)
+    issue_class = "torch"
+
+    def versions(self) -> Dict[str, Any]:
+        import torch
+
+        out: Dict[str, Any] = {"torch": torch.__version__}
+        cudnn = torch.backends.cudnn.version()
+        if cudnn is not None:
+            out["cudnn"] = int(cudnn)
+        return out
+
+
 register_runner(OasrCutlassGemm())
 register_runner(OasrFusedGemm())
 register_runner(CublasGemm())
 register_runner(OasrCutlassConv1d())
 register_runner(OasrScaledMm("scaled_mm"))
 register_runner(OasrScaledMm("scaled_mm_fp8"))
+register_runner(OasrCuteFmha())
+register_runner(OasrCxxFmha())
+register_runner(SdpaFmha())

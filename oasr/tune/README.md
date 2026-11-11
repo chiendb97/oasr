@@ -22,3 +22,5 @@ Kernel selection from measured data, per GPU architecture. User documentation:
 | `autotuner.py`, `backends/` | The runtime `oasr.autotune()` (FlashInfer-style registry + cache), on the same protocol |
 | `runners/` | The backends a region selects among (OASR lanes, cuBLAS, ...): registry, traits, versions, and the bind a dispatcher calls |
 | `capture.py` | The GEMM shape recorder (`OASR_CAPTURE_GEMM`) the census probes use |
+| `attention_census.py` | The `fmha` census: replay a manifest through the engine (graphs off), count every attention call shape |
+| `build_fmha.py` | `oasr tune build --family fmha`: every attention lane and tile per shape, partitioned over the key length |

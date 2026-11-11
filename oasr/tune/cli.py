@@ -10,6 +10,8 @@
     oasr tune census --ckpt-dir CKPT --quantization int8_w8a8 --out q.json  # a quantized model
     oasr tune build --census q.json --family scaled_mm --out user  # its int8 GEMMs only
     oasr tune census --ckpt-dir CKPT --quantization fp8_w8a8 --out f.json   # fp8 (sm89+)
+    oasr tune census --ckpt-dir CKPT --family fmha --manifest M --audio-root R --out a.json
+    oasr tune build --census a.json --family fmha --out user  # attention lanes and tiles
     oasr tune diff oasr/tune/db/sm120/gemm.json ~/.cache/oasr/tune/v2/sm120/gemm.json
     oasr tune status
     oasr tune export-misses --out misses.json               # after a workload ran
@@ -19,7 +21,9 @@ architecture family; a shipped file for another family is built on that family
 (``ci/modal_app.py``'s tune entry point runs one per GPU of the matrix).  A census
 of a quantized model also holds 8-bit points: ``build`` then writes
 ``scaled_mm.json`` (int8) or ``scaled_mm_fp8.json`` (fp8) beside ``gemm.json``
-(``--family`` restricts it to one).
+(``--family`` restricts it to one).  An attention census (``census --family
+fmha``) replays the manifest through the engine and is built into ``fmha.json``:
+which attention lane, and which tile or split-KV setting, serves each shape.
 """
 
 from __future__ import annotations
@@ -35,23 +39,12 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 def _cmd_census(args) -> int:
-    from oasr.engine import ASREngine, EngineConfig
+    from oasr.engine import ASREngine
     from oasr.tune import census as C
 
-    kw = {
-        "ckpt_dir": args.ckpt_dir,
-        "service_mode": args.service_mode,
-        "max_batch_size": args.max_batch_size,
-    }
-    if args.architecture:
-        kw["architecture"] = args.architecture
-    if args.chunk_size:
-        kw["chunk_size"] = args.chunk_size
-    if args.preferred_batch_size:
-        kw["preferred_batch_size"] = args.preferred_batch_size
-    if args.quantization:
-        kw["quantization"] = args.quantization
-    cfg = EngineConfig(**kw)
+    if args.family == "fmha":
+        return _cmd_census_fmha(args)
+    cfg = _deploy_config(args)
     if args.manifest:
         traffic = C.TrafficModel.from_manifest(args.manifest, args.audio_root)
     else:
@@ -87,6 +80,65 @@ def _cmd_census(args) -> int:
     return 0
 
 
+def _deploy_config(args, decode_options: Optional[Dict[str, Any]] = None):
+    from oasr.engine import EngineConfig
+
+    kw: Dict[str, Any] = {
+        "ckpt_dir": args.ckpt_dir,
+        "service_mode": args.service_mode,
+        "max_batch_size": args.max_batch_size,
+    }
+    for name in ("architecture", "chunk_size", "preferred_batch_size", "quantization"):
+        if getattr(args, name, None):
+            kw[name] = getattr(args, name)
+    if decode_options:
+        kw["decode_options"] = dict(decode_options)
+    return EngineConfig(**kw)
+
+
+def _cmd_census_fmha(args) -> int:
+    """``census --family fmha``: replay the manifest, count every ``fmha`` call shape."""
+    from oasr.engine import ASREngine
+    from oasr.tune import census as C
+    from oasr.tune.attention_census import attention_census
+
+    cfg = _deploy_config(args)
+    traffic = C.TrafficModel()
+    if args.manifest:
+        traffic = C.TrafficModel.from_manifest(args.manifest, args.audio_root)
+    if args.streaming_widths:
+        traffic.streaming_widths = {int(w): 1.0 for w in args.streaming_widths}
+    engine = ASREngine(C.census_engine_config(cfg))
+    options = getattr(getattr(engine._output_processor, "strategy", None), "options", None)
+    if getattr(options, "step_graphs", False):
+        # An AR decode family captures its decoder step in a CUDA graph of its
+        # own (an ``ArOptions`` knob, not ``use_cuda_graphs``), and a replay never
+        # re-enters the recorder: every step after the capture would go uncounted.
+        # Without step graphs ``kv_storage="auto"`` turns dense, so keep the
+        # paged layout the served steps read.
+        engine.shutdown()
+        cfg = _deploy_config(args, {"step_graphs": False, "kv_storage": "paged"})
+        engine = ASREngine(C.census_engine_config(cfg))
+    waves = None
+    if args.manifest:
+        from oasr.testing.accuracy import load_audio, load_manifest
+
+        root = Path(args.audio_root) if args.audio_root else None
+        entries = load_manifest(Path(args.manifest), root, limit=args.limit)
+        waves, _ = load_audio(entries, engine.sample_rate)
+    ss = attention_census(engine, cfg, traffic, waves=waves)
+    ss.provenance["model_name"] = C.model_name(args.ckpt_dir)
+    if args.architecture:
+        ss.provenance["architecture"] = args.architecture
+    ss.save(args.out)
+    print(
+        f"[census] fmha: {len(ss.points)} call shapes over {len(ss.signatures())} signatures"
+        + ("" if waves else " (no manifest: encoder only)")
+        + f" -> {args.out}"
+    )
+    return 0
+
+
 def _resolve_out(out: str, sm: int, family: str = "gemm") -> Path:
     """Where *family*'s file goes for ``--out``.
 
@@ -104,7 +156,7 @@ def _resolve_out(out: str, sm: int, family: str = "gemm") -> Path:
     if out == "system":
         return database.system_path(sm, family)
     path = Path(out)
-    if family == "gemm":
+    if family == "gemm" or path.name == f"{family}.json":
         return path
     if path.name == "gemm.json":
         return path.with_name(f"{family}.json")
@@ -147,17 +199,86 @@ def _cmd_prebuild(args) -> int:
     return 1 if any(r.status == "failed" for r in results) else 0
 
 
+def _build_options(args):
+    from oasr.tune.build import BuildOptions
+
+    return BuildOptions(
+        min_speedup=args.min_speedup,
+        partition=args.partition,
+        cover_eps=args.eps,
+        max_points_per_sig=args.max_points,
+        thin=args.thin,
+        fill=not args.no_fill,
+        dtype_class=args.dtype_class,
+        log_path=args.log,
+        top_k=args.top_k,
+        compile_budget=args.compile_budget,
+        budget_s=args.budget_s,
+        checkpoint_path=args.checkpoint,
+        progress=(lambda s: print(f"[build] {s}", file=sys.stderr, flush=True)),
+    )
+
+
+def _write_built(args, tf, out: Path, since) -> None:
+    from oasr.tune import database
+
+    if args.note:
+        tf.provenance["notes"] = list(args.note)
+    if args.fresh:
+        database.save_file(tf, out)
+    else:
+        # Merged under the file's lock: a build takes minutes, and whatever
+        # another process wrote to the file meanwhile is kept.
+        tf = database.save_merged(tf, out, since=since)
+    print(f"[build] {tf.family}: {len(tf.entries)} entries, {len(tf.configs)} configs -> {out}")
+
+
+def _cmd_build_fmha(args, paths: Sequence[str], sm: int) -> int:
+    from oasr.tune import database
+    from oasr.tune.attention_census import AttnShapeSet
+    from oasr.tune.build_fmha import build_fmha
+
+    if not paths:
+        print("[build] fmha needs an attention census (oasr tune census --family fmha)")
+        return 1
+    merged = AttnShapeSet(points=[], provenance={})
+    sources: List[Dict[str, Any]] = []
+    for path in paths:
+        ss = AttnShapeSet.load(path)
+        sources.append({"path": os.path.basename(path), **ss.provenance})
+        merged.points.extend(ss.points)
+    merged.provenance = sources[0] if len(sources) == 1 else {"censuses": sources}
+    out = _resolve_out(args.out, sm, "fmha")
+    base = database.load_file(out, "fmha", sm) if (out.is_file() and not args.fresh) else None
+    since = None if base is None else base.to_json()
+    opts = _build_options(args)
+    if args.max_points == 24:  # the GEMM default; attention signatures need fewer
+        opts.max_points_per_sig = 12
+    tf = build_fmha(merged, sm=sm, opts=opts, base=base, allow_external=args.allow_external)
+    _write_built(args, tf, out, since)
+    return 0
+
+
 def _cmd_build(args) -> int:
     from oasr.jit.core import _get_target_sm
     from oasr.tune import database
-    from oasr.tune.build import BuildOptions, build_gemm
+    from oasr.tune.attention_census import is_attention_census
+    from oasr.tune.build import build_gemm
     from oasr.tune.build_scaled_mm import build_scaled_mm
     from oasr.tune.census import ShapeSet, kernel_family
 
     sm = _get_target_sm()
+    attn_paths = [p for p in args.census if is_attention_census(p)]
+    gemm_paths = [p for p in args.census if p not in attn_paths]
+    if args.family == "fmha" or (args.family == "auto" and not gemm_paths):
+        return _cmd_build_fmha(args, attn_paths, sm)
+    if args.family == "auto" and attn_paths:
+        rc = _cmd_build_fmha(args, attn_paths, sm)
+        if rc:
+            return rc
     merged: Optional[ShapeSet] = None
     sources: List[Dict[str, Any]] = []
-    for path in args.census:
+    for path in gemm_paths:
         ss = ShapeSet.load(path)
         sources.append({"path": os.path.basename(path), **ss.provenance})
         if merged is None:
@@ -194,21 +315,7 @@ def _cmd_build(args) -> int:
         if family in want and family not in families:
             print(f"[build] the census has no {what} {family} points (census a quantized model)")
             return 1
-    opts = BuildOptions(
-        min_speedup=args.min_speedup,
-        partition=args.partition,
-        cover_eps=args.eps,
-        max_points_per_sig=args.max_points,
-        thin=args.thin,
-        fill=not args.no_fill,
-        dtype_class=args.dtype_class,
-        log_path=args.log,
-        top_k=args.top_k,
-        compile_budget=args.compile_budget,
-        budget_s=args.budget_s,
-        checkpoint_path=args.checkpoint,
-        progress=(lambda s: print(f"[build] {s}", file=sys.stderr, flush=True)),
-    )
+    opts = _build_options(args)
     builders: Dict[str, Callable[..., Any]] = {
         "gemm": build_gemm,
         "scaled_mm": build_scaled_mm,
@@ -219,15 +326,7 @@ def _cmd_build(args) -> int:
         base = database.load_file(out, family, sm) if (out.is_file() and not args.fresh) else None
         since = None if base is None else base.to_json()
         tf = builders[family](merged, sm=sm, opts=opts, base=base)
-        if args.note:
-            tf.provenance["notes"] = list(args.note)
-        if args.fresh:
-            database.save_file(tf, out)
-        else:
-            # Merged under the file's lock: a build takes minutes, and whatever
-            # another process wrote to the file meanwhile is kept.
-            tf = database.save_merged(tf, out, since=since)
-        print(f"[build] {family}: {len(tf.entries)} entries, {len(tf.configs)} configs -> {out}")
+        _write_built(args, tf, out, since)
     return 0
 
 
@@ -335,6 +434,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="observed active-stream counts (default: uniform 1..max)",
     )
     c.add_argument("--capture", help="also merge an OASR_CAPTURE_GEMM JSON (decode paths)")
+    c.add_argument(
+        "--family",
+        choices=("gemm", "fmha"),
+        default="gemm",
+        help="gemm: the GEMM-family census (probes the engine's keys); fmha: the attention "
+        "census (replays --manifest through the engine, decode steps included)",
+    )
+    c.add_argument("--limit", type=int, help="fmha: replay at most this many utterances")
     c.add_argument("--coverage", type=float, default=0.97)
     c.add_argument("--out", required=True)
     c.set_defaults(func=_cmd_census)
@@ -348,10 +455,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     b.add_argument(
         "--family",
-        choices=("auto", "gemm", "scaled_mm", "scaled_mm_fp8"),
+        choices=("auto", "gemm", "scaled_mm", "scaled_mm_fp8", "fmha"),
         default="auto",
-        help="which kernel family's file to build (auto: every family the census has points "
-        "for -- scaled_mm when it has int8 points, scaled_mm_fp8 when it has fp8 ones)",
+        help="which kernel family's file to build (auto: every family the censuses have points "
+        "for -- scaled_mm when one has int8 points, scaled_mm_fp8 when it has fp8 ones, fmha "
+        "for an attention census)",
+    )
+    b.add_argument(
+        "--allow-external",
+        action="store_true",
+        help="fmha: let torch SDPA win a region (it is always measured, as a reference; a "
+        "region it wins is a policy hit at every dispatch)",
     )
     b.add_argument(
         "--note",
