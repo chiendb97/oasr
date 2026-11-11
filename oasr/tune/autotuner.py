@@ -1298,13 +1298,22 @@ _active_cache_path: Optional[str] = None
 
 
 def _ensure_backends_registered() -> None:
-    """Import backend modules to trigger registration."""
+    """Import backend modules to trigger registration, then add every runner's entries.
+
+    The built-in candidates are registered by ``oasr.tune.backends``; a runner
+    registered with ``oasr.tune.runners`` contributes its own through
+    ``Runner.backend_entries``, once, so the build and ``oasr.autotune()``
+    measure it without an edit here.
+    """
     from .backends import (  # noqa: F401
         conv2d as _conv2d_backends,
         gemm as _gemm_backends,
         recurrent as _recurrent_backends,
         torch_gemm as _torch_gemm_backends,
     )
+    from .runners import register_backend_entries
+
+    register_backend_entries(_global_registry)
 
 
 def is_tuning_enabled() -> bool:

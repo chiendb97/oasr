@@ -20,4 +20,5 @@ Kernel selection from measured data, per GPU architecture. User documentation:
 | `telemetry.py` | Runtime misses as the next census |
 | `cli.py` | `oasr tune census|build|prebuild|evaluate|diff|status|export-misses` |
 | `autotuner.py`, `backends/` | The runtime `oasr.autotune()` (FlashInfer-style registry + cache), on the same protocol |
+| `runners/` | The backends a region selects among (OASR lanes, cuBLAS, ...): registry, traits, versions, and the bind a dispatcher calls |
 | `capture.py` | The GEMM shape recorder (`OASR_CAPTURE_GEMM`) the census probes use |

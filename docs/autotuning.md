@@ -81,7 +81,8 @@ dynamic dimension:
   the largest measured one falls through to the next tier.
 - **Configs are explicit parameters** (`"configs": {id: {"tile": [...], "warp":
   [...], "stages": 3, ...}}`), never an import-time sentinel; `"default"`,
-  `"torch"` and `"fused"` are the three sentinels.
+  `"torch"` and `"fused"` are the three sentinels. Every config's `"kind"`
+  names the [runner](#runners-backends-a-region-selects-among) that serves it.
 - `dt=half` serves fp16 and bf16 alike (measured in one, verified to carry to the
   other); a `dt=fp16`/`dt=bf16` entry wins over it for its own dtype.
 - Conv1D entries use exact `points` (`"1x3000"`) until they are re-measured as
@@ -89,10 +90,12 @@ dynamic dimension:
 
 **Validators.** *Hard* (schema, kernel family, arch family, MMA lane): a mismatch
 makes the file unusable and it is skipped with a warning. *Soft* (kernel
-implementation hash, SKU, nvcc, CUTLASS stamp): a mismatch keeps the file in
-service and marks it **stale** (`oasr tune status`) — a stale entry can only be
-slower than a fresh tune, because every config is checked against the compiled
-set and the static feasibility predicates at resolve time.
+implementation hash, SKU, nvcc, CUTLASS stamp, and each runner's library
+versions under `"runners"`): a mismatch keeps the file in service and marks it
+**stale** (`oasr tune status`) — a stale entry can only be slower than a fresh
+tune, because every config is checked against the compiled set, the static
+feasibility predicates and its runner at resolve time. A runner's version change
+makes stale only the entries that select that runner.
 
 The soft validators describe the entries, not the last writer:
 - **Re-stamping:** a write stamps the file with the writer's validators. Every
@@ -188,6 +191,86 @@ names a tile, or the heuristic (an illustrative entry):
   tier before capture (one `budget_s` for both families), and the tuning report
   ends with one line per quantized model: `scaled_mm: 96 quantized layer(s) over
   5 signature(s): 96 with a tuning entry (system=96), 0 on the shape heuristic`.
+
+## Runners: backends a region selects among
+
+`oasr/tune/runners/`. A **runner** is one backend that can serve a kernel
+family's operations, and a **tactic** is one configuration inside it. Tuning is
+a joint search over `(runner, tactic)` pairs under the one benchmark protocol,
+and a region names the winner. The file format already carries the runner: a
+config's `"kind"` is owned by exactly one runner of its family.
+
+| Family | Runner | Kinds | External | Dispatch |
+|---|---|---|---|---|
+| `gemm` | `oasr_cutlass` | `cutlass`, `default` | no | the compiled variant, by name |
+| `gemm` | `oasr_fused` | `fused` | no | the CTC head's single-call launcher |
+| `gemm` | `cublas` | `torch` | **yes** | `Runner.bind` → `oasr.functionals.gemm_torch` |
+| `conv1d` | `oasr_cutlass` | `cutlass`, `default` | no | the family's own resolver |
+| `scaled_mm`, `scaled_mm_fp8` | `oasr_cutlass` | `cutlass`, `heuristic` | no | the family's own resolver |
+
+**What a runner declares.** `RunnerTraits`: `capturable` (may serve a shape a
+captured graph reaches), `batch_invariant` (a runner-wide guarantee that rows do
+not depend on M), `numerics` (`bitwise` or `tolerance`), `external` (not an OASR
+kernel), and `compiled` (its tactics are OASR JIT variants, so only these count
+against the compile budget and the coverage basis). `versions()` names the
+library versions its timings depend on.
+
+**Adding one** is a subclass and a `register_runner` call, with no edit to the
+tuner, the database or the dispatcher (AGENTS rule 1):
+
+```python
+from oasr.tune.runners import Runner, RunnerTraits, register_runner
+
+class MyGemm(Runner):
+    name, family = "mylib", "gemm"
+    kinds = ("mylib",)            # the config kind its tactics are stored under
+    backends = ("mylib",)         # its Tactic.backend in the oasr.autotune() registry
+    ops = ("gemm", "bmm")
+    traits = RunnerTraits(capturable=True, external=True)
+
+    def unavailable(self):        # None, or why it cannot run here
+        ...
+    def versions(self):           # soft validators
+        return {"mylib": mylib.__version__}
+    def supports(self, op, M, N, K, dtype):   # None, or why it refuses this problem
+        ...
+    def bind(self, op, choice):   # once per shape; host work only; output first
+        return lambda out, A, B, C=None, split_k=1: ...
+    def backend_entries(self):    # candidates for `oasr tune build` and oasr.autotune()
+        ...
+
+register_runner(MyGemm())
+```
+
+**Resolution.** A region naming a runner's config is served only if a runner of
+that family owns the kind, the runner is available, it serves the op, and
+`supports()` accepts the problem. Otherwise the lookup falls through to the next
+tier and says so once. One config of a runner this process lacks used to make
+the whole file unreadable; now it costs only its own regions. A refused shape is
+not a declared gap: the fall-through lands on an OASR kernel.
+
+**Dispatch.** The GEMM dispatcher binds a runner choice once per shape, when it
+first plans it, into its memoised plan (`_PLAN_RUNNER`); the call path invokes
+the bound callable, which takes the `gemm_torch` calling convention. `bind` may
+plan on the host but must not launch device work: a shape can first be seen
+inside a capture. cuBLAS takes
+this path.
+
+**Accounting.** The dispatcher counts each new plan by the runner it runs on
+(`database.runner_counts()`, and a `kernel dispatch by runner` block in
+`tuning_report()`, where `*` marks an external runner). It counts the plan, not
+the resolution, because the batch-invariant selector reads the tuned choice and
+may drop it. A plan on an external runner is also a policy hit
+(`tuned-cublas:gemm.gemm` in `oasr.layers._backend.policy_hits()` and
+`format_gap_report()`). A library winning on a shape is a measured decision and
+a standing argument for kernel work, not a silent bypass.
+
+**Build.** A runner contributes autotuner candidates through
+`backend_entries()`. `gemm_tune.choice_of` maps its tactics back to choices
+named by `Runner.config_id`, and those flow through measurement, the numerics
+gate, partition and the file unchanged. They are never pruned by the cost model
+and never dropped by the compile budget. An arm whose issue time was not
+measured borrows the median of its `issue_class` (all OASR launchers share one).
 
 ## The cost model
 

@@ -631,7 +631,9 @@ class TestDispatchPlanCache:
         try:
             jg.select_default_config = lambda *a, **k: "torch"
             second = fg._plan(*args)
-            assert second[1] == fg._PLAN_TORCH
+            from oasr.functionals.gemm_torch import torch_gemm
+
+            assert second[1] == fg._PLAN_RUNNER and second[2] is torch_gemm
             assert second[0] is not first[0], "the plan must record which resolver made it"
         finally:
             jg.select_default_config = orig
@@ -669,7 +671,7 @@ class TestDispatchPlanCache:
                 expect = jg.select_default_config(op, M, N, K, torch.bfloat16, _SM)
                 kind = fg._plan(op, False, M, N, K, torch.bfloat16)[1]
                 if expect == "torch":
-                    assert kind == fg._PLAN_TORCH, (op, N, K, M)
+                    assert kind == fg._PLAN_RUNNER, (op, N, K, M)
                 elif expect == "fused":
                     assert kind == fg._PLAN_FUSED, (op, N, K, M)
                 else:

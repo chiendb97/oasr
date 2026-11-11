@@ -114,6 +114,14 @@ def choice_of(tactic, sm: Optional[int] = None):
         from oasr.jit.core import _get_target_sm
 
         sm = _get_target_sm()
+    if tactic.backend != "cutlass":
+        # Any other backend is a registered runner's: it names its own choice.
+        from oasr.tune.runners import runner_for_backend
+
+        runner = runner_for_backend("gemm", tactic.backend)
+        if runner is None:
+            raise ValueError(f"no GEMM runner owns autotuner backend {tactic.backend!r}")
+        return runner.choice_from_tactic(tactic, sm)
     d = dict(tactic.config)
     cfg: "jg.CutlassGemmConfig | jg.CutlassGemmConfigSm90"
     if "block_m" in d:
@@ -166,9 +174,11 @@ def structural_key(m: bench.Measurement) -> Tuple:
     the smaller tile, fewer stages, smaller split.  The order the tuner has
     always used (``_pick_winner``), so re-tunes agree with the history.
     """
+    from oasr.tune.runners import RunnerChoice
+
     choice = m.payload
-    if choice == "torch":
-        return (2, 0, 0, 0, 0)
+    if choice == "torch" or isinstance(choice, RunnerChoice):
+        return (2, 0, 0, 0, 0)  # a library call: cuBLAS and every other runner
     if isinstance(choice, str):
         return (0, 0, 0, 0, 0)
     if getattr(choice, "stream_k", False):

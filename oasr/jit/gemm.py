@@ -14,7 +14,7 @@ import itertools
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, TypeGuard, Union
 
 from . import env
 from .core import _TARGET_SMS, GeneratedSource, JitSpec, _get_target_sm, gen_jit_spec
@@ -975,10 +975,10 @@ def _tuned_compile_names(sm: int) -> List[str]:
     for _tier, tf in database.tiers("gemm", sm).ordered():
         for cid in tf.referenced_configs():
             try:
-                choice = gemm_config_from_params(tf.configs[cid], sm)
+                choice = gemm_config_from_params(tf.configs[cid], sm, config_id=cid)
             except (KeyError, TypeError, ValueError):
                 continue
-            if not isinstance(choice, str):
+            if is_kernel_variant(choice):
                 names.append(choice.compile_name)
     return names
 
@@ -1389,14 +1389,38 @@ GEMM_LANE_BY_SM: Dict[int, str] = {
 #: identity callers compare against -- not a parameter set.
 _SENTINEL_IDS = ("torch", "fused", "default")
 
-GemmChoice = Union[CutlassGemmConfig, CutlassGemmConfigSm90, str]
+#: The config kinds this module decodes itself.  Any other kind belongs to a
+#: runner (:mod:`oasr.tune.runners`) and decodes to a ``RunnerChoice``.
+_OWN_KINDS = ("cutlass", "default", "torch", "fused")
+
+#: A CUTLASS config, a sentinel string, or an ``oasr.tune.runners.RunnerChoice``.
+GemmChoice = Union[CutlassGemmConfig, CutlassGemmConfigSm90, str, Any]
+
+
+def _runner_choice_type():
+    from oasr.tune.runners import RunnerChoice
+
+    return RunnerChoice
+
+
+def is_kernel_variant(
+    choice: GemmChoice,
+) -> TypeGuard[Union[CutlassGemmConfig, CutlassGemmConfigSm90]]:
+    """Whether *choice* is a compiled CUTLASS variant of this module.
+
+    ``False`` for the sentinels and for every runner choice: those bring their
+    own kernels, so they cost no JIT build and take no slot in the production
+    compile set.  :data:`GEMM_DEFAULT` is a variant (always compiled).
+    """
+    return isinstance(choice, (CutlassGemmConfig, CutlassGemmConfigSm90))
 
 
 def gemm_config_id(choice: GemmChoice) -> str:
     """The stable, human-readable id a choice is stored under.
 
     The config's ``name`` without its ``sm<N>_`` prefix: the prefix is the
-    file's arch, stated once in the file rather than on every id.
+    file's arch, stated once in the file rather than on every id.  A runner
+    choice carries the id it was stored or measured under.
     """
     if isinstance(choice, str):
         if choice not in ("torch", "fused"):
@@ -1404,6 +1428,8 @@ def gemm_config_id(choice: GemmChoice) -> str:
         return choice
     if choice is GEMM_DEFAULT:
         return "default"
+    if isinstance(choice, _runner_choice_type()):
+        return str(choice.config_id)
     return choice.name.split("_", 1)[1]
 
 
@@ -1416,6 +1442,9 @@ def gemm_config_to_params(choice: GemmChoice, *, sentinel_default: bool = True) 
     """
     if isinstance(choice, str) or (sentinel_default and choice is GEMM_DEFAULT):
         return {"kind": gemm_config_id(choice)}
+    if isinstance(choice, _runner_choice_type()):
+        params: Dict[str, Any] = choice.params
+        return params
     if isinstance(choice, CutlassGemmConfig):
         return {
             "kind": "cutlass",
@@ -1442,13 +1471,29 @@ def gemm_config_to_params(choice: GemmChoice, *, sentinel_default: bool = True) 
     }
 
 
-def gemm_config_from_params(params: Dict[str, Any], sm: int) -> GemmChoice:
-    """Inverse of :func:`gemm_config_to_params` for arch family *sm*."""
+def gemm_config_from_params(
+    params: Dict[str, Any], sm: int, config_id: Optional[str] = None
+) -> GemmChoice:
+    """Inverse of :func:`gemm_config_to_params` for arch family *sm*.
+
+    A kind this module does not own decodes to a ``RunnerChoice`` under
+    *config_id* (the id the file stores it under) -- whether or not a runner in
+    this process owns it.  That is decided where it would be served
+    (:func:`select_default_config`), so one config of a runner this process
+    lacks makes that region fall through instead of the whole file unreadable.
+    """
     kind = params.get("kind")
     if kind == "default":
         return GEMM_DEFAULT
     if kind in ("torch", "fused"):
         return str(kind)
+    if isinstance(kind, str) and kind and kind not in _OWN_KINDS:
+        from oasr.tune.runners import RunnerChoice, runner_for_kind
+
+        runner = runner_for_kind("gemm", kind)
+        if runner is not None:
+            return runner.decode(params, config_id)
+        return RunnerChoice.of(kind, config_id or kind, params)
     if kind != "cutlass":
         raise ValueError(f"unknown GEMM config kind {kind!r}")
     tile = [int(v) for v in params["tile"]]  # type: ignore[union-attr]
@@ -1561,7 +1606,9 @@ def _table_from_file(tf, dtype_class: str) -> _RuleTable:
         for m_max, cid in entry.regions:
             choice = decoded.get(cid)
             if choice is None:
-                choice = decoded[cid] = gemm_config_from_params(tf.configs[cid], tf.arch_family)
+                choice = decoded[cid] = gemm_config_from_params(
+                    tf.configs[cid], tf.arch_family, config_id=cid
+                )
             rules.append((m_max, choice))
         table[(fields["op"], int(fields["N"]), int(fields["K"]))] = rules
     return table
@@ -1674,8 +1721,11 @@ def mark_tuning_module_loaded(sm: int) -> None:
 
 
 def _is_compiled(choice: GemmChoice, sm: int) -> bool:
-    """Can *choice* be dispatched on arch family *sm*?  Sentinels always can."""
-    if isinstance(choice, str) or choice is GEMM_DEFAULT:
+    """Is *choice* in *sm*'s compile set?  Sentinels and runner choices compile nothing.
+
+    Whether a runner can serve its choice here is :func:`_runner_refusal`.
+    """
+    if isinstance(choice, (str, _runner_choice_type())) or choice is GEMM_DEFAULT:
         return True
     names = _COMPILED_NAMES.get(sm)
     if names is None:
@@ -1845,10 +1895,14 @@ def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
         had_rules = True
         for m_max, choice in rules:
             if m_max is None or M <= m_max:
-                if _is_compiled(choice, sm):
+                why = _runner_refusal(op, choice, M, N, K, dtype)
+                if why is not None:
+                    _note_unservable(tier, key, choice, why)
+                elif _is_compiled(choice, sm):
                     record_tier("gemm", op, tier)
                     return choice
-                _note_uncompiled(tier, key, choice, sm)
+                else:
+                    _note_uncompiled(tier, key, choice, sm)
                 break
     if not had_rules:
         st = _RULE_MISSES.get(key)
@@ -1862,6 +1916,39 @@ def select_default_config(op: str, M: int, N: int, K: int, dtype, sm: int):
             return choice
     record_tier("gemm", op, "default")
     return GEMM_DEFAULT
+
+
+def _runner_refusal(op: str, choice: GemmChoice, M: int, N: int, K: int, dtype) -> Optional[str]:
+    """Why a tuned *choice* outside this module's own configs cannot serve the shape.
+
+    ``None`` for this module's CUTLASS configs (the compile-set check is
+    :func:`_is_compiled`).  The rest -- the sentinels and every runner choice --
+    must have a runner here that serves the op and the problem.
+    """
+    if not isinstance(choice, (str, _runner_choice_type())):
+        return None
+    from oasr.tune.runners import unservable
+
+    return unservable("gemm", op, choice, int(M), int(N), int(K), dtype)
+
+
+_UNSERVABLE_WARNED: set = set()
+
+
+def _note_unservable(tier: str, key, choice: GemmChoice, why: str) -> None:
+    """A rule named a runner choice this process cannot serve: say so once, fall through."""
+    wkey = (tier, key, gemm_config_id(choice) if not isinstance(choice, str) else choice)
+    if wkey in _UNSERVABLE_WARNED:
+        return
+    _UNSERVABLE_WARNED.add(wkey)
+    logger.warning(
+        "GEMM %s-tier rule for %s names %s, which this process cannot serve (%s); "
+        "falling through",
+        tier,
+        key,
+        wkey[2],
+        why,
+    )
 
 
 #: ``OASR_TUNE_MODEL_FALLBACK``: ``auto`` (default) ranks a shape no tuning entry

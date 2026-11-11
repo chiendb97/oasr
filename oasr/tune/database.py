@@ -35,7 +35,9 @@ the kernel family, the architecture family and its MMA lane.  A mismatch makes
 the file unusable and it is skipped, loudly.
 
 *Soft* validators decide whether it is *current* -- the kernel implementation
-hash, the SKU, the nvcc and CUTLASS versions.  A mismatch keeps the file in
+hash, the SKU, the nvcc and CUTLASS versions, and the library versions of each
+runner (:mod:`oasr.tune.runners`; cuBLAS, say) -- that last one counted only
+against the entries that select that runner.  A mismatch keeps the file in
 service and marks it stale.  That is deliberately gentler than TensorRT or XLA,
 which drop on any mismatch: their entries are opaque tactic ids that may no
 longer exist, whereas an entry here is an explicit parameter set that the
@@ -107,7 +109,9 @@ __all__ = [
     "register_soft_validator",
     "current_soft_validators",
     "record_tier",
+    "record_runner",
     "tier_counts",
+    "runner_counts",
     "reset_tier_counts",
     "tuning_report",
     "hash_paths",
@@ -379,12 +383,23 @@ def register_soft_validator(family: str, fn: Callable[[], Dict[str, Any]]) -> No
 
 
 def current_soft_validators(family: str) -> Dict[str, Any]:
-    """The soft validators a file for *family* written now would carry."""
+    """The soft validators a file for *family* written now would carry.
+
+    ``"runners"`` holds the library versions of every runner of the family that
+    can run here (:meth:`oasr.tune.runners.Runner.versions`).  A mismatch there
+    makes stale only the entries that select that runner.
+    """
     out = dict(_common_soft_validators())
     fn = _SOFT_VALIDATORS.get(family)
     if fn is not None:
         with contextlib.suppress(Exception):
             out.update(fn())
+    with contextlib.suppress(Exception):
+        from oasr.tune.runners import runner_versions
+
+        versions = runner_versions(family)
+        if versions:
+            out["runners"] = versions
     return out
 
 
@@ -432,24 +447,59 @@ def _stale_reasons(tf: TuningFile) -> List[str]:
     under other validators (:attr:`Entry.soft`) is reported against its own.
     """
     current = current_soft_validators(tf.family)
-    reasons = _soft_mismatches(tf.validators.get("soft", {}), current)
-    own: Dict[str, Tuple[Dict[str, Any], int]] = {}
+    stamped = [e for e in tf.entries.values() if e.soft is None]
+    reasons = _soft_mismatches(tf.validators.get("soft", {}), current, _runners_used(tf, stamped))
+    own: Dict[str, Tuple[Dict[str, Any], List[Entry]]] = {}
     for entry in tf.entries.values():
         if entry.soft is not None:
             tag = json.dumps(entry.soft, sort_keys=True)
-            saved, n = own.get(tag, (entry.soft, 0))
-            own[tag] = (saved, n + 1)
-    for saved, n in own.values():
-        for reason in _soft_mismatches(saved, current):
+            own.setdefault(tag, (entry.soft, []))[1].append(entry)
+    for saved, group in own.values():
+        n = len(group)
+        for reason in _soft_mismatches(saved, current, _runners_used(tf, group)):
             reasons.append(f"{n} entr{'y' if n == 1 else 'ies'} measured under {reason}")
     return reasons
 
 
-def _soft_mismatches(saved_validators: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
+def _runners_used(tf: TuningFile, entries: Iterable[Entry]) -> Dict[str, int]:
+    """``{runner name: entries selecting it}`` over *entries*, by their configs' kinds."""
+    from oasr.tune.runners import runner_for_kind
+
+    used: Counter = Counter()
+    for entry in entries:
+        names = set()
+        for cid in [c for _, c in entry.regions] + list(entry.points.values()):
+            kind = tf.configs.get(cid, {}).get("kind")
+            runner = None if kind is None else runner_for_kind(tf.family, str(kind))
+            if runner is not None:
+                names.add(runner.name)
+        used.update(names)
+    return dict(used)
+
+
+def _soft_mismatches(
+    saved_validators: Dict[str, Any],
+    current: Dict[str, Any],
+    used: Optional[Dict[str, int]] = None,
+) -> List[str]:
+    """Readable mismatches of *saved_validators* against *current*.
+
+    ``"runners"`` is compared runner by runner, and only for the runners in
+    *used* (``None``: every runner): a library nobody's entry selects cannot
+    make an entry stale.
+    """
     reasons = []
     for key, saved in sorted(saved_validators.items()):
         now = current.get(key)
         if now is None or saved in (None, "*"):
+            continue
+        if key == "runners" and isinstance(saved, dict) and isinstance(now, dict):
+            for name, was in sorted(saved.items()):
+                is_now = now.get(name)
+                if is_now is None or was in (None, "*") or (used is not None and name not in used):
+                    continue
+                if was != is_now:
+                    reasons.append(f"runner {name}: saved {was!r}, now {is_now!r}")
             continue
         if key == "sku" and isinstance(saved, dict) and isinstance(now, dict):
             # The identity that moves a crossover is (SM count, L2); a name
@@ -822,17 +872,51 @@ def flush_user(reload_after: bool = True) -> List[Path]:
 #: resolution, not per call: the per-call path is a memoised plan.
 _TIER_COUNTS: "Counter[Tuple[str, str, str]]" = Counter()
 
+#: ``(kernel family, op, runner name) -> dispatch plans``: which runner each
+#: distinct shape was *dispatched* to.  Recorded by the dispatcher, not the
+#: resolver, because a caller may resolve and then not use the answer (the
+#: batch-invariant selector reads the tuned choice and keeps it only if it is
+#: in its class).
+_RUNNER_COUNTS: "Counter[Tuple[str, str, str]]" = Counter()
+
 
 def record_tier(family: str, op: str, tier: str) -> None:
     _TIER_COUNTS[(family, op, tier)] += 1
+
+
+def record_runner(family: str, op: str, runner: str) -> None:
+    """Count one dispatch plan by the runner it runs on.
+
+    A plan on an *external* runner (one whose kernels are not OASR's) is also a
+    policy hit (``oasr.layers._backend.policy_hits``): a measured decision that
+    a library is faster here today, so a standing argument for kernel work
+    rather than an invisible bypass.
+    """
+    _RUNNER_COUNTS[(family, op, runner)] += 1
+    from oasr.tune.runners import get_runner
+
+    r = get_runner(family, runner)
+    if r is None or not r.traits.external:
+        return
+    try:
+        from oasr.layers._backend import take_policy
+    except Exception:  # noqa: BLE001 -- accounting must never break a dispatch
+        return
+    take_policy(f"tuned-{runner}:{family}.{op}")
 
 
 def tier_counts() -> Dict[Tuple[str, str, str], int]:
     return dict(_TIER_COUNTS)
 
 
+def runner_counts() -> Dict[Tuple[str, str, str], int]:
+    """``(family, op, runner) -> distinct shapes dispatched``, since the last reset."""
+    return dict(_RUNNER_COUNTS)
+
+
 def reset_tier_counts() -> None:
     _TIER_COUNTS.clear()
+    _RUNNER_COUNTS.clear()
 
 
 #: The order :func:`tuning_report` lists tiers in: measured first, then each
@@ -860,6 +944,21 @@ def tuning_report(families: Optional[Iterable[str]] = None) -> str:
         for (family, op), c in sorted(by_family.items()):
             parts = ", ".join(f"{t}={c[t]}" for t in _REPORT_TIERS if c.get(t))
             lines.append(f"    {family}.{op:<18} {parts}")
+    by_runner: Dict[Tuple[str, str], Counter] = {}
+    for (family, op, runner), n in _RUNNER_COUNTS.items():
+        if wanted is None or family in wanted:
+            by_runner.setdefault((family, op), Counter())[runner] += n
+    if by_runner:
+        from oasr.tune.runners import get_runner
+
+        lines.append("kernel dispatch by runner (distinct shapes; * = not an OASR kernel):")
+        for (family, op), c in sorted(by_runner.items()):
+            labels = []
+            for name, n in sorted(c.items(), key=lambda kv: (-kv[1], kv[0])):
+                r = get_runner(family, name)
+                star = "*" if r is not None and r.traits.external else ""
+                labels.append(f"{name}{star}={n}")
+            lines.append(f"    {family}.{op:<18} {', '.join(labels)}")
     for t in list(_TIERS.values()):
         if wanted is not None and t.family not in wanted:
             continue
