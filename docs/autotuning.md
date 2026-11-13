@@ -301,6 +301,94 @@ Each is now a family whose regions name a *path* (`oasr/jit/recurrent_select.py`
   recurrence imposes. Numerics against an fp32 formula within four times the
   error of today's path (`auto`, measured to the end); the GEMM build's partition.
 
+## Inductor as a fusion reference (`oasr tune compare-inductor`)
+
+`oasr/tune/inductor.py`. A benchmark, not a runner: it writes a report and never
+a tuning file. The question it answers is which fusions or GEMM tiles
+`torch.compile` finds that OASR's kernels miss. Each answer is kernel work for
+OASR, not a backend to serve: Inductor's code depends on the torch and Triton
+versions, it compiles per shape, and it can only see the layers' torch path.
+
+```bash
+set -a; source .env; set +a
+oasr tune compare-inductor --ckpt-dir $CKPT_DIR --out .artifacts/inductor
+oasr tune compare-inductor --ckpt-dir $OASR_PARAFORMER_CKPT --dtype bfloat16 \
+    --blocks EncoderLayerSANM --batches 1,16 --seconds 8
+```
+
+**Blocks.** A block is a non-leaf module the encoder repeats: the layer and the
+feed-forward, attention and convolution modules inside it. The command takes one
+block per class and set of weight shapes, so a Zipformer stack of another width
+is its own block. A leaf module is a single kernel, which the GEMM and conv
+tables already cover. `--blocks` filters by class name or by part of the module
+path.
+
+**Arguments.** The command does not synthesise arguments; it records them. It
+runs one offline encoder forward on the CPU (fp32, real weights) for each batch
+size and length. A pre-hook on each block records its first call, and the
+forward stops once every block has been reached. The masks, positional
+embeddings and keyword arguments are what the model really passes, so any
+architecture works without an adapter. A fixed-window frontend (Whisper,
+Qwen2-Audio) always feeds its window, so every length gives one shape.
+
+**Arms**, each the block in the served dtype on the current GPU:
+
+| Arm | What runs |
+|---|---|
+| `oasr` | the OASR kernels: what serves |
+| `torch` | the layers' torch path (`OASR_LAYERS_BACKEND=torch`), eager: Inductor's input |
+| `inductor` | `torch.compile` of the torch path, default mode: the pointwise and reduction glue fused, GEMMs on ATen |
+| `inductor-max` | `max-autotune-no-cudagraphs` with `--backends` (default `ATEN,TRITON,CUTLASS,CUTEDSL`): Triton GEMM templates with fused epilogues, plus whatever the CUTLASS and CuTeDSL generators offer on this architecture |
+
+All four arms go through [the benchmark protocol](#the-benchmark-protocol):
+graph-captured loops, rotated weight copies sized by the model's weight bytes
+(`--max-copy-mib` bounds them), and interleaved rounds. Inductor's own CUDA
+graphs stay off because the harness captures every arm itself. One compiled
+graph serves every weight copy, since parameters are graph inputs. Compiles skip
+Inductor's FX and autotune caches, so each compile is real, timed and recorded.
+
+**Isolation.** Each shape is measured in a child process (`--in-process`
+measures in the command's own process instead). Inductor's autotuning launches
+candidate kernels, and one that faults can leave a sticky CUDA error, after
+which no number from that process can be trusted. Inductor catches the exception,
+so the fault surfaces at the next CUDA call. When a child dies, the block it was
+on is recorded as failed, with the child's last error (all of the children's
+stderr is kept in `<stem>.children.log`), and a fresh child measures the
+remaining blocks. `--autotune-subproc` decides where `inductor-max` benchmarks
+its candidates. In-process, a layer's few hundred candidate modules stay loaded,
+which runs a shared GPU out of memory. In Inductor's tuning subprocess, one
+sm120 run left a misaligned-address fault in the parent. `auto` (the default)
+uses the subprocess only when the GPU has under 8 GiB free.
+
+**What the report holds** (`<stem>.json` with every number, `<stem>.md` for
+reading):
+
+- **Timing:** per block and shape, each arm's time and sigma, OASR time divided
+  by the best compiled time, and a verdict. Inductor is *ahead* when it is at
+  least `--gap` faster (default 5 %) and the difference exceeds three combined
+  sigmas.
+- **Numerics:** each arm is compared with the block in fp32 and passes when its
+  error is within four times the eager torch arm's (`bench.numerics_ok`). A
+  compiled arm that fails is reported, never counted as a win.
+- **Kernel inventory:** the kernels one call launches, from the profiler, each
+  named by the aten op that launched it (`aten::masked_fill_`) or by its own
+  demangled name (an OASR launcher, an Inductor Triton kernel). The ops fused
+  into an Inductor kernel are read from the kernel's name, leaving out
+  layout-only ops.
+- **Kernel to-do:** the blocks where Inductor is ahead, worst shape first. Each
+  entry gives OASR's kernels, the torch kernels still on the OASR path, the
+  winning arm's kernels, and its graph breaks.
+- **Inductor autotune:** for every autotuned op, the candidates each backend
+  offered and the backend that won, recorded through Inductor's feedback hook. A
+  backend that cannot generate for this GPU shows up as offering nothing.
+
+**Reading it.** A *graph break* is a call Dynamo cannot trace, such as an OASR
+kernel the torch path still reaches (the fused attention, for example). That
+call runs as itself inside the compiled arm, and Inductor cannot fuse across it,
+so Inductor's time is the conservative one. Only encoders are covered: offline
+forward, unquantized. Decoder steps and streaming chunks carry state that a
+recorded call cannot replay.
+
 ## Runners: backends a region selects among
 
 `oasr/tune/runners/`. A **runner** is one backend that can serve a kernel
