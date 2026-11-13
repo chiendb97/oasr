@@ -15,6 +15,7 @@
     oasr tune diff oasr/tune/db/sm120/gemm.json ~/.cache/oasr/tune/v2/sm120/gemm.json
     oasr tune status
     oasr tune export-misses --out misses.json               # after a workload ran
+    oasr tune compare-inductor --ckpt-dir CKPT --out .artifacts/inductor  # a report, not a file
 
 ``build`` measures on the GPU it runs on and writes the file for that GPU's
 architecture family; a shipped file for another family is built on that family
@@ -24,6 +25,9 @@ of a quantized model also holds 8-bit points: ``build`` then writes
 (``--family`` restricts it to one).  An attention census (``census --family
 fmha``) replays the manifest through the engine and is built into ``fmha.json``:
 which attention lane, and which tile or split-KV setting, serves each shape.
+``compare-inductor`` is a benchmark, not a tuner: it times ``torch.compile`` of
+each repeated encoder block against the OASR path and writes a report of the
+fusions Inductor finds that OASR's kernels miss (``oasr.tune.inductor``).
 """
 
 from __future__ import annotations
@@ -495,6 +499,234 @@ def _cmd_evaluate(args) -> int:
     return 0
 
 
+def _ints(text: str) -> List[int]:
+    return [int(x) for x in str(text).replace(",", " ").split()]
+
+
+def _floats(text: str) -> List[float]:
+    return [float(x) for x in str(text).replace(",", " ").split()]
+
+
+def _cmd_compare_inductor(args) -> int:
+    """``compare-inductor``: ``torch.compile`` of each repeated encoder block vs OASR.
+
+    A benchmark only (``oasr.tune.inductor``): it writes a report, never a
+    tuning file.  Each shape is measured in a child process (``--in-process``
+    measures here): a compiled arm can leave a sticky CUDA error -- a Triton
+    candidate faulting inside Inductor's autotuning -- and no later number in
+    that process can be trusted, so the block it was on is recorded as failed and
+    a fresh child carries on with the rest.
+    """
+    import datetime
+    import re
+    import shutil
+    import tempfile
+
+    import torch
+
+    from oasr.models.loaders import load_pretrained
+    from oasr.tune import bench, inductor as ind
+    from oasr.tune.census import model_name
+
+    ckpt = args.ckpt_dir or os.environ.get("CKPT_DIR")
+    if not ckpt:
+        raise SystemExit("compare-inductor: --ckpt-dir is required (or export CKPT_DIR)")
+    if not torch.cuda.is_available():
+        raise SystemExit("compare-inductor measures on a GPU; none is visible")
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
+    backends = [b.strip().upper() for b in args.backends.split(",") if b.strip()]
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    batches, seconds = _ints(args.batches), _floats(args.seconds)
+    loaded = load_pretrained(ckpt, device="cpu", architecture=args.architecture)
+    encoder = loaded.model.encoder
+    policy = (
+        bench.BenchPolicy(solo=False, stage_rounds=(2, 3, 5))
+        if args.quick
+        else bench.BenchPolicy(solo=False)
+    )
+    subproc = ind.autotune_subproc(args.autotune_subproc)
+    paths = [p for p in args.paths.split(",") if p] if args.paths else None
+    measure = functools.partial(
+        ind.compare,
+        encoder,
+        loaded.feature_spec,
+        select=args.blocks or None,
+        paths=paths,
+        arms=arms,
+        dtype=dtype,
+        backends=backends,
+        policy=policy,
+        max_copy_bytes=int(args.max_copy_mib) << 20,
+        verbose=args.verbose,
+        subproc=subproc,
+    )
+
+    if args.child_out:  # one shape, for an isolating parent: stream progress, no report
+        with open(args.child_out, "a") as sink:
+
+            def emit(rec: Dict[str, Any]) -> None:
+                sink.write(json.dumps(rec) + "\n")
+                sink.flush()
+
+            measure(
+                batches=batches,
+                seconds=seconds,
+                on_start=lambda path: emit({"start": path}),
+                on_result=lambda r: emit({"result": r.to_json()}),
+                on_skip=lambda path, why: emit({"skip": path, "reason": why}),
+            )
+        return 0
+
+    t0 = time.time()
+    children_log: Optional[Path] = None
+    if args.in_process:
+        results = measure(batches=batches, seconds=seconds)
+    else:
+        scratch = Path(tempfile.mkdtemp(prefix="oasr-inductor-"))
+        children_log = scratch / "children.log"
+        results = _compare_isolated(
+            args,
+            ckpt,
+            ind,
+            encoder,
+            loaded.feature_spec,
+            batches,
+            seconds,
+            arms,
+            subproc,
+            scratch,
+            children_log,
+        )
+    from oasr.jit.core import _get_target_sm
+
+    try:
+        import triton
+
+        triton_version = triton.__version__
+    except ImportError:  # pragma: no cover -- Inductor itself needs Triton on CUDA
+        triton_version = "missing"
+    try:
+        import cutlass
+
+        cutedsl = str(getattr(cutlass, "__version__", "unknown"))
+    except ImportError:
+        cutedsl = "missing"
+    name = model_name(ckpt)
+    sm = _get_target_sm()
+    meta = {
+        "model": name,
+        "architecture": loaded.architecture,
+        "dtype": args.dtype,
+        "gpu": torch.cuda.get_device_name(),
+        "sm": sm,
+        "torch": torch.__version__,
+        "triton": triton_version,
+        "cutedsl": cutedsl,
+        "backends": backends,
+        "backend_status": ind.available_backends(backends),
+        "autotune_in_subproc": subproc,
+        "isolated": not args.in_process,
+        "arms": arms,
+        "batches": batches,
+        "seconds": seconds,
+        "quick": bool(args.quick),
+        "bench_protocol": bench.PROTOCOL_VERSION,
+        "wall_s": round(time.time() - t0, 1),
+        "date": datetime.date.today().isoformat(),
+    }
+    stem = args.stem or re.sub(r"[^A-Za-z0-9._-]+", "_", f"{name}_{args.dtype}_sm{sm}")
+    jpath, mpath = ind.save_report(results, meta, Path(args.out), stem, args.gap)
+    if children_log is not None:
+        if children_log.exists():
+            shutil.copyfile(children_log, Path(args.out) / f"{stem}.children.log")
+        shutil.rmtree(children_log.parent, ignore_errors=True)
+    ahead = [r for r in results if r.verdict(args.gap) == "inductor-ahead"]
+    died = [r for r in results if r.copies == 0]
+    print(
+        f"[inductor] {len(results)} block-shapes; Inductor ahead at {len(ahead)} "
+        f"(>= {args.gap:.0%})"
+        + (f"; {len(died)} lost to a dead process (see {stem}.children.log)" if died else "")
+        + f" -> {mpath} ({jpath.name})"
+    )
+    return 0
+
+
+def _last_error(log: Path) -> str:
+    """The last line of *log* that names an error (a child's stderr), or ``""``."""
+    try:
+        lines = log.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    hits = [ln.strip() for ln in lines if "Error" in ln or "error:" in ln]
+    return hits[-1][:300] if hits else ""
+
+
+def _compare_isolated(
+    args, ckpt, ind, encoder, feature_spec, batches, seconds, arms, subproc, scratch, log_path
+) -> List[Any]:
+    """Measure each shape in a child process; respawn past a block that killed one."""
+    import subprocess
+
+    blocks = ind.discover_blocks(encoder, args.blocks or None)
+    if not blocks:
+        raise SystemExit("compare-inductor: no repeated block found")
+    kinds = {p: type(m).__name__ for p, m in blocks}
+    results: List[Any] = []
+    n = 0
+    for b, s, frames in ind.shape_ladder(feature_spec, batches, seconds):
+        remaining = [p for p, _ in blocks]
+        while remaining:
+            n += 1
+            out = scratch / f"child{n}.jsonl"
+            cmd = [
+                sys.executable, "-m", "oasr.tune.cli", "compare-inductor",
+                "--child-out", str(out), "--paths", ",".join(remaining),
+                "--batches", str(b), "--seconds", repr(s), "--ckpt-dir", ckpt,
+                "--dtype", args.dtype, "--arms", args.arms, "--backends", args.backends,
+                "--max-copy-mib", str(args.max_copy_mib),
+                "--autotune-subproc", "on" if subproc else "off",
+            ]  # fmt: skip
+            if args.architecture:
+                cmd += ["--architecture", args.architecture]
+            cmd += [
+                flag for flag, on in (("--quick", args.quick), ("--verbose", args.verbose)) if on
+            ]
+            with open(log_path, "a") as err:
+                err.write(f"=== child {n}: B={b} {s:g}s, {len(remaining)} block(s)\n")
+                err.flush()
+                rc = subprocess.run(cmd, stderr=err).returncode
+            started, finished = None, set()
+            for line in out.read_text().splitlines() if out.exists() else []:
+                rec = json.loads(line)
+                if "start" in rec:
+                    started = rec["start"]
+                elif "result" in rec:
+                    r = ind.BlockResult.from_json(rec["result"])
+                    results.append(r)
+                    finished.add(r.block)
+                elif "skip" in rec:
+                    finished.add(rec["skip"])
+            remaining = [p for p in remaining if p not in finished]
+            if not remaining:
+                break
+            if rc != 0 and started in remaining:
+                why = _last_error(log_path) or "no error message"
+                reason = f"the measuring process died (exit {rc}): {why}"
+                print(f"[inductor] {started} B={b} {s:g}s: {reason}")
+                results.append(
+                    ind.failed_block(started, kinds[started], b, s, frames, arms, reason)
+                )
+                remaining.remove(started)
+                continue
+            # A child that exits without reporting its blocks made no progress:
+            # record them rather than loop.
+            reason = f"the measuring process exited ({rc}) without measuring it"
+            for p in remaining:
+                results.append(ind.failed_block(p, kinds[p], b, s, frames, arms, reason))
+            remaining = []
+    return results
+
+
 def _cmd_export_misses(args) -> int:
     from oasr.tune import telemetry
 
@@ -670,7 +902,75 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("export-misses", help="dump this process's selection misses")
     e.add_argument("--out", required=True)
     e.set_defaults(func=_cmd_export_misses)
+
+    ci = sub.add_parser(
+        "compare-inductor",
+        help="time torch.compile of each repeated encoder block against OASR (report only)",
+    )
+    ci.add_argument("--ckpt-dir", help="the checkpoint (default: $CKPT_DIR)")
+    ci.add_argument(
+        "--architecture",
+        help="force a registered architecture (explicit-only ones, e.g. transducer)",
+    )
+    ci.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
+    ci.add_argument(
+        "--batches",
+        default=",".join(str(b) for b in _inductor_defaults()[0]),
+        help="batch sizes (comma-separated)",
+    )
+    ci.add_argument(
+        "--seconds",
+        default=",".join(f"{s:g}" for s in _inductor_defaults()[1]),
+        help="utterance lengths in seconds (a fixed-window frontend always uses its window)",
+    )
+    ci.add_argument(
+        "--blocks",
+        nargs="*",
+        help="only blocks whose class name, or part of whose module path, matches",
+    )
+    ci.add_argument(
+        "--arms",
+        default="oasr,torch,inductor,inductor-max",
+        help="arms to time: oasr, torch, inductor, inductor-max",
+    )
+    ci.add_argument(
+        "--backends",
+        default="ATEN,TRITON,CUTLASS,CUTEDSL",
+        help="Inductor GEMM backends for the inductor-max arm",
+    )
+    ci.add_argument("--gap", type=float, default=0.05, help="how far ahead counts as ahead")
+    ci.add_argument(
+        "--max-copy-mib",
+        type=int,
+        default=256,
+        help="bound on the rotated block copies' bytes (L2 honesty vs a shared GPU)",
+    )
+    ci.add_argument("--quick", action="store_true", help="fewer timing rounds")
+    ci.add_argument("--verbose", action="store_true", help="keep Inductor's autotune logging")
+    ci.add_argument(
+        "--autotune-subproc",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="benchmark max-autotune candidates in Inductor's subprocess "
+        "(auto: when the GPU has under 8 GiB free)",
+    )
+    ci.add_argument(
+        "--in-process",
+        action="store_true",
+        help="measure in this process (default: one child process per shape)",
+    )
+    ci.add_argument("--out", default=".artifacts/inductor", help="report directory")
+    ci.add_argument("--stem", help="report file name (default: model_dtype_smNN)")
+    ci.add_argument("--child-out", help=argparse.SUPPRESS)
+    ci.add_argument("--paths", help=argparse.SUPPRESS)
+    ci.set_defaults(func=_cmd_compare_inductor)
     return p
+
+
+def _inductor_defaults() -> Tuple[Tuple[int, ...], Tuple[float, ...]]:
+    from oasr.tune.inductor import DEFAULT_BATCHES, DEFAULT_SECONDS
+
+    return DEFAULT_BATCHES, DEFAULT_SECONDS
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -18,10 +18,11 @@ Kernel selection from measured data, per GPU architecture. User documentation:
 | `prebuild.py` | `oasr tune prebuild`: compile a build's modules without a GPU (`OASR_CUDA_ARCH_LIST`) |
 | `evaluate.py` | Selection regret against the measured oracle |
 | `telemetry.py` | Runtime misses as the next census |
-| `cli.py` | `oasr tune census|build|prebuild|evaluate|diff|status|export-misses` |
+| `cli.py` | `oasr tune census|build|prebuild|evaluate|diff|status|export-misses|compare-inductor` |
 | `autotuner.py`, `backends/` | The runtime `oasr.autotune()` (FlashInfer-style registry + cache), on the same protocol |
 | `runners/` | The backends a region selects among (OASR lanes, cuBLAS, ...): registry, traits, versions, and the bind a dispatcher calls |
 | `capture.py` | The GEMM shape recorder (`OASR_CAPTURE_GEMM`) the census probes use |
 | `attention_census.py` | The `fmha` census: replay a manifest through the engine (graphs off), count every attention call shape |
 | `build_fmha.py` | `oasr tune build --family fmha`: every attention lane and tile per shape, partitioned over the key length |
 | `build_fused.py` | The `recurrent` and `gated_mlp` families: census (a model's layer dims × a batch / row ladder) and build (every path, dependent-chain timing for a recurrence) |
+| `inductor.py` | `oasr tune compare-inductor`: `torch.compile` of each repeated encoder block against the OASR path, a fusion-gap report (benchmark only, never a runner) |
