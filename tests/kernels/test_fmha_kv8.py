@@ -248,9 +248,23 @@ def _rel_err(got: torch.Tensor, want: torch.Tensor) -> float:
     return ((got.float() - want.float()).norm() / want.float().norm()).item()
 
 
+@pytest.fixture
+def mma_oracle(monkeypatch):
+    """The served-dtype oracle on the MMA mainloop the fp8 variants share.
+
+    On an architecture with the CUDA-core decode kernel (``oasr.jit.fmha.
+    DECODE_KERNEL_SM``) a served-dtype ``T_q == 1`` call takes that kernel -- a
+    different summation order -- so the bit-exact comparison names the MMA path.
+    """
+    from oasr.jit import fmha as jf
+
+    monkeypatch.setattr(jf, "DECODE_KERNEL_SM", ())
+
+
 @pytest.mark.cuda
+@pytest.mark.usefixtures("mma_oracle")
 class TestAgainstTheDequantizedOracle:
-    """fp8 kernel == the served-dtype kernel on the dequantized cache, exactly."""
+    """fp8 kernel == the served-dtype MMA kernel on the dequantized cache, exactly."""
 
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("D", [32, 64, 128])
@@ -444,6 +458,7 @@ class TestUnalignedQueryAndOutput:
 
 
 @pytest.mark.cuda
+@pytest.mark.usefixtures("mma_oracle")
 class TestGraphReplay:
     def test_a_captured_paged_decode_step_recomputes(self):
         """Lengths, table and cache bytes all change through the captured buffers;

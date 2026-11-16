@@ -292,7 +292,7 @@ extension cookbook for each axis.
 | `oasr/jit/core.py`, `oasr/jit/env.py` | JIT specs, nvcc flags, the cache key |
 | `oasr/functionals/gemm.py`, `oasr/functionals/attention.py` | The two families with shape-aware routing |
 | `include/oasr/common/{cute_sm80,tile_rules}.h`, `oasr/jit/arch_facts.py` | The Ampere-class CuTe toolkit and tile rules the three C++ CuTe families (attention, gated MLP, recurrent step) share, and their Python mirror |
-| `include/oasr/attention/`, `oasr/jit/fmha.py` | The C++ CUTLASS/CuTe fused attention and its lane; `oasr/jit/attention.py` is the arbiter between it, the CuTeDSL one and SDPA |
+| `include/oasr/attention/`, `oasr/jit/fmha.py` | The C++ CUTLASS/CuTe fused attention and its lane -- with a CUDA-core single-query decode kernel (`fmha_decode.h`, cluster-merged splits, sm_90+) serving `T_q == 1` where measured; `oasr/jit/attention.py` is the arbiter between it, the CuTeDSL one and SDPA |
 | `include/oasr/mlp/`, `oasr/jit/gated_mlp.py` | The C++ CUTLASS/CuTe fused gated MLP and its lane; `oasr/jit/mlp.py` is the arbiter between it and the CuTeDSL one |
 | `include/oasr/recurrent/recurrent_step_*.h`, `oasr/jit/recurrent_step.py` | The C++ CUTLASS/CuTe fused recurrent step and its lane; `oasr/jit/recurrent_cute.py` is the arbiter between it and the CuTeDSL one |
 | `csrc/tvm_ffi_utils.h` | DLPack dispatch + the validation macros every launcher uses |
