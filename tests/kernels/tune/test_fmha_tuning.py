@@ -6,8 +6,11 @@ fp16, against the lanes this GPU has (the CuTeDSL and C++ kernels on sm80 /
 sm86 / sm89 / sm120).
 """
 
+import dataclasses
+import json
 import logging
 import math
+from collections import Counter
 
 import pytest
 import torch
@@ -146,6 +149,132 @@ class TestPlanPoints:
         pts = [self._pt(64, t_q=64), self._pt(512, t_q=512)]
         plan = plan_points(pts, cap=6)
         assert all(p.t_q == p.t_k for p in plan)
+
+
+class TestLengthRange:
+    """The rows' key lengths, recorded by the census and drawn by the build.
+
+    A Whisper cross-attention step's rows are all its full 1500-frame extent; the
+    build used to draw every point's rows from 0.6-1.0 x ``t_k``, and the C++
+    lane's split choice measured on that ragged batch lost 1.2-1.27x on the real
+    one.
+    """
+
+    _SHAPE = S.AttnShape("float16", 64, 6, 6, "none", False, 16, False, 8, 1, 1536)
+    _KEY = (_SHAPE, True, -1, -1)
+
+    def test_accumulate_is_the_call_weighted_mean(self):
+        from oasr.tune.attention_census import _accumulate
+
+        points, ranged = {}, {}
+        k = self._KEY
+        _accumulate(points, Counter({k: 3}), 1.0, "a", {k: [3.0, 3.0, 3.0]}, ranged)
+        _accumulate(points, Counter({k: 1}), 2.0, "b", {k: [1.0, 0.5, 0.7]}, ranged)
+        pt = points[k]
+        assert pt.calls == pytest.approx(5.0)
+        assert pt.lens_lo == pytest.approx((3 * 1.0 + 2 * 0.5) / 5)
+        assert pt.lens_hi == pytest.approx((3 * 1.0 + 2 * 0.7) / 5)
+
+    def test_no_range_keeps_the_ragged_default(self):
+        from oasr.tune.attention_census import _accumulate
+
+        points = {}
+        _accumulate(points, Counter({self._KEY: 4}), 1.0, "a")
+        assert (points[self._KEY].lens_lo, points[self._KEY].lens_hi) == (0.6, 1.0)
+
+    def test_a_census_without_the_fields_loads_with_the_default(self, tmp_path):
+        d = AttnShapeSet([TestPlanPoints()._pt(300)], {}).to_json()
+        for p in d["points"]:
+            del p["lens_lo"], p["lens_hi"]
+        path = tmp_path / "old.json"
+        path.write_text(json.dumps(d))
+        pt = AttnShapeSet.load(str(path)).points[0]
+        assert (pt.lens_lo, pt.lens_hi) == (0.6, 1.0)
+
+    @pytest.mark.skipif(not _CUDA, reason="operands are CUDA tensors")
+    def test_operands_draw_from_the_range(self):
+        from oasr.tune.build_fmha import _operands
+
+        full = AttnPoint(
+            **dataclasses.asdict(self._SHAPE), lens_lo=1500 / 1536, lens_hi=1500 / 1536
+        )
+        ops = _operands(full, full.shape, torch.Generator(device="cuda").manual_seed(0))
+        assert ops["lens"].tolist() == [1500] * 8
+        ragged = dataclasses.replace(full, lens_lo=0.6, lens_hi=1.0)
+        lens = _operands(ragged, ragged.shape, torch.Generator(device="cuda").manual_seed(0))[
+            "lens"
+        ]
+        assert lens[0].item() == 1536 and lens.min().item() >= (3 * 1536) // 5
+
+    @pytest.mark.skipif(not _CUDA, reason="needs a device")
+    def test_range_skips_a_capturing_stream(self):
+        """Reading the lengths synchronises; under a capture it must not be attempted."""
+        from oasr.tune.attention_census import _lens_range
+
+        lens = torch.full((4,), 100, device="cuda", dtype=torch.int32)
+        assert _lens_range(lens, 128) == (100 / 128, 100 / 128)
+        s = torch.cuda.Stream()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+            seen = _lens_range(lens, 128)
+        assert seen is None
+
+
+class TestCensusCommand:
+    def test_an_ar_census_drops_the_first_engine_before_building_the_second(
+        self, monkeypatch, tmp_path
+    ):
+        """An AR family is censused on a second engine without step graphs.
+
+        ``shutdown`` releases pools, not the model, so building the second while
+        the first is referenced held two models at once: Qwen2-Audio-7B (16 GiB
+        in bf16) ran out of a 32 GiB GPU.
+        """
+        import argparse
+        import gc
+        import types
+        import weakref
+
+        import oasr.engine as eng
+        import oasr.tune.attention_census as ac
+        import oasr.tune.census as C
+        import oasr.tune.cli as cli
+
+        live, alive_at_build = [], []
+
+        class FakeEngine:
+            sample_rate = 16000
+
+            def __init__(self, cfg):
+                gc.collect()
+                alive_at_build.append(sum(r() is not None for r in live))
+                live.append(weakref.ref(self))
+                opts = types.SimpleNamespace(step_graphs=True)
+                self._output_processor = types.SimpleNamespace(
+                    strategy=types.SimpleNamespace(options=opts)
+                )
+
+            def shutdown(self):
+                pass
+
+        monkeypatch.setattr(eng, "ASREngine", FakeEngine)
+        monkeypatch.setattr(cli, "_deploy_config", lambda args, opts=None: opts)
+        monkeypatch.setattr(C, "census_engine_config", lambda cfg: cfg)
+        monkeypatch.setattr(C, "model_name", lambda d: "fake")
+        monkeypatch.setattr(
+            ac, "attention_census", lambda engine, cfg, traffic, waves=None: AttnShapeSet([], {})
+        )
+        args = argparse.Namespace(
+            manifest=None,
+            audio_root=None,
+            streaming_widths=None,
+            limit=None,
+            ckpt_dir="ckpt",
+            architecture=None,
+            out=str(tmp_path / "census.json"),
+        )
+        assert cli._cmd_census_fmha(args) == 0
+        assert alive_at_build == [0, 0]
 
 
 class TestCensusFile:
@@ -347,10 +476,119 @@ class TestDispatch:
             assert _close(_run(ops), ref)
             assert spy.calls == [call]
 
+    def test_paged_decode_step_untuned_runs_the_decode_route(self, monkeypatch, user_db):
+        ops, shape = _paged_step()
+        spy = _Spy(monkeypatch)
+        out = _run(ops)
+        assert spy.calls == [(S._routed_lane(shape), None)]
+        assert _close(out, _run(ops, backend="sdpa"))
+
     def test_paged_refuses_a_tile_taller_than_the_padding(self):
         shape = S.AttnShape("float16", 64, 6, 6, "none", True, 16, False, 8, 16, 640, True)
         why = S.unusable_reason(S.AttnChoice("cute", 128, 32, 256), shape)
         assert why is not None and "64-row padding" in why
+
+
+def _paged_step(B=8, H=6, D=64, T=640, bs=16, full=False, seed=3, left_pad=False):
+    """A paged single-query decode step: ``(ops, shape)``.  ``left_pad``: the speech LLM's."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    per = T // bs
+    k = torch.randn(B * per + 1, bs, H, D, device="cuda", dtype=torch.float16, generator=g)
+    v = torch.randn_like(k)
+    q = torch.randn(B, H, 1, D, device="cuda", dtype=torch.float16, generator=g)
+    table = (torch.randperm(B * per, device="cuda", generator=g) + 1).view(B, per).int()
+    if full:
+        lens = torch.full((B,), T, device="cuda", dtype=torch.int32)
+    else:
+        lens = torch.randint(T // 2, T + 1, (B,), device="cuda", dtype=torch.int32, generator=g)
+    shape = S.AttnShape("float16", D, H, H, "none", False, bs, left_pad, B, 1, T)
+    ops = {"q": q, "k": k, "v": v, "cache_seqlens": lens, "block_table": table}
+    if left_pad:
+        starts = torch.randint(0, T // 8, (B,), device="cuda", dtype=torch.int32, generator=g)
+        ops["cache_seqstarts"] = starts
+    return ops, shape
+
+
+@pytest.fixture
+def decode_route_reset():
+    """Clear the decode route's cache around a test that changes what it reads."""
+    ja.fmha_decode_backend.cache_clear()
+    yield
+    ja.fmha_decode_backend.cache_clear()
+
+
+@needs_lanes
+@pytest.mark.skipif(
+    _sm() not in ja.DECODE_PREFERS_CXX_SM, reason="the decode route is measured on another SM"
+)
+class TestDecodeRoute:
+    """An untuned single-query decode step runs the C++ lane, where a sweep showed it faster.
+
+    On sm120 the CuTeDSL default tile was 1.22x the faster lane in geometric mean
+    and up to 4.6x on these steps (small batch over a long cache: only the C++
+    lane splits the keys).  ``auto`` still ran it for every untuned call.
+    """
+
+    def test_untuned_paged_dense_and_left_padded_steps_run_cxx(self, monkeypatch, user_db):
+        paged, _ = _paged_step()
+        dense, _ = _dense(T_q=1, bias=False)
+        padded, _ = _paged_step(left_pad=True)
+        spy = _Spy(monkeypatch)
+        outs = [_run(ops) for ops in (paged, dense, padded)]
+        assert spy.calls == [("cxx", None)] * 3
+        for ops, out in zip((paged, dense, padded), outs):
+            assert _close(out, _run(ops, backend="sdpa"))
+
+    def test_anything_but_a_decode_step_keeps_the_process_lane(self, monkeypatch, user_db):
+        biased, _ = _dense(T_q=1, bias=True)
+        two_rows, _ = _dense(T_q=2, bias=False)
+        spy = _Spy(monkeypatch)
+        _run(biased)
+        _run(two_rows)
+        assert spy.calls == [("cute", None), ("cute", None)]
+
+    def test_naming_cute_or_an_unmeasured_sm_keeps_cute(
+        self, monkeypatch, user_db, decode_route_reset
+    ):
+        ops, _ = _paged_step()
+        spy = _Spy(monkeypatch)
+        monkeypatch.setattr(ja, "_BACKEND_MODE", "cute")
+        ja.fmha_decode_backend.cache_clear()
+        _run(ops)
+        monkeypatch.setattr(ja, "_BACKEND_MODE", "auto")
+        monkeypatch.setattr(ja, "DECODE_PREFERS_CXX_SM", frozenset())
+        ja.fmha_decode_backend.cache_clear()
+        _run(ops)
+        assert spy.calls == [("cute", None), ("cute", None)]
+
+    def test_an_auto_region_means_the_decode_route(self, monkeypatch, user_db):
+        """A table's "auto" is what an untuned call runs, so it moves with the route."""
+        ops, shape = _paged_step(full=True)
+        _write_table(user_db, {shape: [(None, S.AUTO_ID)]})
+        spy = _Spy(monkeypatch)
+        _run(ops)
+        assert spy.calls == [("cxx", None)]
+        assert db.runner_counts()[("fmha", "fmha", "oasr_cxx")] == 1
+
+    def test_routed_lane_agrees_with_fmha(self, monkeypatch, user_db):
+        """The tuner's "auto" pseudo-arm (``_routed_lane``) is the lane ``fmha`` runs."""
+        cases = [
+            _paged_step(),
+            _paged_step(left_pad=True),
+            _dense(T_q=1, bias=False),
+            _dense(T_q=1, bias=True),
+            _dense(T_q=16, bias=False),
+        ]
+        spy = _Spy(monkeypatch)
+        for ops, shape in cases:
+            spy.calls.clear()
+            _run(ops)
+            assert spy.calls[0][0] == S._routed_lane(shape), shape
+
+    def test_the_routing_revision_is_in_the_impl_hash(self, monkeypatch):
+        before = S.impl_hash()
+        monkeypatch.setattr(S, "ROUTING_REVISION", S.ROUTING_REVISION + 1)
+        assert S.impl_hash() != before
 
 
 class TestShippedFile:
@@ -387,6 +625,22 @@ class TestCensus:
             _run(ops, backend="cute")  # a named lane is never selected: not recorded
         counts = rec.take()
         assert counts == {(shape, True, -1, -1): 2}
+
+    def test_records_the_rows_length_range(self):
+        full, shape = _paged_step(full=True)
+        ragged, _ = _paged_step(seed=5)
+        T = shape.t_k
+        with capture_attention_shapes() as rec:
+            _run(full)
+            _run(ragged)
+        counts, lens = rec.take_with_lens()
+        key = (shape, True, -1, -1)
+        assert counts == {key: 2}
+        r = ragged["cache_seqlens"]
+        n, lo, hi = lens[key]
+        assert n == 2
+        assert lo == pytest.approx(1.0 + r.min().item() / T)
+        assert hi == pytest.approx(1.0 + r.max().item() / T)
 
 
 @needs_lanes

@@ -4,7 +4,9 @@
 
 ``OASR_ATTN_BACKEND=auto`` picks one attention lane per process -- the CuTeDSL
 kernel wherever it is built, the C++ one only when the CuTeDSL kernel cannot
-serve a call -- and runs it with one tile.  Neither is right everywhere.  On an
+serve a call or for a single-query decode step where a sweep showed it faster
+(:func:`oasr.jit.attention.fmha_decode_backend`) -- and runs it with one tile.
+Neither is right everywhere.  On an
 RTX 5090 the C++ lane's split-KV wins a small-batch streaming chunk and a
 cross-attention decode step by 2x, the CuTeDSL kernel wins the offline encoder,
 and *inside* the CuTeDSL lane a 64x32 tile is 1.7x the default 64x64 on the
@@ -39,6 +41,7 @@ snapshot, never of CUDA-graph capture state (AGENTS.md rule 11).
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -248,11 +251,20 @@ def sig_key(shape: AttnShape) -> str:
 # =============================================================================
 
 
+#: Revision of what an untuned call runs (:func:`_routed_lane`), folded into
+#: :func:`impl_hash`.  A region naming :data:`AUTO_ID` means "today's routing was
+#: best here", so a file measured under another routing is stale even when no
+#: kernel changed.  2: single-query decode steps prefer the C++ lane on the
+#: architectures in ``oasr.jit.attention.DECODE_PREFERS_CXX_SM``.
+ROUTING_REVISION = 2
+
+
 def impl_hash() -> str:
     """Identity of the attention kernels a tuning result measured.
 
     Both lanes' sources: the C++ lane's templates and headers, and the CuTeDSL
-    kernel's Python.  A soft validator: a change marks the file stale.
+    kernel's Python, plus :data:`ROUTING_REVISION` (what ``auto`` stands for).
+    A soft validator: a change marks the file stale.
     """
     from pathlib import Path
 
@@ -263,7 +275,11 @@ def impl_hash() -> str:
     paths += sorted((env.OASR_INCLUDE_DIR / "oasr" / "attention").rglob("*.h*"))
     kernels = Path(__file__).resolve().parent.parent / "kernels" / "cute" / "attention"
     paths += sorted(kernels.glob("*.py"))
-    return hash_paths(paths)
+    if ROUTING_REVISION == 1:  # the revision the hash did not name yet
+        return hash_paths(paths)
+    return hashlib.sha256(f"{hash_paths(paths)}|routing:{ROUTING_REVISION}".encode()).hexdigest()[
+        :16
+    ]
 
 
 def _soft_validators() -> Dict[str, Any]:
@@ -484,9 +500,18 @@ def _active(epoch: int) -> bool:
     return True
 
 
+def is_decode_step(shape: AttnShape) -> bool:
+    """Whether *shape* is what :func:`~oasr.jit.attention.fmha_decode_backend` routes.
+
+    One query row, no bias, no mask but the key window (lengths, and left
+    padding): the same test :func:`oasr.functionals.attention.fmha` applies.
+    """
+    return shape.t_q == 1 and shape.mask == "none" and not shape.bias
+
+
 def _routed_lane(shape: AttnShape) -> str:
     """The lane today's routing takes for *shape* (what an untuned call runs)."""
-    from .attention import fmha_backend_for, select_backend
+    from .attention import fmha_backend_for, fmha_decode_backend, select_backend
 
     if shape.mask == "window":
         return fmha_backend_for(
@@ -495,6 +520,10 @@ def _routed_lane(shape: AttnShape) -> str:
             paged=shape.paged,
             causal=False,
             local=True,
+        )
+    if is_decode_step(shape):
+        return fmha_decode_backend(
+            head_dim=shape.head_dim, dtype_str=shape.dtype, paged=shape.paged
         )
     return select_backend()
 

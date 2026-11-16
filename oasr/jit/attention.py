@@ -89,6 +89,7 @@ def set_backend_mode(mode: str) -> None:
     _capability_probe.cache_clear()
     fmha_config_supported.cache_clear()
     fmha_backend_for.cache_clear()
+    fmha_decode_backend.cache_clear()
     fmha_cxx_supports.cache_clear()
     fmha_kv8_refusal.cache_clear()
     try:
@@ -152,11 +153,13 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
     ``"cute"`` / ``"cxx"`` / ``"sdpa"``.  The first element is ``None`` if no
     CUDA device is visible.
 
-    ``auto`` resolution order is ``cute`` then ``sdpa``.  The C++ lane is
-    **not** preferred by ``auto`` yet: it is reachable only by naming it
-    (``OASR_ATTN_BACKEND=cxx``) or per call (``oasr.fmha(..., backend="cxx")``)
-    until an interleaved A/B lands in ``.artifacts/``.  Flipping a default on
-    an unmeasured kernel is what this repo's own routing notes warn about.
+    ``auto`` resolution order is ``cute`` then ``sdpa``.  The C++ lane is not
+    the process preference: ``auto`` reaches it per call -- from a measured
+    ``fmha`` tuning entry, for a call the CuTeDSL kernel cannot serve
+    (:func:`fmha_backend_for`), and for a single-query decode step on an
+    architecture where a sweep showed it faster (:func:`fmha_decode_backend`).
+    Flipping a default on an unmeasured kernel is what this repo's own routing
+    notes warn about.
     """
     try:
         import torch
@@ -596,6 +599,42 @@ def fmha_backend_for(
     ):
         return "cxx"
     return "sdpa"
+
+
+#: Architectures where an untuned single-query decode step prefers the C++ lane
+#: (:func:`fmha_decode_backend`), each by a measured sweep, never by analogy.
+#: On sm120 (RTX 5090), over 725 points -- 6x64 fp16, 20x64 fp16 and 32x128 bf16
+#: heads, batch 1-64, key extent 64-2048, paged and dense, rows full-length,
+#: ragged or left-padded, L2 rotated -- the CuTeDSL default tile was 1.22x the
+#: faster lane's time in geometric mean and up to 4.6x (small batch over a long
+#: cache, where only the C++ lane splits the keys), and the C++ lane 1.010x, at
+#: worst 1.14x on a 2-us step.  Another architecture joins this set when the same
+#: sweep has been run on it.
+DECODE_PREFERS_CXX_SM = frozenset({120})
+
+
+@functools.cache
+def fmha_decode_backend(*, head_dim: int, dtype_str: str, paged: bool) -> str:
+    """Which lane an untuned single-query decode step runs under ``auto``.
+
+    A decode step -- one query row per sequence, no bias, no mask but the key
+    window (``cache_seqlens``, and ``cache_seqstarts`` for a left-padded
+    prefill) -- is memory-bound and, at small batch, short of CTAs.  The C++ lane
+    splits its keys across CTAs (``oasr.jit.fmha.num_splits``) and the CuTeDSL
+    one does not, so on an architecture in :data:`DECODE_PREFERS_CXX_SM` the
+    step goes to the C++ lane wherever it can serve it.  A measured ``fmha``
+    tuning entry still overrides this, and so does naming a lane
+    (``OASR_ATTN_BACKEND=cute`` keeps meaning the CuTeDSL kernel everywhere).
+    """
+    backend = select_backend()
+    if _BACKEND_MODE != "auto" or backend != "cute":
+        return backend
+    cap = _capability_probe()[0]
+    if cap is None or cap[0] * 10 + cap[1] not in DECODE_PREFERS_CXX_SM:
+        return backend
+    if fmha_cxx_supports(head_dim=head_dim, dtype_str=dtype_str, paged=paged):
+        return "cxx"
+    return backend
 
 
 # ---------------------------------------------------------------------------

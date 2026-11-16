@@ -702,7 +702,12 @@ Naming a backend **requires** it: a request it cannot serve raises rather than
 quietly computing something else. `backend=None` (the default) is the only mode
 that may degrade, and it degrades through `fmha_backend_for(...)`, which asks
 whether the preferred lane can serve *this* shape rather than only which lane
-the process prefers. Before that, under `OASR_ATTN_BACKEND=auto`, it consults the
+the process prefers. A single-query decode step (no bias, no mask but the key
+window: lengths, and left padding) asks `fmha_decode_backend(...)` instead, which takes the
+`cxx` lane on the architectures where a sweep showed it faster: there the step is
+short of CTAs at small batch, and only `cxx` splits the keys (on sm120 the CuTeDSL
+default tile measured 1.22x the faster lane in geometric mean, up to 4.6x).
+Before either, under `OASR_ATTN_BACKEND=auto`, it consults the
 `fmha` tuning file, which names a lane and its tile or split-KV setting per shape
 ([autotuning.md](autotuning.md#attention-lanes-and-tiles-fmha)).
 

@@ -195,7 +195,9 @@ names a tile, or the heuristic (an illustrative entry):
 ### Attention lanes and tiles (`fmha`)
 
 `OASR_ATTN_BACKEND=auto` picks one attention lane per process -- the CuTeDSL
-kernel wherever it is built -- and runs it with one tile. Neither lane is right
+kernel wherever it is built, except that an untuned single-query decode step
+takes the C++ lane on the architectures where a sweep showed it faster (sm120;
+`oasr.jit.attention.DECODE_PREFERS_CXX_SM`) -- and runs it with one tile. Neither lane is right
 everywhere, and neither is its default tile: on an RTX 5090 the C++ lane's
 split-KV is 1.4-3.4x on a Whisper decode step, and inside the CuTeDSL lane a
 32x16 tile is 1.8x the default 64x64 on the U2++ offline encoder. So the choice is
@@ -220,7 +222,9 @@ the database (`oasr/jit/attention_select.py`):
   `n`-way split-KV (`n=1`: never; a split count is cut to what the key range can
   use, a pure function of the shape); `sdpa` -- torch's SDPA, an external runner;
   and `auto`, "measured; today's routing is best here". A paged call takes no tile
-  taller than 64 rows (the paged path pads to 64).
+  taller than 64 rows (the paged path pads to 64). What `auto` stands for is part
+  of the file's identity: `ROUTING_REVISION` is folded into the `impl_hash` soft
+  validator, so a file measured before the decode route changed is reported stale.
 - **Resolution** (`tuned_choice`, called by `oasr.fmha`): only when nobody named
   a lane -- `OASR_ATTN_BACKEND=auto` and no `backend=` -- and only for fp16 / bf16
   dense or paged calls; `fmha_varlen` and the fp8 KV cache keep their own routing.
@@ -238,6 +242,12 @@ the database (`oasr/jit/attention_select.py`):
   the manifest through the engine with every graph off -- an AR family's decoder
   steps included, with paged decoder KV as served -- because a decode step's shapes
   depend on what was said. Streaming replays it at a few concurrency levels.
+  Each point also carries its rows' key lengths as fractions of `T_k`
+  (`lens_lo` / `lens_hi`: the call-weighted mean of each call's shortest and
+  longest row), and the build draws its lengths from that range. It matters to
+  split-KV: a Whisper cross-attention step's rows are all its full 1500 frames,
+  and splits chosen on ragged rows lost 1.2-1.27x there. A census without the
+  fields (older files) builds with the ragged 0.6-1.0 range it was measured with.
 - **Build.** `oasr tune build --census a.json --family fmha` measures every
   configuration that can serve each point through `oasr.fmha` itself, under the
   shared protocol, numerics-gated against an fp32 SDPA reference (within four
