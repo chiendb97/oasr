@@ -36,7 +36,7 @@ import os
 import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -218,7 +218,7 @@ class AttentionShapeRecorder:
         """The counts so far, and a fresh start (the length ranges are dropped)."""
         return self.take_with_lens()[0]
 
-    def take_with_lens(self) -> tuple:
+    def take_with_lens(self) -> Tuple[Counter, Dict[tuple, List[float]]]:
         """``(counts, length-range sums)`` so far, and a fresh start."""
         with self._lock:
             out, self.counts = self.counts, Counter()
@@ -226,7 +226,7 @@ class AttentionShapeRecorder:
         return out, lens
 
 
-def _lens_range(lens: Optional[torch.Tensor], t_k: int) -> Optional[tuple]:
+def _lens_range(lens: Optional[torch.Tensor], t_k: int) -> Optional[Tuple[float, float]]:
     """``(shortest, longest)`` row of *lens* as fractions of *t_k*, or ``None``.
 
     Reading the values synchronises the stream.  The census runs with every graph
