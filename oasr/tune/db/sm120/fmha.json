@@ -20,7 +20,7 @@
     "sms": 170,
     "l2": 100663296
    },
-   "impl_hash": "10838b185145e797",
+   "impl_hash": "2227dd02f6a0c973",
    "runners": {
     "oasr_cute": {
      "cutedsl": "4.6.1"
@@ -33,7 +33,7 @@
   }
  },
  "provenance": {
-  "created": "2026-11-16T07:28:53+00:00",
+  "created": "2026-11-16T09:21:25+00:00",
   "tool": "oasr tune build",
   "bench_protocol": 3,
   "census": {
@@ -188,7 +188,7 @@
    ]
   },
   "contended": false,
-  "elapsed_s": 78.1,
+  "elapsed_s": 76.3,
   "fallback": "auto: OASR_ATTN_BACKEND=auto routing (CuTeDSL 64x64x128 where built; the C++ lane for a decode step; routing revision 2)",
   "candidates": {
    "cute_tiles": [
@@ -238,12 +238,12 @@
    "sdpa": "measured as a reference only"
   },
   "weighted_ms": {
-   "auto": 7.565446,
-   "tuned": 6.620616,
-   "with_sdpa": 6.620616
+   "auto": 6.71923,
+   "tuned": 6.144978,
+   "with_sdpa": 6.144978
   },
   "notes": [
-   "phase5 step 1: sm120 attention lanes+tiles; decode route cxx (routing rev 2); row lengths from the census; censuses u2pp offline/streaming b64, whisper-tiny b16/b64, paraformer b64, qwen2-audio-7b b16/b32 (ljspeech_200)"
+   "phase5 step 2: sm120 attention lanes+tiles; the C++ lane serves T_q=1 with the CUDA-core decode kernel (cluster merge); step 1 censuses (u2pp offline/streaming b64, whisper-tiny b16/b64, paraformer b64, qwen2-audio-7b b16/b32, ljspeech_200)"
   ]
  },
  "configs": {
@@ -268,12 +268,6 @@
    "n_block": 32,
    "threads": 64
   },
-  "cute_m32n64t64": {
-   "kind": "cute",
-   "m_block": 32,
-   "n_block": 64,
-   "threads": 64
-  },
   "cute_m64n16t128": {
    "kind": "cute",
    "m_block": 64,
@@ -290,6 +284,10 @@
    "kind": "cxx",
    "splits": 0
   },
+  "cxx_s1": {
+   "kind": "cxx",
+   "splits": 1
+  },
   "cxx_s2": {
    "kind": "cxx",
    "splits": 2
@@ -297,6 +295,10 @@
   "cxx_s4": {
    "kind": "cxx",
    "splits": 4
+  },
+  "cxx_s8": {
+   "kind": "cxx",
+   "splits": 8
   }
  },
  "coverage_basis": [],
@@ -312,52 +314,52 @@
    "notes": [
     "partition: cover ['auto'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=192 B=1 T_q=179: auto (fallback is fastest [sdpa 40.8 us, reference only])",
-    "T_k=256 B=1 T_q=249: auto (fallback is fastest [sdpa 45.1 us, reference only])"
+    "T_k=192 B=1 T_q=179: auto (fallback is fastest [sdpa 40.7 us, reference only])",
+    "T_k=256 B=1 T_q=249: auto (fallback is fastest [sdpa 45.0 us, reference only])"
    ],
    "evidence": {
     "T_k=192": {
      "cute_m64n64t128": [
-      0.009774,
-      3.6e-05,
+      0.009771,
+      2.7e-05,
       12
      ],
      "auto": [
-      0.009774,
-      3.6e-05,
+      0.009771,
+      2.7e-05,
       12
      ],
      "cxx_s1": [
-      0.009802,
-      2.5e-05,
+      0.009836,
+      4.7e-05,
       12
      ],
      "cxx": [
-      0.009803,
-      2.6e-05,
+      0.009854,
+      3.2e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
      "cute_m64n64t128": [
-      0.012579,
-      4.4e-05,
+      0.01258,
+      3.9e-05,
       12
      ],
      "auto": [
-      0.012579,
-      4.4e-05,
+      0.01258,
+      3.9e-05,
       12
      ],
      "cxx_s1": [
-      0.012713,
-      2.3e-05,
+      0.012699,
+      3.6e-05,
       12
      ],
      "cxx": [
-      0.012716,
-      4.7e-05,
+      0.012709,
+      5.7e-05,
       12
      ],
      "_l2": "rotated"
@@ -375,33 +377,33 @@
    "notes": [
     "partition: cover ['auto', 'cute_m64n16t128'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=320 B=14 T_q=293: cute_m32n16t64 (1.14x vs auto [sdpa 534.7 us, reference only])"
+    "T_k=320 B=14 T_q=293: cute_m32n16t64 (1.14x vs auto [sdpa 535.0 us, reference only])"
    ],
    "evidence": {
     "T_k=320": {
      "cute_m64n16t128": [
-      0.092108,
-      0.000575,
+      0.092202,
+      0.000789,
       12
      ],
      "cute_m32n16t64": [
-      0.096202,
-      0.00024,
+      0.096316,
+      0.000507,
       12
      ],
      "cute_m64n32t128": [
-      0.105544,
-      0.000341,
+      0.105438,
+      0.000119,
       12
      ],
      "cxx_s1": [
-      0.108392,
-      0.000208,
+      0.108352,
+      0.000148,
       9
      ],
      "auto": [
-      0.109492,
-      0.000151,
+      0.109368,
+      0.000264,
       12
      ],
      "_l2": "warm"
@@ -418,76 +420,76 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto'] (eps 3%), 1 segment(s)",
-    "worst measured regret 1.0%",
-    "T_k=192 B=2 T_q=191: auto (fallback is fastest [sdpa 67.0 us, reference only])",
-    "T_k=256 B=2 T_q=254: auto (fallback is fastest [sdpa 76.6 us, reference only])",
-    "T_k=320 B=2 T_q=294: auto (fallback is fastest [sdpa 93.9 us, reference only])"
+    "worst measured regret 1.1%",
+    "T_k=192 B=2 T_q=191: auto (fallback is fastest [sdpa 67.1 us, reference only])",
+    "T_k=256 B=2 T_q=254: auto (fallback is fastest [sdpa 76.8 us, reference only])",
+    "T_k=320 B=2 T_q=294: auto (fallback is fastest [sdpa 94.0 us, reference only])"
    ],
    "evidence": {
     "T_k=192": {
      "cute_m64n64t128": [
-      0.014495,
-      6.3e-05,
+      0.014522,
+      0.000106,
       12
      ],
      "auto": [
-      0.014495,
-      6.3e-05,
+      0.014522,
+      0.000106,
       12
      ],
      "cxx_s1": [
-      0.014716,
-      6.6e-05,
+      0.014701,
+      5e-05,
       12
      ],
-     "cute_m64n32t128": [
-      0.014793,
-      6.4e-05,
+     "cxx": [
+      0.014701,
+      9.3e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
      "cute_m64n64t128": [
-      0.019209,
-      0.000115,
+      0.019199,
+      4.1e-05,
       12
      ],
      "auto": [
-      0.019209,
-      0.000115,
+      0.019199,
+      4.1e-05,
       12
      ],
      "cxx_s1": [
-      0.019267,
-      5.5e-05,
+      0.019325,
+      6e-05,
       12
      ],
      "cxx": [
-      0.019299,
-      0.00018,
+      0.01935,
+      0.000141,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
      "cxx_s1": [
-      0.024359,
-      6.5e-05,
-      12
-     ],
-     "cxx": [
-      0.024391,
+      0.024275,
       7.7e-05,
       12
      ],
+     "cxx": [
+      0.024328,
+      8.7e-05,
+      12
+     ],
      "cute_m64n64t128": [
-      0.024592,
+      0.024551,
       7.7e-05,
       12
      ],
      "auto": [
-      0.024592,
+      0.024551,
       7.7e-05,
       12
      ],
@@ -505,83 +507,83 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto'] (eps 3%), 1 segment(s)",
-    "worst measured regret 1.3%",
+    "worst measured regret 1.5%",
     "T_k=192 B=4 T_q=191: auto (fallback is fastest [sdpa 96.5 us, reference only])",
-    "T_k=256 B=3 T_q=254: auto (fallback is fastest [sdpa 102.7 us, reference only])",
-    "T_k=320 B=3 T_q=286: auto (fallback is fastest [sdpa 128.9 us, reference only])"
+    "T_k=256 B=3 T_q=254: auto (fallback is fastest [sdpa 102.8 us, reference only])",
+    "T_k=320 B=3 T_q=286: auto (fallback is fastest [sdpa 128.8 us, reference only])"
    ],
    "evidence": {
     "T_k=192": {
      "cute_m64n64t128": [
-      0.020755,
+      0.020645,
       0.000135,
       12
      ],
      "auto": [
-      0.020755,
+      0.020645,
       0.000135,
       12
      ],
-     "cxx": [
-      0.021219,
-      0.000206,
+     "cxx_s1": [
+      0.021138,
+      0.000119,
       12
      ],
-     "cxx_s1": [
-      0.021294,
-      0.000152,
+     "cxx": [
+      0.021168,
+      0.000211,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
      "cute_m64n64t128": [
-      0.02385,
-      8.5e-05,
-      15
+      0.023803,
+      9.5e-05,
+      12
      ],
      "auto": [
-      0.02385,
-      8.5e-05,
-      15
+      0.023803,
+      9.5e-05,
+      12
      ],
      "cxx_s1": [
-      0.023974,
-      0.000204,
-      15
+      0.023939,
+      0.000102,
+      12
      ],
      "cxx": [
-      0.024006,
-      0.000133,
-      15
+      0.024053,
+      0.000228,
+      12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
-     "cute_m64n32t128": [
-      0.03094,
-      0.000163,
-      24
-     ],
      "cxx_s1": [
-      0.030964,
-      0.000225,
-      24
+      0.030762,
+      0.000139,
+      12
      ],
-     "cute_m32n16t64": [
-      0.031218,
-      0.000543,
-      24
+     "cute_m64n32t128": [
+      0.030916,
+      0.000193,
+      12
      ],
      "cxx": [
-      0.031316,
-      0.000599,
+      0.030938,
+      0.000279,
+      12
+     ],
+     "cute_m32n16t64": [
+      0.030988,
+      0.000581,
       9
      ],
      "auto": [
-      0.031356,
-      8.3e-05,
-      24
+      0.031214,
+      8.6e-05,
+      12
      ],
      "_l2": "rotated"
     }
@@ -597,63 +599,63 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 1 segment(s)",
-    "worst measured regret 2.0%",
-    "T_k=256 B=5 T_q=240: auto (fallback is fastest [sdpa 134.5 us, reference only])",
-    "T_k=320 B=8 T_q=295: cute_m32n16t64 (1.07x vs auto [sdpa 304.3 us, reference only])"
+    "worst measured regret 2.6%",
+    "T_k=256 B=5 T_q=240: auto (fallback is fastest [sdpa 134.6 us, reference only])",
+    "T_k=320 B=8 T_q=295: cute_m32n16t64 (1.06x vs auto [sdpa 305.1 us, reference only])"
    ],
    "evidence": {
     "T_k=256": {
      "cute_m32n16t64": [
-      0.031178,
-      0.000234,
-      12
+      0.03126,
+      0.000374,
+      24
      ],
      "cute_m64n16t128": [
-      0.031724,
-      0.000196,
-      12
-     ],
-     "cxx": [
-      0.031984,
-      0.000219,
-      12
+      0.031956,
+      0.000338,
+      24
      ],
      "cxx_s1": [
-      0.03202,
-      0.000243,
+      0.032088,
+      0.000216,
+      24
+     ],
+     "cxx": [
+      0.032148,
+      0.000273,
       9
      ],
      "auto": [
-      0.03216,
-      0.00016,
-      12
+      0.03225,
+      0.000122,
+      24
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
      "cute_m64n16t128": [
-      0.060098,
-      0.000228,
+      0.06,
+      0.000291,
       12
      ],
      "cute_m32n16t64": [
-      0.061318,
-      0.000374,
+      0.061582,
+      0.000116,
       12
      ],
      "cxx_s1": [
-      0.064622,
-      0.000175,
+      0.064548,
+      0.000208,
       12
      ],
      "cxx": [
-      0.064992,
-      0.000658,
+      0.06468,
+      0.000338,
       9
      ],
      "auto": [
-      0.065454,
-      0.000279,
+      0.065398,
+      0.000276,
       12
      ],
      "_l2": "rotated"
@@ -663,123 +665,119 @@
   "fmha|op=fmha|dt=half|D=128|H=32|Hkv=32|mask=none|bias=0|ba=0|kv=paged16|ss=1|q=1|B=1": {
    "regions": [
     [
-     320,
-     "cxx_s2"
-    ],
-    [
      null,
      "auto"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cxx_s2'] (eps 3%), 2 segment(s)",
-    "worst measured regret 0.3%",
-    "T_k=192 B=1 T_q=1: auto (fallback is fastest [sdpa 32.7 us, reference only])",
-    "T_k=256 B=1 T_q=1: cxx_s2 (1.14x vs auto [sdpa 35.0 us, reference only])",
-    "T_k=320 B=1 T_q=1: cxx_s2 (1.12x vs auto [sdpa 42.8 us, reference only])",
-    "T_k=384 B=1 T_q=1: auto (fallback is fastest [sdpa 45.1 us, reference only])"
+    "partition: cover ['auto'] (eps 3%), 1 segment(s)",
+    "worst measured regret 2.2%",
+    "T_k=192 B=1 T_q=1: auto (fallback is fastest [sdpa 32.8 us, reference only])",
+    "T_k=256 B=1 T_q=1: auto (fallback is fastest [sdpa 35.1 us, reference only])",
+    "T_k=320 B=1 T_q=1: auto (fallback is fastest [sdpa 42.7 us, reference only])",
+    "T_k=384 B=1 T_q=1: auto (fallback is fastest [sdpa 44.1 us, reference only])"
    ],
    "evidence": {
     "T_k=192": {
      "cxx": [
-      0.007789,
-      1.5e-05,
+      0.00532,
+      1.4e-05,
       12
      ],
      "auto": [
-      0.007789,
-      1.5e-05,
+      0.00532,
+      1.4e-05,
       12
      ],
      "cxx_s8": [
-      0.007791,
-      2.6e-05,
+      0.005323,
+      3.4e-05,
       12
      ],
      "cxx_s1": [
-      0.007799,
-      2.3e-05,
-      12
+      0.005327,
+      1.7e-05,
+      9
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
      "cxx_s2": [
-      0.008356,
-      5.6e-05,
+      0.006155,
+      1.2e-05,
       12
      ],
      "cxx_s4": [
-      0.008369,
-      4.6e-05,
+      0.00616,
+      3.5e-05,
       12
      ],
      "cxx_s8": [
-      0.00838,
-      6.2e-05,
+      0.00619,
+      4.1e-05,
       12
      ],
-     "cute_m64n32t128": [
-      0.009058,
-      2.4e-05,
-      9
+     "cxx": [
+      0.0062,
+      3e-05,
+      12
      ],
      "auto": [
-      0.009499,
-      4.8e-05,
+      0.0062,
+      3e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
-     "cxx_s8": [
-      0.010399,
-      4.5e-05,
-      12
-     ],
      "cxx_s4": [
-      0.010409,
-      3.1e-05,
+      0.007199,
+      2.7e-05,
       12
      ],
      "cxx_s2": [
-      0.010411,
-      5.3e-05,
+      0.0072,
+      3.1e-05,
       12
      ],
-     "cute_m32n64t64": [
-      0.011649,
-      3.8e-05,
-      9
+     "cxx_s8": [
+      0.007204,
+      2.6e-05,
+      12
+     ],
+     "cxx": [
+      0.007359,
+      2.8e-05,
+      12
      ],
      "auto": [
-      0.01171,
-      4.9e-05,
+      0.007359,
+      2.8e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
      "cxx_s8": [
-      0.009352,
-      8.9e-05,
-      20
+      0.006345,
+      1.8e-05,
+      12
      ],
      "cxx": [
-      0.009373,
-      6.8e-05,
-      20
+      0.006345,
+      3.5e-05,
+      12
      ],
      "auto": [
-      0.009373,
-      6.8e-05,
-      20
+      0.006345,
+      3.5e-05,
+      12
      ],
      "cxx_s4": [
-      0.009387,
-      8.3e-05,
-      20
+      0.006356,
+      3e-05,
+      12
      ],
      "_l2": "rotated"
     }
@@ -789,60 +787,60 @@
    "regions": [
     [
      null,
-     "cute_m32n16t64"
+     "auto"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.0%",
-    "T_k=320 B=14 T_q=1: cute_m32n16t64 (1.10x vs auto [sdpa 179.6 us, reference only])",
-    "T_k=384 B=9 T_q=1: cute_m32n16t64 (1.13x vs auto [sdpa 125.0 us, reference only])"
+    "partition: cover ['auto'] (eps 3%), 1 segment(s)",
+    "worst measured regret 2.9%",
+    "T_k=320 B=14 T_q=1: auto (fallback is fastest [sdpa 178.5 us, reference only])",
+    "T_k=384 B=9 T_q=1: auto (fallback is fastest [sdpa 125.7 us, reference only])"
    ],
    "evidence": {
     "T_k=320": {
-     "cute_m32n16t64": [
-      0.038866,
-      0.000199,
+     "cxx_s1": [
+      0.035706,
+      0.001696,
       24
      ],
      "cxx": [
-      0.042796,
-      0.000801,
+      0.036732,
+      0.00134,
       24
      ],
      "auto": [
-      0.042796,
-      0.000801,
+      0.036732,
+      0.00134,
       24
      ],
-     "cute_m64n32t128": [
-      0.042846,
-      0.000353,
+     "cute_m32n16t64": [
+      0.036864,
+      0.000528,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cute_m32n16t64": [
-      0.025624,
-      0.000136,
-      19
-     ],
-     "cute_m64n16t128": [
-      0.028184,
-      0.000219,
-      19
+     "cxx_s1": [
+      0.02666,
+      0.000962,
+      24
      ],
      "cxx": [
-      0.028944,
-      0.00016,
-      19
+      0.027273,
+      0.000638,
+      24
      ],
      "auto": [
-      0.028944,
-      0.00016,
-      19
+      0.027273,
+      0.000638,
+      24
+     ],
+     "cute_m32n16t64": [
+      0.02789,
+      0.000208,
+      24
      ],
      "_l2": "rotated"
     }
@@ -857,89 +855,78 @@
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cxx_s2'] (eps 3%), 1 segment(s)",
-    "M 256..384: cxx_s2 only 1.04x -> auto",
-    "worst measured regret 11.1%",
-    "T_k=256 B=2 T_q=1: auto (fallback is fastest [sdpa 39.6 us, reference only])",
-    "T_k=320 B=2 T_q=1: auto (fallback is fastest [sdpa 47.2 us, reference only])",
-    "T_k=384 B=2 T_q=1: cxx_s2 (1.11x vs auto [sdpa 50.1 us, reference only])"
+    "partition: cover ['auto'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.1%",
+    "T_k=256 B=2 T_q=1: auto (fallback is fastest [sdpa 39.8 us, reference only])",
+    "T_k=320 B=2 T_q=1: auto (fallback is fastest [sdpa 47.5 us, reference only])",
+    "T_k=384 B=2 T_q=1: auto (fallback is fastest [sdpa 49.8 us, reference only])"
    ],
    "evidence": {
     "T_k=256": {
-     "cxx_s2": [
-      0.009699,
-      7e-05,
-      14
-     ],
-     "cxx_s8": [
-      0.009706,
-      9.6e-05,
-      14
-     ],
-     "cxx_s4": [
-      0.009719,
-      6.3e-05,
-      14
-     ],
-     "cxx_s1": [
-      0.00977,
-      3.1e-05,
-      9
+     "cxx": [
+      0.007367,
+      6.7e-05,
+      12
      ],
      "auto": [
-      0.009858,
-      7.3e-05,
-      14
+      0.007367,
+      6.7e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.007371,
+      3.8e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.007659,
+      4.6e-05,
+      12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
-     "cxx_s2": [
-      0.012429,
-      0.000111,
-      12
-     ],
-     "cxx_s1": [
-      0.012456,
-      5.9e-05,
-      12
-     ],
      "cxx": [
-      0.012459,
-      8.2e-05,
+      0.009549,
+      2.5e-05,
       12
      ],
      "auto": [
-      0.012459,
-      8.2e-05,
+      0.009549,
+      2.5e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.009555,
+      6.3e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.009781,
+      4.2e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
      "cxx_s2": [
-      0.012199,
-      9.9e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.012683,
-      9.2e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.012696,
-      6.5e-05,
+      0.009145,
+      5.9e-05,
       12
      ],
      "cxx": [
-      0.013558,
-      9e-05,
+      0.009156,
+      2e-05,
       12
      ],
      "auto": [
-      0.013558,
-      9e-05,
+      0.009156,
+      2e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.00943,
+      2.1e-05,
       12
      ],
      "_l2": "rotated"
@@ -955,85 +942,79 @@
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 2 segment(s)",
-    "M 384..384: cute_m32n16t64 only 1.03x -> auto",
-    "worst measured regret 3.3%",
-    "T_k=256 B=4 T_q=1: auto (fallback is fastest [sdpa 44.6 us, reference only])",
-    "T_k=320 B=4 T_q=1: auto (fallback is fastest [sdpa 55.0 us, reference only])",
-    "T_k=384 B=4 T_q=1: auto (fallback is fastest [sdpa 59.9 us, reference only])"
+    "partition: cover ['auto'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.2%",
+    "T_k=256 B=4 T_q=1: auto (fallback is fastest [sdpa 45.6 us, reference only])",
+    "T_k=320 B=4 T_q=1: auto (fallback is fastest [sdpa 55.2 us, reference only])",
+    "T_k=384 B=4 T_q=1: auto (fallback is fastest [sdpa 59.6 us, reference only])"
    ],
    "evidence": {
     "T_k=256": {
-     "cute_m32n64t64": [
-      0.012175,
-      0.000106,
+     "cxx_s1": [
+      0.010382,
+      8.9e-05,
       12
      ],
-     "cute_m64n64t128": [
-      0.012211,
-      7.3e-05,
+     "cxx": [
+      0.01039,
+      8.7e-05,
       12
-     ],
-     "cute_m32n32t64": [
-      0.012234,
-      3.5e-05,
-      12
-     ],
-     "cute_m32n16t64": [
-      0.012241,
-      0.000117,
-      9
      ],
      "auto": [
-      0.012401,
-      7.6e-05,
+      0.01039,
+      8.7e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.011114,
+      0.0001,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
      "cxx": [
-      0.013418,
-      0.000108,
-      12
+      0.012022,
+      0.000152,
+      24
      ],
      "auto": [
-      0.013418,
-      0.000108,
-      12
+      0.012022,
+      0.000152,
+      24
      ],
      "cxx_s1": [
-      0.01349,
-      0.000107,
-      12
+      0.012054,
+      0.000125,
+      24
      ],
-     "cute_m32n16t64": [
-      0.013872,
-      5.3e-05,
-      12
+     "cxx_s4": [
+      0.013011,
+      7.9e-05,
+      24
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cute_m32n16t64": [
-      0.015222,
-      0.00015,
-      13
-     ],
-     "cute_m64n16t128": [
-      0.01569,
-      0.000113,
-      13
+     "cxx_s1": [
+      0.014039,
+      0.000103,
+      12
      ],
      "cxx": [
-      0.015719,
-      0.000113,
-      13
+      0.014063,
+      8.2e-05,
+      12
      ],
      "auto": [
-      0.015719,
-      0.000113,
-      13
+      0.014063,
+      8.2e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.01464,
+      7.6e-05,
+      12
      ],
      "_l2": "rotated"
     }
@@ -1043,84 +1024,84 @@
    "regions": [
     [
      null,
-     "cute_m32n16t64"
+     "auto"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.0%",
-    "T_k=256 B=5 T_q=1: auto (fallback is fastest [sdpa 49.2 us, reference only])",
-    "T_k=320 B=8 T_q=1: cute_m32n16t64 (1.12x vs auto [sdpa 100.6 us, reference only])",
-    "T_k=384 B=8 T_q=1: cute_m32n16t64 (1.15x vs auto [sdpa 113.7 us, reference only])"
+    "partition: cover ['auto'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.1%",
+    "T_k=256 B=5 T_q=1: auto (fallback is fastest [sdpa 49.7 us, reference only])",
+    "T_k=320 B=8 T_q=1: auto (fallback is fastest [sdpa 100.7 us, reference only])",
+    "T_k=384 B=8 T_q=1: auto (fallback is fastest [sdpa 113.6 us, reference only])"
    ],
    "evidence": {
     "T_k=256": {
-     "cute_m32n16t64": [
-      0.013098,
-      8e-05,
-      17
-     ],
-     "cute_m64n16t128": [
-      0.013295,
-      7.3e-05,
-      17
-     ],
      "cxx": [
-      0.013322,
-      7.3e-05,
-      17
+      0.011104,
+      7.8e-05,
+      12
      ],
      "auto": [
-      0.013322,
+      0.011104,
+      7.8e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.01124,
+      9.8e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.012098,
       7.3e-05,
-      17
+      12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
-     "cute_m32n16t64": [
-      0.0254,
-      0.000107,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.026412,
-      0.000169,
+     "cxx_s1": [
+      0.02441,
+      0.000243,
       12
      ],
      "cxx": [
-      0.028362,
-      0.000136,
+      0.02444,
+      0.000181,
       12
      ],
      "auto": [
-      0.028362,
-      0.000136,
+      0.02444,
+      0.000181,
+      12
+     ],
+     "cute_m32n16t64": [
+      0.02521,
+      7.4e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cute_m32n16t64": [
-      0.022,
-      9.5e-05,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.024552,
-      0.000234,
-      12
-     ],
      "cxx": [
-      0.025372,
-      0.000136,
-      12
+      0.018794,
+      0.000155,
+      24
      ],
      "auto": [
-      0.025372,
-      0.000136,
-      12
+      0.018794,
+      0.000155,
+      24
+     ],
+     "cxx_s1": [
+      0.018927,
+      0.000218,
+      24
+     ],
+     "cxx_s2": [
+      0.022172,
+      9.7e-05,
+      24
      ],
      "_l2": "rotated"
     }
@@ -1137,63 +1118,63 @@
    "notes": [
     "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=166 B=64 T_q=52: cxx (1.16x vs auto [sdpa 56.7 us, reference only])",
-    "T_k=167 B=64 T_q=57: auto (cxx_s4 1.12x rejected: single replay disagrees (16.1 vs 14.8 us: self-overlap) [sdpa 57.5 us, reference only])"
+    "T_k=166 B=64 T_q=52: cxx_s1 (1.14x vs auto [sdpa 57.2 us, reference only])",
+    "T_k=167 B=64 T_q=57: cxx_s1 (1.12x vs auto [sdpa 57.8 us, reference only])"
    ],
    "evidence": {
     "T_k=166": {
      "cute_m32n16t64": [
-      0.014159,
-      0.000129,
-      17
+      0.014531,
+      0.000104,
+      14
      ],
      "cxx_s4": [
-      0.014217,
-      9.9e-05,
-      17
+      0.014585,
+      0.000121,
+      14
      ],
-     "cxx": [
-      0.014252,
-      0.000108,
-      17
-     ],
-     "cxx_s8": [
-      0.014284,
-      0.000155,
+     "cxx_s2": [
+      0.014691,
+      8.6e-05,
       9
      ],
-     "auto": [
-      0.016489,
+     "cxx_s1": [
+      0.014708,
       0.000108,
-      17
+      14
+     ],
+     "auto": [
+      0.016737,
+      6.7e-05,
+      14
      ],
      "_l2": "rotated"
     },
     "T_k=167": {
      "cute_m32n16t64": [
       0.014692,
-      0.000114,
-      24
+      8.4e-05,
+      16
      ],
      "cute_m64n16t128": [
-      0.014749,
-      8.2e-05,
-      24
+      0.014774,
+      0.000123,
+      16
+     ],
+     "cxx_s2": [
+      0.014912,
+      6e-05,
+      9
      ],
      "cxx_s1": [
-      0.014871,
-      9.9e-05,
-      9
-     ],
-     "cxx_s8": [
-      0.014883,
-      0.000116,
-      9
+      0.014937,
+      6.9e-05,
+      16
      ],
      "auto": [
-      0.016668,
-      0.000224,
-      24
+      0.016682,
+      0.000114,
+      16
      ],
      "_l2": "rotated"
     }
@@ -1209,35 +1190,35 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cute_m32n64t64'] (eps 3%), 1 segment(s)",
-    "M 167..167: cute_m32n64t64 only 1.01x -> auto",
-    "worst measured regret 4.3%",
-    "T_k=167 B=8 T_q=44: auto (fallback is fastest [sdpa 30.8 us, reference only])"
+    "M 167..167: cute_m32n64t64 only 1.02x -> auto",
+    "worst measured regret 4.5%",
+    "T_k=167 B=8 T_q=44: auto (fallback is fastest [sdpa 31.0 us, reference only])"
    ],
    "evidence": {
     "T_k=167": {
-     "cxx_s2": [
-      0.007147,
-      2.4e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.007152,
+     "cxx_s1": [
+      0.007133,
       2.2e-05,
       12
      ],
-     "cxx": [
-      0.007157,
-      1.2e-05,
-      9
-     ],
-     "cxx_s1": [
-      0.007159,
-      4.1e-05,
+     "cxx_s8": [
+      0.007137,
+      3.2e-05,
       12
      ],
+     "cxx": [
+      0.007137,
+      1.2e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.007153,
+      1.1e-05,
+      9
+     ],
      "auto": [
-      0.007453,
-      3e-05,
+      0.007452,
+      2.4e-05,
       12
      ],
      "_l2": "rotated"
@@ -1255,63 +1236,63 @@
    "notes": [
     "partition: cover ['auto', 'cute_m64n16t128'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=166 B=64 T_q=166: cute_m64n16t128 (1.24x vs auto [sdpa 121.9 us, reference only])",
-    "T_k=167 B=64 T_q=167: cute_m64n16t128 (1.27x vs auto [sdpa 121.9 us, reference only])"
+    "T_k=166 B=64 T_q=166: cute_m64n16t128 (1.25x vs auto [sdpa 121.6 us, reference only])",
+    "T_k=167 B=64 T_q=167: cute_m64n16t128 (1.26x vs auto [sdpa 122.2 us, reference only])"
    ],
    "evidence": {
     "T_k=166": {
      "cute_m64n16t128": [
-      0.022746,
-      0.000291,
-      24
+      0.02267,
+      0.000163,
+      12
      ],
      "cute_m32n16t64": [
-      0.02479,
-      0.000252,
-      24
+      0.024774,
+      0.000225,
+      12
+     ],
+     "cxx_s8": [
+      0.025854,
+      0.000178,
+      12
      ],
      "cxx_s4": [
-      0.026042,
-      0.000181,
-      24
-     ],
-     "cxx_s1": [
-      0.026052,
-      0.000107,
+      0.025976,
+      0.000119,
       9
      ],
      "auto": [
-      0.028158,
-      0.000128,
-      24
+      0.028364,
+      0.000255,
+      12
      ],
      "_l2": "rotated"
     },
     "T_k=167": {
      "cute_m64n16t128": [
-      0.023054,
-      0.000122,
-      14
+      0.02312,
+      0.000178,
+      17
      ],
      "cute_m32n16t64": [
-      0.025368,
-      0.000249,
-      14
-     ],
-     "cxx_s4": [
-      0.026784,
-      0.000243,
-      9
+      0.025192,
+      0.000178,
+      17
      ],
      "cxx_s8": [
-      0.02682,
-      9.5e-05,
+      0.02664,
+      0.000237,
+      17
+     ],
+     "cxx_s4": [
+      0.026652,
+      0.000184,
       9
      ],
      "auto": [
-      0.029246,
-      0.000101,
-      14
+      0.02914,
+      5.3e-05,
+      17
      ],
      "_l2": "rotated"
     }
@@ -1333,29 +1314,29 @@
    ],
    "evidence": {
     "T_k=167": {
-     "cxx_s8": [
-      0.008024,
-      1.4e-05,
+     "cxx": [
+      0.007997,
+      2.1e-05,
       12
      ],
      "cxx_s4": [
-      0.008033,
-      1.4e-05,
+      0.007998,
+      2.7e-05,
       12
      ],
-     "cxx": [
-      0.008035,
-      3.7e-05,
+     "cxx_s8": [
+      0.008004,
+      1.7e-05,
       12
      ],
      "cxx_s2": [
-      0.008039,
-      3.2e-05,
+      0.008022,
+      2.7e-05,
       9
      ],
      "auto": [
-      0.00837,
-      3.3e-05,
+      0.008337,
+      4.3e-05,
       12
      ],
      "_l2": "rotated"
@@ -1372,34 +1353,34 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cute_m64n16t128'] (eps 3%), 1 segment(s)",
-    "worst measured regret 2.5%",
-    "T_k=1500 B=1 T_q=1500: cute_m64n16t128 (1.19x vs auto [sdpa 166.6 us, reference only])"
+    "worst measured regret 1.9%",
+    "T_k=1500 B=1 T_q=1500: cute_m64n16t128 (1.19x vs auto [sdpa 166.5 us, reference only])"
    ],
    "evidence": {
     "T_k=1500": {
      "cute_m64n32t128": [
-      0.016019,
-      0.000141,
+      0.016051,
+      0.000148,
       12
      ],
      "cute_m64n16t128": [
-      0.016425,
-      4.6e-05,
+      0.01636,
+      8.7e-05,
       12
      ],
      "cxx_s1": [
-      0.018088,
-      2.5e-05,
+      0.018074,
+      5.7e-05,
       12
      ],
      "cxx": [
-      0.01811,
-      4.2e-05,
+      0.018103,
+      9.8e-05,
       9
      ],
      "auto": [
-      0.019474,
-      0.0001,
+      0.019463,
+      6.7e-05,
       12
      ],
      "_l2": "rotated"
@@ -1417,33 +1398,33 @@
    "notes": [
     "partition: cover ['auto', 'cute_m128n32t256'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=1500 B=14 T_q=1500: cute_m64n32t128 (1.29x vs auto [sdpa 1700.0 us, reference only])"
+    "T_k=1500 B=14 T_q=1500: cute_m64n32t128 (1.29x vs auto [sdpa 1677.8 us, reference only])"
    ],
    "evidence": {
     "T_k=1500": {
      "cute_m128n32t256": [
-      0.210334,
-      0.004641,
+      0.210704,
+      0.004397,
       24
      ],
      "cute_m64n32t128": [
-      0.216238,
-      0.003692,
+      0.216292,
+      0.004294,
       24
      ],
      "cute_m64n16t128": [
-      0.225418,
-      0.003262,
+      0.22589,
+      0.003013,
       24
      ],
      "cute_m32n16t64": [
-      0.2462,
-      0.003475,
+      0.24574,
+      0.005195,
       9
      ],
      "auto": [
-      0.279556,
-      0.001566,
+      0.279842,
+      0.00158,
       24
      ],
      "_l2": "warm"
@@ -1460,35 +1441,35 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cute_m128n32t256'] (eps 3%), 1 segment(s)",
-    "worst measured regret 2.9%",
-    "T_k=1500 B=2 T_q=1500: cute_m64n16t128 (1.20x vs auto [sdpa 291.3 us, reference only])"
+    "worst measured regret 2.1%",
+    "T_k=1500 B=2 T_q=1500: cute_m64n16t128 (1.19x vs auto [sdpa 290.8 us, reference only])"
    ],
    "evidence": {
     "T_k=1500": {
      "cute_m64n32t128": [
-      0.034216,
-      0.000225,
-      15
+      0.034194,
+      0.00016,
+      12
      ],
      "cute_m128n32t256": [
-      0.035216,
-      0.000344,
-      15
+      0.034914,
+      0.00019,
+      12
      ],
      "cute_m64n16t128": [
-      0.035548,
-      0.000196,
-      15
+      0.035772,
+      0.000243,
+      12
      ],
-     "cxx": [
-      0.038548,
-      0.000261,
+     "cxx_s1": [
+      0.03864,
+      0.000166,
       9
      ],
      "auto": [
-      0.042828,
-      0.000154,
-      15
+      0.04262,
+      0.000199,
+      12
      ],
      "_l2": "rotated"
     }
@@ -1505,33 +1486,33 @@
    "notes": [
     "partition: cover ['auto', 'cute_m64n32t128'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=1500 B=3 T_q=1500: cute_m64n32t128 (1.22x vs auto [sdpa 414.4 us, reference only])"
+    "T_k=1500 B=3 T_q=1500: cute_m64n32t128 (1.22x vs auto [sdpa 414.8 us, reference only])"
    ],
    "evidence": {
     "T_k=1500": {
      "cute_m64n32t128": [
-      0.045272,
-      0.00027,
+      0.045114,
+      0.00013,
       24
      ],
      "cute_m128n32t256": [
-      0.046858,
-      0.000721,
+      0.046552,
+      0.000667,
       24
      ],
      "cute_m64n16t128": [
-      0.049406,
-      0.000362,
+      0.04925,
+      0.000439,
       24
      ],
      "cxx_s1": [
-      0.051256,
-      4.7e-05,
+      0.051224,
+      8.9e-05,
       9
      ],
      "auto": [
-      0.055314,
-      0.000116,
+      0.055166,
+      0.000199,
       24
      ],
      "_l2": "rotated"
@@ -1548,34 +1529,34 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cute_m128n32t256'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.2%",
-    "T_k=1500 B=5 T_q=1500: cute_m64n16t128 (1.29x vs auto [sdpa 650.0 us, reference only])"
+    "worst measured regret 0.1%",
+    "T_k=1500 B=5 T_q=1500: cute_m64n16t128 (1.29x vs auto [sdpa 648.6 us, reference only])"
    ],
    "evidence": {
     "T_k=1500": {
      "cute_m64n32t128": [
-      0.06914,
-      0.000219,
+      0.068968,
+      0.000187,
       12
      ],
      "cute_m128n32t256": [
-      0.069298,
-      0.000231,
+      0.069064,
+      0.000442,
       12
      ],
      "cute_m64n16t128": [
-      0.072352,
-      0.000371,
+      0.071878,
+      9.8e-05,
       12
      ],
      "cute_m32n16t64": [
-      0.079468,
-      0.000279,
+      0.07934,
+      0.000344,
       9
      ],
      "auto": [
-      0.093526,
-      0.000107,
+      0.093026,
+      0.000216,
       12
      ],
      "_l2": "rotated"
@@ -1593,62 +1574,62 @@
    "notes": [
     "partition: cover ['auto', 'cute_m64n16t128'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=247 B=64 T_q=247: cute_m64n16t128 (2.11x vs auto [sdpa 117.4 us, reference only])",
-    "T_k=249 B=64 T_q=249: cute_m64n16t128 (2.10x vs auto [sdpa 118.5 us, reference only])"
+    "T_k=247 B=64 T_q=247: cute_m64n16t128 (2.11x vs auto [sdpa 116.8 us, reference only])",
+    "T_k=249 B=64 T_q=249: cute_m64n16t128 (2.11x vs auto [sdpa 119.1 us, reference only])"
    ],
    "evidence": {
     "T_k=247": {
      "cute_m64n16t128": [
-      0.049632,
-      0.00048,
-      13
+      0.049562,
+      0.000329,
+      18
      ],
      "cute_m64n32t128": [
-      0.051028,
-      0.000362,
-      13
+      0.050976,
+      0.000199,
+      18
      ],
      "cute_m32n16t64": [
-      0.052332,
-      0.000403,
-      13
+      0.052494,
+      0.000418,
+      18
      ],
      "cute_m128n32t256": [
-      0.054752,
-      0.000996,
+      0.054512,
+      0.000984,
       9
      ],
      "auto": [
-      0.104696,
-      0.000979,
-      13
+      0.104416,
+      0.00102,
+      18
      ],
      "_l2": "rotated"
     },
     "T_k=249": {
      "cute_m64n16t128": [
-      0.049966,
-      0.000466,
+      0.049858,
+      0.000421,
       12
      ],
      "cute_m64n32t128": [
-      0.05319,
-      0.0004,
+      0.053062,
+      0.000513,
       12
      ],
      "cute_m32n16t64": [
-      0.053314,
-      0.000454,
+      0.053068,
+      0.000492,
       12
      ],
      "cute_m128n32t256": [
-      0.055884,
-      0.000955,
+      0.055852,
+      0.001257,
       9
      ],
      "auto": [
-      0.105112,
-      0.001035,
+      0.104988,
+      0.000768,
       12
      ],
      "_l2": "rotated"
@@ -1666,33 +1647,33 @@
    "notes": [
     "partition: cover ['auto', 'cute_m32n32t64'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=249 B=8 T_q=249: cute_m32n16t64 (1.17x vs auto [sdpa 29.6 us, reference only])"
+    "T_k=249 B=8 T_q=249: cute_m32n32t64 (1.23x vs auto [sdpa 29.6 us, reference only])"
    ],
    "evidence": {
     "T_k=249": {
      "cute_m32n32t64": [
-      0.013709,
-      4.9e-05,
+      0.013744,
+      5.3e-05,
       12
      ],
      "cute_m32n16t64": [
-      0.014359,
-      5e-05,
+      0.014479,
+      7.2e-05,
       12
      ],
      "cute_m64n32t128": [
-      0.014464,
-      6.6e-05,
+      0.014538,
+      9.2e-05,
       12
      ],
      "cute_m64n16t128": [
-      0.014945,
-      8.8e-05,
+      0.015069,
+      9.7e-05,
       9
      ],
      "auto": [
-      0.016752,
-      7.5e-05,
+      0.016859,
+      0.00011,
       12
      ],
      "_l2": "rotated"
@@ -1710,33 +1691,33 @@
    "notes": [
     "partition: cover ['auto', 'cxx'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=248 B=64 T_q=248: cxx (1.95x vs auto [sdpa 77.4 us, reference only])"
+    "T_k=248 B=64 T_q=248: cxx (1.94x vs auto [sdpa 77.3 us, reference only])"
    ],
    "evidence": {
     "T_k=248": {
      "cxx_s1": [
-      0.046912,
-      0.000335,
+      0.047118,
+      0.000225,
       24
      ],
      "cxx": [
-      0.046918,
-      0.000356,
+      0.047122,
+      0.000439,
       24
      ],
      "cute_m64n16t128": [
-      0.04833,
-      0.001091,
+      0.048808,
+      0.000961,
       24
      ],
      "cute_m64n32t128": [
-      0.051892,
-      0.000937,
+      0.052188,
+      0.000931,
       9
      ],
      "auto": [
-      0.091292,
-      0.001112,
+      0.091626,
+      0.001287,
       24
      ],
      "_l2": "rotated"
@@ -1753,150 +1734,150 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cxx_s2'] (eps 3%), 1 segment(s)",
-    "worst measured regret 1.7%",
-    "T_k=64 B=1 T_q=16: cxx (1.57x vs auto [sdpa 17.4 us, reference only])",
-    "T_k=128 B=1 T_q=16: cxx (1.57x vs auto [sdpa 21.0 us, reference only])",
-    "T_k=192 B=1 T_q=16: cxx (1.28x vs auto [sdpa 25.1 us, reference only])",
-    "T_k=256 B=1 T_q=16: cxx (1.16x vs auto [sdpa 29.2 us, reference only])",
-    "T_k=320 B=1 T_q=16: cxx_s2 (1.37x vs auto [sdpa 33.8 us, reference only])"
+    "worst measured regret 0.4%",
+    "T_k=64 B=1 T_q=16: cxx (1.58x vs auto [sdpa 17.3 us, reference only])",
+    "T_k=128 B=1 T_q=16: cxx (1.57x vs auto [sdpa 20.9 us, reference only])",
+    "T_k=192 B=1 T_q=16: cxx_s1 (1.28x vs auto [sdpa 25.0 us, reference only])",
+    "T_k=256 B=1 T_q=16: cxx_s2 (1.20x vs auto [sdpa 29.1 us, reference only])",
+    "T_k=320 B=1 T_q=16: cxx_s2 (1.44x vs auto [sdpa 33.7 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
+     "cxx": [
+      0.002846,
+      8e-06,
+      12
+     ],
      "cxx_s8": [
-      0.002856,
+      0.002847,
       4e-06,
       12
      ],
-     "cxx": [
-      0.002857,
-      5e-06,
-      12
-     ],
-     "cxx_s4": [
-      0.002857,
-      6e-06,
-      12
-     ],
-     "cxx_s2": [
-      0.002858,
-      7e-06,
+     "cxx_s1": [
+      0.002847,
+      9e-06,
       9
      ],
+     "cxx_s4": [
+      0.002848,
+      3e-06,
+      12
+     ],
      "auto": [
-      0.004497,
-      5e-06,
+      0.004505,
+      7e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cxx_s1": [
-      0.002885,
-      2e-06,
-      12
-     ],
      "cxx_s2": [
-      0.002886,
-      3e-06,
+      0.002878,
+      5e-06,
       12
      ],
      "cxx": [
-      0.002886,
-      4e-06,
+      0.002878,
+      7e-06,
       12
      ],
-     "cxx_s4": [
-      0.002887,
-      4e-06,
+     "cxx_s8": [
+      0.002879,
+      5e-06,
       9
      ],
+     "cxx_s1": [
+      0.002879,
+      7e-06,
+      12
+     ],
      "auto": [
-      0.004536,
+      0.004526,
       9e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cxx": [
-      0.004551,
-      5e-06,
-      12
-     ],
-     "cxx_s2": [
-      0.004552,
+     "cxx_s1": [
+      0.004532,
       7e-06,
       12
      ],
-     "cxx_s4": [
-      0.004552,
-      8e-06,
+     "cxx_s8": [
+      0.004533,
+      1.1e-05,
       12
      ],
-     "cxx_s1": [
-      0.004553,
-      8e-06,
+     "cxx_s4": [
+      0.004534,
+      5e-06,
+      12
+     ],
+     "cxx": [
+      0.004535,
+      1e-06,
       9
      ],
      "auto": [
-      0.005823,
-      8e-06,
+      0.005806,
+      9e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cxx": [
-      0.006271,
-      8e-06,
-      12
-     ],
-     "cxx_s1": [
-      0.006271,
-      4e-06,
+     "cxx_s2": [
+      0.006021,
+      9e-06,
       12
      ],
      "cxx_s8": [
-      0.006373,
-      1.5e-05,
+      0.006027,
+      1.8e-05,
       12
      ],
      "cxx_s4": [
-      0.006378,
-      8e-06,
+      0.006027,
+      1.7e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.006251,
+      6e-06,
       9
      ],
      "auto": [
-      0.007251,
-      2.3e-05,
+      0.007229,
+      2.2e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
      "cxx_s8": [
-      0.006501,
-      3.2e-05,
+      0.006123,
+      2.5e-05,
       12
      ],
      "cxx_s4": [
-      0.006506,
-      3e-05,
+      0.006131,
+      1.5e-05,
       12
      ],
      "cxx_s2": [
-      0.006517,
-      1.8e-05,
+      0.006146,
+      2.2e-05,
       12
      ],
-     "cxx": [
-      0.008054,
-      6.5e-05,
+     "cxx_s1": [
+      0.008018,
+      3.3e-05,
       9
      ],
      "auto": [
-      0.008951,
-      1.3e-05,
+      0.00887,
+      4.1e-05,
       12
      ],
      "_l2": "rotated"
@@ -1913,151 +1894,151 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cxx_s2'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.6%",
-    "T_k=64 B=16 T_q=16: auto (cxx 1.99x rejected: single replay disagrees (9.6 vs 9.5 us: self-overlap) [sdpa 21.9 us, reference only])",
-    "T_k=128 B=16 T_q=16: auto (cxx_s1 1.83x rejected: single replay disagrees (9.3 vs 9.3 us: self-overlap) [sdpa 26.3 us, reference only])",
-    "T_k=192 B=16 T_q=16: auto (cxx 1.43x rejected: single replay disagrees (9.7 vs 9.7 us: self-overlap) [sdpa 30.9 us, reference only])",
-    "T_k=256 B=9 T_q=16: cxx_s2 (1.26x vs auto [sdpa 33.9 us, reference only])",
-    "T_k=320 B=15 T_q=16: cxx_s2 (1.38x vs auto [sdpa 39.8 us, reference only])"
+    "worst measured regret 0.7%",
+    "T_k=64 B=16 T_q=16: cxx (1.99x vs auto [sdpa 21.7 us, reference only])",
+    "T_k=128 B=16 T_q=16: auto (cxx_s2 1.87x rejected: single replay disagrees (9.5 vs 9.4 us: self-overlap) [sdpa 26.1 us, reference only])",
+    "T_k=192 B=16 T_q=16: cxx_s1 (1.43x vs auto [sdpa 30.8 us, reference only])",
+    "T_k=256 B=9 T_q=16: cxx_s2 (1.32x vs auto [sdpa 33.8 us, reference only])",
+    "T_k=320 B=15 T_q=16: cxx_s2 (1.38x vs auto [sdpa 39.7 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
-     "cxx_s1": [
-      0.003317,
-      3.1e-05,
-      24
-     ],
      "cxx": [
-      0.003328,
-      3.6e-05,
-      24
+      0.003333,
+      3.1e-05,
+      21
      ],
      "cxx_s2": [
-      0.003336,
-      4.3e-05,
-      24
+      0.003333,
+      2.7e-05,
+      21
      ],
      "cxx_s8": [
-      0.003349,
-      5.7e-05,
+      0.003339,
+      3.2e-05,
+      21
+     ],
+     "cxx_s4": [
+      0.00335,
+      3e-05,
       9
      ],
      "auto": [
-      0.00661,
-      4.4e-05,
-      24
+      0.006617,
+      1.4e-05,
+      21
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cxx_s1": [
-      0.003553,
-      6e-05,
+     "cxx_s2": [
+      0.003492,
+      2.9e-05,
+      24
+     ],
+     "cxx_s8": [
+      0.003493,
+      5.2e-05,
       24
      ],
      "cxx_s4": [
-      0.003553,
-      3.4e-05,
-      24
-     ],
-     "cxx_s2": [
-      0.003554,
-      4.8e-05,
+      0.003501,
+      4.4e-05,
       24
      ],
      "cxx": [
-      0.003798,
-      0.000344,
+      0.003696,
+      0.00031,
       9
      ],
      "auto": [
-      0.006507,
-      2.3e-05,
+      0.006538,
+      3.2e-05,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cxx_s2": [
-      0.006127,
-      7e-05,
-      24
-     ],
-     "cxx": [
-      0.006134,
-      4.6e-05,
-      24
-     ],
-     "cxx_s8": [
-      0.006135,
-      5.3e-05,
-      24
+     "cxx_s1": [
+      0.006091,
+      6.1e-05,
+      13
      ],
      "cxx_s4": [
-      0.006185,
-      0.000112,
+      0.0061,
+      4.8e-05,
+      13
+     ],
+     "cxx_s8": [
+      0.006127,
+      5.5e-05,
+      13
+     ],
+     "cxx_s2": [
+      0.006133,
+      6.5e-05,
       9
      ],
      "auto": [
-      0.008758,
-      4.2e-05,
-      24
+      0.00871,
+      5.4e-05,
+      13
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
      "cxx_s8": [
-      0.007598,
-      4.7e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.007618,
-      3.5e-05,
+      0.007261,
+      3e-05,
       12
      ],
      "cxx_s2": [
-      0.007619,
-      3.3e-05,
+      0.007275,
+      2.1e-05,
       12
      ],
-     "cxx_s1": [
-      0.007761,
-      2e-05,
+     "cxx_s4": [
+      0.007293,
+      3.7e-05,
+      12
+     ],
+     "cxx": [
+      0.007754,
+      1.2e-05,
       9
      ],
      "auto": [
-      0.009626,
-      2.3e-05,
+      0.009637,
+      3.8e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
-     "cxx_s2": [
-      0.008735,
-      7.3e-05,
-      12
-     ],
      "cxx_s8": [
-      0.008753,
-      5.4e-05,
-      12
+      0.00867,
+      5.9e-05,
+      14
      ],
      "cxx_s4": [
-      0.008773,
-      4.1e-05,
-      12
+      0.008689,
+      8.4e-05,
+      14
      ],
-     "cxx_s1": [
-      0.00985,
-      2e-05,
+     "cxx_s2": [
+      0.008691,
+      7.3e-05,
+      14
+     ],
+     "cxx": [
+      0.009872,
+      8.4e-05,
       9
      ],
      "auto": [
-      0.012036,
-      5.6e-05,
-      12
+      0.012032,
+      2.2e-05,
+      14
      ],
      "_l2": "rotated"
     }
@@ -2074,34 +2055,34 @@
    "notes": [
     "partition: cover ['auto', 'cxx'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=256 B=27 T_q=16: cxx (1.28x vs auto [sdpa 38.5 us, reference only])"
+    "T_k=256 B=27 T_q=16: cxx (1.30x vs auto [sdpa 38.4 us, reference only])"
    ],
    "evidence": {
     "T_k=256": {
      "cxx": [
-      0.009679,
-      8.7e-05,
-      19
+      0.009615,
+      9.5e-05,
+      17
      ],
      "cxx_s1": [
-      0.00972,
-      7.7e-05,
-      19
+      0.009672,
+      4.9e-05,
+      17
      ],
-     "cute_m32n32t64": [
-      0.012039,
-      0.000119,
-      19
-     ],
-     "cute_m64n32t128": [
-      0.012183,
+     "cxx_s2": [
+      0.011977,
       6.5e-05,
+      17
+     ],
+     "cxx_s8": [
+      0.012015,
+      0.000101,
       9
      ],
      "auto": [
-      0.012377,
-      8.5e-05,
-      19
+      0.012455,
+      6.5e-05,
+      17
      ],
      "_l2": "rotated"
     }
@@ -2117,34 +2098,34 @@
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cxx_s2'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.0%",
-    "T_k=320 B=4 T_q=16: cxx_s2 (1.36x vs auto [sdpa 36.4 us, reference only])"
+    "worst measured regret 0.2%",
+    "T_k=320 B=4 T_q=16: cxx_s2 (1.42x vs auto [sdpa 36.3 us, reference only])"
    ],
    "evidence": {
     "T_k=320": {
      "cxx_s4": [
-      0.007783,
-      4e-05,
-      12
-     ],
-     "cxx_s2": [
-      0.007785,
-      3.8e-05,
+      0.007438,
+      1.7e-05,
       12
      ],
      "cxx_s8": [
-      0.007788,
-      2.2e-05,
+      0.00745,
+      1.6e-05,
       12
      ],
-     "cxx_s1": [
-      0.009685,
-      3.7e-05,
+     "cxx_s2": [
+      0.00745,
+      1.9e-05,
+      12
+     ],
+     "cxx": [
+      0.00968,
+      1.2e-05,
       9
      ],
      "auto": [
-      0.010596,
-      2e-05,
+      0.010607,
+      1.2e-05,
       12
      ],
      "_l2": "rotated"
@@ -2154,8 +2135,8 @@
   "fmha|op=fmha|dt=half|D=64|H=4|Hkv=4|mask=none|bias=1|ba=1|kv=paged16|ss=0|q=16|B=64": {
    "regions": [
     [
-     192,
-     "cxx_s2"
+     128,
+     "cxx_s8"
     ],
     [
      null,
@@ -2164,122 +2145,122 @@
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cxx_s2', 'cxx', 'cute_m32n16t64'] (eps 3%), 2 segment(s)",
-    "worst measured regret 4.4%",
-    "T_k=64 B=64 T_q=16: cxx (1.82x vs auto [sdpa 27.8 us, reference only])",
-    "T_k=128 B=64 T_q=16: cxx_s1 (1.75x vs auto [sdpa 35.6 us, reference only])",
-    "T_k=192 B=60 T_q=16: cxx_s2 (1.46x vs auto [sdpa 42.1 us, reference only])",
-    "T_k=256 B=42 T_q=16: cxx (1.45x vs auto [sdpa 41.1 us, reference only])"
+    "partition: cover ['auto', 'cxx_s8', 'cxx', 'cute_m32n16t64'] (eps 3%), 2 segment(s)",
+    "worst measured regret 5.5%",
+    "T_k=64 B=64 T_q=16: cxx (1.79x vs auto [sdpa 27.7 us, reference only])",
+    "T_k=128 B=64 T_q=16: cxx_s1 (1.76x vs auto [sdpa 35.4 us, reference only])",
+    "T_k=192 B=60 T_q=16: cxx (1.46x vs auto [sdpa 42.2 us, reference only])",
+    "T_k=256 B=42 T_q=16: cxx (1.46x vs auto [sdpa 41.0 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
      "cute_m32n16t64": [
-      0.005388,
-      0.000162,
+      0.005427,
+      0.000253,
       24
      ],
      "cute_m64n16t128": [
-      0.005544,
-      0.000124,
+      0.005572,
+      9.3e-05,
       24
      ],
      "cxx_s8": [
-      0.00561,
-      6.1e-05,
+      0.005724,
+      6.4e-05,
       9
      ],
      "cxx_s2": [
-      0.005623,
-      7.9e-05,
+      0.005741,
+      0.000106,
       9
      ],
      "auto": [
-      0.010298,
-      4.2e-05,
+      0.010323,
+      4.3e-05,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cxx_s1": [
-      0.005843,
-      6.8e-05,
+     "cxx_s8": [
+      0.005806,
+      5e-05,
       24
      ],
      "cxx_s2": [
-      0.00587,
-      0.000119,
+      0.00581,
+      8.3e-05,
       24
      ],
-     "cxx_s4": [
-      0.005871,
-      9e-05,
+     "cxx_s1": [
+      0.005812,
+      6.9e-05,
       24
      ],
      "cxx": [
-      0.006194,
-      0.000524,
+      0.006157,
+      0.000557,
       9
      ],
      "auto": [
-      0.010235,
-      8.8e-05,
+      0.010245,
+      9.6e-05,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
      "cxx_s4": [
-      0.010282,
-      0.000173,
+      0.010434,
+      0.000141,
+      24
+     ],
+     "cxx": [
+      0.010474,
+      0.000199,
       24
      ],
      "cxx_s8": [
-      0.010336,
-      0.000206,
+      0.010496,
+      0.000154,
       24
      ],
      "cxx_s2": [
-      0.010388,
-      0.00035,
-      24
-     ],
-     "cxx_s1": [
-      0.0108,
-      0.000614,
+      0.010928,
+      0.000211,
       9
      ],
      "auto": [
-      0.015126,
-      0.000133,
+      0.015291,
+      9e-05,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cxx_s1": [
-      0.009606,
-      0.000303,
+     "cxx": [
+      0.00967,
+      0.000238,
       24
      ],
-     "cxx": [
-      0.009752,
-      0.000313,
+     "cxx_s1": [
+      0.009795,
+      0.000251,
       24
      ],
      "cute_m64n32t128": [
-      0.012206,
-      0.000132,
+      0.012199,
+      7e-05,
       24
      ],
      "cute_m32n32t64": [
-      0.012254,
+      0.012211,
       9e-05,
       9
      ],
      "auto": [
-      0.014141,
-      8.1e-05,
+      0.014137,
+      8.2e-05,
       24
      ],
      "_l2": "rotated"
@@ -2297,62 +2278,62 @@
    "notes": [
     "partition: cover ['auto', 'cxx_s2'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.1%",
-    "T_k=256 B=8 T_q=16: cxx_s2 (1.45x vs auto [sdpa 33.3 us, reference only])",
-    "T_k=320 B=6 T_q=16: cxx_s2 (1.38x vs auto [sdpa 37.0 us, reference only])"
+    "T_k=256 B=8 T_q=16: cxx_s2 (1.52x vs auto [sdpa 33.2 us, reference only])",
+    "T_k=320 B=6 T_q=16: cxx_s2 (1.44x vs auto [sdpa 36.9 us, reference only])"
    ],
    "evidence": {
     "T_k=256": {
      "cxx_s4": [
-      0.007514,
-      1.9e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.007515,
-      3.2e-05,
+      0.007168,
+      3.7e-05,
       12
      ],
      "cxx_s2": [
-      0.007522,
-      3e-05,
+      0.007176,
+      2.9e-05,
       12
      ],
-     "cxx_s1": [
-      0.009454,
-      3.2e-05,
+     "cxx_s8": [
+      0.007183,
+      2.3e-05,
+      12
+     ],
+     "cxx": [
+      0.009426,
+      1.9e-05,
       9
      ],
      "auto": [
-      0.010931,
-      2.2e-05,
+      0.010896,
+      4.4e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=320": {
-     "cxx_s4": [
-      0.007826,
-      2e-05,
+     "cxx_s8": [
+      0.007475,
+      2.4e-05,
       12
      ],
-     "cxx_s8": [
-      0.007827,
-      1.7e-05,
+     "cxx_s4": [
+      0.007478,
+      2.5e-05,
       12
      ],
      "cxx_s2": [
-      0.007829,
-      2.2e-05,
+      0.007481,
+      2.8e-05,
       12
      ],
-     "cxx_s1": [
-      0.009664,
-      1.9e-05,
+     "cxx": [
+      0.009651,
+      1.1e-05,
       9
      ],
      "auto": [
-      0.010792,
-      1.7e-05,
+      0.010775,
+      1.8e-05,
       12
      ],
      "_l2": "rotated"
@@ -2363,37 +2344,36 @@
    "regions": [
     [
      null,
-     "auto"
+     "cxx"
     ]
    ],
    "source": "aot",
    "notes": [
     "partition: cover ['auto', 'cxx'] (eps 3%), 1 segment(s)",
-    "M 1536..1536: cxx only 1.03x -> auto",
-    "worst measured regret 3.4%",
-    "T_k=1536 B=16 T_q=4: auto (fallback is fastest [sdpa 123.6 us, reference only])"
+    "worst measured regret 0.0%",
+    "T_k=1536 B=16 T_q=4: cxx (1.05x vs auto [sdpa 123.4 us, reference only])"
    ],
    "evidence": {
     "T_k=1536": {
      "cxx": [
-      0.029206,
-      0.000273,
-      22
+      0.028692,
+      0.000243,
+      21
      ],
      "cxx_s8": [
-      0.02987,
-      0.000225,
-      22
+      0.029724,
+      0.000213,
+      21
      ],
      "cute_m64n64t128": [
-      0.030186,
-      0.000297,
-      22
+      0.03014,
+      0.000291,
+      21
      ],
      "auto": [
-      0.030186,
-      0.000297,
-      22
+      0.03014,
+      0.000291,
+      21
      ],
      "_l2": "rotated"
     }
@@ -2403,41 +2383,41 @@
    "regions": [
     [
      null,
-     "cute_m32n16t64"
+     "cute_m32n32t64"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 1 segment(s)",
-    "worst measured regret 1.4%",
-    "T_k=1536 B=64 T_q=4: cute_m32n16t64 (1.10x vs auto [sdpa 339.0 us, reference only])"
+    "partition: cover ['auto', 'cute_m32n32t64'] (eps 3%), 1 segment(s)",
+    "worst measured regret 0.0%",
+    "T_k=1536 B=64 T_q=4: cute_m32n16t64 (1.10x vs auto [sdpa 337.8 us, reference only])"
    ],
    "evidence": {
     "T_k=1536": {
      "cute_m32n32t64": [
-      0.095132,
-      0.000845,
-      24
-     ],
-     "cute_m32n16t64": [
-      0.096428,
-      0.001011,
-      24
+      0.092048,
+      0.000718,
+      12
      ],
      "cute_m64n32t128": [
-      0.096546,
-      0.001889,
-      24
+      0.09521,
+      0.000789,
+      12
+     ],
+     "cute_m32n16t64": [
+      0.096558,
+      0.000222,
+      12
      ],
      "cute_m64n16t128": [
-      0.098896,
-      0.0007,
+      0.096984,
+      0.000486,
       9
      ],
      "auto": [
-      0.106234,
-      0.000199,
-      24
+      0.106128,
+      0.000222,
+      12
      ],
      "_l2": "warm"
     }
@@ -2454,33 +2434,33 @@
    "notes": [
     "partition: cover ['auto', 'cxx'] (eps 3%), 1 segment(s)",
     "worst measured regret 0.0%",
-    "T_k=1536 B=8 T_q=4: cxx (1.61x vs auto [sdpa 110.2 us, reference only])"
+    "T_k=1536 B=8 T_q=4: cxx (1.64x vs auto [sdpa 110.5 us, reference only])"
    ],
    "evidence": {
     "T_k=1536": {
      "cxx": [
-      0.017384,
-      9.5e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.019758,
-      8.5e-05,
+      0.017082,
+      7.6e-05,
       12
      ],
      "cxx_s2": [
-      0.019934,
+      0.019746,
+      0.000142,
+      12
+     ],
+     "cxx_s8": [
+      0.019797,
       0.000114,
       12
      ],
      "cxx_s4": [
-      0.022003,
-      9.5e-05,
+      0.022016,
+      0.000218,
       9
      ],
      "auto": [
-      0.027952,
-      0.000154,
+      0.028058,
+      0.000128,
       12
      ],
      "_l2": "rotated"
@@ -2490,266 +2470,7 @@
   "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=1": {
    "regions": [
     [
-     192,
-     "cute_m32n64t64"
-    ],
-    [
-     256,
-     "cxx_s2"
-    ],
-    [
-     null,
-     "auto"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m32n64t64', 'cxx_s2'] (eps 3%), 3 segment(s)",
-    "worst measured regret 0.3%",
-    "T_k=64 B=1 T_q=1: auto (cute_m32n16t64 1.07x rejected: single replay disagrees (9.3 vs 9.2 us: self-overlap) [sdpa 14.6 us, reference only])",
-    "T_k=128 B=1 T_q=1: auto (cute_m32n64t64 1.12x rejected: single replay disagrees (10.8 vs 10.5 us: self-overlap) [sdpa 18.1 us, reference only])",
-    "T_k=192 B=1 T_q=1: auto (cute_m32n64t64 1.08x rejected: single replay disagrees (10.6 vs 10.5 us: self-overlap) [sdpa 22.4 us, reference only])",
-    "T_k=256 B=1 T_q=1: cxx_s2 (1.20x vs auto [sdpa 26.7 us, reference only])",
-    "T_k=384 B=1 T_q=1: auto (fallback is fastest [sdpa 34.1 us, reference only])",
-    "T_k=512 B=1 T_q=1: auto (fallback is fastest [sdpa 41.7 us, reference only])",
-    "T_k=768 B=1 T_q=1: auto (fallback is fastest [sdpa 55.5 us, reference only])",
-    "T_k=1024 B=1 T_q=1: auto (fallback is fastest [sdpa 68.9 us, reference only])",
-    "T_k=1536 B=1 T_q=1: auto (fallback is fastest [sdpa 96.6 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=64": {
-     "cute_m32n64t64": [
-      0.002074,
-      9e-06,
-      12
-     ],
-     "cute_m32n16t64": [
-      0.002113,
-      5e-06,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.002178,
-      4e-06,
-      12
-     ],
-     "cute_m32n32t64": [
-      0.002201,
-      4e-06,
-      9
-     ],
-     "auto": [
-      0.002261,
-      7e-06,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=128": {
-     "cute_m32n64t64": [
-      0.003054,
-      8e-06,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.003132,
-      7e-06,
-      12
-     ],
-     "cxx_s1": [
-      0.003408,
-      7e-06,
-      12
-     ],
-     "cxx_s4": [
-      0.003411,
-      9e-06,
-      9
-     ],
-     "auto": [
-      0.003413,
-      7e-06,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=192": {
-     "cute_m64n64t128": [
-      0.004297,
-      8e-06,
-      12
-     ],
-     "cute_m32n64t64": [
-      0.004308,
-      1e-05,
-      12
-     ],
-     "cxx_s1": [
-      0.004659,
-      7e-06,
-      12
-     ],
-     "cxx": [
-      0.00466,
-      1.1e-05,
-      12
-     ],
-     "auto": [
-      0.00466,
-      1.1e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=256": {
-     "cxx_s2": [
-      0.005154,
-      4e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.005178,
-      3.9e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.005189,
-      3.5e-05,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.00565,
-      7e-06,
-      9
-     ],
-     "auto": [
-      0.006162,
-      2.6e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=384": {
-     "cxx": [
-      0.00568,
-      7e-06,
-      12
-     ],
-     "auto": [
-      0.00568,
-      7e-06,
-      12
-     ],
-     "cxx_s4": [
-      0.005709,
-      1.1e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.005769,
-      1.2e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=512": {
-     "cxx": [
-      0.005466,
-      1.3e-05,
-      12
-     ],
-     "auto": [
-      0.005466,
-      1.3e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.005487,
-      1.7e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.005498,
-      1.4e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=768": {
-     "cxx": [
-      0.006117,
-      1.3e-05,
-      12
-     ],
-     "auto": [
-      0.006117,
-      1.3e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.006145,
-      2.6e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.006898,
-      2e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=1024": {
-     "cxx_s8": [
-      0.005997,
-      2.8e-05,
-      12
-     ],
-     "cxx": [
-      0.006,
-      1.9e-05,
-      12
-     ],
-     "auto": [
-      0.006,
-      1.9e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.008077,
-      1.9e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=1536": {
-     "cxx": [
-      0.00687,
-      4.9e-05,
-      12
-     ],
-     "auto": [
-      0.00687,
-      4.9e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.007529,
-      2e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.010574,
-      2e-05,
-      12
-     ],
-     "_l2": "rotated"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=16": {
-   "regions": [
-    [
-     128,
+     64,
      "cute_m32n16t64"
     ],
     [
@@ -2759,264 +2480,488 @@
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n16t64', 'cute_m32n64t64', 'cute_m32n32t64'] (eps 3%), 3 segment(s)",
-    "M 192..1024: cute_m32n64t64 only 1.04x -> auto",
-    "worst measured regret 8.9%",
-    "T_k=64 B=16 T_q=1: cute_m32n16t64 (1.39x vs auto [sdpa 18.3 us, reference only])",
-    "T_k=128 B=16 T_q=1: auto (cute_m32n16t64 1.03x rejected: under the gate 1.05 [sdpa 23.1 us, reference only])",
-    "T_k=192 B=16 T_q=1: auto (fallback is fastest [sdpa 27.7 us, reference only])",
-    "T_k=256 B=16 T_q=1: auto (cute_m32n32t64 1.07x rejected: single replay disagrees (9.6 vs 9.4 us: self-overlap) [sdpa 32.3 us, reference only])",
-    "T_k=384 B=16 T_q=1: auto (fallback is fastest [sdpa 41.1 us, reference only])",
-    "T_k=512 B=16 T_q=1: auto (cute_m32n64t64 1.04x rejected: under the gate 1.05 [sdpa 49.9 us, reference only])",
-    "T_k=768 B=16 T_q=1: cute_m32n64t64 (1.05x vs auto [sdpa 67.5 us, reference only])",
-    "T_k=1024 B=16 T_q=1: auto (cxx_s8 1.05x rejected: under the gate 1.05 [sdpa 83.8 us, reference only])",
-    "T_k=1536 B=16 T_q=1: auto (fallback is fastest [sdpa 121.1 us, reference only])"
+    "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 2 segment(s)",
+    "worst measured regret 2.0%",
+    "T_k=64 B=1 T_q=1: auto (cute_m32n16t64 1.08x rejected: single replay disagrees (9.3 vs 9.0 us: self-overlap) [sdpa 14.7 us, reference only])",
+    "T_k=128 B=1 T_q=1: auto (fallback is fastest [sdpa 18.1 us, reference only])",
+    "T_k=192 B=1 T_q=1: auto (fallback is fastest [sdpa 22.3 us, reference only])",
+    "T_k=256 B=1 T_q=1: auto (fallback is fastest [sdpa 26.6 us, reference only])",
+    "T_k=384 B=1 T_q=1: auto (fallback is fastest [sdpa 33.9 us, reference only])",
+    "T_k=512 B=1 T_q=1: auto (fallback is fastest [sdpa 41.4 us, reference only])",
+    "T_k=768 B=1 T_q=1: auto (fallback is fastest [sdpa 55.0 us, reference only])",
+    "T_k=1024 B=1 T_q=1: auto (fallback is fastest [sdpa 68.6 us, reference only])",
+    "T_k=1536 B=1 T_q=1: auto (fallback is fastest [sdpa 96.0 us, reference only])"
+   ],
+   "evidence": {
+    "T_k=64": {
+     "cute_m32n64t64": [
+      0.002073,
+      4e-06,
+      12
+     ],
+     "cute_m32n16t64": [
+      0.002115,
+      6e-06,
+      12
+     ],
+     "cute_m64n64t128": [
+      0.002178,
+      1e-05,
+      12
+     ],
+     "cute_m32n32t64": [
+      0.002205,
+      6e-06,
+      9
+     ],
+     "auto": [
+      0.002287,
+      9e-06,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=128": {
+     "cxx_s1": [
+      0.002645,
+      4e-06,
+      12
+     ],
+     "cxx_s2": [
+      0.00265,
+      1.1e-05,
+      12
+     ],
+     "cxx": [
+      0.00265,
+      9e-06,
+      12
+     ],
+     "auto": [
+      0.00265,
+      9e-06,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=192": {
+     "cxx_s8": [
+      0.003167,
+      3e-06,
+      12
+     ],
+     "cxx": [
+      0.003168,
+      5e-06,
+      12
+     ],
+     "auto": [
+      0.003168,
+      5e-06,
+      12
+     ],
+     "cxx_s1": [
+      0.003168,
+      3e-06,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=256": {
+     "cxx_s4": [
+      0.003892,
+      1.9e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.003906,
+      3.8e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.003924,
+      1.9e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.003942,
+      2.3e-05,
+      9
+     ],
+     "auto": [
+      0.003946,
+      2.9e-05,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=384": {
+     "cxx": [
+      0.004266,
+      1e-05,
+      12
+     ],
+     "auto": [
+      0.004266,
+      1e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.004268,
+      1e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.00427,
+      1.2e-05,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=512": {
+     "cxx": [
+      0.004331,
+      4e-06,
+      12
+     ],
+     "auto": [
+      0.004331,
+      4e-06,
+      12
+     ],
+     "cxx_s4": [
+      0.004332,
+      6e-06,
+      12
+     ],
+     "cxx_s8": [
+      0.004335,
+      9e-06,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=768": {
+     "cxx_s8": [
+      0.004546,
+      7e-06,
+      12
+     ],
+     "cxx": [
+      0.004547,
+      1.2e-05,
+      12
+     ],
+     "auto": [
+      0.004547,
+      1.2e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.00486,
+      8e-06,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=1024": {
+     "cxx_s8": [
+      0.00473,
+      7e-06,
+      12
+     ],
+     "cxx": [
+      0.004733,
+      2.2e-05,
+      12
+     ],
+     "auto": [
+      0.004733,
+      2.2e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.005091,
+      1.8e-05,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=1536": {
+     "cxx_s8": [
+      0.005426,
+      2.2e-05,
+      12
+     ],
+     "cxx": [
+      0.005429,
+      2.3e-05,
+      12
+     ],
+     "auto": [
+      0.005429,
+      2.3e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.006132,
+      2.9e-05,
+      12
+     ],
+     "_l2": "rotated"
+    }
+   }
+  },
+  "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=16": {
+   "regions": [
+    [
+     64,
+     "cute_m32n16t64"
+    ],
+    [
+     null,
+     "cxx_s1"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['auto', 'cxx_s1', 'cute_m32n16t64'] (eps 3%), 2 segment(s)",
+    "worst measured regret 0.1%",
+    "T_k=64 B=16 T_q=1: cute_m32n16t64 (1.35x vs auto [sdpa 18.3 us, reference only])",
+    "T_k=128 B=16 T_q=1: auto (fallback is fastest [sdpa 23.0 us, reference only])",
+    "T_k=192 B=16 T_q=1: auto (fallback is fastest [sdpa 27.2 us, reference only])",
+    "T_k=256 B=16 T_q=1: auto (fallback is fastest [sdpa 32.3 us, reference only])",
+    "T_k=384 B=16 T_q=1: auto (cxx_s1 1.09x rejected: single replay disagrees (9.5 vs 9.4 us: self-overlap) [sdpa 41.4 us, reference only])",
+    "T_k=512 B=16 T_q=1: cxx_s1 (1.05x vs auto [sdpa 50.4 us, reference only])",
+    "T_k=768 B=16 T_q=1: auto (fallback is fastest [sdpa 66.4 us, reference only])",
+    "T_k=1024 B=16 T_q=1: auto (fallback is fastest [sdpa 85.3 us, reference only])",
+    "T_k=1536 B=16 T_q=1: auto (cxx_s1 1.05x rejected: within the noise (1.11x) [sdpa 121.6 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
      "cute_m32n16t64": [
-      0.001667,
-      0.000142,
+      0.00164,
+      0.000151,
       24
      ],
      "cute_m64n16t128": [
-      0.001703,
-      9.8e-05,
+      0.001667,
+      8.7e-05,
       24
      ],
      "cute_m32n32t64": [
-      0.002131,
-      3.2e-05,
+      0.002125,
+      4.3e-05,
       24
      ],
-     "cxx_s2": [
-      0.002297,
-      1.7e-05,
+     "cxx_s4": [
+      0.002192,
+      3.8e-05,
       9
      ],
      "auto": [
-      0.00231,
+      0.00221,
       2.1e-05,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cute_m32n32t64": [
-      0.005017,
-      2.4e-05,
+     "cxx_s1": [
+      0.004848,
+      1.5e-05,
       12
      ],
-     "cute_m64n32t128": [
-      0.005037,
-      3.7e-05,
+     "cxx_s8": [
+      0.004852,
+      4.4e-05,
       12
      ],
-     "cute_m32n16t64": [
-      0.005172,
+     "cxx_s2": [
+      0.004855,
       2.6e-05,
       12
      ],
-     "cute_m32n64t64": [
-      0.00529,
-      2.4e-05,
+     "cxx_s4": [
+      0.004862,
+      2.3e-05,
       9
      ],
      "auto": [
-      0.005314,
-      2.7e-05,
+      0.004875,
+      1.1e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cute_m64n32t128": [
-      0.006507,
-      2.9e-05,
+     "cxx_s8": [
+      0.005385,
+      1.5e-05,
       12
      ],
-     "cute_m32n32t64": [
-      0.00654,
-      5.3e-05,
-      12
-     ],
-     "cute_m32n64t64": [
-      0.006598,
+     "cxx_s1": [
+      0.005388,
       3.2e-05,
       12
      ],
-     "cute_m64n64t128": [
-      0.006651,
-      1.7e-05,
-      9
+     "cxx": [
+      0.005393,
+      2.9e-05,
+      12
      ],
      "auto": [
-      0.006695,
-      3.9e-05,
+      0.005393,
+      2.9e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cute_m64n32t128": [
-      0.007669,
-      3.9e-05,
+     "cxx": [
+      0.006879,
+      2.6e-05,
       12
-     ],
-     "cute_m32n32t64": [
-      0.007673,
-      3.4e-05,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.007941,
-      3.8e-05,
-      12
-     ],
-     "cute_m32n64t64": [
-      0.007957,
-      6.7e-05,
-      9
      ],
      "auto": [
-      0.008203,
-      2.5e-05,
+      0.006879,
+      2.6e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.006888,
+      1e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.007619,
+      3.8e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cute_m64n64t128": [
-      0.010152,
-      6.9e-05,
+     "cxx_s1": [
+      0.009102,
+      1.3e-05,
       12
      ],
-     "cute_m32n32t64": [
-      0.0102,
-      9.6e-05,
+     "cxx_s4": [
+      0.009469,
+      4.2e-05,
       12
      ],
-     "cute_m64n32t128": [
-      0.010259,
-      5.8e-05,
+     "cxx_s8": [
+      0.009481,
+      4.2e-05,
       12
      ],
-     "cute_m32n64t64": [
-      0.010355,
-      2.3e-05,
+     "cxx_s2": [
+      0.009876,
+      3.4e-05,
       9
      ],
      "auto": [
-      0.010458,
-      5.3e-05,
+      0.009908,
+      5.1e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=512": {
-     "cute_m64n64t128": [
-      0.012096,
-      6.3e-05,
+     "cxx_s1": [
+      0.010817,
+      3.8e-05,
       12
      ],
-     "cute_m32n64t64": [
-      0.012412,
-      4.5e-05,
+     "cxx_s2": [
+      0.011367,
+      3.3e-05,
       12
      ],
-     "cute_m64n32t128": [
-      0.01257,
-      7e-05,
+     "cxx": [
+      0.011368,
+      2.7e-05,
       12
-     ],
-     "cute_m32n32t64": [
-      0.012635,
-      5e-05,
-      9
      ],
      "auto": [
-      0.012858,
-      7.2e-05,
+      0.011368,
+      2.7e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=768": {
-     "cute_m64n64t128": [
-      0.016991,
-      0.000168,
-      14
+     "cxx_s1": [
+      0.013265,
+      5.5e-05,
+      24
      ],
-     "cute_m32n64t64": [
-      0.017377,
-      0.000106,
-      14
+     "cxx_s2": [
+      0.013313,
+      0.000133,
+      24
      ],
-     "cute_m64n32t128": [
-      0.017961,
-      0.000132,
-      14
-     ],
-     "cute_m32n32t64": [
-      0.018129,
-      9.5e-05,
-      9
+     "cxx": [
+      0.013344,
+      0.00013,
+      24
      ],
      "auto": [
-      0.018295,
-      7.3e-05,
-      14
+      0.013344,
+      0.00013,
+      24
      ],
      "_l2": "rotated"
     },
     "T_k=1024": {
-     "cute_m64n64t128": [
-      0.021035,
-      0.000213,
-      24
+     "cxx_s1": [
+      0.015427,
+      0.000151,
+      23
      ],
-     "cute_m32n64t64": [
-      0.021552,
-      0.000182,
-      24
-     ],
-     "cxx_s8": [
-      0.021895,
-      0.000182,
-      24
-     ],
-     "cute_m64n32t128": [
-      0.022624,
-      0.000227,
-      9
+     "cxx": [
+      0.015537,
+      0.000112,
+      23
      ],
      "auto": [
-      0.022898,
-      0.000177,
-      24
+      0.015537,
+      0.000112,
+      23
+     ],
+     "cxx_s2": [
+      0.015633,
+      0.000138,
+      23
      ],
      "_l2": "rotated"
     },
     "T_k=1536": {
+     "cxx_s1": [
+      0.02407,
+      0.000326,
+      24
+     ],
+     "cxx_s2": [
+      0.024546,
+      0.001183,
+      24
+     ],
+     "cxx_s4": [
+      0.025352,
+      0.000391,
+      9
+     ],
      "cxx": [
-      0.029068,
-      0.000184,
-      12
+      0.025386,
+      0.001429,
+      24
      ],
      "auto": [
-      0.029068,
-      0.000184,
-      12
-     ],
-     "cxx_s8": [
-      0.029668,
-      0.000252,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.030148,
-      0.000219,
-      12
+      0.025386,
+      0.001429,
+      24
      ],
      "_l2": "rotated"
     }
@@ -3029,256 +2974,238 @@
      "cute_m32n32t64"
     ],
     [
-     192,
-     "cute_m32n64t64"
-    ],
-    [
-     256,
-     "cxx_s2"
-    ],
-    [
      null,
      "auto"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n32t64', 'cute_m32n64t64', 'cxx_s2'] (eps 3%), 4 segment(s)",
-    "worst measured regret 0.7%",
-    "T_k=64 B=2 T_q=1: cute_m32n32t64 (1.38x vs auto [sdpa 14.8 us, reference only])",
-    "T_k=128 B=2 T_q=1: cute_m32n64t64 (1.06x vs auto [sdpa 19.9 us, reference only])",
-    "T_k=192 B=2 T_q=1: auto (cute_m32n64t64 1.06x rejected: single replay disagrees (9.6 vs 9.4 us: self-overlap) [sdpa 24.0 us, reference only])",
-    "T_k=256 B=2 T_q=1: auto (cxx_s2 1.17x rejected: single replay disagrees (14.0 vs 9.2 us: self-overlap) [sdpa 28.4 us, reference only])",
-    "T_k=384 B=2 T_q=1: auto (fallback is fastest [sdpa 35.3 us, reference only])",
-    "T_k=512 B=2 T_q=1: auto (fallback is fastest [sdpa 42.2 us, reference only])",
-    "T_k=768 B=2 T_q=1: auto (fallback is fastest [sdpa 56.2 us, reference only])",
-    "T_k=1024 B=2 T_q=1: auto (fallback is fastest [sdpa 70.2 us, reference only])",
+    "partition: cover ['auto', 'cute_m32n32t64'] (eps 3%), 2 segment(s)",
+    "worst measured regret 0.5%",
+    "T_k=64 B=2 T_q=1: cute_m32n32t64 (1.40x vs auto [sdpa 14.7 us, reference only])",
+    "T_k=128 B=2 T_q=1: auto (fallback is fastest [sdpa 19.9 us, reference only])",
+    "T_k=192 B=2 T_q=1: auto (fallback is fastest [sdpa 23.9 us, reference only])",
+    "T_k=256 B=2 T_q=1: auto (fallback is fastest [sdpa 28.3 us, reference only])",
+    "T_k=384 B=2 T_q=1: auto (fallback is fastest [sdpa 35.2 us, reference only])",
+    "T_k=512 B=2 T_q=1: auto (fallback is fastest [sdpa 42.0 us, reference only])",
+    "T_k=768 B=2 T_q=1: auto (fallback is fastest [sdpa 56.0 us, reference only])",
+    "T_k=1024 B=2 T_q=1: auto (fallback is fastest [sdpa 70.0 us, reference only])",
     "T_k=1536 B=2 T_q=1: auto (fallback is fastest [sdpa 98.7 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
      "cute_m32n32t64": [
-      0.001637,
-      1e-05,
-      12
-     ],
-     "cute_m64n32t128": [
-      0.001666,
+      0.001633,
       7e-06,
       12
      ],
+     "cute_m64n32t128": [
+      0.001664,
+      3e-06,
+      12
+     ],
      "cute_m32n16t64": [
-      0.001755,
+      0.001757,
       9e-06,
       12
      ],
      "cute_m64n16t128": [
-      0.001931,
-      9e-06,
+      0.001934,
+      5e-06,
       9
      ],
      "auto": [
-      0.002261,
-      6e-06,
+      0.002287,
+      8e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cute_m32n64t64": [
-      0.003549,
-      1.7e-05,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.003596,
-      8e-06,
+     "cxx_s1": [
+      0.00314,
+      1.1e-05,
       12
      ],
      "cxx_s2": [
-      0.003767,
-      9e-06,
-      9
+      0.003152,
+      1.8e-05,
+      12
      ],
      "cxx": [
-      0.003769,
-      1.9e-05,
+      0.003157,
+      1.6e-05,
       12
      ],
      "auto": [
-      0.003769,
-      1.9e-05,
+      0.003157,
+      1.6e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cute_m64n64t128": [
-      0.004991,
+     "cxx_s1": [
+      0.004001,
+      8e-06,
+      12
+     ],
+     "cxx_s2": [
+      0.004001,
       5e-06,
       12
      ],
-     "cute_m32n64t64": [
-      0.005028,
-      6e-06,
+     "cxx_s8": [
+      0.004002,
+      1.1e-05,
       12
      ],
-     "cxx_s4": [
-      0.005343,
-      6e-06,
-      9
-     ],
-     "cxx_s1": [
-      0.005343,
-      1e-05,
+     "cxx": [
+      0.004004,
+      8e-06,
       12
      ],
      "auto": [
-      0.005343,
-      7e-06,
+      0.004004,
+      8e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cxx_s2": [
-      0.005511,
+     "cxx_s1": [
+      0.004291,
+      1.4e-05,
+      12
+     ],
+     "cxx": [
+      0.004293,
       2.1e-05,
       12
      ],
-     "cxx_s4": [
-      0.005531,
-      2.4e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.005544,
-      1.9e-05,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.006061,
-      9e-06,
-      9
-     ],
      "auto": [
-      0.006471,
-      2e-05,
+      0.004293,
+      2.1e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.004326,
+      1.6e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cxx_s8": [
-      0.005925,
-      2.6e-05,
-      12
-     ],
      "cxx": [
-      0.005929,
-      3.1e-05,
+      0.004525,
+      1.2e-05,
       12
      ],
      "auto": [
-      0.005929,
-      3.1e-05,
+      0.004525,
+      1.2e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.004529,
+      1.5e-05,
       12
      ],
      "cxx_s4": [
-      0.005942,
-      3.6e-05,
+      0.004532,
+      1.7e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=512": {
+     "cxx_s8": [
+      0.004727,
+      2.1e-05,
+      12
+     ],
      "cxx_s4": [
-      0.005686,
-      3.3e-05,
+      0.00473,
+      3.9e-05,
       12
      ],
      "cxx": [
-      0.005689,
-      2.1e-05,
+      0.004732,
+      3e-05,
       12
      ],
      "auto": [
-      0.005689,
-      2.1e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.00569,
-      1.6e-05,
+      0.004732,
+      3e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=768": {
      "cxx": [
-      0.006665,
-      2.5e-05,
+      0.005215,
+      1.3e-05,
       12
      ],
      "auto": [
-      0.006665,
-      2.5e-05,
+      0.005215,
+      1.3e-05,
       12
      ],
      "cxx_s8": [
-      0.006672,
-      3.7e-05,
+      0.005225,
+      3.2e-05,
       12
      ],
      "cxx_s4": [
-      0.007274,
-      1e-05,
+      0.005458,
+      3.2e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=1024": {
      "cxx_s8": [
-      0.006823,
-      3.2e-05,
+      0.005619,
+      1.1e-05,
       12
      ],
      "cxx": [
-      0.006838,
-      1.8e-05,
+      0.005641,
+      3.8e-05,
       12
      ],
      "auto": [
-      0.006838,
-      1.8e-05,
+      0.005641,
+      3.8e-05,
       12
      ],
      "cxx_s4": [
-      0.008682,
-      4.3e-05,
+      0.00589,
+      2.9e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=1536": {
      "cxx": [
-      0.008209,
-      4.7e-05,
+      0.006835,
+      5.4e-05,
       12
      ],
      "auto": [
-      0.008209,
-      4.7e-05,
+      0.006835,
+      5.4e-05,
       12
      ],
      "cxx_s8": [
-      0.00861,
-      4.3e-05,
+      0.006841,
+      4.7e-05,
       12
      ],
      "cxx_s4": [
-      0.011093,
-      4.2e-05,
+      0.007294,
+      4.3e-05,
       12
      ],
      "_l2": "rotated"
@@ -3288,264 +3215,243 @@
   "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=32": {
    "regions": [
     [
+     64,
+     "cute_m32n32t64"
+    ],
+    [
      null,
      "auto"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m64n32t128', 'cute_m32n64t64'] (eps 3%), 2 segment(s)",
-    "M 64..768: cute_m64n32t128 only 1.05x -> auto",
-    "worst measured regret 19.3%",
-    "T_k=64 B=21 T_q=1: cute_m32n16t64 (1.14x vs auto [sdpa 19.5 us, reference only])",
-    "T_k=128 B=21 T_q=1: auto (cute_m32n16t64 1.06x rejected: single replay disagrees (9.5 vs 9.0 us: self-overlap) [sdpa 24.6 us, reference only])",
-    "T_k=192 B=21 T_q=1: auto (fallback is fastest [sdpa 29.1 us, reference only])",
-    "T_k=256 B=21 T_q=1: auto (fallback is fastest [sdpa 33.6 us, reference only])",
-    "T_k=384 B=21 T_q=1: auto (fallback is fastest [sdpa 43.1 us, reference only])",
-    "T_k=512 B=21 T_q=1: auto (fallback is fastest [sdpa 52.8 us, reference only])",
-    "T_k=768 B=21 T_q=1: auto (fallback is fastest [sdpa 70.8 us, reference only])",
-    "T_k=1024 B=21 T_q=1: auto (cute_m32n64t64 1.03x rejected: under the gate 1.05 [sdpa 90.7 us, reference only])",
-    "T_k=1536 B=21 T_q=1: auto (fallback is fastest [sdpa 138.2 us, reference only])"
+    "partition: cover ['auto', 'cute_m32n32t64', 'cxx_s1'] (eps 3%), 2 segment(s)",
+    "M 128..1536: cxx_s1 only 1.01x -> auto",
+    "worst measured regret 7.7%",
+    "T_k=64 B=21 T_q=1: auto (cute_m32n16t64 1.16x rejected: single replay disagrees (9.6 vs 8.6 us: self-overlap) [sdpa 19.5 us, reference only])",
+    "T_k=128 B=21 T_q=1: auto (fallback is fastest [sdpa 24.1 us, reference only])",
+    "T_k=192 B=21 T_q=1: auto (fallback is fastest [sdpa 29.5 us, reference only])",
+    "T_k=256 B=21 T_q=1: auto (fallback is fastest [sdpa 34.3 us, reference only])",
+    "T_k=384 B=21 T_q=1: auto (cxx_s1 1.08x rejected: single replay disagrees (10.0 vs 9.3 us: self-overlap) [sdpa 44.1 us, reference only])",
+    "T_k=512 B=21 T_q=1: auto (fallback is fastest [sdpa 52.9 us, reference only])",
+    "T_k=768 B=21 T_q=1: auto (fallback is fastest [sdpa 70.5 us, reference only])",
+    "T_k=1024 B=21 T_q=1: auto (fallback is fastest [sdpa 91.6 us, reference only])",
+    "T_k=1536 B=21 T_q=1: auto (fallback is fastest [sdpa 136.8 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
-     "cute_m64n32t128": [
-      0.0024,
-      8.3e-05,
+     "cute_m32n32t64": [
+      0.002395,
+      2.9e-05,
       24
      ],
-     "cute_m32n32t64": [
-      0.002408,
-      3.5e-05,
+     "cute_m64n32t128": [
+      0.002431,
+      3.4e-05,
       24
      ],
      "cute_m32n16t64": [
-      0.002518,
-      1.7e-05,
+      0.002479,
+      3.3e-05,
       24
      ],
      "cute_m64n16t128": [
-      0.002591,
-      2.6e-05,
+      0.002662,
+      7.1e-05,
       9
      ],
      "auto": [
-      0.002862,
-      1.2e-05,
+      0.002883,
+      1.4e-05,
       24
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cute_m32n16t64": [
-      0.005414,
-      4e-05,
-      12
-     ],
-     "cute_m32n32t64": [
-      0.005496,
-      5e-05,
-      12
-     ],
-     "cute_m64n32t128": [
-      0.005506,
-      1.4e-05,
-      12
-     ],
      "cxx": [
-      0.005752,
+      0.004904,
       3.7e-05,
-      12
+      13
      ],
      "auto": [
-      0.005752,
+      0.004904,
       3.7e-05,
-      12
+      13
+     ],
+     "cxx_s8": [
+      0.004922,
+      4.8e-05,
+      13
+     ],
+     "cxx_s4": [
+      0.004923,
+      3.2e-05,
+      13
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cute_m64n32t128": [
-      0.006689,
-      2.8e-05,
-      12
-     ],
-     "cute_m32n32t64": [
-      0.006707,
+     "cxx": [
+      0.006817,
       3.9e-05,
       12
-     ],
-     "cute_m32n64t64": [
-      0.006953,
-      2.4e-05,
-      12
-     ],
-     "cxx_s1": [
-      0.006956,
-      1.5e-05,
-      9
      ],
      "auto": [
-      0.006957,
+      0.006817,
       3.9e-05,
       12
+     ],
+     "cxx_s8": [
+      0.006823,
+      1.9e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.006849,
+      1.1e-05,
+      9
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cute_m64n32t128": [
-      0.007865,
-      5.7e-05,
-      24
+     "cxx_s1": [
+      0.007945,
+      4.6e-05,
+      12
      ],
-     "cute_m32n32t64": [
-      0.007889,
-      7.2e-05,
-      24
-     ],
-     "cute_m64n64t128": [
-      0.007998,
-      8.2e-05,
-      24
-     ],
-     "cute_m32n64t64": [
-      0.008032,
-      0.000103,
-      9
+     "cxx": [
+      0.007962,
+      3.5e-05,
+      12
      ],
      "auto": [
-      0.008171,
-      5.7e-05,
-      24
+      0.007962,
+      3.5e-05,
+      12
+     ],
+     "cute_m64n32t128": [
+      0.008327,
+      3e-05,
+      9
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cute_m64n32t128": [
-      0.01047,
-      8.3e-05,
-      14
-     ],
-     "cute_m64n64t128": [
-      0.010519,
-      5.1e-05,
-      14
+     "cxx_s1": [
+      0.010385,
+      1.6e-05,
+      12
      ],
      "cute_m32n32t64": [
-      0.010526,
-      0.000101,
-      14
+      0.011008,
+      6.7e-05,
+      12
      ],
-     "cute_m32n64t64": [
-      0.010684,
-      1.3e-05,
-      9
+     "cute_m64n32t128": [
+      0.011014,
+      3.5e-05,
+      12
+     ],
+     "cxx": [
+      0.011188,
+      2.9e-05,
+      12
      ],
      "auto": [
-      0.010711,
-      3.7e-05,
-      14
+      0.011188,
+      2.9e-05,
+      12
      ],
      "_l2": "rotated"
     },
     "T_k=512": {
-     "cute_m64n32t128": [
-      0.013605,
-      8.1e-05,
-      18
+     "cxx_s1": [
+      0.012419,
+      9.7e-05,
+      12
      ],
-     "cute_m32n32t64": [
-      0.013632,
-      0.000108,
-      18
-     ],
-     "cute_m64n64t128": [
-      0.013715,
-      0.000115,
-      18
-     ],
-     "cute_m32n64t64": [
-      0.013906,
-      0.000112,
-      9
+     "cxx": [
+      0.012904,
+      9.3e-05,
+      12
      ],
      "auto": [
-      0.013941,
-      8.3e-05,
-      18
+      0.012904,
+      9.3e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.012934,
+      0.000124,
+      12
      ],
      "_l2": "rotated"
     },
     "T_k=768": {
-     "cute_m64n64t128": [
-      0.018518,
-      7.1e-05,
-      12
+     "cxx_s1": [
+      0.015293,
+      0.000121,
+      18
      ],
-     "cute_m32n64t64": [
-      0.018976,
-      5.5e-05,
-      12
+     "cxx_s2": [
+      0.015491,
+      5.8e-05,
+      18
      ],
-     "cute_m64n32t128": [
-      0.019002,
-      0.000128,
-      12
-     ],
-     "cute_m32n32t64": [
-      0.01913,
-      0.00018,
-      9
+     "cxx": [
+      0.015494,
+      0.000151,
+      18
      ],
      "auto": [
-      0.019163,
-      2.6e-05,
-      12
+      0.015494,
+      0.000151,
+      18
      ],
      "_l2": "rotated"
     },
     "T_k=1024": {
-     "cute_m64n64t128": [
-      0.022834,
-      0.000216,
-      12
+     "cxx_s1": [
+      0.022864,
+      0.000254,
+      24
      ],
-     "cute_m32n64t64": [
-      0.023417,
-      0.000127,
-      12
+     "cxx_s2": [
+      0.023392,
+      0.000235,
+      24
      ],
      "cxx": [
-      0.024082,
-      0.000121,
-      12
+      0.023408,
+      0.000261,
+      24
      ],
      "auto": [
-      0.024082,
-      0.000121,
-      12
+      0.023408,
+      0.000261,
+      24
      ],
      "_l2": "rotated"
     },
     "T_k=1536": {
-     "cute_m64n64t128": [
-      0.03583,
-      0.000169,
+     "cxx_s1": [
+      0.03338,
+      0.000157,
       12
      ],
-     "cxx_s1": [
-      0.035944,
-      0.000181,
+     "cxx_s2": [
+      0.033516,
+      0.000184,
       12
      ],
      "cxx": [
-      0.035956,
-      0.000237,
+      0.033546,
+      0.000202,
       12
      ],
      "auto": [
-      0.035956,
-      0.000237,
+      0.033546,
+      0.000202,
       12
      ],
      "_l2": "rotated"
@@ -3559,38 +3465,34 @@
      "cute_m32n32t64"
     ],
     [
-     256,
-     "cute_m32n64t64"
-    ],
-    [
      null,
      "auto"
     ]
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n32t64', 'cute_m32n64t64', 'cxx_s2'] (eps 3%), 3 segment(s)",
-    "worst measured regret 10.1%",
-    "T_k=64 B=3 T_q=1: auto (cute_m32n32t64 1.38x rejected: single replay disagrees (10.9 vs 10.6 us: self-overlap) [sdpa 15.8 us, reference only])",
+    "partition: cover ['auto', 'cute_m32n32t64'] (eps 3%), 2 segment(s)",
+    "worst measured regret 0.1%",
+    "T_k=64 B=3 T_q=1: auto (cute_m32n32t64 1.39x rejected: single replay disagrees (15.1 vs 13.9 us: self-overlap) [sdpa 15.7 us, reference only])",
     "T_k=128 B=3 T_q=1: auto (fallback is fastest [sdpa 20.7 us, reference only])",
-    "T_k=192 B=3 T_q=1: auto (cute_m32n64t64 1.07x rejected: single replay disagrees (11.0 vs 10.7 us: self-overlap) [sdpa 24.9 us, reference only])",
-    "T_k=256 B=3 T_q=1: auto (cxx_s2 1.15x rejected: single replay disagrees (10.8 vs 10.3 us: self-overlap) [sdpa 28.6 us, reference only])",
-    "T_k=384 B=3 T_q=1: auto (fallback is fastest [sdpa 35.5 us, reference only])",
-    "T_k=512 B=3 T_q=1: auto (fallback is fastest [sdpa 42.8 us, reference only])",
-    "T_k=768 B=3 T_q=1: auto (fallback is fastest [sdpa 57.5 us, reference only])",
-    "T_k=1024 B=3 T_q=1: auto (fallback is fastest [sdpa 71.7 us, reference only])",
-    "T_k=1536 B=3 T_q=1: auto (fallback is fastest [sdpa 100.7 us, reference only])"
+    "T_k=192 B=3 T_q=1: auto (fallback is fastest [sdpa 24.8 us, reference only])",
+    "T_k=256 B=3 T_q=1: auto (fallback is fastest [sdpa 28.5 us, reference only])",
+    "T_k=384 B=3 T_q=1: auto (fallback is fastest [sdpa 35.3 us, reference only])",
+    "T_k=512 B=3 T_q=1: auto (fallback is fastest [sdpa 42.7 us, reference only])",
+    "T_k=768 B=3 T_q=1: auto (fallback is fastest [sdpa 57.4 us, reference only])",
+    "T_k=1024 B=3 T_q=1: auto (fallback is fastest [sdpa 71.3 us, reference only])",
+    "T_k=1536 B=3 T_q=1: auto (fallback is fastest [sdpa 100.4 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
      "cute_m32n32t64": [
-      0.001655,
-      1e-05,
+      0.00165,
+      7e-06,
       12
      ],
      "cute_m64n32t128": [
-      0.001688,
-      1.3e-05,
+      0.001686,
+      1.4e-05,
       12
      ],
      "cute_m32n16t64": [
@@ -3599,212 +3501,202 @@
       12
      ],
      "cute_m64n16t128": [
-      0.001956,
-      8e-06,
+      0.001951,
+      1.8e-05,
       9
      ],
      "auto": [
-      0.002288,
-      9e-06,
+      0.0023,
+      8e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cute_m32n64t64": [
-      0.00392,
-      1.3e-05,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.003964,
-      1.7e-05,
-      12
-     ],
      "cxx_s2": [
-      0.004051,
-      1.5e-05,
+      0.003545,
+      9e-06,
+      12
+     ],
+     "cxx_s8": [
+      0.003546,
+      8e-06,
       12
      ],
      "cxx_s1": [
-      0.004051,
+      0.003546,
+      1.4e-05,
+      12
+     ],
+     "cxx": [
+      0.003547,
       8e-06,
-      9
+      12
      ],
      "auto": [
-      0.004058,
-      2.1e-05,
+      0.003547,
+      8e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cute_m64n64t128": [
-      0.005033,
-      7e-06,
-      12
-     ],
-     "cute_m32n64t64": [
-      0.005071,
-      1.8e-05,
-      12
-     ],
-     "cxx_s1": [
-      0.00543,
+     "cxx_s8": [
+      0.004037,
       6e-06,
-      9
+      12
      ],
-     "cxx_s2": [
-      0.005432,
-      1.2e-05,
-      9
+     "cxx": [
+      0.004042,
+      1e-05,
+      12
      ],
      "auto": [
-      0.005433,
-      1.3e-05,
+      0.004042,
+      1e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.004044,
+      9e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cxx_s8": [
-      0.005628,
-      2.6e-05,
+     "cxx": [
+      0.004331,
+      1e-05,
       12
-     ],
-     "cxx_s2": [
-      0.00565,
-      1.3e-05,
-      12
-     ],
-     "cxx_s4": [
-      0.00565,
-      5e-06,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.00613,
-      1.1e-05,
-      9
      ],
      "auto": [
-      0.00652,
-      1.2e-05,
+      0.004331,
+      1e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.004336,
+      1.1e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.004513,
+      8e-06,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
-     "cxx": [
-      0.006082,
-      1.7e-05,
-      12
-     ],
-     "auto": [
-      0.006082,
-      1.7e-05,
+     "cxx_s4": [
+      0.004819,
+      2.3e-05,
       12
      ],
      "cxx_s8": [
-      0.006106,
-      2.4e-05,
+      0.004819,
+      1.7e-05,
       12
      ],
-     "cxx_s4": [
-      0.006126,
-      2.7e-05,
+     "cxx": [
+      0.004825,
+      2.1e-05,
+      12
+     ],
+     "auto": [
+      0.004825,
+      2.1e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=512": {
-     "cxx_s8": [
-      0.006152,
-      2.1e-05,
-      12
-     ],
      "cxx": [
-      0.006154,
-      4.2e-05,
+      0.005192,
+      1.2e-05,
       12
      ],
      "auto": [
-      0.006154,
-      4.2e-05,
+      0.005192,
+      1.2e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.005198,
+      2.1e-05,
       12
      ],
      "cxx_s4": [
-      0.006155,
-      4.7e-05,
+      0.005207,
+      1e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=768": {
-     "cxx_s8": [
-      0.007288,
-      3.3e-05,
-      12
-     ],
      "cxx": [
-      0.007291,
-      1.7e-05,
+      0.005895,
+      2.9e-05,
       12
      ],
      "auto": [
-      0.007291,
-      1.7e-05,
+      0.005895,
+      2.9e-05,
+      12
+     ],
+     "cxx_s8": [
+      0.005896,
+      1.9e-05,
       12
      ],
      "cxx_s4": [
-      0.007683,
-      2.6e-05,
+      0.006109,
+      4.4e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=1024": {
      "cxx": [
-      0.007669,
-      3.8e-05,
+      0.006324,
+      3e-05,
       12
      ],
      "auto": [
-      0.007669,
-      3.8e-05,
+      0.006324,
+      3e-05,
       12
      ],
      "cxx_s8": [
-      0.007689,
-      3.8e-05,
+      0.006342,
+      4.3e-05,
       12
      ],
      "cxx_s4": [
-      0.009116,
-      6.1e-05,
+      0.006566,
+      4.4e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=1536": {
+     "cxx_s8": [
+      0.007187,
+      4.4e-05,
+      12
+     ],
      "cxx": [
-      0.009568,
-      4.3e-05,
+      0.007197,
+      2.4e-05,
       12
      ],
      "auto": [
-      0.009568,
-      4.3e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.009569,
-      1.7e-05,
+      0.007197,
+      2.4e-05,
       12
      ],
      "cxx_s4": [
-      0.011518,
-      7.2e-05,
+      0.007726,
+      6.4e-05,
       12
      ],
      "_l2": "rotated"
@@ -3814,288 +3706,8 @@
   "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=64": {
    "regions": [
     [
-     null,
+     192,
      "cute_m32n16t64"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m32n16t64', 'cute_m32n32t64'] (eps 3%), 1 segment(s)",
-    "worst measured regret 6.4%",
-    "T_k=64 B=64 T_q=1: cute_m32n16t64 (2.81x vs auto [sdpa 27.8 us, reference only])",
-    "T_k=128 B=64 T_q=1: cute_m32n16t64 (1.33x vs auto [sdpa 38.1 us, reference only])",
-    "T_k=192 B=64 T_q=1: cute_m32n16t64 (1.28x vs auto [sdpa 48.3 us, reference only])",
-    "T_k=256 B=64 T_q=1: cute_m32n16t64 (1.31x vs auto [sdpa 57.7 us, reference only])",
-    "T_k=384 B=64 T_q=1: cute_m32n16t64 (1.20x vs auto [sdpa 81.2 us, reference only])",
-    "T_k=512 B=64 T_q=1: cute_m32n16t64 (1.28x vs auto [sdpa 108.6 us, reference only])",
-    "T_k=768 B=64 T_q=1: cute_m32n16t64 (1.21x vs auto [sdpa 173.0 us, reference only])",
-    "T_k=1024 B=64 T_q=1: cute_m32n32t64 (1.88x vs auto [sdpa 225.8 us, reference only])",
-    "T_k=1536 B=64 T_q=1: cute_m32n16t64 (1.18x vs auto [sdpa 336.7 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=64": {
-     "cute_m32n16t64": [
-      0.002018,
-      9.2e-05,
-      24
-     ],
-     "cute_m64n16t128": [
-      0.002243,
-      7.3e-05,
-      24
-     ],
-     "cute_m32n32t64": [
-      0.003032,
-      0.000123,
-      24
-     ],
-     "cute_m64n32t128": [
-      0.003488,
-      0.000236,
-      9
-     ],
-     "auto": [
-      0.005661,
-      4.9e-05,
-      24
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=128": {
-     "cute_m32n16t64": [
-      0.009261,
-      9.3e-05,
-      14
-     ],
-     "cute_m32n32t64": [
-      0.009432,
-      5.7e-05,
-      14
-     ],
-     "cute_m64n32t128": [
-      0.010297,
-      4.7e-05,
-      14
-     ],
-     "cute_m64n16t128": [
-      0.010341,
-      2.6e-05,
-      9
-     ],
-     "auto": [
-      0.01231,
-      9.5e-05,
-      14
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=192": {
-     "cute_m32n16t64": [
-      0.013759,
-      6.5e-05,
-      12
-     ],
-     "cute_m32n32t64": [
-      0.013971,
-      9.1e-05,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.014918,
-      7.3e-05,
-      12
-     ],
-     "cute_m64n32t128": [
-      0.015124,
-      0.00022,
-      9
-     ],
-     "auto": [
-      0.017664,
-      7.8e-05,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=256": {
-     "cute_m32n32t64": [
-      0.015974,
-      0.000168,
-      24
-     ],
-     "cute_m32n16t64": [
-      0.016011,
-      0.000176,
-      24
-     ],
-     "cute_m64n32t128": [
-      0.017312,
-      0.000119,
-      24
-     ],
-     "cute_m64n16t128": [
-      0.017571,
-      0.000204,
-      9
-     ],
-     "auto": [
-      0.021006,
-      4.3e-05,
-      24
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=384": {
-     "cute_m32n32t64": [
-      0.024988,
-      0.001397,
-      24
-     ],
-     "cute_m32n16t64": [
-      0.025294,
-      0.000436,
-      24
-     ],
-     "cute_m64n32t128": [
-      0.025874,
-      0.001153,
-      24
-     ],
-     "cute_m64n16t128": [
-      0.02626,
-      0.000421,
-      9
-     ],
-     "auto": [
-      0.030366,
-      0.000228,
-      24
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=512": {
-     "cute_m32n32t64": [
-      0.029996,
-      0.000178,
-      12
-     ],
-     "cute_m32n16t64": [
-      0.03026,
-      0.000205,
-      12
-     ],
-     "cute_m64n32t128": [
-      0.032318,
-      8.9e-05,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.032776,
-      0.00016,
-      9
-     ],
-     "auto": [
-      0.03863,
-      0.000181,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=768": {
-     "cute_m32n16t64": [
-      0.048516,
-      0.00032,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.049824,
-      0.000246,
-      12
-     ],
-     "cute_m32n32t64": [
-      0.050018,
-      0.000347,
-      12
-     ],
-     "cute_m64n32t128": [
-      0.051008,
-      0.000504,
-      9
-     ],
-     "auto": [
-      0.058942,
-      0.000125,
-      12
-     ],
-     "_l2": "rotated"
-    },
-    "T_k=1024": {
-     "cute_m32n32t64": [
-      0.032292,
-      0.000219,
-      12
-     ],
-     "cute_m32n16t64": [
-      0.03437,
-      0.000202,
-      12
-     ],
-     "cute_m64n32t128": [
-      0.0453,
-      0.000166,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.04842,
-      8.3e-05,
-      9
-     ],
-     "auto": [
-      0.060582,
-      0.000213,
-      12
-     ],
-     "_l2": "warm"
-    },
-    "T_k=1536": {
-     "cute_m32n32t64": [
-      0.095128,
-      0.000635,
-      24
-     ],
-     "cute_m32n16t64": [
-      0.095484,
-      0.000563,
-      24
-     ],
-     "cute_m64n16t128": [
-      0.096136,
-      0.000658,
-      9
-     ],
-     "cute_m64n32t128": [
-      0.096634,
-      0.001835,
-      24
-     ],
-     "auto": [
-      0.112924,
-      0.000142,
-      24
-     ],
-     "_l2": "warm"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=8": {
-   "regions": [
-    [
-     128,
-     "cute_m32n32t64"
-    ],
-    [
-     512,
-     "cxx_s4"
     ],
     [
      null,
@@ -4104,242 +3716,486 @@
    ],
    "source": "aot",
    "notes": [
-    "partition: cover ['auto', 'cute_m32n32t64', 'cute_m64n64t128', 'cxx_s2', 'cxx_s4'] (eps 3%), 3 segment(s)",
-    "worst measured regret 5.8%",
-    "T_k=64 B=8 T_q=1: cute_m32n32t64 (1.21x vs auto [sdpa 18.1 us, reference only])",
-    "T_k=128 B=8 T_q=1: auto (fallback is fastest [sdpa 21.7 us, reference only])",
-    "T_k=192 B=8 T_q=1: auto (fallback is fastest [sdpa 25.8 us, reference only])",
-    "T_k=256 B=8 T_q=1: cxx_s2 (1.07x vs auto [sdpa 29.6 us, reference only])",
-    "T_k=384 B=8 T_q=1: cxx_s4 (1.24x vs auto [sdpa 37.8 us, reference only])",
-    "T_k=512 B=8 T_q=1: cxx_s2 (1.25x vs auto [sdpa 45.8 us, reference only])",
-    "T_k=768 B=8 T_q=1: auto (fallback is fastest [sdpa 61.2 us, reference only])",
-    "T_k=1024 B=8 T_q=1: auto (fallback is fastest [sdpa 76.8 us, reference only])",
-    "T_k=1536 B=8 T_q=1: auto (fallback is fastest [sdpa 107.4 us, reference only])"
+    "partition: cover ['auto', 'cute_m32n16t64'] (eps 3%), 2 segment(s)",
+    "worst measured regret 6.1%",
+    "T_k=64 B=64 T_q=1: cute_m32n16t64 (2.04x vs auto [sdpa 27.8 us, reference only])",
+    "T_k=128 B=64 T_q=1: cute_m32n16t64 (1.12x vs auto [sdpa 39.1 us, reference only])",
+    "T_k=192 B=64 T_q=1: cute_m32n16t64 (1.09x vs auto [sdpa 47.3 us, reference only])",
+    "T_k=256 B=64 T_q=1: auto (fallback is fastest [sdpa 59.3 us, reference only])",
+    "T_k=384 B=64 T_q=1: auto (fallback is fastest [sdpa 82.5 us, reference only])",
+    "T_k=512 B=64 T_q=1: auto (fallback is fastest [sdpa 108.7 us, reference only])",
+    "T_k=768 B=64 T_q=1: auto (cxx_s1 1.04x rejected: under the gate 1.05 [sdpa 174.5 us, reference only])",
+    "T_k=1024 B=64 T_q=1: auto (fallback is fastest [sdpa 226.9 us, reference only])",
+    "T_k=1536 B=64 T_q=1: auto (fallback is fastest [sdpa 336.8 us, reference only])"
    ],
    "evidence": {
     "T_k=64": {
-     "cute_m32n32t64": [
-      0.002169,
-      1.5e-05,
-      19
-     ],
-     "cute_m64n32t128": [
-      0.002191,
-      1.5e-05,
-      19
-     ],
      "cute_m32n16t64": [
-      0.002292,
-      1.6e-05,
-      19
+      0.001944,
+      7.5e-05,
+      24
      ],
      "cute_m64n16t128": [
-      0.002391,
-      8.9e-05,
+      0.002278,
+      6.8e-05,
+      24
+     ],
+     "cute_m32n32t64": [
+      0.003033,
+      6.1e-05,
+      24
+     ],
+     "cute_m64n32t128": [
+      0.003397,
+      7.5e-05,
       9
      ],
      "auto": [
-      0.002617,
-      7e-06,
-      19
+      0.003958,
+      7.4e-05,
+      24
      ],
      "_l2": "rotated"
     },
     "T_k=128": {
-     "cxx_s8": [
-      0.004351,
-      1.1e-05,
+     "cute_m32n16t64": [
+      0.010315,
+      4.7e-05,
       12
      ],
-     "cxx": [
-      0.004362,
-      9e-06,
+     "cute_m32n32t64": [
+      0.010602,
+      7.5e-05,
       12
+     ],
+     "cute_m64n16t128": [
+      0.011111,
+      4.7e-05,
+      12
+     ],
+     "cute_m64n32t128": [
+      0.011257,
+      3.4e-05,
+      9
      ],
      "auto": [
-      0.004362,
-      9e-06,
+      0.011554,
+      7.3e-05,
       12
-     ],
-     "cxx_s1": [
-      0.004365,
-      1.8e-05,
-      9
      ],
      "_l2": "rotated"
     },
     "T_k=192": {
-     "cute_m64n64t128": [
-      0.005591,
-      4.5e-05,
+     "cute_m32n16t64": [
+      0.012906,
+      0.000104,
       12
      ],
-     "cute_m32n64t64": [
-      0.005593,
-      2e-05,
+     "cute_m32n32t64": [
+      0.013146,
+      0.000115,
       12
      ],
-     "cxx": [
-      0.005817,
-      1.5e-05,
-      12
+     "cxx_s2": [
+      0.014028,
+      9.9e-05,
+      9
+     ],
+     "cxx_s8": [
+      0.014031,
+      5.8e-05,
+      9
      ],
      "auto": [
-      0.005817,
-      1.5e-05,
+      0.014033,
+      0.000128,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=256": {
-     "cxx_s8": [
-      0.006661,
-      3.4e-05,
+     "cxx_s1": [
+      0.015492,
+      6.5e-05,
       12
      ],
-     "cxx_s4": [
-      0.006668,
-      3.3e-05,
+     "cxx": [
+      0.015551,
+      0.000153,
       12
+     ],
+     "auto": [
+      0.015551,
+      0.000153,
+      12
+     ],
+     "cute_m32n32t64": [
+      0.015594,
+      0.000129,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=384": {
+     "cxx": [
+      0.022054,
+      0.000593,
+      24
+     ],
+     "auto": [
+      0.022054,
+      0.000593,
+      24
+     ],
+     "cute_m32n32t64": [
+      0.022526,
+      0.000222,
+      24
+     ],
+     "cxx_s1": [
+      0.02391,
+      0.002002,
+      24
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=512": {
+     "cxx_s1": [
+      0.029086,
+      0.000374,
+      24
+     ],
+     "cxx": [
+      0.029226,
+      0.000368,
+      24
+     ],
+     "auto": [
+      0.029226,
+      0.000368,
+      24
+     ],
+     "cute_m32n32t64": [
+      0.029878,
+      0.000222,
+      24
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=768": {
+     "cute_m32n16t64": [
+      0.046414,
+      0.000433,
+      24
+     ],
+     "cxx_s1": [
+      0.047458,
+      0.001394,
+      24
+     ],
+     "cute_m64n16t128": [
+      0.048292,
+      0.000593,
+      9
+     ],
+     "cxx": [
+      0.049246,
+      0.000887,
+      24
+     ],
+     "auto": [
+      0.049246,
+      0.000887,
+      24
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=1024": {
+     "cxx": [
+      0.023321,
+      0.000219,
+      16
+     ],
+     "auto": [
+      0.023321,
+      0.000219,
+      16
+     ],
+     "cxx_s1": [
+      0.023358,
+      0.000213,
+      16
      ],
      "cxx_s2": [
-      0.006672,
-      3.7e-05,
-      12
+      0.02546,
+      0.000124,
+      16
      ],
-     "cute_m64n64t128": [
-      0.006857,
-      8e-06,
+     "_l2": "warm"
+    },
+    "T_k=1536": {
+     "cute_m32n32t64": [
+      0.092756,
+      0.00078,
+      22
+     ],
+     "cxx_s4": [
+      0.094068,
+      0.000495,
+      22
+     ],
+     "cxx": [
+      0.094116,
+      0.000913,
+      22
+     ],
+     "auto": [
+      0.094116,
+      0.000913,
+      22
+     ],
+     "_l2": "warm"
+    }
+   }
+  },
+  "fmha|op=fmha|dt=half|D=64|H=6|Hkv=6|mask=none|bias=0|ba=0|kv=paged16|ss=0|q=1|B=8": {
+   "regions": [
+    [
+     64,
+     "cute_m32n32t64"
+    ],
+    [
+     1024,
+     "auto"
+    ],
+    [
+     null,
+     "cxx_s4"
+    ]
+   ],
+   "source": "aot",
+   "notes": [
+    "partition: cover ['auto', 'cxx_s4', 'cute_m32n32t64'] (eps 3%), 3 segment(s)",
+    "worst measured regret 0.4%",
+    "T_k=64 B=8 T_q=1: cute_m32n32t64 (1.19x vs auto [sdpa 18.0 us, reference only])",
+    "T_k=128 B=8 T_q=1: auto (fallback is fastest [sdpa 21.8 us, reference only])",
+    "T_k=192 B=8 T_q=1: auto (fallback is fastest [sdpa 25.8 us, reference only])",
+    "T_k=256 B=8 T_q=1: auto (fallback is fastest [sdpa 29.7 us, reference only])",
+    "T_k=384 B=8 T_q=1: auto (fallback is fastest [sdpa 37.4 us, reference only])",
+    "T_k=512 B=8 T_q=1: auto (fallback is fastest [sdpa 44.9 us, reference only])",
+    "T_k=768 B=8 T_q=1: auto (fallback is fastest [sdpa 61.6 us, reference only])",
+    "T_k=1024 B=8 T_q=1: auto (fallback is fastest [sdpa 77.6 us, reference only])",
+    "T_k=1536 B=8 T_q=1: auto (cxx_s4 1.05x rejected: single replay disagrees (9.4 vs 9.4 us: self-overlap) [sdpa 107.1 us, reference only])"
+   ],
+   "evidence": {
+    "T_k=64": {
+     "cute_m32n32t64": [
+      0.002174,
+      1.5e-05,
+      21
+     ],
+     "cute_m64n32t128": [
+      0.002199,
+      1.9e-05,
+      21
+     ],
+     "cute_m32n16t64": [
+      0.002301,
+      2.2e-05,
+      21
+     ],
+     "cute_m64n16t128": [
+      0.002403,
+      9.6e-05,
       9
      ],
      "auto": [
-      0.007161,
-      2.8e-05,
+      0.002583,
+      1.5e-05,
+      21
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=128": {
+     "cxx_s8": [
+      0.003966,
+      1.2e-05,
+      12
+     ],
+     "cxx_s4": [
+      0.003977,
+      1.6e-05,
+      12
+     ],
+     "cxx": [
+      0.00398,
+      2e-05,
+      12
+     ],
+     "auto": [
+      0.00398,
+      2e-05,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=192": {
+     "cxx_s2": [
+      0.004659,
+      1.2e-05,
+      12
+     ],
+     "cxx": [
+      0.004663,
+      8e-06,
+      12
+     ],
+     "auto": [
+      0.004663,
+      8e-06,
+      12
+     ],
+     "cxx_s1": [
+      0.004664,
+      1.2e-05,
+      12
+     ],
+     "_l2": "rotated"
+    },
+    "T_k=256": {
+     "cxx": [
+      0.005114,
+      1.8e-05,
+      12
+     ],
+     "auto": [
+      0.005114,
+      1.8e-05,
+      12
+     ],
+     "cxx_s1": [
+      0.005128,
+      2.6e-05,
+      12
+     ],
+     "cxx_s2": [
+      0.005601,
+      1.5e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=384": {
      "cxx_s8": [
-      0.007707,
-      4.9e-05,
+      0.006074,
+      2.6e-05,
+      12
+     ],
+     "cxx": [
+      0.006082,
+      3.7e-05,
+      12
+     ],
+     "auto": [
+      0.006082,
+      3.7e-05,
       12
      ],
      "cxx_s4": [
-      0.00774,
-      5.8e-05,
-      12
-     ],
-     "cxx_s2": [
-      0.008238,
-      2.2e-05,
-      12
-     ],
-     "cute_m64n64t128": [
-      0.008948,
-      1.7e-05,
-      9
-     ],
-     "auto": [
-      0.009633,
-      5.5e-05,
+      0.006086,
+      3.3e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=512": {
-     "cxx_s2": [
-      0.009768,
-      2.7e-05,
+     "cxx": [
+      0.006624,
+      1.5e-05,
       12
      ],
-     "cxx_s4": [
-      0.010335,
-      6.5e-05,
+     "auto": [
+      0.006624,
+      1.5e-05,
       12
      ],
      "cxx_s8": [
-      0.010336,
-      4.8e-05,
+      0.006662,
+      5.5e-05,
       12
      ],
-     "cute_m64n64t128": [
-      0.011219,
-      2.4e-05,
+     "cxx_s4": [
+      0.006675,
+      2.7e-05,
       9
-     ],
-     "auto": [
-      0.012244,
-      6.8e-05,
-      12
      ],
      "_l2": "rotated"
     },
     "T_k=768": {
+     "cxx_s8": [
+      0.009508,
+      2.3e-05,
+      12
+     ],
      "cxx": [
-      0.01064,
-      6.2e-05,
+      0.009518,
+      5.2e-05,
       12
      ],
      "auto": [
-      0.01064,
-      6.2e-05,
+      0.009518,
+      5.2e-05,
       12
      ],
-     "cxx_s2": [
-      0.011885,
-      3.6e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.012275,
-      6.2e-05,
+     "cxx_s4": [
+      0.00987,
+      1.7e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=1024": {
      "cxx": [
-      0.013373,
-      0.000104,
+      0.011591,
+      5.1e-05,
       12
      ],
      "auto": [
-      0.013373,
-      0.000104,
+      0.011591,
+      5.1e-05,
       12
      ],
-     "cxx_s8": [
-      0.014169,
-      0.000101,
+     "cxx_s4": [
+      0.011782,
+      8e-05,
       12
      ],
      "cxx_s2": [
-      0.014385,
-      9.9e-05,
+      0.012072,
+      7.6e-05,
       12
      ],
      "_l2": "rotated"
     },
     "T_k=1536": {
+     "cxx_s4": [
+      0.013282,
+      7.8e-05,
+      12
+     ],
      "cxx": [
-      0.016688,
-      6.3e-05,
+      0.013947,
+      3.1e-05,
       12
      ],
      "auto": [
-      0.016688,
-      6.3e-05,
-      12
-     ],
-     "cxx_s8": [
-      0.019084,
-      5.9e-05,
+      0.013947,
+      3.1e-05,
       12
      ],
      "cxx_s2": [
-      0.019541,
-      0.000125,
+      0.014066,
+      4.6e-05,
       12
      ],
      "_l2": "rotated"

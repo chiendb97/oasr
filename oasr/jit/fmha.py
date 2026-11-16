@@ -23,7 +23,10 @@ translation units but not within one (the reasoning is written out at
 ``oasr/jit/gemm.py:1000``).  Measured on this box: one variant compiles in
 31-34 s, and 12 of them are a single ninja wave on 64 cores.  So a cell costs
 about one variant's wall time, once, and then covers every shape that cell will
-ever be asked for.
+ever be asked for.  Beside them: four split-KV variants (``mask="none"``), and on
+the architectures in :data:`DECODE_KERNEL_SM` the two (dense / paged) of the
+CUDA-core single-query decode kernel (``include/oasr/attention/fmha_decode.h``),
+which compile in seconds.
 
 Everything else is deliberately **runtime**, not a compile-time axis:
 ``num_heads`` / ``num_kv_heads``, the page size, the window bounds, the
@@ -60,6 +63,11 @@ __all__ = [
     "split_range",
     "fmha_coverage_report",
     "variant_symbol",
+    "DECODE_KERNEL_SM",
+    "decode_supported",
+    "decode_num_splits",
+    "clamp_decode_splits",
+    "get_fmha_decode_fn",
     "resolve_config_kv8",
     "kv8_config_supported",
     "gen_fmha_kv8_module",
@@ -106,6 +114,27 @@ MIN_BLOCKS_PER_SPLIT = 2
 MIN_BLOCKS_FOR_SPLIT = 6
 SPLIT_MAX_UTIL_PCT = 60
 SPLIT_DEPTH_PER_CTA = 30
+
+#: Architectures where a single-query decode step runs the CUDA-core decode
+#: kernel (``include/oasr/attention/fmha_decode.h``) instead of the MMA
+#: mainloop.  It merges its splits through a thread-block cluster, so it needs
+#: sm_90+; of this lane's architectures that is sm_120, where it was measured
+#: (1.02-1.54x the MMA path's decode step with L2 rotated, up to 3.2x L2-warm).
+#: Another joins when the same measurement has been made on it.
+DECODE_KERNEL_SM: Tuple[int, ...] = (120,)
+#: Mirrors ``kFmhaDecodeMaxSplits`` / ``kFmhaDecodeMaxHeadDim``.
+DECODE_MAX_SPLITS = 8
+DECODE_MAX_HEAD_DIM = 256
+#: The decode split rule (:func:`decode_num_splits`), fitted on sm_120 over 284
+#: shapes (6x64, 20x64 and 32x128 heads, batch 1-64, T_k 128-4096, full and
+#: ragged rows, L2 rotated) against the best measured split: 0.6 % geomean
+#: regret, 7 % worst.  Split while the unsplit grid fills less than this share
+#: of the SMs ...
+DECODE_FILL_PCT = 75
+#: ... and the key range is at least this long ...
+DECODE_MIN_KEYS_FOR_SPLIT = 384
+#: ... giving every split at least this many keys.
+DECODE_MIN_KEYS_PER_SPLIT = 128
 
 _ARCH_UNDERSERVED: "Counter[int]" = Counter()
 _REFUSED: "Counter[str]" = Counter()
@@ -386,6 +415,66 @@ def split_range(n_block_min: int, n_block_max: int, split_idx: int, splits: int)
     return (lo, min(lo + per, n_block_max))
 
 
+def _decode_buildable(sm: int, dtype_str: str, head_dim: int) -> bool:
+    """Can this cell carry the decode kernel at all (its cluster merge needs sm_90+)?
+
+    Deliberately separate from :func:`decode_supported`: what a cell *contains*
+    must not depend on what is *routed*, or a cell built while routing is off (a
+    test naming the MMA path) is cached without the decode symbols, and every
+    later decode call in the process fails to find them.
+    """
+    return (
+        sm >= 90
+        and sm in SUPPORTED_SM
+        and dtype_str in _DTYPES
+        and head_dim % 8 == 0
+        and padded_head_dim(head_dim) <= DECODE_MAX_HEAD_DIM
+    )
+
+
+def decode_supported(*, sm: int, dtype_str: str, head_dim: int) -> bool:
+    """Does a single-query decode step of this shape take the decode kernel?
+
+    The caller has established the rest: one query row, no bias, no mask but the
+    key window (``oasr.functionals.attention._call_cxx``).
+    """
+    return sm in DECODE_KERNEL_SM and _decode_buildable(sm, dtype_str, head_dim)
+
+
+def decode_num_splits(cta_count: int, t_k: int, num_sms: int) -> int:
+    """How many ways the decode kernel cuts a step's key range.
+
+    ``cta_count`` is ``batch * num_heads`` (one CTA per query head and row),
+    ``t_k`` the key extent of the call's *shape* -- the table width for a paged
+    call -- never the per-row lengths, which are data.  A pure function of shape
+    and SM count, never of CUDA-graph capture state (``AGENTS.md`` rule 11): the
+    split count fixes the order the partials are merged in.
+
+    Split while the unsplit grid fills less than ``DECODE_FILL_PCT`` % of the
+    SMs and the range is at least ``DECODE_MIN_KEYS_FOR_SPLIT`` keys, to the
+    count that fills that share, each split at least
+    ``DECODE_MIN_KEYS_PER_SPLIT`` keys, at most ``DECODE_MAX_SPLITS``.  Integer
+    arithmetic, so the answer is exact.
+    """
+    if cta_count <= 0 or num_sms <= 0 or t_k < DECODE_MIN_KEYS_FOR_SPLIT:
+        return 1
+    if 100 * cta_count >= DECODE_FILL_PCT * num_sms:
+        return 1
+    want = -(-(DECODE_FILL_PCT * num_sms) // (100 * cta_count))
+    return max(1, min(want, t_k // DECODE_MIN_KEYS_PER_SPLIT, DECODE_MAX_SPLITS))
+
+
+def clamp_decode_splits(splits: int, t_k: int) -> int:
+    """A requested decode split count cut to what this key range can use.
+
+    A measured setting (an ``fmha`` table's ``cxx_s{n}``) means the same thing
+    on both of the lane's kernels: at most ``n`` splits, each at least
+    ``DECODE_MIN_KEYS_PER_SPLIT`` keys -- the MMA path's two-K-tile floor -- and
+    no more than the cluster holds.
+    """
+    return max(1, min(int(splits), DECODE_MAX_SPLITS, t_k // DECODE_MIN_KEYS_PER_SPLIT))
+
+
 def _mask_mode(causal: bool, local: bool) -> str:
     if local:
         return "local"
@@ -401,6 +490,7 @@ def variant_symbol(
     paged: bool,
     varlen: bool = False,
     split: bool = False,
+    decode: bool = False,
 ) -> str:
     """The exported name of one variant.
 
@@ -414,6 +504,8 @@ def variant_symbol(
         f"fmha_sm{sm}_{dtype_str}_d{d}_{mask}"
         f"_{'bias' if has_bias else 'nobias'}_{'paged' if paged else 'dense'}"
     )
+    if decode:
+        return f"fmha_sm{sm}_{dtype_str}_d{d}_decode_{'paged' if paged else 'dense'}"
     if split:
         return f"{sym}_split"
     return f"{sym}_varlen" if varlen else sym
@@ -483,6 +575,19 @@ def gen_fmha_module(sm: int, dtype_str: str, head_dim: int) -> JitSpec:
             paged_kv=paged,
         )
         sources.append(GeneratedSource(f"{func}.cu", rendered))
+    if _decode_buildable(sm, dtype_str, head_dim):
+        for paged in _PAGED_MODES:
+            func = variant_symbol(sm, dtype_str, head_dim, "none", False, paged, decode=True)
+            rendered = render_template(
+                "fmha_decode_template.cu.jinja",
+                func_name=func,
+                sm_version=sm,
+                dtype=dtype_str,
+                cutlass_dtype=_DTYPES[dtype_str],
+                head_dim=d,
+                paged_kv=paged,
+            )
+            sources.append(GeneratedSource(f"{func}.cu", rendered))
     sources.append(env.OASR_CSRC_DIR / "fmha_jit_binding.cu")
     return gen_jit_spec(name, sources)
 
@@ -626,6 +731,23 @@ def get_fmha_fn(
     module = _cell_module(sm, dtype_str, head_dim)
     return getattr(
         module, variant_symbol(sm, dtype_str, head_dim, mask, has_bias, paged, varlen, split)
+    )
+
+
+def get_fmha_decode_fn(
+    *,
+    dtype_str: str,
+    head_dim: int,
+    paged: bool = False,
+    sm: Optional[int] = None,
+):
+    """The bound launcher of the decode kernel, building its cell on first use."""
+    sm = _get_target_sm() if sm is None else sm
+    if not _decode_buildable(sm, dtype_str, head_dim):
+        raise ValueError(f"fmha: no decode kernel for sm_{sm} / {dtype_str} / head_dim {head_dim}")
+    module = _cell_module(sm, dtype_str, head_dim)
+    return getattr(
+        module, variant_symbol(sm, dtype_str, head_dim, "none", False, paged, decode=True)
     )
 
 

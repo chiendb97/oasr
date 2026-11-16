@@ -1576,6 +1576,39 @@ def _call_cxx(
     if _needs_operand_copy(out):
         out = torch.empty(out.shape, dtype=out.dtype, device=out.device)
 
+    # --- a single-query decode step: the CUDA-core decode kernel ------------
+    # One query row, no bias, no mask but the key window -- where the kernel is
+    # built (`decode_supported`: sm_90+ for its cluster merge, measured on
+    # sm_120).  Its split count is a pure function of shape and SM count, like
+    # the MMA path's (rule 11); a measured `cxx_s{n}` caps it the same way.
+    if T_q == 1 and attn_bias is None and not causal and not local:
+        from oasr.jit.fmha import (
+            clamp_decode_splits,
+            decode_num_splits,
+            decode_supported,
+            get_fmha_decode_fn,
+        )
+
+        if decode_supported(sm=_target_sm(), dtype_str=dtype_str, head_dim=D):
+            if not splits:
+                n = decode_num_splits(B * H, T_k, _multiprocessor_count())
+            else:
+                n = clamp_decode_splits(splits, T_k)
+            get_fmha_decode_fn(dtype_str=dtype_str, head_dim=D, paged=paged)(
+                out,
+                q,
+                k,
+                v,
+                cache_seqlens,
+                cache_seqstarts,
+                block_table,
+                int(n),
+                float(softmax_scale),
+            )
+            if out_target is not out:
+                out_target.copy_(out)
+            return out_target
+
     # --- split-KV (flash decoding) ---------------------------------------
     # Worth it exactly when the unsplit grid cannot fill the machine, which at
     # these shapes means a decode step: `B*H*m_blocks` CTAs against 170 SMs.

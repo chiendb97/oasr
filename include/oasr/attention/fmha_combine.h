@@ -37,6 +37,12 @@
 namespace oasr {
 namespace attention {
 
+//! Most splits the combine reduces: each lane holds `kFmhaCombineMaxSplits / 32`
+//! LSEs.  At least `kFmhaMaxSplits`; the decode kernel may cut more.
+inline constexpr int kFmhaCombineMaxSplits = 64;
+static_assert(kFmhaCombineMaxSplits % 32 == 0 && kFmhaCombineMaxSplits >= kFmhaMaxSplits,
+              "the combine holds whole warps of LSEs and covers every split the lane cuts");
+
 /*! \brief Reduce `(num_splits, B, H, T_q, D)` fp32 partials into `(B, H, T_q, D)`.
  *
  * **One warp per output row**, where a row is one `(batch, head, query)`
@@ -57,15 +63,24 @@ namespace attention {
  * `exp2f(lse_s - lse_max)` depends only on `(row, split)`, but computing it
  * inside the column loop evaluated it -- and re-read its LSE -- `head_dim`
  * times per `(row, split)`.  Hoisting it out of a **split-outer, column-inner**
- * loop costs one `exp2f` per `(row, split)` per lane instead, and lets the
- * accumulator be a `kHeadDim / 32` register array indexed only by an unrolled
- * loop.  A runtime-indexed local array here would spill the whole thing to
- * local memory, which is why `num_splits` never subscripts a local.
+ * loop lets the accumulator be a `kHeadDim / 32` register array indexed only
+ * by an unrolled loop.  A runtime-indexed local array here would spill the
+ * whole thing to local memory, which is why `num_splits` never subscripts a
+ * local.
+ *
+ * The third cost was latency.  Reading the LSEs one split at a time, in two
+ * loops, made every row a chain of `2 * num_splits` dependent global loads:
+ * at a small batch -- the only place that splits -- that chain *was* the pass
+ * (6.1 us at B1 H6 and 12 splits, against 7.6 us for the split mainloop; ncu,
+ * base clocks).  Now each lane reads one split's LSE and computes its weight,
+ * the weights reach the other lanes by shuffle, and `kAhead` splits' partials
+ * are loaded before any is accumulated.
  *
  * The arithmetic *order* is unchanged -- `sum_w` still accumulates over
- * ascending `s`, the weighted sum still accumulates over ascending `s`, and
- * `inv_sum` is still applied once at the end -- so this produces bit-identical
- * output to the tiled version it replaces.
+ * ascending `s` one add at a time, the weighted sum still accumulates over
+ * ascending `s` with the same expression, and `inv_sum` is still applied once
+ * at the end -- so this produces bit-identical output to both versions it
+ * replaces (`tests/kernels/test_fmha_cpp.py` pins the split path).
  *
  * \tparam Element   the served dtype the output is cast back to
  * \tparam kHeadDim  **padded** value head dim; `head_dim` is the real one and
@@ -101,19 +116,52 @@ __global__ void fmha_combine_kernel(Element* out, float const* o_partial,
 
     int64_t const lse_stride_split = int64_t(batch) * num_heads * seqlen_q;
     int64_t const o_stride_split = lse_stride_split * head_dim;
-    // Every lane of the warp reads the same LSE address, so these are
-    // broadcasts rather than 32 separate sectors.
     float const* lse_row = lse_partial + row;
 
+    // Lane `j` reads split `j` (and `j + 32`): every LSE in one round trip.  The
+    // loop this replaces read them one split at a time, twice -- `2 * num_splits`
+    // dependent global loads per row, which at small batch *was* the pass
+    // (~6 us at 12 splits, more than the split mainloop it reduces).
+    constexpr unsigned kFull = 0xffffffffu;
+    constexpr int kSlots = kFmhaCombineMaxSplits / 32;
+    float lse[kSlots];
     float lse_max = -INFINITY;
-    for (int s = 0; s < num_splits; ++s) {
-        float const l = lse_row[int64_t(s) * lse_stride_split];
-        lse_max = l > lse_max ? l : lse_max;
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < kSlots; ++r) {
+        int const s = r * 32 + lane;
+        lse[r] = s < num_splits ? lse_row[int64_t(s) * lse_stride_split] : -INFINITY;
+        lse_max = lse[r] > lse_max ? lse[r] : lse_max;
     }
+    // A max is exact in any order.
+    CUTLASS_PRAGMA_UNROLL
+    for (int o = 16; o > 0; o >>= 1) {
+        float const other = __shfl_xor_sync(kFull, lse_max, o);
+        lse_max = other > lse_max ? other : lse_max;
+    }
+    // Lane `j`'s weight is `exp2f(lse_j - lse_max)`, the value the old loop
+    // recomputed; `weight(s)` hands split `s`'s to every lane.  The register is
+    // picked by unrolled compares, never by a runtime subscript -- that would
+    // put `w` in local memory.
+    float w[kSlots];
+    CUTLASS_PRAGMA_UNROLL
+    for (int r = 0; r < kSlots; ++r) {
+        w[r] = ::exp2f(lse[r] - lse_max);
+    }
+    auto weight = [&](int s) {
+        float pick = w[0];
+        CUTLASS_PRAGMA_UNROLL
+        for (int r = 1; r < kSlots; ++r) {
+            pick = s >= r * 32 ? w[r] : pick;
+        }
+        return __shfl_sync(kFull, pick, s & 31);
+    };
+
+    // Summed in ascending `s`, one add at a time, from zero: the same sequence of
+    // fp32 operations as before, so the same bits.
     float sum_w = 0.f;
     if (lse_max != -INFINITY) {
         for (int s = 0; s < num_splits; ++s) {
-            sum_w += ::exp2f(lse_row[int64_t(s) * lse_stride_split] - lse_max);
+            sum_w += weight(s);
         }
     }
     // Every split empty means the row saw no live key, and the contract says
@@ -126,15 +174,35 @@ __global__ void fmha_combine_kernel(Element* out, float const* o_partial,
         acc[c] = 0.f;
     }
     if (inv_sum > 0.f) {
+        // `kAhead` splits' partials are loaded before any is accumulated, so their
+        // latencies overlap; the accumulation itself stays in ascending `s` with
+        // the same expression, hence the same rounding.
+        constexpr int kAhead = 4;
         float const* o_row = o_partial + int64_t(row) * head_dim;
-        for (int s = 0; s < num_splits; ++s) {
-            float const w = ::exp2f(lse_row[int64_t(s) * lse_stride_split] - lse_max);
-            float const* src = o_row + int64_t(s) * o_stride_split;
+        for (int s0 = 0; s0 < num_splits; s0 += kAhead) {
+            float vals[kAhead][kColsPerLane];
             CUTLASS_PRAGMA_UNROLL
-            for (int c = 0; c < kColsPerLane; ++c) {
-                int const col = lane + c * 32;
-                if (col < head_dim) {
-                    acc[c] += w * src[col];
+            for (int j = 0; j < kAhead; ++j) {
+                int const s = s0 + j;
+                float const* src = o_row + int64_t(s) * o_stride_split;
+                CUTLASS_PRAGMA_UNROLL
+                for (int c = 0; c < kColsPerLane; ++c) {
+                    int const col = lane + c * 32;
+                    vals[j][c] = (s < num_splits && col < head_dim) ? src[col] : 0.f;
+                }
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < kAhead; ++j) {
+                int const s = s0 + j;
+                if (s < num_splits) {
+                    float const ws = weight(s);
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int c = 0; c < kColsPerLane; ++c) {
+                        int const col = lane + c * 32;
+                        if (col < head_dim) {
+                            acc[c] += ws * vals[j][c];
+                        }
+                    }
                 }
             }
         }
@@ -171,6 +239,9 @@ cudaError_t run_fmha_combine(Element* out, float const* o_partial, float const* 
     int const total_rows = batch * num_heads * seqlen_q;
     if (total_rows <= 0) {
         return cudaSuccess;
+    }
+    if (num_splits < 1 || num_splits > kFmhaCombineMaxSplits) {
+        return cudaErrorInvalidValue;
     }
     dim3 const grid(uint32_t((total_rows + kRowsPerCta - 1) / kRowsPerCta));
     fmha_combine_kernel<Element, kHeadDim, kThreads><<<grid, kThreads, 0, stream>>>(

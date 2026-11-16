@@ -410,9 +410,10 @@ class TestDecoderMerge:
         assert not model.decoder.can_merge(grown, sized)
 
     @pytest.mark.cuda
+    @pytest.mark.parametrize("decode_kernel", [False, True], ids=["mma", "decode_kernel"])
     @pytest.mark.parametrize("block_tokens", [8, 16, 64])
-    def test_paged_storage_matches_dense(self, block_tokens):
-        """Paging the decoder KV must not change a single logit.
+    def test_paged_storage_matches_dense(self, block_tokens, decode_kernel, monkeypatch):
+        """Paging the decoder KV must not change a single logit -- on the MMA path.
 
         Both halves are paged: the self-attention, and the cross-attention over
         the encoder window (a 50-frame window here, so its last page is partial
@@ -423,10 +424,24 @@ class TestDecoderMerge:
         tile, say — is never tested.  Several page sizes because the kernel walks
         ``N_BLOCK // block_size`` pages per tile, so the page size is what decides
         how many of them one tile spans.
+
+        Exactly equal on the MMA path, which is what the page-walk preconditions
+        above concern.  Where the CUDA-core decode kernel serves the paged decode
+        steps (``oasr.jit.fmha.DECODE_KERNEL_SM``) the paged cross-attention sums
+        in another order than the dense one, which the waist hands to SDPA as an
+        unmasked read, so the two agree to fp16 rounding: at most one ulp of the
+        largest logit (|x| ~ 100 here, an ulp of 2**-4), measured -- tight enough
+        that a wrong page, which changes every logit, still fails.
         """
         if not torch.cuda.is_available():
             pytest.skip("needs CUDA")
         from oasr.cache.decoder_kv import DecoderKVCacheManager
+        from oasr.jit import fmha as jf
+        from oasr.jit.core import _get_target_sm
+
+        if not decode_kernel:
+            monkeypatch.setattr(jf, "DECODE_KERNEL_SM", ())
+        exact = _get_target_sm() not in jf.DECODE_KERNEL_SM
 
         cfg = _tiny_config(d_model=128, decoder_attention_heads=2, max_target_positions=64)
         torch.manual_seed(21)
@@ -462,7 +477,11 @@ class TestDecoderMerge:
             return out
 
         for dense, paged in zip(run(None), run(mgr)):
-            torch.testing.assert_close(dense, paged, atol=0, rtol=0)
+            if exact:
+                torch.testing.assert_close(dense, paged, atol=0, rtol=0)
+            else:
+                ulp = 2.0 ** (torch.frexp(dense.abs().max()).exponent.item() - 11)
+                torch.testing.assert_close(dense, paged, atol=ulp, rtol=0)
 
     def test_a_different_encoder_window_declares_itself_unmergeable(self):
         """Dense, Whisper reads cross-attention unmasked over the whole window, so

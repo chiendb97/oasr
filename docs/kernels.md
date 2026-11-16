@@ -725,6 +725,11 @@ partials are summed (rule 11). The workspace is allocated in Python, from
 torch's caching allocator, deliberately **not** from `oasr::getCachedWorkspace`,
 which branches on `cudaStreamIsCapturing`.
 
+A single-query decode step (`T_q == 1`, no bias, no mask but the key window) is
+served by a separate CUDA-core kernel on the architectures where it was measured
+(sm_120; `oasr.jit.fmha.DECODE_KERNEL_SM`): see
+[the decode kernel](#the-single-query-decode-kernel-fmha_decodeh) below.
+
 The kernel moves q, k, v and the output in 128-bit vectors along the head
 dimension:
 - **Every operand:** the base must be 16-byte aligned, and the stride of every
@@ -808,7 +813,7 @@ template — nothing else moves.
 
 ### The C++ attention kernel (`include/oasr/attention/`)
 
-Fifteen headers, structured the way CUTLASS 3.x structures a collective:
+The headers are structured the way CUTLASS 3.x structures a collective:
 `CollectiveFmhaMainloopSm80` + `CollectiveFmhaEpilogue` + `SingleTileScheduler`,
 composed by `FmhaKernel` — a shell that names no architecture and
 touches no layout. `fmha_launch_template.h` is the **one** file that names
@@ -844,6 +849,49 @@ Two implementation notes, because nothing in the C++ says them:
   streaming chunks and cost up to 6% on interior 2–4-tile CTAs, including a
   realistic Conformer batch, so it is not shipped (`fmha_bias.h`).
 
+#### The single-query decode kernel (`fmha_decode.h`)
+
+A decode step attends one query row per sequence over its cache, and the MMA
+mainloop serves it badly: on an RTX 5090 it ran one 4-warp CTA per SM (57 KB of
+shared memory, 168 registers), 8 % of warp slots active, and reached 42-52 % of
+DRAM bandwidth on a step that is nothing but a read of K and V; its split pass
+paid a second launch for the combine. `fmha_decode.h` is the read and nothing
+else:
+
+- **CUDA cores, one CTA per (split, query head, batch row).** A group of
+  `next_pow2(D / 8)` threads holds one key row, one 128-bit load each; 256
+  threads walk the split's keys 4 per group per step, with two register buffers
+  in ping-pong so the next step's K and V are in flight during this step's dot
+  products. A paged split reads its page ids into shared memory once. Each group
+  keeps an fp32 online softmax on base-2 exponents (the scale is folded into
+  `q`); the groups merge once, through shared memory.
+- **Splits merge through a thread-block cluster**, so there is no workspace and
+  no second launch: every rank reads all ranks' `(max, sum)` in one round of
+  distributed-shared-memory reads and writes its own slice of the row. Hence
+  sm_90+ only; the older parts keep the MMA path.
+- **Split rule** (`oasr.jit.fmha.decode_num_splits`): split while the unsplit
+  grid fills under 75 % of the SMs and the key range is at least 384 keys, to
+  the count that fills that share, each split at least 128 keys, at most 8 (the
+  portable cluster). A pure function of shape and SM count (rule 11). Fitted on
+  sm_120 over 284 shapes: 0.6 % geomean regret against the best measured
+  split. A measured `cxx_s{n}` caps it (`clamp_decode_splits`).
+- **The same contract as the MMA path**: lengths, left padding, an empty key
+  window gives exactly zero, GQA, dense and paged at any page size, padded head
+  dims up to 256 (`tests/kernels/test_fmha_decode.py`, including graph replay
+  bit-equal to eager). Its summation order differs from the MMA path's, so the
+  two agree to rounding, not bit for bit.
+
+Measured on an RTX 5090 through `oasr.fmha`, graph-replayed, L2 rotated (the
+served, DRAM-bound case), against the MMA path it replaces: Whisper-tiny
+cross-attention (6 x 64 heads, 1500 keys) B1 1.21x, B8 1.07x, B16 1.12x,
+**B32 1.44x**, B64 1.18x; Whisper-tiny self-attention 1.25-1.54x;
+Whisper-large-v3 cross-attention 1.02-1.13x; Qwen2-Audio-7B self-attention
+(32 x 128, bf16, left-padded) 1.04-1.23x. With L2 warm (a small decoder's working
+set) it is 1.24-3.2x. The one loss is the shortest range: 64 keys at B8, 0.94x
+(0.2 us), which the shipped `fmha` table sends to a CuTeDSL tile anyway. Against
+cuDNN SDPA on a dense copy it is 3-10 % behind on cross-attention with L2
+rotated, and ahead on every masked step and on Qwen2-Audio.
+
 #### FP8 KV variants (`fmha_kv8.h`)
 
 An autoregressive decoder's KV cache can be stored as `float8_e4m3fn` with one
@@ -859,12 +907,14 @@ reads such a cache when `k`/`v` are fp8 and `k_scale`/`v_scale` are given:
   tile for both.  Each thread converts the 16-byte chunks it issued itself, so
   only the scales need the barrier the ring already takes; the conversion costs
   one extra `__syncthreads` per gemm.  Nothing past the conversion changes.
-- **Bit-identical to the served-dtype kernel on the dequantized cache.** The
+- **Bit-identical to the served-dtype MMA kernel on the dequantized cache.** The
   scales are powers of two (`include/oasr/kv_quant/kv_quant.cuh`), so `q * scale`
   rounded to fp16/bf16 is exact, and `fmhaResolveTileKv8` walks the same ladder
   as `fmhaResolveTile`, so a shipped head dim lands on the same K tile (the split
   count and the online-softmax tiling both follow it).  `tests/kernels/
-  test_fmha_kv8.py` holds the lane to that at `atol=0`, dense and paged.
+  test_fmha_kv8.py` holds the lane to that at `atol=0`, dense and paged.  (A
+  served-dtype decode step on sm_120 takes the decode kernel above instead; the
+  fp8 variants have no decode-kernel counterpart yet.)
 - **Own cell, own variants.** `fmha_kv8_sm{SM}_{dtype}_d{D}` -- dense / paged x
   unsplit / split, rendered from `csrc/templates/fmha_kv8_template.cu.jinja` --
   so a process that never reads fp8 never compiles it.  Rendered for unmasked,
