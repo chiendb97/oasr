@@ -243,18 +243,13 @@
    "with_sdpa": 6.144978
   },
   "notes": [
-   "phase5 step 2: sm120 attention lanes+tiles; the C++ lane serves T_q=1 with the CUDA-core decode kernel (cluster merge); step 1 censuses (u2pp offline/streaming b64, whisper-tiny b16/b64, paraformer b64, qwen2-audio-7b b16/b32, ljspeech_200)"
+   "phase5 step 2: sm120 attention lanes+tiles; the C++ lane serves T_q=1 with the CUDA-core decode kernel (cluster merge); step 1 censuses (u2pp offline/streaming b64, whisper-tiny b16/b64, paraformer b64, qwen2-audio-7b b16/b32, ljspeech_200)",
+   "2026-11-16: removed the 5 entries of the 20x64 dense unmasked encoder signature (Qwen2-Audio's audio encoder; Whisper-large-v3's): every key tile other than 64 failed the llm_kv_fp8 WER gate (n32 tiles 6.11 %, n16 5.85 %, vs 5.44 % + 0.3 recorded under the 64-key default), with per-call error unchanged. They route as untuned (the CuTeDSL 64x64 tile). tests/kernels/tune/test_fmha_tuning.py keeps a rebuild from re-adding them."
   ]
  },
  "configs": {
   "auto": {
    "kind": "auto"
-  },
-  "cute_m128n32t256": {
-   "kind": "cute",
-   "m_block": 128,
-   "n_block": 32,
-   "threads": 256
   },
   "cute_m32n16t64": {
    "kind": "cute",
@@ -272,12 +267,6 @@
    "kind": "cute",
    "m_block": 64,
    "n_block": 16,
-   "threads": 128
-  },
-  "cute_m64n32t128": {
-   "kind": "cute",
-   "m_block": 64,
-   "n_block": 32,
    "threads": 128
   },
   "cxx": {
@@ -1337,226 +1326,6 @@
      "auto": [
       0.008337,
       4.3e-05,
-      12
-     ],
-     "_l2": "rotated"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=20|Hkv=20|mask=none|bias=0|ba=0|kv=dense|ss=0|q=L|B=1": {
-   "regions": [
-    [
-     null,
-     "cute_m64n16t128"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m64n16t128'] (eps 3%), 1 segment(s)",
-    "worst measured regret 1.9%",
-    "T_k=1500 B=1 T_q=1500: cute_m64n16t128 (1.19x vs auto [sdpa 166.5 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=1500": {
-     "cute_m64n32t128": [
-      0.016051,
-      0.000148,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.01636,
-      8.7e-05,
-      12
-     ],
-     "cxx_s1": [
-      0.018074,
-      5.7e-05,
-      12
-     ],
-     "cxx": [
-      0.018103,
-      9.8e-05,
-      9
-     ],
-     "auto": [
-      0.019463,
-      6.7e-05,
-      12
-     ],
-     "_l2": "rotated"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=20|Hkv=20|mask=none|bias=0|ba=0|kv=dense|ss=0|q=L|B=16": {
-   "regions": [
-    [
-     null,
-     "cute_m128n32t256"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m128n32t256'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.0%",
-    "T_k=1500 B=14 T_q=1500: cute_m64n32t128 (1.29x vs auto [sdpa 1677.8 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=1500": {
-     "cute_m128n32t256": [
-      0.210704,
-      0.004397,
-      24
-     ],
-     "cute_m64n32t128": [
-      0.216292,
-      0.004294,
-      24
-     ],
-     "cute_m64n16t128": [
-      0.22589,
-      0.003013,
-      24
-     ],
-     "cute_m32n16t64": [
-      0.24574,
-      0.005195,
-      9
-     ],
-     "auto": [
-      0.279842,
-      0.00158,
-      24
-     ],
-     "_l2": "warm"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=20|Hkv=20|mask=none|bias=0|ba=0|kv=dense|ss=0|q=L|B=2": {
-   "regions": [
-    [
-     null,
-     "cute_m128n32t256"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m128n32t256'] (eps 3%), 1 segment(s)",
-    "worst measured regret 2.1%",
-    "T_k=1500 B=2 T_q=1500: cute_m64n16t128 (1.19x vs auto [sdpa 290.8 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=1500": {
-     "cute_m64n32t128": [
-      0.034194,
-      0.00016,
-      12
-     ],
-     "cute_m128n32t256": [
-      0.034914,
-      0.00019,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.035772,
-      0.000243,
-      12
-     ],
-     "cxx_s1": [
-      0.03864,
-      0.000166,
-      9
-     ],
-     "auto": [
-      0.04262,
-      0.000199,
-      12
-     ],
-     "_l2": "rotated"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=20|Hkv=20|mask=none|bias=0|ba=0|kv=dense|ss=0|q=L|B=4": {
-   "regions": [
-    [
-     null,
-     "cute_m64n32t128"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m64n32t128'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.0%",
-    "T_k=1500 B=3 T_q=1500: cute_m64n32t128 (1.22x vs auto [sdpa 414.8 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=1500": {
-     "cute_m64n32t128": [
-      0.045114,
-      0.00013,
-      24
-     ],
-     "cute_m128n32t256": [
-      0.046552,
-      0.000667,
-      24
-     ],
-     "cute_m64n16t128": [
-      0.04925,
-      0.000439,
-      24
-     ],
-     "cxx_s1": [
-      0.051224,
-      8.9e-05,
-      9
-     ],
-     "auto": [
-      0.055166,
-      0.000199,
-      24
-     ],
-     "_l2": "rotated"
-    }
-   }
-  },
-  "fmha|op=fmha|dt=half|D=64|H=20|Hkv=20|mask=none|bias=0|ba=0|kv=dense|ss=0|q=L|B=8": {
-   "regions": [
-    [
-     null,
-     "cute_m128n32t256"
-    ]
-   ],
-   "source": "aot",
-   "notes": [
-    "partition: cover ['auto', 'cute_m128n32t256'] (eps 3%), 1 segment(s)",
-    "worst measured regret 0.1%",
-    "T_k=1500 B=5 T_q=1500: cute_m64n16t128 (1.29x vs auto [sdpa 648.6 us, reference only])"
-   ],
-   "evidence": {
-    "T_k=1500": {
-     "cute_m64n32t128": [
-      0.068968,
-      0.000187,
-      12
-     ],
-     "cute_m128n32t256": [
-      0.069064,
-      0.000442,
-      12
-     ],
-     "cute_m64n16t128": [
-      0.071878,
-      9.8e-05,
-      12
-     ],
-     "cute_m32n16t64": [
-      0.07934,
-      0.000344,
-      9
-     ],
-     "auto": [
-      0.093026,
-      0.000216,
       12
      ],
      "_l2": "rotated"

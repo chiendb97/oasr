@@ -605,6 +605,26 @@ class TestShippedFile:
         for key in tf.entries:
             assert key.startswith("fmha|op=fmha|")
 
+    def test_sm120_keeps_the_audio_encoder_at_its_recorded_routing(self):
+        """No tuned tile for the 20x64 dense unmasked encoder signature on sm_120.
+
+        That is Qwen2-Audio's audio encoder (and Whisper-large-v3's).  Its WER
+        references were recorded under the untuned 64-key tile, and every other
+        key tile measured -- each as accurate per call -- moved enough fp8-KV
+        Qwen2-Audio transcripts to fail the ``llm_kv_fp8`` gate (n32 tiles 6.11 %,
+        n16 5.85 %, against 5.44 % + 0.3).  A rebuild re-adds these entries from
+        the census; drop them again, or re-record that reference with the evidence.
+        """
+        path = db.system_dir() / "sm120" / "fmha.json"
+        if not path.exists():
+            pytest.skip("no shipped sm120 fmha table")
+        tf = db.load_file(path, "fmha", 120)
+        held = {
+            S.sig_key(S.AttnShape("bfloat16", 64, 20, 20, "none", False, 0, False, b, 1500, 1500))
+            for b in (1, 2, 4, 8, 16, 32, 64)
+        }
+        assert not held & set(tf.entries)
+
 
 @needs_lanes
 class TestSplitClamp:

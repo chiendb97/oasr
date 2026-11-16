@@ -237,7 +237,13 @@ the database (`oasr/jit/attention_select.py`):
 - **Numerics.** The lanes compute in a different order, so a table can change a
   transcript at the rounding level: gate it with the WER references, as any
   attention change. Graph and eager agree, because the choice is a function of
-  the shape alone.
+  the shape alone. A WER reference is recorded under one summation order, and a
+  fragile row can fail on another that is just as accurate. The sm_120 table
+  therefore carries no entry for the 20 x 64 dense, unmasked encoder signature
+  (Qwen2-Audio's audio encoder, Whisper-large-v3's). Every key tile but the
+  untuned 64 failed the `llm_kv_fp8` row: 32-key tiles gave 6.11 %, the 16-key
+  tile 5.85 %, against 5.44 % + 0.3. Per-call error was the same.
+  `tests/kernels/tune/test_fmha_tuning.py` fails a rebuild that re-adds them.
 - **Census.** `oasr tune census --family fmha --manifest M --audio-root R` replays
   the manifest through the engine with every graph off -- an AR family's decoder
   steps included, with paged decoder KV as served -- because a decode step's shapes
