@@ -144,9 +144,13 @@ def _operands(pt: AttnPoint, shape: S.AttnShape, g: torch.Generator) -> Dict[str
     q = torch.randn(B, H, Tq, D, device=dev, dtype=dt, generator=g)
     lens = None
     if pt.lens:
-        lo = max(1, (3 * Tk) // 5)
-        lens = torch.randint(lo, Tk + 1, (B,), device=dev, generator=g, dtype=torch.int32)
-        lens[0] = Tk
+        # The census's range (`AttnPoint.lens_lo` / `lens_hi`): a cross-attention
+        # step's rows are all its full extent, which split-KV treats differently
+        # from a ragged batch.  The longest row is always present.
+        hi = min(Tk, max(1, int(math.floor(pt.lens_hi * Tk + 1e-6))))
+        lo = min(hi, max(1, int(math.floor(pt.lens_lo * Tk + 1e-6))))
+        lens = torch.randint(lo, hi + 1, (B,), device=dev, generator=g, dtype=torch.int32)
+        lens[0] = hi
     starts = None
     if shape.seqstart and lens is not None:
         starts = torch.randint(0, max(1, Tk // 8), (B,), device=dev, generator=g, dtype=torch.int32)
@@ -439,7 +443,10 @@ def _digest(pts: Sequence[AttnPoint], opts: BuildOptions, allow_external: bool) 
     import hashlib
 
     h = hashlib.sha256()
-    rows = sorted((p.t_k, p.t_q, p.batch, round(p.weight, 9)) for p in pts)
+    rows = sorted(
+        (p.t_k, p.t_q, p.batch, round(p.weight, 9), round(p.lens_lo, 4), round(p.lens_hi, 4))
+        for p in pts
+    )
     h.update(json.dumps(rows).encode())
     knobs = [opts.max_points_per_sig, opts.fill, opts.min_speedup, opts.tie, opts.cover_eps]
     knobs += [opts.partition, bench.PROTOCOL_VERSION, allow_external, S.CUTE_TILES, S.CXX_SPLITS]
@@ -587,7 +594,10 @@ def build_fmha(
             "census": shapes.provenance,
             "contended": contended,
             "elapsed_s": round(time.time() - t0, 1),
-            "fallback": "auto: OASR_ATTN_BACKEND=auto routing (CuTeDSL 64x64x128 where built)",
+            "fallback": (
+                "auto: OASR_ATTN_BACKEND=auto routing (CuTeDSL 64x64x128 where built; "
+                f"the C++ lane for a decode step; routing revision {S.ROUTING_REVISION})"
+            ),
             "candidates": {
                 "cute_tiles": [list(t) for t in S.CUTE_TILES],
                 "cxx_splits": list(S.CXX_SPLITS),

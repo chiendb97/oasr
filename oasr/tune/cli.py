@@ -179,6 +179,17 @@ def _cmd_build_fused(args, family: str, paths: Sequence[str], sm: int) -> int:
     return 0
 
 
+def _release_device_memory() -> None:
+    """Collect what was just dropped and return its cached blocks to the device."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _cmd_census_fmha(args) -> int:
     """``census --family fmha``: replay the manifest, count every ``fmha`` call shape."""
     from oasr.engine import ASREngine
@@ -200,6 +211,11 @@ def _cmd_census_fmha(args) -> int:
         # Without step graphs ``kv_storage="auto"`` turns dense, so keep the
         # paged layout the served steps read.
         engine.shutdown()
+        # ``shutdown`` releases pools, not the model: drop the first engine
+        # before the second is built, or both models are resident at once and
+        # an 8B speech LLM (16 GiB in bf16) cannot be censused on a 32 GiB GPU.
+        del engine, options
+        _release_device_memory()
         cfg = _deploy_config(args, {"step_graphs": False, "kv_storage": "paged"})
         engine = ASREngine(C.census_engine_config(cfg))
     waves = None

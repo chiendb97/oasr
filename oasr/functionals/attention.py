@@ -20,6 +20,7 @@ from oasr.jit import attention as _jit_attention
 from oasr.jit.attention import (
     fmha_backend_for,
     fmha_cxx_supports,
+    fmha_decode_backend,
     fmha_kv8_backend,
     fmha_kv8_refusal,
     get_compiled_fmha,
@@ -702,17 +703,25 @@ def fmha(
         else:
             # `fmha_backend_for` degrades to a lane that can serve the call
             # rather than raising.  A *named* backend skips this deliberately.
-            backend = (
-                fmha_backend_for(
+            if windowed and half:
+                backend = fmha_backend_for(
                     head_dim=D,
                     dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
                     paged=paged,
                     causal=causal,
                     local=windowed,
                 )
-                if windowed and half
-                else select_backend()
-            )
+            elif half and T_q == 1 and attn_bias is None and not causal:
+                # A decode step: the lane that splits its keys, where measured
+                # (`fmha_decode_backend`).  `attention_select._routed_lane` is the
+                # same rule, so a table's "auto" means what this branch runs.
+                backend = fmha_decode_backend(
+                    head_dim=D,
+                    dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",
+                    paged=paged,
+                )
+            else:
+                backend = select_backend()
     elif isinstance(backend, _AttnChoice):
         # A lane *and* its configuration, named: what the tuner's arms and the
         # tests call.  Required like a named lane -- there is no fallback.

@@ -79,6 +79,15 @@ class AttnPoint:
     #: Whether the calls carried per-row key lengths (``cache_seqlens``): what
     #: the build's operands reproduce.  Not part of the signature.
     lens: bool = True
+    #: The rows' key lengths as fractions of ``t_k``: the call-weighted mean of
+    #: each call's shortest (``lens_lo``) and longest (``lens_hi``) row.  The
+    #: build draws its lengths from this range.  It is a property of the
+    #: traffic, not of the signature, and it decides split-KV: a
+    #: cross-attention step's rows are all its full encoder extent (1500 of a
+    #: 1536-key table), where a ragged batch leaves splits idle.  The defaults
+    #: are the ragged range a census without the field was measured with.
+    lens_lo: float = 0.6
+    lens_hi: float = 1.0
     window_left: int = -1
     window_right: int = -1
     #: Calls per unit of traffic (an utterance offline, a stream when streaming).
@@ -179,25 +188,61 @@ class AttentionShapeRecorder:
 
     Keyed ``(shape, has lengths, window_left, window_right)``: the selection
     signature plus what the build needs to reproduce the call's operands.
+    Beside the counts, per key, the sums of each call's shortest and longest
+    row as a fraction of ``t_k`` (:attr:`AttnPoint.lens_lo` / ``lens_hi``).
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.counts: Counter = Counter()
+        #: key -> [calls with a length range, sum of lo fractions, sum of hi fractions]
+        self.lens: Dict[tuple, List[float]] = {}
 
-    def record(self, shape: AttnShape, lens: bool = True, window: tuple = (-1, -1)) -> None:
+    def record(
+        self,
+        shape: AttnShape,
+        lens: bool = True,
+        window: tuple = (-1, -1),
+        lens_range: Optional[tuple] = None,
+    ) -> None:
+        key = (shape, bool(lens), int(window[0]), int(window[1]))
         with self._lock:
-            self.counts[(shape, bool(lens), int(window[0]), int(window[1]))] += 1
+            self.counts[key] += 1
+            if lens_range is not None:
+                acc = self.lens.setdefault(key, [0.0, 0.0, 0.0])
+                acc[0] += 1.0
+                acc[1] += float(lens_range[0])
+                acc[2] += float(lens_range[1])
 
     def take(self) -> Counter:
-        """The counts so far, and a fresh start."""
+        """The counts so far, and a fresh start (the length ranges are dropped)."""
+        return self.take_with_lens()[0]
+
+    def take_with_lens(self) -> tuple:
+        """``(counts, length-range sums)`` so far, and a fresh start."""
         with self._lock:
             out, self.counts = self.counts, Counter()
-        return out
+            lens, self.lens = self.lens, {}
+        return out, lens
+
+
+def _lens_range(lens: Optional[torch.Tensor], t_k: int) -> Optional[tuple]:
+    """``(shortest, longest)`` row of *lens* as fractions of *t_k*, or ``None``.
+
+    Reading the values synchronises the stream.  The census runs with every graph
+    off, so that costs only time; under a capture it would raise, so a capturing
+    stream records no range rather than break the forward it watches.
+    """
+    if lens is None or t_k <= 0 or lens.numel() == 0:
+        return None
+    if lens.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    lo, hi = (int(x) for x in torch.stack(torch.aminmax(lens)).tolist())
+    return (min(1.0, lo / t_k), min(1.0, hi / t_k))
 
 
 def _shape_of(args, kwargs) -> Optional[tuple]:
-    """``(shape, has lengths, window)`` of one ``fmha`` call, as ``fmha`` itself reads it."""
+    """``(shape, has lengths, window, length range)`` of one ``fmha`` call, as ``fmha`` reads it."""
     from oasr.functionals.attention import _paged_table_width
 
     if kwargs.get("backend") is not None:
@@ -237,7 +282,8 @@ def _shape_of(args, kwargs) -> Optional[tuple]:
         T_k,
         bias is not None and bias.size(-1) % 2 == 0,
     )
-    return shape, kwargs.get("cache_seqlens") is not None, window
+    lens = kwargs.get("cache_seqlens")
+    return shape, lens is not None, window, _lens_range(lens, T_k)
 
 
 def _make_wrapper(rec: AttentionShapeRecorder, fn):
@@ -303,14 +349,40 @@ def _streaming_levels(cfg, traffic) -> Dict[int, float]:
     return {w: v / total for w, v in hist.items()}
 
 
-def _accumulate(points: Dict[tuple, AttnPoint], counts: Counter, scale: float, label: str) -> None:
+def _accumulate(
+    points: Dict[tuple, AttnPoint],
+    counts: Counter,
+    scale: float,
+    label: str,
+    lens: Optional[Dict[tuple, List[float]]] = None,
+    ranged: Optional[Dict[tuple, float]] = None,
+) -> None:
+    """Add one batch of recorder counts to *points*, *scale* calls per recorded call.
+
+    *lens* holds the recorder's length-range sums for the same keys; *ranged*
+    carries, across calls of this function, how many scaled calls each point's
+    ``lens_lo`` / ``lens_hi`` already average over, so the result is the
+    call-weighted mean over the whole census.
+    """
+    lens = lens or {}
+    ranged = ranged if ranged is not None else {}
     for key, n in counts.items():
-        shape, lens, wl, wr = key
+        shape, has_lens, wl, wr = key
         pt = points.get(key)
         if pt is None:
             pt = points[key] = AttnPoint(
-                **dataclasses.asdict(shape), lens=lens, window_left=wl, window_right=wr
+                **dataclasses.asdict(shape), lens=has_lens, window_left=wl, window_right=wr
             )
+        acc = lens.get(key)
+        if acc is not None and acc[0] > 0:
+            w_new = scale * acc[0]
+            w_old = ranged.get(key, 0.0)
+            lo, hi = acc[1] / acc[0], acc[2] / acc[0]
+            if w_old > 0:
+                lo = (pt.lens_lo * w_old + lo * w_new) / (w_old + w_new)
+                hi = (pt.lens_hi * w_old + hi * w_new) / (w_old + w_new)
+            pt.lens_lo, pt.lens_hi = lo, hi
+            ranged[key] = w_old + w_new
         c = scale * n
         pt.calls += c
         pt.weight += c * estimate_ms(shape)
@@ -339,6 +411,7 @@ def attention_census(
     streaming = deploy_cfg.service_mode == "streaming"
     bs = int(batch_size or deploy_cfg.max_batch_size)
     points: Dict[tuple, AttnPoint] = {}
+    ranged: Dict[tuple, float] = {}
     rec = AttentionShapeRecorder()
     provenance: Dict[str, Any] = {
         "family": CENSUS_FAMILY,
@@ -355,12 +428,16 @@ def attention_census(
                     group = list(waves[: max(width, min(len(waves), 2 * width))])
                     transcribe(engine, group, width, streaming=True)
                     torch.cuda.synchronize()
-                    _accumulate(points, rec.take(), share / len(group), f"streaming:x{width}")
+                    counts, lens = rec.take_with_lens()
+                    _accumulate(
+                        points, counts, share / len(group), f"streaming:x{width}", lens, ranged
+                    )
                     logger.info("[census.fmha] streaming x%d: %d shapes", width, len(points))
             else:
                 transcribe(engine, list(waves), bs, streaming=False)
                 torch.cuda.synchronize()
-                _accumulate(points, rec.take(), 1.0 / len(waves), "offline:manifest")
+                counts, lens = rec.take_with_lens()
+                _accumulate(points, counts, 1.0 / len(waves), "offline:manifest", lens, ranged)
             provenance["utterances"] = len(waves)
         else:
             from oasr.tune.census import ShapeProbe, offline_keys, streaming_keys
@@ -381,7 +458,8 @@ def attention_census(
                 else:
                     probe.offline(key)
                     scale = w / total
-                _accumulate(points, rec.take(), scale, key.label())
+                counts, lens = rec.take_with_lens()
+                _accumulate(points, counts, scale, key.label(), lens, ranged)
             provenance["keys"] = {k.label(): round(v / total, 6) for k, v in ordered}
             provenance["encoder_only"] = True
     selected = sorted(
