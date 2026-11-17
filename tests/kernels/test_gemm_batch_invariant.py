@@ -326,9 +326,12 @@ class TestDispatch:
         """A non-member falls back only to a default that is itself a member."""
         sk = jg.CutlassGemmConfig(64, 128, 64, 32, 64, 64, 3, _SM, stream_k=True)
         monkeypatch.setattr(jg, "select_batch_invariant_config", lambda *a, **k: sk)
-        plan = fgemm._plan_pinned("gemm", False, 4096, 256, 4864, torch.float16)
         if jg.is_batch_invariant(jg.GEMM_DEFAULT):
+            plan = fgemm._plan_pinned("gemm", False, 4096, 256, 4864, torch.float16)
             assert plan[2] == fgemm._PLAN_DEFAULT
+        else:  # sm_90 / sm_100: the default is a CUTLASS 3.x variant, outside the class
+            with pytest.raises(RuntimeError, match="not batch-invariant"):
+                fgemm._plan_pinned("gemm", False, 4096, 256, 4864, torch.float16)
         # And where the default is not a member either, it raises.
         monkeypatch.setattr(jg, "GEMM_DEFAULT", sk)
         with pytest.raises(RuntimeError, match="not batch-invariant"):

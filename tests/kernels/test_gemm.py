@@ -37,7 +37,7 @@ from oasr.functionals.gemm import (  # noqa: E402
     _tune_gemm_fn as _gemm_fn,
 )
 from oasr.jit.core import _get_target_sm
-from oasr.jit.gemm import CutlassGemmConfig, get_unique_compile_configs
+from oasr.jit.gemm import CutlassGemmConfig, _level_configs, get_unique_compile_configs
 
 pytestmark = pytest.mark.cuda
 
@@ -975,18 +975,31 @@ class TestWorkspaceCacheBytesBound:
 # Every compiled variant, against an fp32 oracle
 # ---------------------------------------------------------------------------
 
-_ALL_VARIANTS = sorted(
-    {
-        cfg.compile_name: cfg
-        for cfg in get_unique_compile_configs(_SM).values()
-        if isinstance(cfg, CutlassGemmConfig)
-    }.items()
-)
 
-#: Tiles without a K-decomposition — the subset every family exports.
-_PLAIN_VARIANTS = [
-    (name, cfg) for name, cfg in _ALL_VARIANTS if not (cfg.stream_k or cfg.parallel_split_k)
-]
+def _exported(family: str):
+    """Every variant a *family* module exports on this SM, both levels.
+
+    Read from what the modules render rather than from the config space: on a
+    mixed-lane SM (sm_90 / sm_100) GEMM holds both the CUTLASS 3.x variants and
+    the 2.x ``mma.sync`` ones, while BMM renders the native lane only -- so a
+    sweep over the 2.x configs asked BMM for symbols it never exports, and
+    neither sweep reached the 3.x tiles those SMs actually run.
+    """
+    configs = {}
+    for level in ("production", "tune"):
+        configs.update(_level_configs(level, family=family, native_only=family != "gemm"))
+    return sorted(configs.items())
+
+
+def _decomposed(cfg) -> bool:
+    return bool(getattr(cfg, "stream_k", False) or getattr(cfg, "parallel_split_k", False))
+
+
+_ALL_VARIANTS = _exported("gemm")
+
+#: BMM's tiles, without a K-decomposition: Stream-K and parallel split-K are
+#: confined to the GEMM family.
+_PLAIN_VARIANTS = [(name, cfg) for name, cfg in _exported("bmm") if not _decomposed(cfg)]
 
 
 class TestEveryCompiledVariantIsCorrect:
@@ -1015,7 +1028,11 @@ class TestEveryCompiledVariantIsCorrect:
     def test_matches_an_fp32_reference(self, name, cfg, dtype, device):
         # Parallel split-K is a decomposition, not a tile: its reduction kernel
         # requires more than one K slice and refuses split_k == 1 by design.
-        split_k = max(2, int(getattr(cfg, "split_k", 1))) if cfg.parallel_split_k else 1
+        split_k = (
+            max(2, int(getattr(cfg, "split_k", 1)))
+            if getattr(cfg, "parallel_split_k", False)
+            else 1
+        )
         for M, N, K in self.SHAPES:
             torch.manual_seed(0)
             A = torch.randn(M, K, device=device, dtype=dtype)

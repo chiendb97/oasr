@@ -110,6 +110,23 @@ KERNEL_GAPS: Dict[str, KernelGap] = {
             ),
         ),
         KernelGap(
+            id="fmha-arch",
+            what=(
+                "fused attention on an SM no attention lane is built for: the "
+                "CuTeDSL and C++ CuTe kernels cover sm_80 / sm_86 / sm_89 / "
+                "sm_120, so Hopper (sm_90) and data-center Blackwell (sm_100) "
+                "run every masked attention call -- padding, windows, biases -- "
+                "on SDPA, the mask materialized"
+            ),
+            fix=(
+                "kernel: a Hopper / Blackwell attention lane (TMA with wgmma / "
+                "tcgen05), or the C++ lane's mma.sync kernel built for sm_90 / "
+                "sm_100 (SUPPORTED_SM in oasr/jit/fmha.py; mma.sync runs on both) "
+                "once it is measured against SDPA's flash and cuDNN paths there. "
+                "It used to be counted as fmha-head-dim, blaming shared memory"
+            ),
+        ),
+        KernelGap(
             id="transducer-beam-topk",
             what=(
                 "a transducer beam-search frame outside the fused selection "

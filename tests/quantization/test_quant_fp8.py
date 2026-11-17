@@ -181,12 +181,18 @@ class TestStorage:
 class TestKernelPath:
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_lane_and_reference_agree(self, dtype):
+        from oasr.jit.core import _get_target_sm
+        from oasr.jit.scaled_mm import native_lane_available
+
+        sm = _get_target_sm()
+        # The native CUTLASS 3.x lane where one runs (sm_90, sm_100), else mma.sync.
+        lane = f"cutlass_sm{sm}_fp8" if native_lane_available(sm, "fp8") else "cutlass_sm89_fp8"
         model = tiny_conformer()
         quantize_model(model, get_recipe("smoothquant_fp8_w8a8"), _loop)
         model = _served(model, dtype)
         for layer in quantized_layers(model).values():
             assert layer.quant_method.lane is not None
-            assert layer.quant_method.lane.name == "cutlass_sm89_fp8"
+            assert layer.quant_method.lane.name == lane
         got = _encode(model, "cuda", dtype)
         with layers_backend_override("torch"):
             ref = _encode(model, "cuda", dtype)

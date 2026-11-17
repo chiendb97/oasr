@@ -44,6 +44,7 @@
 
 #include <cutlass/gemm/group_array_problem_shape.hpp>
 
+#include <oasr/common/arch_dispatch.h>
 #include <oasr/common/epilogue_functors.h>
 #include <oasr/common/graph_safe_workspace.h>
 #include <oasr/common/utils.h>
@@ -409,6 +410,16 @@ struct CutlassGroupGemmKernelSm90 {
         strides_B_device.copy_from_host(strides_B_host.data());
         strides_D_device.copy_from_host(strides_D_host.data());
 
+        // The SM count, stated rather than left for the kernel to find: SM100's
+        // ptr-array kernel sizes its per-SM tensormap workspace and its
+        // persistent grid from hw_info.sm_count and, unlike SM90's, never fills
+        // in a zero for itself.  Left default, grouped GEMM on a B200 got no
+        // tensormap workspace and an empty grid, and every launch failed
+        // (CUTLASS_ERROR -- the adapter consumes the CUDA error it hit).
+        cutlass::KernelHardwareInfo hw_info;
+        cudaGetDevice(&hw_info.device_id);
+        hw_info.sm_count = oasr::getDeviceMultiProcessorCount();
+
         typename Gemm::Arguments arguments{
             cutlass::gemm::GemmUniversalMode::kGrouped,
             {problem_count, problem_shapes_device.get(), problem_shapes_host.data()},
@@ -422,7 +433,8 @@ struct CutlassGroupGemmKernelSm90 {
              nullptr,
              nullptr,
              problem_desc.ptr_D_device.get(),
-             strides_D_device.get()}};
+             strides_D_device.get()},
+            hw_info};
 
         Gemm gemm;
 

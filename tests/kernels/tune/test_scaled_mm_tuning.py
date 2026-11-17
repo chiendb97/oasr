@@ -366,11 +366,15 @@ class TestCensus:
 
 class TestTooling:
     def test_prebuild_compiles_the_int8_module_for_an_int8_census(self):
+        from oasr.jit.scaled_mm import module_name
         from oasr.tune.prebuild import modules_for
 
-        assert [n for n, _ in modules_for({"scaled_mm"})] == ["scaled_mm"]
-        assert "scaled_mm" in [n for n, _ in modules_for({"gemm", "scaled_mm_quant"})]
-        assert "scaled_mm" not in [n for n, _ in modules_for({"gemm"})]
+        # This device's lane: ``scaled_mm`` (mma.sync), or the native module on
+        # sm_90 / sm_100 (``scaled_mm_sm90``).
+        int8 = module_name("int8")
+        assert [n for n, _ in modules_for({"scaled_mm"})] == [int8]
+        assert int8 in [n for n, _ in modules_for({"gemm", "scaled_mm_quant"})]
+        assert int8 not in [n for n, _ in modules_for({"gemm"})]
 
     def test_the_int8_file_goes_beside_the_gemm_file(self, tmp_path):
         from oasr.tune.cli import _resolve_out
@@ -558,14 +562,16 @@ class TestFp8Family:
         assert cfg.fp8 and "int8 config" in caplog.text
 
     def test_census_and_prebuild_know_the_fp8_ops(self):
+        from oasr.jit.scaled_mm import module_name
         from oasr.tune import census as C
         from oasr.tune.prebuild import modules_for
 
         assert C.kernel_family("scaled_mm_fp8") == "scaled_mm_fp8"
         assert C.kernel_family("scaled_mm_fp8_quant") == "scaled_mm_fp8"
         assert C._weight_bytes("scaled_mm_fp8", 256, 512, "float8_e4m3fn", 1) == 256 * 512
-        assert [n for n, _ in modules_for({"scaled_mm_fp8"})] == ["scaled_mm_fp8"]
-        assert "scaled_mm_fp8" not in [n for n, _ in modules_for({"scaled_mm"})]
+        fp8 = module_name("fp8")  # this device's lane, as above
+        assert [n for n, _ in modules_for({"scaled_mm_fp8"})] == [fp8]
+        assert fp8 not in [n for n, _ in modules_for({"scaled_mm"})]
 
 
 @pytest.mark.cuda
@@ -598,3 +604,41 @@ class TestFp8CaptureAndBuild:
             res = measure_case(op, 200, 256, 512, sm=sm, issue_cost=False)
             assert not res.rejected, res.rejected
             assert set(res.results) == set(candidates(op, sm)) | {jsm.HEURISTIC_ID}
+
+
+@pytest.mark.cuda
+@_cuda
+class TestTheReferenceGate:
+    """``_check_reference`` allows fp8's reduced-precision accumulation and no more.
+
+    The allowance scales with each output's summand magnitude, so it must stay
+    far below what a broken tile costs; one K tile missing out of four is the
+    smallest such break, an error of about half the result.
+    """
+
+    K = 512
+
+    @staticmethod
+    def _expected(op, a, b, a_scale, b_scale, bias, out_mul):
+        from oasr.functionals.scaled_mm import reference_scaled_mm, reference_scaled_mm_quant
+        from oasr.tune.build_scaled_mm import _ACTIVATION, _OUT_DTYPE
+
+        if jsm.is_quant_op(op):
+            return reference_scaled_mm_quant(
+                a, b, a_scale, b_scale, bias, _ACTIVATION, out_mul, _OUT_DTYPE
+            )
+        return reference_scaled_mm(a, b, a_scale, b_scale, bias, _ACTIVATION, _OUT_DTYPE)
+
+    @pytest.mark.parametrize("op", ["scaled_mm_fp8", "scaled_mm_fp8_quant"])
+    def test_the_exact_result_passes_and_a_dropped_k_tile_does_not(self, op):
+        from oasr.tune.build_scaled_mm import _check_reference, _operands
+
+        a, bs, a_scale, b_scale, bias, out_mul, out = _operands(op, 64, 128, self.K, 1)
+        b = bs[0]
+        out.copy_(self._expected(op, a, b, a_scale, b_scale, bias, out_mul))
+        assert _check_reference(op, out, a, b, a_scale, b_scale, bias, out_mul, "exact") >= 0.0
+
+        k = self.K - 128
+        out.copy_(self._expected(op, a[:, :k], b[:, :k], a_scale, b_scale, bias, out_mul))
+        with pytest.raises(RuntimeError, match="disagrees with the torch reference"):
+            _check_reference(op, out, a, b, a_scale, b_scale, bias, out_mul, "dropped")

@@ -120,7 +120,10 @@ class TestFunctional:
     def test_rows_are_bitwise_independent_of_the_batch(self, n, k):
         """M=1 and M=1000 pick different tiles; int32 sums make the row identical anyway."""
         a, b, a_scale, b_scale, bias = _operands(1000, n, k, torch.float16)
-        assert select_config(1, n, k) != select_config(1000, n, k)
+        if select_config(1, n, k) == select_config(1000, n, k):
+            # The native heuristic (sm_90 / sm_100) keeps one tile here; that
+            # lane's tile and batch invariance is test_scaled_mm_native.py's.
+            pytest.skip(f"M=1 and M=1000 run one tile at n={n} k={k} on this SM")
         full = oasr.scaled_mm(a, b, a_scale, b_scale, bias, "swish")
         for r in (0, 517, 999):
             one = oasr.scaled_mm(
@@ -269,7 +272,8 @@ class TestFp8:
         """
         a, b, a_scale, b_scale, bias = _fp8_operands(1000, n, k, torch.float16)
         cuts = (0, 1, 17, 81, 1000)
-        assert len({select_config(hi - lo, n, k, fmt="fp8") for lo, hi in zip(cuts, cuts[1:])}) > 1
+        if len({select_config(hi - lo, n, k, fmt="fp8") for lo, hi in zip(cuts, cuts[1:])}) == 1:
+            pytest.skip(f"every cut runs one tile at n={n} k={k} on this SM")  # as above
         full = oasr.scaled_mm(a, b, a_scale, b_scale, bias, "swish")
         parts = [
             oasr.scaled_mm(

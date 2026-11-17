@@ -173,6 +173,11 @@ names a tile, or the heuristic (an illustrative entry):
   (`--family scaled_mm_fp8`) measures its eight tiles the same way. Its tiles
   also compute the same bits as each other (one summation order, see
   [quantization.md](quantization.md#fp8)), so the bitwise numerics gate holds.
+  The anchor itself is checked against an fp64 reference with an allowance of
+  2^-9 of each output's summand magnitude, `sum_k |a_k b_k|`: Ada's and
+  Hopper's fp8 tensor cores accumulate below fp32 precision, so a bound on the
+  result alone -- enough on sm_120 -- rejected sound anchors on an L4 and an
+  H100.
   The shipped `sm120/scaled_mm_fp8.json` covers the Conformer widths: at large
   M the 64x64 tile beats the heuristic's 128-wide ones on every signature.
 - **Lanes.** A *lane* is a kernel generation with its own config space and JIT

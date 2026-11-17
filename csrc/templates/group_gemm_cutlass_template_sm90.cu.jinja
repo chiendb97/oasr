@@ -63,7 +63,7 @@ void {{ func_name }}(TensorView output, TensorView A, TensorView B, TensorView o
         auto status = oasr::gemm::CutlassGroupGemmKernelSm90<
             Config, CutlassType, CutlassType, CutlassType>::run(
                 problem_desc, static_cast<int>(problem_count), stream);
-        CHECK_GEMM_STATUS(status, "GroupGemm SM90 kernel {{ func_name }}");
+        CHECK_GEMM_STATUS(status, "GroupGemm SM{{ sm_version }} kernel {{ func_name }}");
         return true;
     });
 }
