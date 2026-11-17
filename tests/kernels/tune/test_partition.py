@@ -238,6 +238,39 @@ class TestPrebuild:
         # bmm is census data the build does not tune -- nothing to compile for it.
         assert modules_for({"bmm"}) == []
 
+    def test_all_is_every_aot_module_and_every_tuning_module_once(self):
+        """``--all``: what a test run loads, which CI compiles on a CPU container first."""
+        from oasr.aot import gen_all_modules
+        from oasr.tune.build import TUNED_OPS
+        from oasr.tune.build_scaled_mm import SCALED_MM_TUNED_OPS
+        from oasr.tune.prebuild import all_modules, modules_for
+
+        got = all_modules()
+        libs = [str(spec._get_lib_path()) for _, spec in got]
+        assert len(libs) == len(set(libs))  # the production GEMM module is in both lists
+        names = {name for name, _ in got}
+        assert {spec.name for spec in gen_all_modules()} <= names
+        tuned = set(TUNED_OPS) | set(SCALED_MM_TUNED_OPS)
+        assert {name for name, _ in modules_for(tuned)} <= names
+
+    def test_hopper_also_compiles_the_mma_sync_arm_of_its_native_lanes(self):
+        """sm_90 runs the CUTLASS 3.x 8-bit lanes; the 2.x arm beside them is loaded too.
+
+        A subprocess, because ``OASR_CUDA_ARCH_LIST`` is read into module-level
+        caches this process shares with every other test.
+        """
+        import os
+        import subprocess
+        import sys
+
+        code = "from oasr.tune.prebuild import all_modules; print(sorted({n for n, _ in all_modules()}))"
+        env = {**os.environ, "OASR_CUDA_ARCH_LIST": "9.0", "CUDA_VISIBLE_DEVICES": ""}
+        out = subprocess.run(
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+        ).stdout
+        for name in ("scaled_mm_sm90", "scaled_mm_fp8_sm90", "scaled_mm", "scaled_mm_fp8"):
+            assert repr(name) in out
+
 
 class TestThinCensus:
     """``oasr tune build --thin``: a log-spaced subset that still carries the traffic."""

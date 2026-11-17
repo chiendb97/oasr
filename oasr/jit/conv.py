@@ -865,9 +865,16 @@ def _torch_cudnn_paths() -> Tuple[Optional[Path], Optional[Path]]:
         import nvidia
     except ImportError:  # pragma: no cover - depends on the torch wheel flavour
         return None, None
-    if not getattr(nvidia, "__file__", None):
+    # Searched through ``__path__``, not ``__file__``: in a plain torch install
+    # ``nvidia`` is a *namespace* package -- the cuDNN, cuBLAS, ... wheels share
+    # the directory and none ships an ``__init__.py`` -- so it has no
+    # ``__file__``, and only a box where some unrelated wheel happens to add
+    # one (nvimgcodec, nvjpeg2k, ...) found cuDNN at all.  Everywhere else this
+    # returned nothing and the module failed to build with no ``cudnn.h``.
+    roots = [Path(p).resolve() / "cudnn" for p in getattr(nvidia, "__path__", ())]
+    root = next((r for r in roots if (r / "include" / "cudnn.h").is_file()), None)
+    if root is None:
         return None, None
-    root = Path(nvidia.__file__).resolve().parent / "cudnn"
     include = root / "include"
     lib_dir = root / "lib"
 

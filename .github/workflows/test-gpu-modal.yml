@@ -55,6 +55,10 @@ on:
         type: boolean
         required: false
         default: true
+      max_usd:
+        description: "Refuse the run if its worst case (every run at its timeout) costs more, USD"
+        required: false
+        default: "10"
 
 # Keyed on the PR when one is named: two PRs dispatched from the same branch
 # would otherwise share `github.ref` and cancel each other.
@@ -164,6 +168,7 @@ jobs:
           modal run ci/modal_app.py::main \
             --gpus "${{ inputs.gpus || 'all' }}" \
             --suites "${{ inputs.suites }}" \
+            --max-usd "${{ inputs.max_usd || '10' }}" \
             $strict_flag $assets_flag
 
       # `always()` so a failed or cancelled run does not leave the PR pending.

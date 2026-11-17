@@ -273,12 +273,19 @@ def _cmd_prebuild(args) -> int:
 
     tuned = set(TUNED_OPS) | set(SCALED_MM_TUNED_OPS)
     ops = set(TUNED_OPS)
+    if args.all and args.census:
+        print("[prebuild] --all and --census are exclusive", file=sys.stderr)
+        return 2
     if args.census:
         ops = {p.op for path in args.census for p in ShapeSet.load(path).points}
     jobs = args.jobs or os.cpu_count() or 8
-    print(f"[prebuild] sm{_get_target_sm()}: ops {sorted(ops & tuned)}, -j{jobs}")
+    specs = P.all_modules() if args.all else None
+    what = f"all {len(specs)} modules" if specs is not None else f"ops {sorted(ops & tuned)}"
+    print(f"[prebuild] sm{_get_target_sm()}: {what}, -j{jobs}")
     t0 = time.time()
-    results = P.prebuild(ops, jobs, progress=lambda s: print(f"[prebuild] {s}", flush=True))
+    results = P.prebuild(
+        ops, jobs, progress=lambda s: print(f"[prebuild] {s}", flush=True), specs=specs
+    )
     rss = P.peak_child_rss_mib()
     for r in results:
         print(f"[prebuild] {r.name:<18} {r.status:<7} {r.sources:>3} TUs  {r.seconds:>6.0f}s")
@@ -891,6 +898,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--census",
         action="append",
         help="compile only what these censuses' ops need (default: every tuned op)",
+    )
+    pb.add_argument(
+        "--all",
+        action="store_true",
+        help="compile every module oasr.aot names (what a test run loads), not only the "
+        "tuning modules",
     )
     pb.add_argument("--jobs", type=int, default=None, help="parallel compiles (default: nproc)")
     pb.add_argument("--json", help="write the per-module report here")
