@@ -72,7 +72,13 @@ def _quantized_conv() -> Conv2d:
 
 
 def _as_device(monkeypatch, major: int, minor: int) -> None:
+    import oasr.jit.scaled_mm as jsm
+
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (major, minor))
+    # Whether a native lane runs reads the process's capability, not the patched
+    # query above: on a real cc 10.0 card a simulated 10.3 still bound the native
+    # int8 lane, which 10.3 cannot run.
+    monkeypatch.setattr(jsm, "_device_capability", lambda: (major, minor))
 
 
 class TestSmFamily:

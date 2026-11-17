@@ -910,7 +910,11 @@ class TestKernelGapRegistry:
     #: selection covers V <= 1024 and beams <= 32; no in-tree model exceeds either.
     #: The int8 scaled GEMM is the Sm80 mma.sync kernel, which Turing cannot run:
     #: a W8A8 layer on sm75 takes the torch reference of the pinned numerics.
+    #: No attention lane is built for Hopper or data-center Blackwell, so masked
+    #: attention there is SDPA (``fmha-arch``; it used to be miscounted as
+    #: ``fmha-head-dim``).
     PINNED = {
+        "fmha-arch",
         "fmha-head-dim",
         "fmha-paged-config",
         "transducer-beam-topk",
@@ -1435,6 +1439,14 @@ class TestLeftPaddedWindowRouting:
         v = torch.randn(B, H, T_k, D, device="cuda", dtype=dtype)
         return q, k, v
 
+    @staticmethod
+    def _no_lane_here() -> bool:
+        """Hopper / data-center Blackwell: no attention lane to fuse into."""
+        from oasr.jit.attention import fused_lane_built_for
+
+        major, minor = torch.cuda.get_device_capability()
+        return not fused_lane_built_for(major * 10 + minor)
+
     def test_left_padding_reaches_the_kernel(self):
         from oasr.layers import Attention
         from oasr.layers._backend import gap_hits, policy_hits, reset_backend_stats
@@ -1445,8 +1457,48 @@ class TestLeftPaddedWindowRouting:
         starts = torch.tensor([16, 48], device="cuda", dtype=torch.int32)
         reset_backend_stats()
         a(q, k, v, kv_lens=lens, kv_starts=starts)
+        if self._no_lane_here():
+            # Nothing to fuse into, and the call says so by name.
+            assert gap_hits() == {"fmha-arch": 1} and not policy_hits()
+            return
         assert not gap_hits(), "left padding is no longer a declared gap"
         assert not policy_hits(), "a plain left-padded window should fuse"
+
+    def test_an_sm_without_a_lane_is_the_arch_gap(self, monkeypatch):
+        """sm_90 / sm_100 as any box sees them: the gap names the arch, not the head_dim."""
+        import oasr.jit.attention as ja
+        from oasr.layers import Attention
+        from oasr.layers._backend import gap_hits, policy_hits, reset_backend_stats
+
+        monkeypatch.setattr(ja, "select_backend", lambda: "sdpa")
+        monkeypatch.setattr(ja, "fused_lane_built_for", lambda sm: False)
+        a = Attention(4, 64)
+        q, k, v = self._qkv(2, 4, 96, 128, 64)
+        lens = torch.tensor([128, 128], device="cuda", dtype=torch.int32)
+        starts = torch.tensor([16, 48], device="cuda", dtype=torch.int32)
+        reset_backend_stats()
+        a(q, k, v, kv_lens=lens, kv_starts=starts)
+        assert gap_hits() == {"fmha-arch": 1} and not policy_hits()
+
+    def test_a_process_on_sdpa_is_a_policy_not_a_gap(self, monkeypatch):
+        """``OASR_ATTN_BACKEND=sdpa`` (or no CuteDSL) is the process's choice, not
+        a missing kernel -- unless no lane exists for this SM at all."""
+        import oasr.jit.attention as ja
+        from oasr.layers import Attention
+        from oasr.layers._backend import gap_hits, policy_hits, reset_backend_stats
+
+        monkeypatch.setattr(ja, "select_backend", lambda: "sdpa")
+        a = Attention(4, 64)
+        q, k, v = self._qkv(2, 4, 96, 128, 64)
+        lens = torch.tensor([128, 128], device="cuda", dtype=torch.int32)
+        starts = torch.tensor([16, 48], device="cuda", dtype=torch.int32)
+        reset_backend_stats()
+        a(q, k, v, kv_lens=lens, kv_starts=starts)
+        if self._no_lane_here():
+            assert gap_hits() == {"fmha-arch": 1} and not policy_hits()
+        else:
+            assert not gap_hits(), "a process on SDPA was counted as a missing kernel"
+            assert policy_hits() == {"fmha-backend-sdpa": 1}
 
     def test_kernel_and_torch_agree_on_a_left_padded_window(self):
         from oasr.layers import Attention
@@ -1481,9 +1533,12 @@ class TestLeftPaddedWindowRouting:
         starts = torch.tensor([0, 32, 64, 96], device="cuda", dtype=torch.int32)
         reset_backend_stats()
         out = a(q, k, v, kv_lens=lens, kv_starts=starts, is_causal=True)
+        assert torch.isfinite(out).all()
+        if self._no_lane_here():
+            assert gap_hits() == {"fmha-arch": 1} and not policy_hits()
+            return
         assert not gap_hits()
         assert not policy_hits(), f"expected the fused path, got {policy_hits()}"
-        assert torch.isfinite(out).all()
 
     def test_causal_window_stays_on_sdpa_below_the_work_floor(self):
         """Below it the fused path's fixed stride-copy cost dominates — measured

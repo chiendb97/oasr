@@ -145,6 +145,23 @@ def _check_cutedsl_version() -> None:
         )
 
 
+#: The SMs the CuTeDSL attention kernel has an arch class for
+#: (``oasr.kernels.cute.attention.base.pick_arch_cls``).
+CUTE_SM: Tuple[int, ...] = (80, 86, 89, 120)
+
+
+def fused_lane_built_for(sm: int) -> bool:
+    """Whether *any* fused attention lane -- CuTeDSL or C++ -- exists for *sm*.
+
+    ``False`` on Hopper and data-center Blackwell today: everything there runs
+    SDPA, which ``oasr.layers`` declares as the ``fmha-arch`` gap rather than
+    blaming the shape it happened to be asked about.
+    """
+    from oasr.jit import fmha as _fmha_cxx
+
+    return sm in CUTE_SM or sm in _fmha_cxx.SUPPORTED_SM
+
+
 @functools.cache
 def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
     """Detect (major, minor) compute capability and which backend is usable.
@@ -186,7 +203,7 @@ def _capability_probe() -> Tuple[Optional[Tuple[int, int]], Optional[str]]:
             )
         return cap, "cxx"
 
-    cute_supported = sm in (80, 86, 89, 120)
+    cute_supported = sm in CUTE_SM
     if cute_supported:
         # Try importing the per-arch backend; if CuteDSL isn't installed or
         # the subclass import explodes, log + degrade to SDPA in 'auto',

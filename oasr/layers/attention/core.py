@@ -497,8 +497,20 @@ class Attention(nn.Module):
             # Nothing to fuse; the library path avoids the fused wrapper overhead.
             return take_policy("fmha-unmasked")
 
-        from oasr.jit.attention import fmha_config_supported
+        from oasr.jit.attention import (
+            fmha_config_supported,
+            fused_lane_built_for,
+            select_backend,
+        )
 
+        if select_backend() == "sdpa":
+            # No fused lane in this process, so no shape is the reason: either
+            # none is built for this SM (a declared gap), or the process runs
+            # SDPA by choice -- OASR_ATTN_BACKEND=sdpa, or CuteDSL absent.
+            major, minor = torch.cuda.get_device_capability(q.device)
+            if not fused_lane_built_for(major * 10 + minor):
+                return take_gap("fmha-arch", f"sm_{major}{minor}, head_dim={self.head_dim}")
+            return take_policy("fmha-backend-sdpa")
         if not fmha_config_supported(
             head_dim=self.head_dim,
             dtype_str="float16" if q.dtype is torch.float16 else "bfloat16",

@@ -140,6 +140,29 @@ def _operands(op: str, M: int, N: int, K: int, copies: int):
     return a, bs, a_scale, b_scale, bias, out_mul, out
 
 
+#: The fp8 accumulation allowance, as a fraction of each output's summand
+#: magnitude (:func:`_summand_magnitude`).  Ada's and Hopper's fp8 tensor cores
+#: accumulate below fp32 precision (about 14 bits; the sm_90 lane promotes to
+#: fp32 every 128 K, the ``mma.sync`` lane never), so their error scales with
+#: ``sum_k |a_k b_k|``, not with the result -- which cancellation keeps ~sqrt(K)
+#: times smaller.  A bound on the result alone (the first one here, set on an
+#: sm_120 card, whose accumulator is fp32) rejected sound anchors on an L4 and an
+#: H100: max|err| 0.031 and 0.016 at K = 512, where this term is ~0.09.  A
+#: broken tile errs by the size of the result, ~3 there.
+_FP8_ACCUMULATION = 2.0**-9
+
+#: Steepest slope of :data:`_ACTIVATION` (swish: 1.0998 at x = 2.4), carrying a
+#: pre-activation error through to the output.
+_ACTIVATION_SLOPE = 1.1
+
+
+def _summand_magnitude(a, b, a_scale, b_scale) -> torch.Tensor:
+    """``|a_scale| |b_scale| sum_k |a_k b_k|`` per output, through the activation."""
+    s = a.double().abs() @ b.double().abs().t()
+    s = s * a_scale.double().abs().reshape(-1, 1) * b_scale.double().abs().reshape(1, -1)
+    return (s * _ACTIVATION_SLOPE).float()
+
+
 def _check_reference(op: str, out, a, b, a_scale, b_scale, bias, out_mul, name: str) -> float:
     """Max error of the heuristic's variant against the torch reference; raise if off."""
     import oasr.jit.scaled_mm as jsm
@@ -157,7 +180,11 @@ def _check_reference(op: str, out, a, b, a_scale, b_scale, bias, out_mul, name: 
             got_f, ref_f = out[:r].float(), ref.float()
             diff = (got_f - ref_f).abs()
             err = float(diff.max()) if r else 0.0
-            ok = bool((diff <= ref_f.abs() * 2.0**-3 + 2.0**-9).all())  # one e4m3 step
+            # One e4m3 step, plus the accumulation allowance carried through the
+            # quantizing multiply (and the step that shift can cross).
+            drift = out_mul.float().abs().reshape(1, -1) * _FP8_ACCUMULATION
+            drift = drift * _summand_magnitude(a[:r], b, a_scale[:r], b_scale) * (1 + 2.0**-3)
+            ok = bool((diff <= ref_f.abs() * 2.0**-3 + 2.0**-9 + drift).all())
         else:
             err = float((out[:r].int() - ref.int()).abs().max()) if r else 0.0
             ok = err <= 1.0  # one int8 step at a rounding tie
@@ -166,9 +193,10 @@ def _check_reference(op: str, out, a, b, a_scale, b_scale, bias, out_mul, name: 
         got = out[:r].float()
         diff = (got - ref.float()).abs()
         err = float(diff.max()) if r else 0.0
-        ok = bool(torch.isfinite(got).all()) and bool(
-            (diff <= ref.float().abs() * rel + 1e-3).all()
-        )
+        bound = ref.float().abs() * rel + 1e-3
+        if fp8:
+            bound = bound + _FP8_ACCUMULATION * _summand_magnitude(a[:r], b, a_scale[:r], b_scale)
+        ok = bool(torch.isfinite(got).all()) and bool((diff <= bound).all())
     if not ok:
         raise RuntimeError(
             f"scaled_mm variant {name} disagrees with the torch reference ({op}, "

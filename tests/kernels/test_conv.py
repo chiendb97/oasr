@@ -699,16 +699,22 @@ class TestConv2DCudnn:
         # PyTorch reference
         x_nchw = x.permute(0, 3, 1, 2).contiguous()
         filt_nchw = filt.permute(0, 3, 1, 2).contiguous()
-        ref_nchw = F.conv2d(
+        conv = F.conv2d(
             x_nchw.float(),
             filt_nchw.float(),
-            bias=bias.float(),
             padding=(pad_h, pad_w),
             stride=(stride_h, stride_w),
-        )
-        expected = ref_nchw.permute(0, 2, 3, 1).to(dtype)
+        ).permute(0, 2, 3, 1)
+        expected = conv + bias.float()
 
-        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+        # The ladder's bound, plus half an output ulp of the *pre-bias* value: a
+        # cuDNN engine may round the convolution to the output dtype before it
+        # adds the bias (seen on sm_100, bf16: 8 of 128000 elements one ulp of
+        # |conv| ~ 2-4 off, where the biased result is small).
+        unit = 2.0**-8 if dtype == torch.bfloat16 else 2.0**-11
+        bound = expected.abs() * 1e-2 + 1e-2 + conv.abs() * unit
+        diff = (output.float() - expected).abs()
+        assert bool((diff <= bound).all()), f"max |diff| {float(diff.max()):.4g}"
 
     @pytest.mark.parametrize(
         "activation_type,activation_fn",

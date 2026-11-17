@@ -77,11 +77,15 @@ Zipformer called the functionals directly, so its forward raised on a CPU
 tensor and ignored `OASR_LAYERS_BACKEND=torch`; `test_architecture_encodes_on_cpu`
 now runs every architecture's encoder on CPU.
 
-One kernel-side gap is declared:
+Two attention gaps are declared:
 
 | Gap | Missing | Reached by |
 |---|---|---|
 | `fmha-head-dim` | head dims so wide that even a 1-deep cp.async ring overflows smem: **>384** on sm_86/89/120's 98 KiB budget, **>640** on sm_80's 162 KiB | nothing in-tree |
+| `fmha-arch` | any fused attention on sm_90 / sm_100: neither attention lane (CuTeDSL, C++ CuTe) is built for Hopper or data-center Blackwell, so masked attention there is SDPA with the mask materialized | every padded or windowed attention call on an H100 / B200 |
+
+A process that runs SDPA by choice (`OASR_ATTN_BACKEND=sdpa`, or no CuTeDSL) is
+counted as the policy `fmha-backend-sdpa`, not as either gap.
 
 `conv2d-groups` is closed: grouped and depthwise calls use the direct NHWC
 kernel, dense 1×1 calls use the layout-equivalent GEMM path, and Zipformer's
