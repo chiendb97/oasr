@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-__all__ = ["Prebuilt", "modules_for", "prebuild"]
+__all__ = ["Prebuilt", "all_modules", "modules_for", "prebuild"]
 
 
 @dataclass
@@ -79,14 +79,79 @@ def modules_for(ops: Iterable[str]) -> List[Tuple[str, Any]]:
     return specs
 
 
+def all_modules() -> List[Tuple[str, Any]]:
+    """Every module :func:`oasr.aot.gen_all_modules` names, plus the tuning modules.
+
+    What a cold test run or a server's first requests load, rather than what one
+    tuning build does: ``oasr tune prebuild --all``, which is how CI compiles a
+    rented GPU's kernels on a CPU container first (``ci/modal_app.py``).  A
+    module a test generates for itself (an arm it compares against, a cell
+    another census names) is not here, and the GPU run compiles it as usual.
+    Deduplicated by library path, since the production GEMM module is in both.
+    """
+    from oasr.aot import gen_all_modules
+    from oasr.tune.build import TUNED_OPS
+    from oasr.tune.build_scaled_mm import SCALED_MM_TUNED_OPS
+
+    named = [(spec.name, spec) for spec in gen_all_modules()]
+    named += modules_for(set(TUNED_OPS) | set(SCALED_MM_TUNED_OPS))
+    named += _mma_sync_arms()
+    import oasr.jit.gemm as jg
+
+    if jg.has_tuning_module():
+        # The tuning halves of BMM and grouped GEMM, beside the GEMM one above:
+        # what the kernels tests load to check every compiled variant.
+        named += [
+            (s.name, s) for s in (jg.gen_bmm_module("tune"), jg.gen_group_gemm_module("tune"))
+        ]
+    seen: set = set()
+    out: List[Tuple[str, Any]] = []
+    for name, spec in named:
+        lib = str(spec._get_lib_path())
+        if lib not in seen:
+            seen.add(lib)
+            out.append((name, spec))
+    return out
+
+
+def _mma_sync_arms() -> List[Tuple[str, Any]]:
+    """The 8-bit ``mma.sync`` modules where a native lane is the default (sm_90, sm_100).
+
+    ``oasr.aot`` names the lane a device runs; this is the one beside it that
+    ``OASR_SCALED_MM_BACKEND=mma_sync`` selects and the native lanes' tests
+    compare against.
+    """
+    from oasr.jit.core import _get_target_sm
+    from oasr.jit.scaled_mm import (
+        FORMATS,
+        LANE_ID,
+        default_lane,
+        gen_scaled_mm_module,
+        lane_available,
+        module_name,
+    )
+
+    sm = _get_target_sm()
+    return [
+        (module_name(fmt, LANE_ID[fmt]), gen_scaled_mm_module(fmt, LANE_ID[fmt]))
+        for fmt in FORMATS
+        if lane_available(sm, fmt) and default_lane(sm, fmt) != LANE_ID[fmt]
+    ]
+
+
 def _split_jobs(sizes: List[int], jobs: int) -> List[int]:
     """Each module's share of *jobs*, proportional to its TU count (at least 1)."""
     total = sum(sizes) or 1
     return [max(1, min(n, round(jobs * n / total))) for n in sizes]
 
 
-def prebuild(ops: Iterable[str], jobs: int, progress=None) -> List[Prebuilt]:
-    """Compile (never load) every module a build over *ops* needs.
+def prebuild(
+    ops: Iterable[str],
+    jobs: int,
+    progress=None,
+    specs: Optional[List[Tuple[str, Any]]] = None,
+) -> List[Prebuilt]:
+    """Compile (never load) every module a build over *ops* needs, or *specs*.
 
     Raises nothing on a compile failure: each module reports its own status, so
     one architecture's broken template is a line in the report rather than the
@@ -96,7 +161,8 @@ def prebuild(ops: Iterable[str], jobs: int, progress=None) -> List[Prebuilt]:
     from oasr.jit.cubin_loader import is_complete_shared_object, locked_compile
 
     require_known_cuda_arch("the tuning modules")
-    specs = modules_for(ops)
+    if specs is None:
+        specs = modules_for(ops)
     pending, results = [], []
     for name, spec in specs:
         lib = spec._get_lib_path()

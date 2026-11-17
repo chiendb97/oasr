@@ -39,7 +39,12 @@ from modal_app import (  # noqa: E402  -- needs the path line above
     JIT_VOLUME,
     REPO_REMOTE,
     REPO_ROOT,
+    _cc_of,
+    _committing,
     _jit_dir,
+    _jit_libs,
+    _lane_of,
+    _poll,
 )
 
 app = modal.App("oasr-gpu-tune")
@@ -211,17 +216,6 @@ tune_image = (
 )
 
 
-def _cc_of(gpu: str) -> str:
-    """``"sm_100"`` -> ``"10.0"``: the ``OASR_CUDA_ARCH_LIST`` spelling of *gpu*'s arch."""
-    digits = GPU_ARCH[gpu].split("_")[1]
-    return f"{digits[:-1]}.{digits[-1]}"
-
-
-def _lane_of(cc: str) -> str:
-    """CUTLASS lane of a capability: 3.x (TMA/wgmma/tcgen05) on sm_90/sm_100, else 2.x."""
-    return "3x" if cc.split(".")[0] in ("9", "10") else "2x"
-
-
 def _census_files(spec: str) -> list[Path]:
     """Comma-separated files and/or directories (every ``*.json`` inside)."""
     out: list[Path] = []
@@ -240,12 +234,6 @@ def _write_censuses(texts: list[str]) -> list[str]:
         p.write_text(text)
         args += ["--census", str(p)]
     return args
-
-
-def _jit_libs(root: str) -> set[str]:
-    """Every compiled library under a JIT prefix (``<name>/<hash>/<name>.so``)."""
-    base = Path(root)
-    return {str(p.relative_to(base)) for p in base.glob("*/*/*.so")} if base.is_dir() else set()
 
 
 @app.function(
@@ -272,23 +260,6 @@ def precompile_tuning(cc: str, censuses: list[str], jobs: int) -> dict:
     out = json.loads(report.read_text()) if report.is_file() else {"modules": []}
     out.update({"cc": cc, "returncode": proc.returncode})
     return out
-
-
-def _committing(vol, every_s: float = 60.0):
-    """Start a thread committing *vol* every *every_s* seconds; returns its stop event."""
-    import threading
-
-    stop = threading.Event()
-
-    def _loop():
-        while not stop.wait(every_s):
-            try:
-                vol.commit()
-            except Exception as exc:  # noqa: BLE001 -- the next tick retries
-                print(f"[modal] runs volume commit failed: {exc}", flush=True)
-
-    threading.Thread(target=_loop, daemon=True).start()
-    return stop
 
 
 @app.function(
@@ -365,33 +336,6 @@ def tune_arch(
         "tuning_file": out.read_text() if out.is_file() else "",
         "measurements_xz": lzma.compress(log.read_bytes()) if log.is_file() else b"",
     }
-
-
-#: Consecutive polling errors before a stage counts as failed.  A transient
-#: "Deadline exceeded" from the control plane once read as a failed compile and
-#: abandoned a run whose compile had succeeded (2026-10-02).
-_POLL_TOLERANCE = 5
-
-
-def _poll(call, errors: dict, key: str):
-    """``call``'s result if it has one now, else ``None`` (never blocks).
-
-    Raises only after ``_POLL_TOLERANCE`` consecutive errors -- a remote failure
-    repeats on every poll, a network blip does not.
-    """
-    try:
-        res = call.get(timeout=0)
-    except (TimeoutError, modal.exception.TimeoutError):
-        errors[key] = 0
-        return None
-    except Exception as exc:  # noqa: BLE001 -- counted, re-raised when persistent
-        errors[key] = errors.get(key, 0) + 1
-        if errors[key] >= _POLL_TOLERANCE:
-            raise
-        print(f"  [poll] {key}: {type(exc).__name__}: {exc} (retrying)", flush=True)
-        return None
-    errors[key] = 0
-    return res
 
 
 @app.local_entrypoint()

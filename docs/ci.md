@@ -260,9 +260,12 @@ PR. A PR from a fork is refused unless `allow_fork` is ticked — see
 developer box:
 
 ```bash
-modal run ci/modal_app.py::main --gpus all                    # one per architecture
+modal run ci/modal_app.py::main --gpus H100,B200 --dry-run    # the plan and its worst-case bill
+modal run ci/modal_app.py::main --gpus all --max-usd 90       # one per architecture
 modal run ci/modal_app.py::main --gpus H100,B200              # a subset
 modal run ci/modal_app.py::main --gpus L40S --suites kernels  # one arch, one family
+modal run ci/modal_app.py::main --gpus B200 --no-assets \
+    --paths tests/kernels/test_fmha.py,tests/models/test_layer_waist.py
 ```
 
 `--gpus all` expands to `ARCH_SWEEP` in `ci/modal_app.py`: one accelerator per
@@ -278,6 +281,46 @@ concurrently.
 | `H100` / `H200` | sm_90 | Hopper — the `sm_90a` arch-conditional path |
 | `B200` | sm_100 | Blackwell datacentre |
 | `RTX-PRO-6000` | sm_120 | GB202, the SM the reference box ships on |
+
+### What a run costs, and what keeps it down
+
+Every Modal run is billed by the second for the GPU and for the cores and memory
+its container reserves, so `ci/modal_app.py` is built around three facts.
+
+**Compiling, not testing, is most of a cold run, and compiling needs no GPU.**
+The kernels JIT-compile on first call; on an empty cache the kernels family
+took 20 min on an A100 and was cut at 38 % after 90 min on a B200, almost all of
+it nvcc on the GPU container's CPU share. So `main` first runs `precompile` on a
+CPU-only container per architecture -- `oasr tune prebuild --all` with
+`OASR_CUDA_ARCH_LIST` set -- into the per-arch prefix of the JIT Volume. Its
+memory limit (`COMPILE`) is measured, not guessed: every module compiles at
+once, so more compilers are in flight than jobs, and sm_89's 36 modules peaked
+at 34 GiB at 20 jobs (a 48 GiB limit at 32 jobs thrashed until Modal killed the
+container). The cache key is
+device-free, so the GPU run finds every library, and each run lists what it
+still compiled itself (`compiled on the GPU: ...`): a module a test generates
+for itself, or a sign that the two stages disagree on a key. An architecture
+whose kernels do not compile is reported without renting its GPU
+(`--run-on-compile-failure` to rent it anyway).
+
+**Containers request little and limit high.** Modal bills CPU and memory at
+the higher of the request and the use, so the compile container (4 cores
+requested, 24 jobs) and the GPU container (2 requested, 8 allowed, `MAX_JOBS=8`)
+pay for what they use: a compile down to its last translation unit (`topk`
+alone is 10-23 min) costs the cores it occupies, not 24.
+
+**A run has a ceiling, and the plan has a price.** Each (accelerator, suite) run
+stops at `--timeout-s` (30 min). Before spawning, `main` prices the worst case,
+every stage running into its timeout at list prices (`GPU_USD_PER_S`), and
+refuses a plan above `--max-usd` (10 by default; the workflow's `max_usd`
+input). Each run reports its wall time and estimated cost as it finishes;
+`modal billing report --for today` is the authority.
+
+**Run what the change needs.** `--paths` replaces the families with test files
+or node ids, `--no-assets` drops the checkpoint-gated tests, and `--dry-run`
+prints the plan for nothing. Validate a new invocation on a cheap accelerator
+(`L4`, `T4`) before an expensive one; an image or harness problem fails the
+same way on both.
 
 ### The assets Volume fills itself
 
@@ -333,12 +376,15 @@ prefix.
 One image serves every architecture. The CMake half of the build compiles no
 CUDA (`OASR_SOURCES` is six `.cc` files), so `CUDA_ARCHITECTURES` is the whole
 list `80;86;89;90;100;120` and costs nothing; the kernels that actually differ
-per arch are JIT-compiled on the GPU that will run them. An image per arch would
+per arch are JIT-compiled for it, ahead of the GPU run. An image per arch would
 mean an image build per arch for no coverage.
 
-The base is `nvidia/cuda:*-devel`, not `-runtime`, because the JIT shells out to
-`nvcc` at run time. Torch comes from the `cu128` index — the first one with
-sm_100 and sm_120 wheels.
+The base is `nvidia/cuda:13.0.x-devel`, not `-runtime`, because the JIT shells
+out to `nvcc` at run time, and CUDA 13 because sm_100 is built for the
+`sm_100f` family target, which nvcc 12.8 rejects -- a 12.8 image compiled
+nothing for a B200. Torch, torchaudio and torchcodec are pinned as a set from
+the matching `cu130` index (`cu132`, which the tuning image uses, has no
+torchaudio).
 
 **`3rdparty/cutlass` is not uploaded.** It is 26 069 files and 2.0 GiB, and it
 was going into the image context on every `modal run`, dwarfing the code change

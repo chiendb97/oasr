@@ -6,8 +6,27 @@
 Usage::
 
     modal run ci/modal_app.py::fetch_assets                     # once, ~20 GiB
+    modal run ci/modal_app.py::main --gpus H100 --dry-run       # the plan + worst-case bill
     modal run ci/modal_app.py::main --gpus L40S,H100,B200
     modal run ci/modal_app.py::main --gpus H100 --suites engine,models
+    modal run ci/modal_app.py::main --gpus B200 --no-assets \\
+        --paths tests/kernels/test_fmha.py,tests/models/test_layer_waist.py
+
+Where the money goes, and what keeps it down:
+
+* **nvcc, not the tests, dominates a cold run, and it needs no GPU.**  Every
+  architecture's kernels are compiled first on a CPU-only container
+  (``precompile``: ``oasr tune prebuild --all`` with ``OASR_CUDA_ARCH_LIST``)
+  into the per-arch JIT prefix the GPU run reads, and an architecture whose
+  kernels do not compile is reported without renting its GPU.  Cold, the
+  kernels family took 20 min on an A100 and was cut at 38 % after 90 min on a
+  B200, nearly all of it nvcc.  Each run reports what it still had to compile.
+* **A hard ceiling per run** (``--timeout-s``, 30 min by default) and a refusal
+  to start when the worst case -- every run hitting it -- exceeds
+  ``--max-usd``.  Each run prints its own estimate at list prices; ``modal
+  billing report --for today`` is the authority.
+* **Narrow runs**: ``--paths`` takes test files or node ids instead of whole
+  families, and ``--no-assets`` skips the checkpoint-gated tests.
 
 The GEMM tuning matrix is its own app, ``ci/modal_tune.py``.
 """
@@ -17,6 +36,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import modal
@@ -74,6 +94,54 @@ ARCH_SWEEP = ("B200", "RTX-PRO-6000", "H100", "L40S", "A100-40GB")
 
 DEFAULT_GPU = os.environ.get("OASR_MODAL_GPU") or "RTX-PRO-6000"
 
+#: Modal list prices, USD per second (modal.com/pricing, read 2026-11-16).  They
+#: price the plan's worst case and each run's estimate, nothing else.
+GPU_USD_PER_S: dict[str, float] = {
+    "T4": 0.000164,
+    "L4": 0.000222,
+    "A10G": 0.000306,
+    "L40S": 0.000542,
+    "A100-40GB": 0.000583,
+    "A100-80GB": 0.000694,
+    "RTX-PRO-6000": 0.000842,
+    "H100": 0.001097,
+    "H200": 0.001261,
+    "B200": 0.001736,
+}
+CPU_USD_PER_CORE_S = 0.0000131
+MEM_USD_PER_GIB_S = 0.00000222
+
+#: Modal bills CPU and memory at whichever is higher, the request or the use, and
+#: lets a container burst past its request to a limit.  So every container here
+#: *requests* little and *limits* high: a stage that is busy gets the cores, and
+#: one that idles -- a test waiting on the device, a compile down to its last
+#: translation unit -- pays for what it uses rather than for what it may need.
+#:
+#: GPU test container, ``(request, limit)``: one pytest process waiting on the
+#: device, plus whatever ``precompile`` cannot reach (a module a test generates
+#: for itself, the CuTeDSL kernels, which compile in-process).
+GPU_CPU = (2.0, 8.0)
+GPU_MEMORY_MIB = (8 * 1024, 48 * 1024)
+#: Hard ceiling on one (accelerator, suite) run.  It used to be 3 h, sized for a
+#: cold JIT cache compiling on the GPU's CPU share -- at B200 prices one such run
+#: was ~$19.  With the kernels compiled ahead, a run is its tests.
+GPU_TIMEOUT_S = 1800
+
+#: The compile container per CUTLASS lane: limits ``(cores, memory MiB)``, cores =
+#: nvcc jobs.  Memory is a hard limit (thrashing, then a kill), and ``prebuild``
+#: runs every module at once with at least one job each, so the compilers in
+#: flight outnumber the jobs: ``prebuild --all -j20`` for sm_89 (36 modules, the
+#: C++ CuTe cells among them) peaked at 34 GiB over 66 compiler processes, and
+#: 32 jobs under a 48 GiB limit thrashed until Modal killed it.  A 3.x (wgmma /
+#: tcgen05) TU peaks at 4-5.4 GiB.  The request is ``COMPILE_REQUEST``: on sm_90
+#: 20 jobs were busy for the first ~6 min of a 15 min compile and one or two for
+#: the rest, a tail that now costs its own cores rather than the whole limit.
+COMPILE: dict[str, tuple[int, int]] = {"2x": (24, 80 * 1024), "3x": (24, 128 * 1024)}
+COMPILE_REQUEST = (4.0, 8 * 1024)
+#: One TU sets the floor: ``topk``'s two compile serially at one job each, 570 s
+#: for sm_100, 910 s for sm_90 and 1378 s for sm_89 on the reference box.
+COMPILE_TIMEOUT_S = 3600
+
 #: Every SM the ``_C.so`` build is configured for.  It compiles no CUDA
 #: (``OASR_SOURCES`` is pure C++), so a wide list costs nothing and one image
 #: serves the whole sweep — which is the point: an image per arch would mean an
@@ -81,8 +149,22 @@ DEFAULT_GPU = os.environ.get("OASR_MODAL_GPU") or "RTX-PRO-6000"
 #: on the target anyway.
 CUDA_ARCHITECTURES = os.environ.get("OASR_MODAL_CUDA_ARCH", "80;86;89;90;100;120")
 
-# cu128: the first index with sm_100 (B200) and sm_120 wheels.
-TORCH_INDEX = os.environ.get("OASR_MODAL_TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
+
+def _torch_arch_list(cmake_archs: str) -> str:
+    """``"80;90;100"`` -> ``"8.0;9.0;10.0"``: the CMake list in torch's spelling."""
+    return ";".join(f"{a[:-1]}.{a[-1]}" for a in cmake_archs.split(";") if a)
+
+
+#: The toolkit the JIT compiles with, and the torch built against the same one.
+#: CUDA 13, not 12.8: ``oasr.jit.core._GENCODE_TARGET`` builds sm_100 for the
+#: ``sm_100f`` family target, which nvcc 12.8 rejects ("Unsupported gpu
+#: architecture 'compute_100f'"), so a 12.8 image compiled nothing for a B200.
+#: cu130, not cu132 like the tuning image: cu132 has no torchaudio, which the
+#: models family needs.  The three wheels are pinned as a set -- torchaudio and
+#: torchcodec are built against one torch release each.
+CUDA_IMAGE = os.environ.get("OASR_MODAL_CUDA_IMAGE", "nvidia/cuda:13.0.2-devel-ubuntu24.04")
+TORCH_INDEX = os.environ.get("OASR_MODAL_TORCH_INDEX", "https://download.pytorch.org/whl/cu130")
+TORCH_WHEELS = ("torch==2.11.0", "torchaudio==2.11.0", "torchcodec==0.11.0")
 
 
 def _cutlass_ref() -> str:
@@ -139,7 +221,7 @@ jit_vol = modal.Volume.from_name(JIT_VOLUME, create_if_missing=True)
 
 image = (
     # -devel, not -runtime: the JIT shells out to nvcc at run time.
-    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
+    modal.Image.from_registry(CUDA_IMAGE, add_python="3.12")
     .apt_install(
         "git",
         "curl",
@@ -174,12 +256,14 @@ image = (
         "echo 'source $HOME/.cargo/env' >> /root/.bashrc",
     )
     .env({"PATH": "/root/.cargo/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"})
-    .pip_install("torch", "torchaudio", "torchcodec", index_url=TORCH_INDEX)
+    .pip_install(*TORCH_WHEELS, index_url=TORCH_INDEX)
     .pip_install(
         # pyproject [project.dependencies] + the optional extras whose absence
         # would turn real coverage into importorskips.
         "numpy",
-        "apache-tvm-ffi>=0.1.0",
+        # Pinned to what the JIT is developed and tuned against (ci/modal_tune.py):
+        # every kernel module is built and loaded through it.
+        "apache-tvm-ffi==0.1.10",
         "jinja2>=3.0",
         "PyYAML>=5.4",
         "safetensors",
@@ -248,7 +332,12 @@ image = (
         # only ever reads headers out of it, and ``cutlass_version_stamp`` reads
         # ``include/cutlass/version.h`` through the link like any other path.
         f"mkdir -p {REPO_REMOTE}/3rdparty && ln -sfn {CUTLASS_HOME} {REPO_REMOTE}/3rdparty/cutlass",
+        # TORCH_CUDA_ARCH_LIST as well: torch's CMake config replaces
+        # CMAKE_CUDA_ARCHITECTURES with -gencode flags of its own, and with no
+        # GPU in the builder its default list starts at compute_50, which CUDA
+        # 13 removed ("nvcc fatal: Unsupported gpu architecture").
         f"cd {REPO_REMOTE} && CUDA_ARCHITECTURES='{CUDA_ARCHITECTURES}'"
+        f" TORCH_CUDA_ARCH_LIST='{_torch_arch_list(CUDA_ARCHITECTURES)}'"
         " pip install -e . --no-build-isolation",
     )
     .workdir(REPO_REMOTE)
@@ -293,49 +382,158 @@ def _jit_dir(cc: str | None = None) -> str:
         return f"{JIT_MOUNT}/unknown"
 
 
+def _cc_of(gpu: str) -> str:
+    """``"sm_100"`` -> ``"10.0"``: the ``OASR_CUDA_ARCH_LIST`` spelling of *gpu*'s arch."""
+    digits = GPU_ARCH[gpu].split("_")[1]
+    return f"{digits[:-1]}.{digits[-1]}"
+
+
+def _lane_of(cc: str) -> str:
+    """CUTLASS lane of a capability: 3.x (TMA/wgmma/tcgen05) on sm_90/sm_100, else 2.x."""
+    return "3x" if cc.split(".")[0] in ("9", "10") else "2x"
+
+
+def _jit_libs(root: str) -> set[str]:
+    """Every compiled library under a JIT prefix (``<name>/<hash>/<name>.so``)."""
+    base = Path(root)
+    return {str(p.relative_to(base)) for p in base.glob("*/*/*.so")} if base.is_dir() else set()
+
+
+def _committing(vol, every_s: float = 60.0):
+    """Start a thread committing *vol* every *every_s* seconds; returns its stop event.
+
+    Modal preempts GPU containers and reschedules the input from the start, and
+    a library compiled before that is lost unless it was committed.
+    """
+    import threading
+
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(every_s):
+            try:
+                vol.commit()
+            except Exception as exc:  # noqa: BLE001 -- the next tick retries
+                print(f"[modal] volume commit failed: {exc}", flush=True)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return stop
+
+
+def _usd(seconds: float, gpu: str | None, cpu: float, memory_mib: float) -> float:
+    """List-price cost of a container alive for *seconds* at *cpu* cores and *memory_mib*."""
+    per_s = GPU_USD_PER_S.get(gpu, 0.0) if gpu else 0.0
+    per_s += cpu * CPU_USD_PER_CORE_S + memory_mib / 1024 * MEM_USD_PER_GIB_S
+    return seconds * per_s
+
+
+def _billed_shape(wall_s: float, request: tuple[float, int]) -> tuple[float, float]:
+    """Estimated mean ``(cores, MiB)`` billed: the request, or the use above it.
+
+    Use is read from this process's children (the pytest or prebuild tree):
+    their CPU time over the wall for cores, and that many concurrent copies of
+    the largest one's peak RSS for memory -- an estimate, not Modal's meter.
+    """
+    import resource
+
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cores = (ru.ru_utime + ru.ru_stime) / max(wall_s, 1.0)
+    mib = max(cores, 1.0) * ru.ru_maxrss / 1024
+    return max(request[0], cores), max(request[1], mib)
+
+
+@app.function(
+    image=image,
+    cpu=(COMPILE_REQUEST[0], COMPILE["2x"][0]),
+    memory=(COMPILE_REQUEST[1], COMPILE["2x"][1]),
+    timeout=COMPILE_TIMEOUT_S,
+    retries=0,
+    volumes={JIT_MOUNT: jit_vol},
+)
+def precompile(cc: str, jobs: int) -> dict:
+    """``oasr tune prebuild --all`` for capability *cc* on this CPU container.
+
+    Writes into the arch's JIT prefix, where the GPU run finds every library:
+    ``JitSpec``'s cache key is device-free (sources, headers, flags, toolchain
+    identity) and this is the image the GPU run uses.  Returns the per-module
+    report.
+    """
+    import json
+
+    report = Path("/tmp/prebuild.json")
+    env = {**os.environ, "OASR_CUDA_ARCH_LIST": cc, "OASR_JIT_DIR": _jit_dir(cc)}
+    cmd = ["python", "-m", "oasr.cli", "tune", "prebuild", "--all"]
+    cmd += ["--jobs", str(jobs), "--json", str(report)]
+    print(f"[modal] precompile cc={cc} -j{jobs} jit={env['OASR_JIT_DIR']}", flush=True)
+    t0 = time.time()
+    stop = _committing(jit_vol)
+    try:
+        proc = subprocess.run(cmd, cwd=REPO_REMOTE, env=env)
+    finally:
+        stop.set()
+        jit_vol.commit()
+    out = json.loads(report.read_text()) if report.is_file() else {"modules": []}
+    wall = time.time() - t0
+    cores, mib = _billed_shape(wall, COMPILE_REQUEST)
+    out.update(
+        {
+            "cc": cc,
+            "returncode": proc.returncode,
+            "container_s": round(wall, 1),
+            "usd": round(_usd(wall, None, cores, mib), 3),
+            "mean_cores": round(cores, 1),
+        }
+    )
+    return out
+
+
 @app.function(
     image=image,
     gpu=DEFAULT_GPU,
-    # Three hours, not one.  The kernels family JIT-compiles every GEMM, BMM,
-    # Conv2D and attention module on first *call*, and on an architecture whose
-    # cache prefix is empty that is the run.  Measured: sm_100 was cancelled at
-    # 38 % against the old 5400 s, which reads exactly like a hang and is not
-    # one.  The cost is paid once per architecture — the JIT Volume carries it
-    # forward — so the ceiling has to clear a cold cache or the first run on any
-    # new accelerator reports a timeout instead of a result.
-    timeout=10800,
+    cpu=GPU_CPU,
+    memory=GPU_MEMORY_MIB,
+    timeout=GPU_TIMEOUT_S,
+    retries=0,
+    # The container is billed while it idles before scaling down; a run is one
+    # input, so there is nothing to wait for.
+    scaledown_window=2,
     volumes={ASSETS_MOUNT: assets_vol, JIT_MOUNT: jit_vol},
 )
-def run_suite(name: str, strict: bool = True, extra: str = "", assets: bool = True) -> str:
-    """Run one family from ci/gpu_suites.py.  Raises on failure.
+def run_suite(
+    name: str,
+    strict: bool = True,
+    extra: str = "",
+    assets: bool = True,
+    paths: str = "",
+    gpu: str = "",
+) -> dict:
+    """Run one family from ci/gpu_suites.py, or the comma-separated *paths*.
 
-    ``assets=False`` runs the suite with the Volume unused: no asset env var is
-    set, so every checkpoint- and audio-gated test skips and what is left is the
-    kernel / layer / plumbing coverage that needs only a GPU.  ``strict`` stays
-    meaningful there — the allow-list simply widens to every declared asset, so
-    the run still *names* what it did not cover instead of turning the gate off.
+    Returns the outcome rather than raising, so a failed run still reports its
+    time, its cost and what it had to compile.  ``assets=False`` runs with the
+    Volume unused: no asset env var is set, so every checkpoint- and
+    audio-gated test skips and what is left is the kernel / layer / plumbing
+    coverage that needs only a GPU.  ``strict`` stays meaningful there -- the
+    allow-list simply widens to every declared asset, so the run still *names*
+    what it did not cover instead of turning the gate off.
     """
-    env = {**os.environ, "OASR_JIT_DIR": _jit_dir()}
+    import collections
+
+    import torch
+
+    t0 = time.time()
+    jit = _jit_dir()
+    # MAX_JOBS: ninja's own default counts the host's cores, not this container's
+    # limit, and a compile that reaches here would oversubscribe the memory.
+    env = {**os.environ, "OASR_JIT_DIR": jit, "MAX_JOBS": str(int(GPU_CPU[1]))}
     if assets:
         env.update(_asset_env())
+    device = torch.cuda.get_device_name()
+    print(f"[modal] {device} suite={name} strict={strict} assets={assets} jit={jit}", flush=True)
 
-    subprocess.run(["nvidia-smi"], check=False)
-    print(
-        f"[modal] suite={name} strict={strict} assets={assets} jit={env['OASR_JIT_DIR']}",
-        flush=True,
-    )
-
-    cmd = [
-        "python",
-        "-m",
-        "pytest",
-        *paths_for(name),
-        "-m",
-        DEFAULT_MARKER_EXPR,
-        "-q",
-        "-rs",
-        "-rE",
-    ]
+    targets = [p.strip() for p in paths.split(",") if p.strip()] or paths_for(name)
+    cmd = ["python", "-m", "pytest", *targets, "-m", DEFAULT_MARKER_EXPR, "-q", "-rfE"]
+    cmd += ["-p", "no:cacheprovider", "--durations=15"]
     if strict:
         cmd.append("--strict-assets")
         allowed = ALLOW_MISSING if assets else tuple(test_assets.ASSETS)
@@ -344,12 +542,54 @@ def run_suite(name: str, strict: bool = True, extra: str = "", assets: bool = Tr
     if extra:
         cmd += extra.split()
 
+    before = _jit_libs(jit)
+    tail: collections.deque[str] = collections.deque(maxlen=60)
+    failures: list[str] = []
+    stop = _committing(jit_vol, every_s=120.0)
     try:
-        subprocess.run(cmd, cwd=REPO_REMOTE, env=env, check=True)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=REPO_REMOTE,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            tail.append(line.rstrip())
+            if line.startswith(("FAILED ", "ERROR ")):
+                failures.append(line.rstrip())
+        returncode = proc.wait()
     finally:
         # Persist whatever the JIT compiled so the next run starts warm.
+        stop.set()
         jit_vol.commit()
-    return name
+    compiled = sorted({lib.split("/")[0] for lib in _jit_libs(jit) - before})
+    wall = time.time() - t0
+    summary = next(
+        (
+            ln
+            for ln in reversed(tail)
+            if " in " in ln and ("passed" in ln or "failed" in ln or "error" in ln)
+        ),
+        "",
+    )
+    return {
+        "suite": name,
+        "gpu": gpu,
+        "device": device,
+        "returncode": returncode,
+        "summary": summary.strip("= "),
+        "wall_s": round(wall, 1),
+        "usd": round(_usd(wall, gpu, *_billed_shape(wall, (GPU_CPU[0], GPU_MEMORY_MIB[0]))), 3),
+        "compiled_on_gpu": compiled,
+        # What to show for a failed run: pytest's own short summary, else (a
+        # crash, a collection error) the end of the output.
+        "tail": failures[:40] or (list(tail)[-25:] if returncode != 0 else []),
+    }
 
 
 @app.function(
@@ -418,82 +658,226 @@ def fetch_assets(
         print(line)
 
 
+#: Consecutive polling errors before a stage counts as failed.  A transient
+#: "Deadline exceeded" from the control plane once read as a failed compile and
+#: abandoned a run whose compile had succeeded (2026-10-02).
+_POLL_TOLERANCE = 5
+
+
+def _poll(call, errors: dict, key: str):
+    """``call``'s result if it has one now, else ``None`` (never blocks).
+
+    Raises only after ``_POLL_TOLERANCE`` consecutive errors -- a remote failure
+    repeats on every poll, a network blip does not.
+    """
+    try:
+        res = call.get(timeout=0)
+    except (TimeoutError, modal.exception.TimeoutError):
+        errors[key] = 0
+        return None
+    except Exception as exc:  # noqa: BLE001 -- counted, re-raised when persistent
+        errors[key] = errors.get(key, 0) + 1
+        if errors[key] >= _POLL_TOLERANCE:
+            raise
+        print(f"  [poll] {key}: {type(exc).__name__}: {exc} (retrying)", flush=True)
+        return None
+    errors[key] = 0
+    return res
+
+
+def _print_run(res: dict) -> None:
+    status = "ok  " if res["returncode"] == 0 else "FAIL"
+    print(
+        f"  {status} {res['gpu']} / {res['suite']}: {res['summary'] or 'no summary'} "
+        f"[{res['wall_s']:.0f}s, ~${res['usd']:.2f}]",
+        flush=True,
+    )
+    if res["compiled_on_gpu"]:
+        print(f"       compiled on the GPU: {', '.join(res['compiled_on_gpu'])}", flush=True)
+    for line in res.get("tail", []):
+        print(f"       | {line}", flush=True)
+
+
 @app.local_entrypoint()
 def main(
     gpus: str = "",
     suites: str = "",
+    paths: str = "",
     strict: bool = True,
     extra: str = "",
     assets: bool = True,
+    precompile_first: bool = True,
+    run_on_compile_failure: bool = False,
+    compile_only: bool = False,
+    timeout_s: int = GPU_TIMEOUT_S,
+    max_usd: float = 10.0,
+    dry_run: bool = False,
 ):
-    """Run the families on one or more accelerators.
+    """Run the families on one or more accelerators: compile on CPU, then test on GPU.
 
     ``--gpus`` is a comma-separated list of Modal accelerators, ``all`` for one
     per distinct architecture (``ARCH_SWEEP``), or empty for the default.
     ``--suites`` is a comma-separated list of names from ci/gpu_suites.py; empty
-    means all of them.  Every (gpu, suite) pair runs concurrently.
+    means all of them.  ``--paths`` replaces the families with explicit test
+    files or node ids, run as one suite.  Every (gpu, suite) pair of an
+    architecture starts as soon as that architecture's compile is done.
 
     ``--assets`` reads the checkpoints and audio out of the ``oasr-ci-assets``
-    Volume.  On by default now that ``fetch_assets`` fills it without anybody
-    uploading anything; pass ``--no-assets`` for the GPU-only coverage that
-    needs no external input.
+    Volume; ``--no-assets`` is the GPU-only coverage that needs no external
+    input.  ``--no-precompile-first`` skips the CPU stage (the cache is known
+    warm), ``--compile-only`` runs nothing else (does it build for a B200? for
+    the price of CPU time), ``--run-on-compile-failure`` rents the GPU even for
+    an architecture some module failed to compile for, and ``--max-usd`` refuses
+    a plan whose worst case -- every run hitting ``--timeout-s`` -- costs more.
     """
-    names = [s.strip() for s in suites.split(",") if s.strip()] or list(SUITES)
-    unknown = [n for n in names if n not in SUITES]
-    if unknown:
-        raise SystemExit(f"unknown suite(s): {unknown}; known: {list(SUITES)}")
+    path_list = [p.strip() for p in paths.split(",") if p.strip()]
+    if path_list:
+        names = ["paths"]
+        missing = [p for p in path_list if not (REPO_ROOT / p.split("::")[0]).exists()]
+        if missing:
+            raise SystemExit(f"no such test path(s): {missing}")
+    else:
+        names = [s.strip() for s in suites.split(",") if s.strip()] or list(SUITES)
+        unknown = [n for n in names if n not in SUITES]
+        if unknown:
+            raise SystemExit(f"unknown suite(s): {unknown}; known: {list(SUITES)}")
 
     if gpus.strip().lower() == "all":
         targets = list(ARCH_SWEEP)
     else:
         targets = [g.strip() for g in gpus.split(",") if g.strip()] or [DEFAULT_GPU]
-    unknown_gpu = [g for g in targets if g not in GPU_ARCH]
+    unknown_gpu = [g for g in targets if g not in GPU_ARCH or g not in GPU_USD_PER_S]
     if unknown_gpu:
-        print(f"[modal] note: {unknown_gpu} not in GPU_ARCH; passing through to Modal as-is")
+        raise SystemExit(f"unknown accelerator(s) {unknown_gpu}; known: {sorted(GPU_ARCH)}")
+
+    by_cc: dict[str, list[str]] = {}
+    for g in targets:
+        by_cc.setdefault(_cc_of(g), []).append(g)
 
     scope = "with checkpoints" if assets else "no checkpoints (kernels/plumbing only)"
-    shown = ", ".join("{} ({})".format(g, GPU_ARCH.get(g, "?")) for g in targets)
     print(
         f"[modal] {len(targets)} accelerator(s) x {len(names)} suite(s), {scope}\n"
-        f"        gpus:   {shown}\n"
-        f"        suites: {', '.join(names)}"
+        f"        suites: {', '.join(path_list or names)}"
     )
+    if compile_only and not precompile_first:
+        raise SystemExit("--compile-only needs the compile stage (--precompile-first)")
+    worst = 0.0
+    if precompile_first:
+        for cc in by_cc:
+            cores, mem = COMPILE[_lane_of(cc)]
+            cost = _usd(COMPILE_TIMEOUT_S, None, cores, mem)  # at its limits throughout
+            worst += cost
+            print(
+                f"        compile sm_{cc.replace('.', ''):<4} {cores} CPU / {mem // 1024} GiB, "
+                f"<= {COMPILE_TIMEOUT_S // 60} min (<= ${cost:.2f})"
+            )
+    for g in [] if compile_only else targets:
+        cost = _usd(timeout_s, g, GPU_CPU[1], GPU_MEMORY_MIB[1]) * len(names)
+        worst += cost
+        print(
+            f"        test    {g:<13} {GPU_ARCH[g]:<7} {len(names)} run(s), each "
+            f"<= {timeout_s // 60} min (<= ${cost:.2f})"
+        )
+    print(f"        worst case ${worst:.2f} at list prices (limit --max-usd {max_usd:.2f})")
+    if worst > max_usd:
+        raise SystemExit(
+            f"worst case ${worst:.2f} exceeds --max-usd {max_usd:.2f}: narrow the run, "
+            f"lower --timeout-s, or raise the limit"
+        )
+    if dry_run:
+        print("--dry-run: nothing spawned")
+        return
 
-    # `spawn`, not `starmap`.  `.with_options(gpu=...)` gives each accelerator
-    # its own container pool, but `starmap` returns a *lazy* generator: building
-    # one per GPU and consuming them in order submits nothing for the second
-    # architecture until the first has finished, so a "parallel" sweep runs
-    # strictly serially and takes five times as long.  `spawn` submits on the
-    # call and hands back a FunctionCall to collect later, which is what makes
-    # every (gpu, suite) pair actually start at once.
-    calls = [
-        (gpu, name, run_suite.with_options(gpu=gpu).spawn(name, strict, extra, assets))
-        for gpu in targets
-        for name in names
-    ]
-    print(f"[modal] spawned {len(calls)} run(s); collecting")
+    def _spawn_runs(cc: str) -> list:
+        return [
+            (
+                g,
+                name,
+                run_suite.with_options(gpu=g, timeout=timeout_s).spawn(
+                    name, strict, extra, assets, paths, g
+                ),
+            )
+            for g in by_cc[cc]
+            for name in names
+        ]
 
-    results: dict[str, dict[str, object]] = {gpu: {} for gpu in targets}
-    failed: list[tuple[str, str, Exception]] = []
-    for gpu, name, call in calls:
-        try:
-            call.get()
-            results[gpu][name] = None
-        except Exception as exc:  # one suite failing must not hide the other 29
-            results[gpu][name] = exc
-            failed.append((gpu, name, exc))
+    t0 = time.time()
+    pre: dict = {}
+    runs: list = []
+    if precompile_first:
+        for cc in by_cc:
+            cores, mem = COMPILE[_lane_of(cc)]
+            pre[cc] = precompile.with_options(
+                cpu=(COMPILE_REQUEST[0], cores), memory=(COMPILE_REQUEST[1], mem)
+            ).spawn(cc, cores)
+    else:
+        for cc in by_cc:
+            runs += _spawn_runs(cc)
 
-    print()
-    for gpu in targets:
-        print(f"  {gpu} ({GPU_ARCH.get(gpu, '?')})")
-        for name in names:
-            exc = results[gpu][name]
-            print(f"    {'FAIL' if exc is not None else 'ok  '}  {name}")
+    results: list[dict] = []
+    failed: list[str] = []
+    spent = 0.0
+    errors: dict = {}
+    while pre or runs:
+        for cc in list(pre):
+            try:
+                rep = _poll(pre[cc], errors, f"compile:{cc}")
+            except Exception as exc:  # the container itself failed
+                rep = {"returncode": -1, "modules": [], "error": str(exc)}
+            if rep is None:
+                continue
+            del pre[cc]
+            cost = rep.get("usd", 0.0)
+            spent += cost
+            mods = rep.get("modules", [])
+            bad = [m["name"] for m in mods if m["status"] == "failed"]
+            built = sum(m["status"] == "built" for m in mods)
+            print(
+                f"  sm_{cc.replace('.', '')}: compile rc={rep.get('returncode')} -- {built} built, "
+                f"{len(mods) - built - len(bad)} cached, {len(bad)} failed "
+                f"[{rep.get('container_s', 0)}s, {rep.get('mean_cores', '?')} cores on average, "
+                f"~${cost:.2f}] at {time.time() - t0:.0f}s",
+                flush=True,
+            )
+            for m in mods:
+                if m.get("error"):
+                    print(f"    {m['name']}: ...{m['error'][-1200:]}", flush=True)
+            if rep.get("error"):
+                print(f"    {rep['error'][-1200:]}", flush=True)
+            if rep.get("returncode") != 0 or bad:
+                failed += [f"sm_{cc.replace('.', '')} (compile)"]
+                if not run_on_compile_failure:
+                    print(
+                        f"    not renting {', '.join(by_cc[cc])}: fix the compile first", flush=True
+                    )
+                    continue
+            if not compile_only:
+                runs += _spawn_runs(cc)
+        for item in list(runs):
+            g, name, call = item
+            try:
+                res = _poll(call, errors, f"{g}/{name}")
+            except Exception as exc:  # one run failing must not hide the others
+                runs.remove(item)
+                failed.append(f"{g} / {name}")
+                print(f"  FAIL {g} / {name}: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            if res is None:
+                continue
+            runs.remove(item)
+            results.append(res)
+            spent += res["usd"]
+            _print_run(res)
+            if res["returncode"] != 0:
+                failed.append(f"{g} / {name}")
+        if pre or runs:
+            time.sleep(10)
 
+    print(f"\n[modal] done in {time.time() - t0:.0f}s, ~${spent:.2f} at list prices", flush=True)
+    for res in results:
+        _print_run(res)
     if failed:
-        for gpu, name, exc in failed:
-            print(f"\n--- {gpu} / {name} ---\n{exc}", file=sys.stderr)
-        raise SystemExit(f"{len(failed)}/{len(targets) * len(names)} suite run(s) failed")
+        raise SystemExit(f"{len(failed)} run(s) failed: {', '.join(failed)}")
 
 
 @app.local_entrypoint()

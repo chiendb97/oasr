@@ -2403,11 +2403,16 @@ class TestPruneCache:
         spec = core.JitSpec(name="g18_stamp", sources=[src])
         lib = spec._get_lib_path()
         lib.parent.mkdir(parents=True)
-        # Any complete ELF library stands in; the load itself is stubbed.
+        # Any complete ELF library stands in; the load itself is stubbed.  A
+        # standalone CPython (python-build-standalone, the CI image's) links the
+        # stdlib extensions in, so none of them has a file: torch's is the one
+        # a test environment always has.
         elf = next(
             m.__file__
-            for m in map(importlib.import_module, ("_json", "_ctypes", "_socket", "select"))
-            if getattr(m, "__file__", "").endswith(".so")
+            for m in map(
+                importlib.import_module, ("_json", "_ctypes", "_socket", "select", "torch._C")
+            )
+            if (getattr(m, "__file__", None) or "").endswith(".so")
         )
         shutil.copy(elf, lib)
         monkeypatch.setitem(
@@ -2425,3 +2430,54 @@ class TestPruneCache:
         assert old.exists() and "would remove 1 keys" in capsys.readouterr().out
         assert main(["jit", "prune", "--unused-days", "30"]) == 0
         assert not old.exists() and "removed 1 keys" in capsys.readouterr().out
+
+
+class TestCudnnComesFromTheWheel:
+    """``_torch_cudnn_paths`` finds the cuDNN wheel through a *namespace* ``nvidia``.
+
+    A plain ``pip install torch`` leaves ``site-packages/nvidia/`` as a directory
+    the cuDNN, cuBLAS, ... wheels share with no ``__init__.py``, so the package
+    has a ``__path__`` and no ``__file__``.  Reading ``__file__`` found cuDNN only
+    where an unrelated wheel happened to ship that file, and ``cudnn_conv2d``
+    failed to build everywhere else (seen on a fresh CUDA 13 CI image).
+    """
+
+    @staticmethod
+    def _namespace(monkeypatch, *dirs):
+        import sys
+        import types
+
+        ns = types.ModuleType("nvidia")
+        ns.__path__ = [str(d) for d in dirs]
+        assert not hasattr(ns, "__file__")
+        monkeypatch.setitem(sys.modules, "nvidia", ns)
+
+    @staticmethod
+    def _wheel(base):
+        root = base / "nvidia" / "cudnn"
+        (root / "include").mkdir(parents=True)
+        (root / "include" / "cudnn.h").write_text("")
+        (root / "lib").mkdir()
+        (root / "lib" / "libcudnn.so.9").write_text("")
+        return root.resolve()
+
+    def test_a_namespace_package_is_searched(self, tmp_path, monkeypatch):
+        from oasr.jit.conv import _torch_cudnn_paths
+
+        root = self._wheel(tmp_path)
+        self._namespace(monkeypatch, tmp_path / "nvidia")
+        assert _torch_cudnn_paths() == (root / "include", root / "lib" / "libcudnn.so.9")
+
+    def test_the_entry_that_holds_cudnn_wins(self, tmp_path, monkeypatch):
+        from oasr.jit.conv import _torch_cudnn_paths
+
+        (tmp_path / "other" / "nvidia" / "cublas").mkdir(parents=True)
+        root = self._wheel(tmp_path / "site")
+        self._namespace(monkeypatch, tmp_path / "other" / "nvidia", tmp_path / "site" / "nvidia")
+        assert _torch_cudnn_paths()[0] == root / "include"
+
+    def test_no_wheel_leaves_the_system_cudnn(self, tmp_path, monkeypatch):
+        from oasr.jit.conv import _torch_cudnn_paths
+
+        self._namespace(monkeypatch, tmp_path / "nvidia")
+        assert _torch_cudnn_paths() == (None, None)
