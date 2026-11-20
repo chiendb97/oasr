@@ -276,6 +276,7 @@ extension cookbook for each axis.
 | `oasr/engine/streaming_backend/` | `PagedStreamingBackend`, `SlotStreamingBackend` (fixed-extent state the encoder declares, graph-captured), `StatefulStreamingBackend` |
 | `oasr/engine/graph_cache.py` | CUDA-graph capture of the steady-state streaming encoder |
 | `oasr/engine/offline_graph.py` | CUDA-graph capture of the offline forward, keyed `(B_bucket, T_bucket)` |
+| `oasr/engine/nar_graph.py` | CUDA-graph capture of Paraformer's CIF predictor and NAR decoder: two graphs, keyed `(B, T)` and `(B, T, U_bucket)`, with the token counts read back between them |
 | `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
 | `oasr/engine/decoder_graph.py` | CUDA-graph capture of one AR decoder step (needs paged decoder KV) |
 | `oasr/cache/decoder_state.py` | Per-row decoder KV — dense capacity buffers and paged — that both AR decoder surfaces thread |

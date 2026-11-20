@@ -810,6 +810,32 @@ has the request id, so the failure is answered as an output.
    AR family's decoder-KV budget has promised but not yet allocated therefore
    looks free to it.
 
+   **Paraformer's decode is captured too** (`oasr/engine/nar_graph.py`). Behind
+   the captured encoder, the CIF predictor and the 16-layer NAR decoder issued
+   about 340 launches per request, which held a single request at ~10 ms
+   whatever its length. The decoder's width is the token count, which only the
+   predictor knows, so the decode is two graphs. The predictor's weights replay
+   at `(B, T)`. The host reads back the per-row token counts, the one read the
+   eager path made as well. Then CIF integration, the decoder and the greedy
+   pick replay at `(B, T, U)`, with `U` rounded up to a multiple of 8. A graph
+   at a fixed `U` would not do: at `B=64` the decoder's GPU time grows with `U`
+   (2.33 / 3.10 / 4.79 ms at 17 / 32 / 64 tokens), and rounding to 8 costs
+   about 1 %. The rounding applies on the eager fallback too, for the same
+   reason as the frame padding above. The rows past a row's count are masked,
+   but the width changes the decoder's GEMM shapes.
+
+   Measured on `paraformer-zh` (bf16, AISHELL-1, four interleaved rounds):
+   single-request p50 10.0–11.5 → 3.8–4.0 ms, and a 512-request backlog
+   2,028–2,149 → 2,354–2,454 req/s. All 6,920 test-set transcripts are
+   unchanged. A new shape costs its first request about 20 ms of capture, once.
+   The whole test set needed 16 shapes and a 0.19 GiB pool. The cache follows
+   the encoder cache's switches and bounds (`use_offline_cuda_graphs`,
+   `offline_graph_max_frames`, `offline_graph_max_captures`,
+   `offline_graph_evict`) and its memory rule. It stages the encoder output in
+   one shared buffer rather than one copy per shape. Deferring the decode's
+   read-back behind the next micro-batch (`decode_offline_async`) gained
+   nothing: the count read-back already waits for each batch's encoder.
+
 8. **The streaming graph ladder is pre-warmed exhaustively, and that is what
    flattens the tail.** The streaming graph is keyed
    `(B_active, T_input, cache_t1_bucket)` and a miss captures a graph *on a live

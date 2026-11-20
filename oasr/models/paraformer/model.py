@@ -196,16 +196,48 @@ class ParaformerModel(BaseAsrModel):
         pays only for what it asked for, and here that is one extra live tensor
         per batch.
         """
-        T = enc_out.size(1)
-        mask = (
-            torch.arange(T, device=enc_out.device).unsqueeze(0)
-            < enc_lens.to(enc_out.device).unsqueeze(1)
-        ).float()
+        mask = self._frame_mask(enc_out, enc_lens)
         acoustic_embeds, token_num, alphas, fires = self.predictor(enc_out, mask)
-        token_lens = token_num.round().long().clamp(min=0).to(torch.int32)
+        token_lens = self._token_lens(token_num)
         if return_alphas:
             return acoustic_embeds, token_lens, fires, alphas
         return acoustic_embeds, token_lens, fires
+
+    def predict_weights(
+        self, enc_out: torch.Tensor, enc_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """:meth:`predict` up to the token counts → ``(alphas (B, T+1) fp32,
+        token_lens (B,) int32)``.
+
+        Fixed-shape and free of host reads, which :meth:`predict` cannot be: it
+        has to read the batch's largest count back to size its output.  The
+        decode strategy runs this, reads the counts, then :meth:`integrate`.
+        """
+        alphas, token_num = self.predictor.weights(enc_out, self._frame_mask(enc_out, enc_lens))
+        return alphas, self._token_lens(token_num)
+
+    def integrate(
+        self, enc_out: torch.Tensor, alphas: torch.Tensor, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """CIF integration into ``num_tokens`` rows → ``(acoustic_embeds (B, U, D)
+        fp32, fires (B, T+1) fp32)``.
+
+        ``num_tokens`` may exceed every row's count; the extra rows are zero and
+        :meth:`nar_decode` masks them by ``token_lens``.
+        """
+        return self.predictor.integrate(enc_out, alphas, num_tokens)
+
+    @staticmethod
+    def _frame_mask(enc_out: torch.Tensor, enc_lens: torch.Tensor) -> torch.Tensor:
+        T = enc_out.size(1)
+        return (
+            torch.arange(T, device=enc_out.device).unsqueeze(0)
+            < enc_lens.to(enc_out.device).unsqueeze(1)
+        ).float()
+
+    @staticmethod
+    def _token_lens(token_num: torch.Tensor) -> torch.Tensor:
+        return token_num.round().long().clamp(min=0).to(torch.int32)
 
     def nar_decode(
         self,

@@ -136,6 +136,54 @@ class CifPredictor(nn.Module):
         self.threshold = config.predictor_threshold
         self.tail_threshold = config.predictor_tail_threshold
 
+    def weights(
+        self, hidden: torch.Tensor, mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The first half of :meth:`forward`: per-frame weights and token counts.
+
+        Fixed-shape and free of host reads, so the engine can capture it at
+        ``(B, T)`` and read back only the counts before choosing how many token
+        rows :meth:`integrate` produces.
+
+        Returns
+        -------
+        alphas : Tensor
+            ``(B, T+1)`` float32 tail-appended per-frame weights.
+        token_num : Tensor
+            ``(B,)`` float32 -- ``floor(sum(alphas))`` per row (callers round).
+        """
+        # Alpha head in the module's own dtype (fp16 under the engine); the
+        # integration is always fp32.
+        h = F.pad(
+            hidden.to(self.cif_output.weight.dtype),
+            (0, 0, self.left_padding, self.right_padding),
+        )
+        alpha_logits = self.cif_output(self.cif_conv1d(h))
+        # Apply sigmoid before slicing the aligned alpha head. This keeps the
+        # kernel input contiguous and avoids materializing a row-strided view;
+        # only column 0 is a checkpoint output, the padding columns are ignored.
+        alphas = self.sigmoid(alpha_logits)[..., 0]
+        mask = mask.float()
+        alphas = alphas.float() * mask  # sigmoid is already strictly non-negative
+        alphas = self._append_tail(alphas, mask)
+        return alphas, torch.floor(alphas.sum(dim=-1))
+
+    def integrate(
+        self, hidden: torch.Tensor, alphas: torch.Tensor, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The second half: integrate ``hidden`` into ``num_tokens`` token rows.
+
+        ``alphas`` is :meth:`weights`' output.  Rows past a row's own count are
+        zero, so ``num_tokens`` may exceed the batch maximum; the NAR decoder
+        masks them.  Returns ``(acoustic_embeds (B, num_tokens, D) fp32, fires
+        (B, T+1) fp32)``.
+        """
+        b, _, d = hidden.shape
+        hidden = hidden.float()
+        # The tail frame :meth:`_append_tail` gave ``alphas`` integrates nothing.
+        hidden = torch.cat([hidden, hidden.new_zeros(b, 1, d)], dim=1)
+        return cif_v1(hidden, alphas, self.threshold, num_tokens=num_tokens)
+
     def forward(
         self, hidden: torch.Tensor, mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -159,44 +207,23 @@ class CifPredictor(nn.Module):
         fires : Tensor
             ``(B, T+1)`` float32 CIF peak signal (``≥ 1`` at fire positions).
         """
-        # Alpha head in the module's own dtype (fp16 under the engine); the
-        # integration below is always fp32.
-        h = F.pad(
-            hidden.to(self.cif_output.weight.dtype),
-            (0, 0, self.left_padding, self.right_padding),
-        )
-        alpha_logits = self.cif_output(self.cif_conv1d(h))
-        # Apply sigmoid before slicing the aligned alpha head. This keeps the
-        # kernel input contiguous and avoids materializing a row-strided view;
-        # only column 0 is a checkpoint output, the padding columns are ignored.
-        alphas = self.sigmoid(alpha_logits)[..., 0]
-        hidden = hidden.float()
-        mask = mask.float()
-        alphas = alphas.float() * mask  # sigmoid is already strictly non-negative
-
-        hidden, alphas = self._append_tail(hidden, alphas, mask)
-        token_num = torch.floor(alphas.sum(dim=-1))
-
+        alphas, token_num = self.weights(hidden, mask)
         # The one read-back: how many token rows the batch keeps.  ``cif_v1``
         # integrates exactly those rather than sizing its own and being cut.
         u_max = int(token_num.max().clamp(min=0).item())
-        acoustic_embeds, fires = cif_v1(hidden, alphas, self.threshold, num_tokens=u_max)
+        acoustic_embeds, fires = self.integrate(hidden, alphas, u_max)
         return acoustic_embeds, token_num, alphas, fires
 
-    def _append_tail(
-        self, hidden: torch.Tensor, alphas: torch.Tensor, mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _append_tail(self, alphas: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Add ``tail_threshold`` at each row's first pad position (FunASR
         ``tail_process_fn``): guarantees the trailing partial integral fires
-        so the last token isn't dropped.  Appends one zero frame / one alpha
-        column, so the time axis grows to ``T + 1``."""
-        b, _, d = hidden.shape
-        zeros_t = alphas.new_zeros(b, 1)
+        so the last token isn't dropped.  Appends one alpha column, so the time
+        axis grows to ``T + 1``; :meth:`integrate` appends the matching zero
+        frame."""
+        zeros_t = alphas.new_zeros(alphas.size(0), 1)
         ones_t = torch.ones_like(zeros_t)
         # 1 exactly at the first pad position of each row ((mask | first pad
         # slot) minus (mask shifted right)); rows with no padding fire at the
         # appended column.
         tail = torch.cat([ones_t, mask], dim=1) - torch.cat([mask, zeros_t], dim=1)
-        alphas = torch.cat([alphas, zeros_t], dim=1) + tail * self.tail_threshold
-        hidden = torch.cat([hidden, hidden.new_zeros(b, 1, d)], dim=1)
-        return hidden, alphas
+        return torch.cat([alphas, zeros_t], dim=1) + tail * self.tail_threshold

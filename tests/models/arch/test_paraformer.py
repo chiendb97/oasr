@@ -649,16 +649,19 @@ _FILTERED = (0, 1, 2)
 
 
 class _StubParaformer:
-    """``predict`` / ``nar_decode`` returning fixed tensors, so the strategy's
-    post-processing can be driven over any shape of batch without a model."""
+    """``predict_weights`` / ``integrate`` / ``nar_decode`` returning fixed tensors,
+    so the strategy's post-processing can be driven over any shape of batch
+    without a model."""
 
     def __init__(self, log_probs, token_lens, fires):
         self.config = SimpleNamespace(blank_id=0, sos_id=1, eos_id=2)
         self._log_probs, self._token_lens, self._fires = log_probs, token_lens, fires
 
-    def predict(self, enc_out, enc_lens, return_alphas=False):
-        B, U = self._log_probs.shape[:2]
-        return torch.zeros(B, U, 4), self._token_lens, self._fires
+    def predict_weights(self, enc_out, enc_lens):
+        return torch.zeros_like(self._fires), self._token_lens
+
+    def integrate(self, enc_out, alphas, num_tokens):
+        return torch.zeros(self._log_probs.size(0), num_tokens, 4), self._fires
 
     def nar_decode(self, enc_out, enc_lens, acoustic_embeds, token_lens):
         return self._log_probs
@@ -672,6 +675,7 @@ def _strategy(model, detok):
     strategy._model, strategy._detok = model, detok
     strategy._clock = FrameClock(0.06)
     strategy._filtered_ids = set(_FILTERED)
+    strategy._graphs = None
     return strategy
 
 
@@ -850,6 +854,111 @@ class TestEngineE2E:
         cfg = EngineConfig(ckpt_dir=PARA_CKPT, service_mode="offline", decode_method="ctc")
         with pytest.raises(ValueError, match="not a capability"):
             ASREngine(cfg)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="engine requires CUDA")
+@needs_ckpt
+class TestCapturedDecode:
+    """The predictor and the NAR decoder replayed as CUDA graphs
+    (``oasr.engine.nar_graph``) on the real checkpoint."""
+
+    @pytest.fixture(scope="class")
+    def engine(self):
+        from oasr.engine import ASREngine, EngineConfig
+        from oasr.vad.config import VadConfig
+
+        # ``observe`` leaves the encoder's input alone; it is what lets a
+        # request ask for speech activity at all.
+        cfg = EngineConfig(
+            ckpt_dir=PARA_CKPT,
+            service_mode="offline",
+            max_batch_size=4,
+            vad=VadConfig(mode="observe"),
+        )
+        eng = ASREngine(cfg)
+        yield eng
+        eng.shutdown()
+        del eng
+        torch.cuda.empty_cache()
+
+    @pytest.fixture(scope="class")
+    def wav(self):
+        import torchaudio
+
+        return torchaudio.load(os.path.join(PARA_CKPT, "example", "asr_example.wav"))[0][0]
+
+    @staticmethod
+    def _encode(engine, clips):
+        from oasr.engine.request import Request
+
+        reqs = [Request(audio=c, streaming=False, sample_rate=16000) for c in clips]
+        feats, lens = engine._input_processor.collate(reqs)
+        with torch.no_grad():
+            return engine._model_runner.encode_offline(feats, lens)
+
+    def test_split_cif_is_predict(self, engine, wav):
+        model = engine._output_processor.strategy._model
+        enc, lens = self._encode(engine, [wav, wav[: wav.numel() * 3 // 5]])
+        with torch.no_grad():
+            embeds, token_lens, fires, alphas = model.predict(enc, lens, return_alphas=True)
+            got_alphas, got_lens = model.predict_weights(enc, lens)
+            got_embeds, got_fires = model.integrate(enc, got_alphas, embeds.size(1))
+        for got, want in (
+            (got_alphas, alphas),
+            (got_lens, token_lens),
+            (got_embeds, embeds),
+            (got_fires, fires),
+        ):
+            assert torch.equal(got, want)
+
+    def test_replay_is_bit_identical_to_eager(self, engine, wav):
+        """At a batch bucket (two rows, no padding) the replays and the eager
+        halves run the same kernels on the same inputs."""
+        strategy = engine._output_processor.strategy
+        graphs = strategy._graphs
+        assert graphs is not None and graphs.enabled
+        enc, lens = self._encode(engine, [wav, wav[: wav.numel() // 2]])
+        with torch.no_grad():
+            alphas, token_lens = strategy._model.predict_weights(enc, lens)
+            stage = graphs.weights(enc, lens)
+            assert stage is not None
+            assert torch.equal(stage.alphas[:2], alphas)
+            assert torch.equal(stage.token_lens[:2], token_lens)
+            width = graphs.token_bucket(int(token_lens.max()))
+            want = strategy._decode_tokens(enc, lens, alphas, token_lens, width)
+            got = graphs.decode(stage, width)
+        assert got is not None
+        for g, w in zip(got, want):
+            assert torch.equal(g, w)
+
+    def test_rounding_the_token_width_keeps_every_token(self, engine, wav):
+        strategy = engine._output_processor.strategy
+        clips = [wav, wav[: wav.numel() * 2 // 3], wav[: wav.numel() // 3]]
+        enc, lens = self._encode(engine, clips)
+        with torch.no_grad():
+            alphas, token_lens = strategy._model.predict_weights(enc, lens)
+            u_max = int(token_lens.max())
+            width = strategy._graphs.token_bucket(u_max + 1)  # strictly wider
+            exact = strategy._decode_tokens(enc, lens, alphas, token_lens, u_max)
+            rounded = strategy._decode_tokens(enc, lens, alphas, token_lens, width)
+        assert rounded[0].shape[1] == width > u_max
+        assert torch.equal(rounded[2], exact[2])  # fires do not depend on the width
+        for b, n in enumerate(token_lens.tolist()):
+            assert torch.equal(rounded[1][b, :n], exact[1][b, :n])
+
+    def test_the_engine_decodes_through_the_graphs(self, engine, wav):
+        """``TestEngineE2E`` checks the transcript against FunASR with graphs on;
+        this checks they were on, and that the activity pass reads the replayed
+        weights."""
+        graphs = engine._output_processor.strategy._graphs
+        hits = graphs.hits
+        rid = engine.add_request(wav, streaming=False, decoding={"vad_events": True})
+        out = None
+        while out is None:
+            out = next((o for o in engine.step() if o.request_id == rid and o.finished), None)
+        assert graphs.hits >= hits + 2  # the weights and the decode both replayed
+        assert out.segments, "speech activity from the replayed CIF weights"
 
 
 class TestFsmnDepthwiseFusion:

@@ -3,12 +3,17 @@
 """Paraformer non-autoregressive decode strategy.
 
 Consumes raw encoder hidden states (``consumes="hidden"``) and drives the
-model's CIF predictor + NAR decoder: ``model.predict`` integrates encoder
-frames into per-token acoustic embeddings (plus token counts and CIF fire
-positions), ``model.nar_decode`` produces ``(B, U, V)`` log-probs in **one
-parallel pass**, and the transcript is the per-position argmax — no
-autoregressive loop, so the ordinary one-shot offline path fits unchanged
-(mirroring the FunASR greedy inference exactly).
+model's CIF predictor + NAR decoder: ``model.predict_weights`` gives the per-frame
+token weights and per-row token counts, ``model.integrate`` turns encoder frames
+into per-token acoustic embeddings (plus CIF fire positions),
+``model.nar_decode`` produces ``(B, U, V)`` log-probs in **one parallel pass**,
+and the transcript is the per-position argmax — no autoregressive loop, so the
+ordinary one-shot offline path fits unchanged (mirroring the FunASR greedy
+inference exactly).
+
+On CUDA with offline graphs on, both halves replay as CUDA graphs
+(:mod:`oasr.engine.nar_graph`): the weights keyed by the batch's shape, the rest
+by that and the token width, which the counts read back in between decide.
 
 The CIF fire positions double as a coarse token alignment: token *k* spans
 ``(fire[k-1], fire[k])`` encoder frames, converted to seconds via the LFR
@@ -21,10 +26,12 @@ streaming requests at admission, and the streaming session methods raise.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Protocol, Tuple, cast
 
 import torch
 
+from ..nar_graph import NarDecodeGraphs
+from ..offline_graph import resolve_batch_buckets
 from ..request import Request, RequestOutput
 from .alignment import wants_word_timings
 from .base import DecodeStrategy, register_decode_strategy, wants_speech_activity
@@ -34,6 +41,26 @@ if TYPE_CHECKING:
 
     from ..config import EngineConfig
     from .detokenize import Detokenizer
+
+
+class _Paraformer(Protocol):
+    """What this family calls on the model (``CAPABILITIES["paraformer"]``)."""
+
+    def predict_weights(
+        self, enc_out: torch.Tensor, enc_lens: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    def integrate(
+        self, enc_out: torch.Tensor, alphas: torch.Tensor, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    def nar_decode(
+        self,
+        enc_out: torch.Tensor,
+        enc_lens: torch.Tensor,
+        acoustic_embeds: torch.Tensor,
+        token_lens: torch.Tensor,
+    ) -> torch.Tensor: ...
 
 
 def _read_back(*tensors: torch.Tensor) -> List[torch.Tensor]:
@@ -87,6 +114,50 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         # ``oasr.models.interfaces.CAPABILITIES["paraformer"]``.
         mcfg = model.config
         self._filtered_ids = {int(mcfg.blank_id), int(mcfg.sos_id), int(mcfg.eos_id)}
+        self._graphs: Optional[NarDecodeGraphs] = self._build_graphs(config)
+
+    def _build_graphs(self, config: "EngineConfig") -> Optional[NarDecodeGraphs]:
+        """The capture cache, on the encoder cache's switches and bounds."""
+        if not (config.use_cuda_graphs and config.use_offline_cuda_graphs):
+            return None
+        device = torch.device(config.device)
+        if device.type != "cuda":
+            return None
+        return NarDecodeGraphs(
+            device=device,
+            weights_fn=self._nar.predict_weights,
+            decode_fn=self._decode_tokens,
+            batch_buckets=resolve_batch_buckets(config),
+            max_frames=config.offline_graph_max_frames,
+            max_captures=config.offline_graph_max_captures,
+            evict_lru=config.offline_graph_evict,
+        )
+
+    @property
+    def _nar(self) -> _Paraformer:
+        # ``nn.Module.__getattr__`` types every member as ``Tensor | Module``.
+        return cast(_Paraformer, self._model)
+
+    def _decode_tokens(
+        self,
+        enc_out: torch.Tensor,
+        enc_lens: torch.Tensor,
+        alphas: torch.Tensor,
+        token_lens: torch.Tensor,
+        num_tokens: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """CIF integration, the NAR pass and the greedy pick → ``(best_lp (B, U)
+        fp32, best_ids (B, U) int64, fires (B, T+1) fp32)``.
+
+        What the decode graph captures, and what an unserved shape runs eagerly.
+        The pick runs on the decoder's own dtype and widens only the winners: a
+        widening cast is exact and order-preserving, so this is the same pick as
+        widening the ``(B, U, V)`` log-probs first, without that copy.
+        """
+        acoustic_embeds, fires = self._nar.integrate(enc_out, alphas, num_tokens)
+        log_probs = self._nar.nar_decode(enc_out, enc_lens, acoustic_embeds, token_lens)
+        best_lp, best_ids = log_probs.max(dim=-1)
+        return best_lp.float(), best_ids, fires
 
     # ------------------------------------------------------------------
     # Offline
@@ -101,38 +172,50 @@ class ParaformerDecodeStrategy(DecodeStrategy):
     ) -> List[RequestOutput]:
         B = enc_out.size(0)
         want_activity = requests is not None and any(wants_speech_activity(r) for r in requests)
-        # ``predict`` returns three values, or four when asked for the CIF
-        # weights; indexing rather than unpacking keeps both arities readable to
-        # a checker that only sees the variadic return type.
-        predicted = self._model.predict(enc_out, enc_lengths, return_alphas=want_activity)
-        acoustic_embeds, token_lens, fires = predicted[0], predicted[1], predicted[2]
-        alphas = predicted[3] if want_activity else None
-        # ``acoustic_embeds`` has ``max(token_lens)`` rows (the predictor read
-        # that back to size it), so its width is the "any tokens?" answer and
-        # asking the device again was a second sync for the same number.
-        if acoustic_embeds.size(1) == 0:
+        graphs = self._graphs
+        stage = graphs.weights(enc_out, enc_lengths) if graphs is not None else None
+        if stage is not None:
+            alphas, token_lens = stage.alphas[:B], stage.token_lens[:B]
+        else:
+            alphas, token_lens = self._nar.predict_weights(enc_out, enc_lengths)
+        # The read-back between the halves: each row's token count, which sizes
+        # the decoder.  The predictor used to read only the maximum here and the
+        # counts again after the decoder; one vector now serves both.
+        (lens_cpu,) = _read_back(token_lens)
+        u_max = int(lens_cpu.max()) if B else 0
+        if want_activity and stage is not None:
+            # A replay buffer: the decode replay below may reuse its memory.
+            alphas = alphas.clone()
+        if u_max <= 0:
             empty = [self._empty_output() for _ in range(B)]
             # An utterance CIF found no tokens in is exactly the case a caller
             # asking for speech activity most wants an answer to, so the
             # activity pass still runs; it is the transcript that is empty, not
             # the audio's description of itself.
-            if alphas is not None:
+            if want_activity:
                 self._attach_alpha_activity(empty, alphas, enc_lengths, requests)
             return empty
 
-        log_probs = self._model.nar_decode(enc_out, enc_lengths, acoustic_embeds, token_lens)
-        # Greedy per position; per-row score = sum of best log-probs over the
-        # row's valid tokens (the FunASR greedy hypothesis score).
-        best_lp, best_ids = log_probs.float().max(dim=-1)  # (B, U)
-        # Four copies queued behind the decoder and one wait, not four waits.
-        # Synchronous on purpose: deferring this read-back and the per-row tail
-        # behind the next micro-batch's encoder (``decode_offline_async``)
-        # measured 4-7 % *slower* on a 256-request AISHELL backlog (1,834-1,839
-        # vs 1,974-1,980 req/s with it off), because the predictor's own
-        # read-back already serialises the issue against the encoder.
-        lp_cpu, ids_cpu, lens_cpu, fires_cpu = _read_back(best_lp, best_ids, token_lens, fires)
+        # Rounded on both paths when the cache exists, so a shape that falls
+        # back to eager decodes at the width its replay would have.
+        num_tokens = graphs.token_bucket(u_max) if graphs is not None else u_max
+        decoded = (
+            graphs.decode(stage, num_tokens) if graphs is not None and stage is not None else None
+        )
+        if decoded is None:
+            decoded = self._decode_tokens(enc_out, enc_lengths, alphas, token_lens, num_tokens)
+        # Three copies queued behind the decoder and one wait, not three waits.
+        # Synchronous on purpose, twice measured.  Eager, deferring this read-back
+        # and the host tail behind the next micro-batch's encoder
+        # (``decode_offline_async``) was 4-7 % slower on a 256-request AISHELL
+        # backlog (1,834-1,839 vs 1,974-1,980 req/s).  With both halves replayed
+        # it gained nothing (2,305-2,467 vs 2,354-2,454 req/s on 512, four
+        # interleaved rounds): the count read-back above waits for each batch's
+        # encoder, so the previous batch's host tail could only hide behind this
+        # batch's decoder replay, a few milliseconds of GPU work.
+        lp_cpu, ids_cpu, fires_cpu = _read_back(*decoded)
         outputs = self._outputs(B, lp_cpu, ids_cpu, lens_cpu, fires_cpu, requests)
-        if alphas is not None:
+        if want_activity:
             self._attach_alpha_activity(outputs, alphas, enc_lengths, requests)
         return outputs
 
