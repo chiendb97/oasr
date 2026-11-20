@@ -42,7 +42,7 @@ included, treats the result as an opaque `(B, chunk, C)` tensor.
 | `transducer` | `transducer.py` — `TransducerDecodeStrategy` | `hidden` | offline + streaming | One vectorized frame-sync loop; per-request sessions (label window + predictor projection + hypothesis) threaded across chunks. |
 | `ctc_aed_rescoring` | `rescoring.py` — `CtcAedRescoringStrategy` | `both` | offline | U2++: CTC n-best + one teacher-forced bitransformer pass + WeNet score fusion. Knobs: `rescoring_ctc_weight`, `rescoring_reverse_weight`. |
 | `aed` | `aed.py` — `AedDecodeStrategy` | `hidden` | offline | Incremental AR over the batched decoder protocol (Whisper). |
-| `paraformer` | `paraformer.py` — `ParaformerDecodeStrategy` | `hidden` | offline | One-shot NAR: `model.predict` (CIF) → `model.nar_decode` → argmax. CIF fire positions become `RequestOutput.timestamps`. |
+| `paraformer` | `paraformer.py` — `ParaformerDecodeStrategy` | `hidden` | offline | One-shot NAR: `model.predict_weights` (CIF weights and token counts) → `model.integrate` → `model.nar_decode` → argmax, each half a CUDA graph on CUDA (`oasr/engine/nar_graph.py`). CIF fire positions become `RequestOutput.timestamps`. |
 | `llm` | `llm.py` — `LlmDecodeStrategy` | `hidden` | offline | Speech-LLM. Encodes the checkpoint's ChatML template through the tokenizer axis, splices projected audio embeddings into a **left-padded** embedded prompt, and emits token-streaming partials. |
 
 The two incremental families share `decode/incremental.py::IncrementalArStrategy`,

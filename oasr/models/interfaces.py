@@ -139,7 +139,8 @@ CAPABILITIES: Dict[str, CapabilitySpec] = {
         capability="paraformer",
         requires=(
             "encode_offline",
-            "predict",
+            "predict_weights",
+            "integrate",
             "nar_decode",
             "config.blank_id",
             "config.sos_id",
