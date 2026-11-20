@@ -117,7 +117,7 @@ impl DispatcherShared {
     pub(crate) fn release_submitted(&self) {
         let _ = self
             .submitted
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     }
 
     pub(crate) fn new(label: String, model: Option<&ModelInfo>) -> Self {
