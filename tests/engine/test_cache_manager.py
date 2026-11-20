@@ -1151,6 +1151,44 @@ class TestSlotStateCache:
         assert cache.buffer_of("subsample.0")[0].abs().max() == 0
         assert cache.buffer_of("subsample.0")[2].abs().max() == 0
 
+    def test_a_cohort_allocation_zeroes_exactly_its_slots(self):
+        cache = self._cache()
+        for name in ("conv", "subsample.0"):
+            cache.buffer_of(name).fill_(5.0)
+        cache.allocate_streams([7, 9], [1, 3])
+        assert cache.slot_of(7) == 1 and cache.slot_of(9) == 3
+        conv = cache.buffer_of("conv")  # slot axis 1
+        sub = cache.buffer_of("subsample.0")  # slot axis 0
+        for slot in (1, 3):
+            assert conv[:, slot].abs().max() == 0 and sub[slot].abs().max() == 0
+        for slot in (0, 2):  # other tenants' state is left alone
+            assert (conv[:, slot] == 5.0).all() and (sub[slot] == 5.0).all()
+
+    def test_a_cohort_allocation_matches_one_at_a_time(self):
+        one, many = self._cache(), self._cache()
+        for name in ("conv", "subsample.0"):
+            stale = torch.randn_like(one.buffer_of(name))
+            one.buffer_of(name).copy_(stale)
+            many.buffer_of(name).copy_(stale)
+        one.allocate_stream(4, slot_id=2)
+        one.allocate_stream(5, slot_id=0)
+        many.allocate_streams([4, 5], [2, 0])
+        for name in ("conv", "subsample.0"):
+            assert torch.equal(one.buffer_of(name), many.buffer_of(name))
+
+    def test_a_cohort_allocation_refuses_a_bad_request_whole(self):
+        cache = self._cache()
+        cache.allocate_stream(1, slot_id=0)
+        with pytest.raises(ValueError):
+            cache.allocate_streams([2, 3], [1, 0])  # slot 0 is taken
+        with pytest.raises(ValueError):
+            cache.allocate_streams([2, 2], [1, 2])  # one stream twice
+        with pytest.raises(ValueError):
+            cache.allocate_streams([2], [9])  # out of range
+        # Nothing of a refused cohort was bound.
+        with pytest.raises(KeyError):
+            cache.slot_of(2)
+
     def test_allocation_zeroes_the_slot_because_zero_is_the_initial_state(self):
         """A zero left-context *is* the padding an offline pass applies, so a
         stream's first chunk must see zeros rather than the previous tenant's."""

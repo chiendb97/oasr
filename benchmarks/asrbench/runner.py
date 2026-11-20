@@ -33,6 +33,9 @@ from benchmarks.asrbench.metrics import direction, low_sample_percentiles, unit
 from benchmarks.asrbench.monitor import ResourceMonitor, summarize_window
 from benchmarks.asrbench.profiles import Profile
 from benchmarks.asrbench.results import (
+    FAILED,
+    OK,
+    REJECTED,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_UNSUPPORTED,
@@ -88,6 +91,25 @@ def _headline(r: BenchmarkResult) -> str:
     return "  ".join(parts) or "ok"
 
 
+def _measured_nothing(records: List[Any]) -> Optional[str]:
+    """Why a point's measured records support no number, or ``None``.
+
+    A point whose every request failed, or whose window held no request at all,
+    used to report status ``ok``: the 512-session streaming point had 100 %
+    errors, ``ok`` and exit code 0, and a duration-bounded open-loop point whose
+    arrivals were all warm-up reported ``ok`` with zero requests.  Those are
+    failures of the point, so ``run`` exits non-zero and ``compare`` refuses them.
+    """
+    if not records:
+        return "no request was measured: every arrival fell in the warm-up, or none was sent"
+    statuses = [getattr(r, "status", OK) for r in records]
+    if any(s == OK for s in statuses):
+        return None
+    failed = sum(1 for s in statuses if s == FAILED)
+    rejected = sum(1 for s in statuses if s == REJECTED)
+    return f"every measured request failed ({failed} failed, {rejected} rejected)"
+
+
 async def _run_point(
     bench: Benchmark,
     point: Dict[str, Any],
@@ -104,6 +126,9 @@ async def _run_point(
         records = await bench.measure(ctx, point, result)
         await ctx.backend.synchronize()
         result.summary = bench.summarize(records, result)
+        empty = _measured_nothing(records)
+        if empty:
+            result.status, result.reason = STATUS_FAILED, empty
     except backends.Unsupported as exc:
         result.status, result.reason = STATUS_UNSUPPORTED, str(exc)
     except Exception as exc:  # noqa: BLE001 -- record and carry on with the next point

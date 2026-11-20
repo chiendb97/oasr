@@ -106,6 +106,8 @@ class ModelRunner:
                     frame_granularity=granularity,
                     max_frames=max(config.offline_graph_max_frames, int(fixed) if fixed else 0),
                     max_captures=config.offline_graph_max_captures,
+                    capture_after=config.offline_graph_capture_after,
+                    evict_lru=config.offline_graph_evict,
                 )
 
     # ------------------------------------------------------------------
@@ -251,6 +253,38 @@ class ModelRunner:
         """
         return self._offline(ENCODE, self._model.encode_offline, features, lengths, conditioning)
 
+    def prewarm_offline_graphs(
+        self,
+        batch_sizes: Sequence[int],
+        max_frames: int,
+        feat_dim: int,
+        dtype: torch.dtype,
+        encoder_only: bool,
+    ) -> int:
+        """Capture ``batch_sizes`` x every frame bucket up to ``max_frames`` ahead of traffic.
+
+        Longest first, so each capture can reuse what the wider one before it
+        left in the shared pool.  Returns the number of shapes captured.  A
+        fixed-window frontend has one frame width, so only that is captured.
+        """
+        cache = self._offline_graphs
+        if cache is None or not cache.enabled:
+            return 0
+        fixed = getattr(getattr(self._config, "feature_config", None), "fixed_window_frames", None)
+        if fixed:
+            widths = [int(fixed)]
+        else:
+            top = cache.frame_bucket(int(max_frames))
+            step = cache.frame_bucket(1)
+            widths = list(range(top, 0, -step))
+        shapes = [(int(b), t) for t in widths for b in sorted(set(batch_sizes), reverse=True)]
+        name, fn = (
+            (ENCODE, self._model.encode_offline)
+            if encoder_only
+            else (FUSED, self._model.forward_offline)
+        )
+        return cache.prewarm(name, fn, int(feat_dim), dtype, shapes)
+
     def encoder_conditioning(
         self, requests: Sequence[Request], device: torch.device
     ) -> Optional[Dict[str, torch.Tensor]]:
@@ -292,6 +326,10 @@ class ModelRunner:
     def allocate_stream(self, request: Request) -> Optional[StreamContext]:
         """Allocate the per-request encoder cache for a streaming request."""
         return self._streaming_backend.allocate(request)
+
+    def allocate_streams(self, requests: Sequence[Request]) -> None:
+        """Allocate the encoder caches of a cohort admitted in one tick."""
+        self._streaming_backend.allocate_many(requests)
 
     def free_stream(self, request: Request) -> None:
         """Release the per-request encoder cache for a finished request."""

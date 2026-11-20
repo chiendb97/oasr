@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
+from oasr.utils.staging import to_device
+
 from ..request import DecodingOptions, Request
 from .alignment import TokenAlignment
 from .attention_align import resolve_alignment_heads, token_frame_spans
@@ -120,13 +122,16 @@ class AedDecodeStrategy(IncrementalArStrategy):
         del enc_lengths  # Whisper: fixed-window encoder output, no padding mask
         device = enc_out.device
         rows = [self._prompt_for(r) for r in requests]
+        # Staged through pinned memory: a pageable ``torch.tensor(..., device=)``
+        # synchronises the stream, so the host waited here for the encoder it had
+        # just queued -- 23 % of Whisper-tiny's host samples at batch 64.
         if all(row is self._prompt for row in rows):
             # The common case — no request overrode task or language — stays a
             # single expand rather than a per-row stack.
-            prompt = torch.tensor(self._prompt, dtype=torch.long, device=device)
+            prompt = to_device(self._prompt, dtype=torch.long, device=device)
             prompt_ids = prompt.unsqueeze(0).expand(enc_out.size(0), -1).contiguous()
         else:
-            prompt_ids = torch.tensor(rows, dtype=torch.long, device=device)
+            prompt_ids = to_device(rows, dtype=torch.long, device=device)
         max_new = [self._row_cap(r, self._cap) for r in requests]
         # Only a row that asked pays for the extra slice, and only a checkpoint
         # with the token has the signal.

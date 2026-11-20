@@ -27,8 +27,12 @@ in known steps.  Offline has neither property, so the naive key ``(B, T)`` looks
 unbounded on both axes.  Measured on 200 mixed-length utterances at
 ``max_batch_size=32``, it is not: **3 captured shapes, 2 distinct B and 2
 distinct T.**  The scheduler length-sorts and bucket-fills before the forward
-ever sees a batch, so a micro-batch's maximum length is highly repetitive, and
-``max_captures=64`` is ~20x more headroom than the traffic asks for.
+ever sees a batch, so a micro-batch's maximum length is highly repetitive.  That
+holds for one backlog, not for a server: single requests, a backlog and closed-loop
+clients at 1/4/16 on LibriSpeech test-clean together touched 63 keys of the 448
+the default ladder allows, and a cap of 64 then sent every later small batch eager
+(U2++ at 4 clients: 323 req/s at cap 64, 1,026 at 512).  The engine therefore caps
+at 512 and evicts the least recently replayed capture when full.
 
 That reframes the three levers, two of them against expectation:
 
@@ -131,6 +135,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -144,6 +150,9 @@ if TYPE_CHECKING:
     from .config import EngineConfig
 
 logger = logging.getLogger(__name__)
+
+#: Seconds after which a shape refused for memory is measured again.
+BUDGET_RETRY_S = 60.0
 
 #: Time-axis bucket granularity, matching the FMHA ``N_BLOCK`` tile that the
 #: streaming cache already rounds its cache length to.
@@ -200,6 +209,8 @@ class _Captured:
     lengths: torch.Tensor  # (B_bucket,)
     out: torch.Tensor  # (B_bucket, T_out, V|D)
     out_lengths: torch.Tensor  # (B_bucket,)
+    #: What this capture added to the pool, as measured; returned on eviction.
+    nbytes: int = 0
 
 
 class GraphedOfflineForward:
@@ -224,8 +235,19 @@ class GraphedOfflineForward:
         is genuinely busy (so there is little host overhead left to remove).
     max_captures : int
         Cap on the *number* of live captures.  Once saturated, new shapes run
-        eager and are counted.  Bytes are bounded separately (see
-        ``eager_reserve_factor``).
+        eager and are counted, unless ``evict_lru`` is on.  Bytes are bounded
+        separately (see ``eager_reserve_factor``).
+    capture_after : int
+        Capture a key only on its ``capture_after``-th occurrence; earlier ones
+        run eager and are counted under ``fallback_cold``.  ``1`` captures on
+        first sight, and is what the engine uses: deferring measured worse,
+        because a key that recurs is captured anyway, one live request later.
+    evict_lru : bool
+        When the cache is full, release the least recently replayed capture
+        instead of refusing the new key for the life of the process.  A cache
+        that only refuses ends up holding whatever shapes the first minutes of
+        traffic brought (a benchmark's backlog phase, a burst of wide batches)
+        and serves every later small batch eager, 4-7x slower.
     eager_reserve_factor : float
         A capture is kept only if the device still has this many times the
         largest measured forward free afterwards.  Below that, the shape runs
@@ -244,6 +266,8 @@ class GraphedOfflineForward:
         frame_granularity: int = DEFAULT_FRAME_GRANULARITY,
         max_frames: int = 4096,
         max_captures: int = 64,
+        capture_after: int = 1,
+        evict_lru: bool = False,
         max_capture_failures: int = 1,
         eager_reserve_factor: float = ACTIVATION_SAFETY,
         pool: Optional[Tuple[int, int]] = None,
@@ -253,6 +277,10 @@ class GraphedOfflineForward:
         self._granularity = max(1, int(frame_granularity))
         self._max_frames = int(max_frames)
         self._max_captures = int(max_captures)
+        self._capture_after = max(1, int(capture_after))
+        self._evict_lru = bool(evict_lru)
+        #: Occurrences of keys not (yet) captured, for ``capture_after``.
+        self._seen: Dict[Tuple[str, int, int], int] = {}
         self._max_capture_failures = max(1, int(max_capture_failures))
         self._eager_reserve_factor = float(eager_reserve_factor)
         #: Largest number of bytes any measured warm-up forward took from the
@@ -260,7 +288,7 @@ class GraphedOfflineForward:
         self._largest_forward_bytes = 0
         #: Per forward name, the ``(B, T)`` shapes refused for memory.  A shape at
         #: least as wide and as long as one of these needs at least as much.
-        self._over_budget: Dict[str, List[Tuple[int, int]]] = {}
+        self._over_budget: Dict[str, List[Tuple[int, int, float]]] = {}
         self._logged_budget = False
         self._enabled = device.type == "cuda" and bool(self._buckets)
         # One pool for this cache, shared across its shape buckets -- that is
@@ -269,7 +297,8 @@ class GraphedOfflineForward:
         self._pool: Optional[Tuple[int, int]] = pool
         if self._enabled and self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
-        self._captured: Dict[Tuple[str, int, int], _Captured] = {}
+        #: Live captures in least-recently-replayed-first order (``evict_lru``).
+        self._captured: "OrderedDict[Tuple[str, int, int], _Captured]" = OrderedDict()
         self._failed: Set[Tuple[str, int, int]] = set()
         #: Per forward name: has a cheap B=1 capture of it ever succeeded?
         self._probed: Dict[str, bool] = {}
@@ -288,6 +317,8 @@ class GraphedOfflineForward:
         self.fallback_failed = 0  # this shape is not capturable
         self.fallback_disabled = 0  # capture is off for this engine (OOM / uncapturable)
         self.fallback_budget = 0  # capturing this shape would starve the eager forwards
+        self.fallback_cold = 0  # seen fewer than ``capture_after`` times so far
+        self.evictions = 0  # captures released to make room (``evict_lru``)
         #: Bytes the live captures added to the graph pool, as measured.
         self.pool_bytes = 0
         self._useful_frames = 0
@@ -369,6 +400,7 @@ class GraphedOfflineForward:
         self._release_captures()
         self._failed.clear()
         self._over_budget.clear()
+        self._seen.clear()
 
     def _release_captures(self) -> int:
         """Reset every live capture and return how many there were."""
@@ -393,6 +425,8 @@ class GraphedOfflineForward:
             "fallback_failed": float(self.fallback_failed),
             "fallback_disabled": float(self.fallback_disabled),
             "fallback_budget": float(self.fallback_budget),
+            "fallback_cold": float(self.fallback_cold),
+            "evictions": float(self.evictions),
             "capture_failures": float(self.capture_failures),
             "pool_gib": self.pool_bytes / float(1024**3),
             "largest_forward_gib": self._largest_forward_bytes / float(1024**3),
@@ -501,7 +535,12 @@ class GraphedOfflineForward:
             if self._is_over_budget(key):
                 self.fallback_budget += 1
                 return None
-            if len(self._captured) >= self._max_captures:
+            seen = self._seen.get(key, 0) + 1
+            if seen < self._capture_after:
+                self._seen[key] = seen
+                self.fallback_cold += 1
+                return None
+            if len(self._captured) >= self._max_captures and not self._evict_one():
                 self.fallback_saturated += 1
                 if not self._refused:
                     self._refused = True
@@ -510,6 +549,7 @@ class GraphedOfflineForward:
                         self._max_captures,
                     )
                 return None
+            self._seen.pop(key, None)
             if not self._capturable(name, fn, features, lengths, t_bucket):
                 self.fallback_failed += 1
                 return None
@@ -521,6 +561,8 @@ class GraphedOfflineForward:
                     self.fallback_failed += 1
                 return None
             self._captured[key] = state
+        else:
+            self._captured.move_to_end(key)
 
         # Refill the static inputs.  Everything outside the live window is
         # zeroed: a padded row is not merely discarded output, because a stale
@@ -716,7 +758,28 @@ class GraphedOfflineForward:
             lengths=lens_buf,
             out=out,
             out_lengths=out_lengths,
+            nbytes=grown,
         )
+
+    def _evict_one(self) -> bool:
+        """Release the least recently replayed capture; ``False`` if eviction is off.
+
+        ``CUDAGraph.reset`` hands the capture's blocks back to the shared pool,
+        where the next capture can reuse them; the pool itself is not returned to
+        the driver, so ``pool_bytes`` is an upper bound on what the pool holds
+        rather than what a new capture will add.
+        """
+        if not self._evict_lru or not self._captured:
+            return False
+        key, state = self._captured.popitem(last=False)
+        try:
+            state.graph.reset()
+        except Exception:  # pragma: no cover - teardown must not raise
+            logger.debug("offline graph reset failed during eviction", exc_info=True)
+        self.pool_bytes = max(0, self.pool_bytes - int(state.nbytes))
+        self.evictions += 1
+        logger.debug("evicted offline forward graph %s B=%d T=%d", *key)
+        return True
 
     def _record(
         self, fn: ForwardFn, features: torch.Tensor, lengths: torch.Tensor
@@ -810,7 +873,7 @@ class GraphedOfflineForward:
         free, _ = read_device_memory(self._device)
         if free - need >= reserve:
             return True
-        self._over_budget.setdefault(name, []).append((b_bucket, t_bucket))
+        self._over_budget.setdefault(name, []).append((b_bucket, t_bucket, time.monotonic()))
         log = logger.debug if self._logged_budget else logger.info
         self._logged_budget = True
         gib = float(1024**3)
@@ -837,7 +900,18 @@ class GraphedOfflineForward:
         that would otherwise be spent finding out.
         """
         name, b_bucket, t_bucket = key
-        return any(b_bucket >= b and t_bucket >= t for b, t in self._over_budget.get(name, ()))
+        refused = self._over_budget.get(name)
+        if not refused:
+            return False
+        # Memory changes: another tenant leaves, a burst's allocations are
+        # freed.  A refusal is a fact about that moment, so it expires and the
+        # shape is measured again rather than running eager for good -- an
+        # engine that started next to a full GPU otherwise never captured.
+        now = time.monotonic()
+        live = [r for r in refused if now - r[2] < BUDGET_RETRY_S]
+        if len(live) != len(refused):
+            self._over_budget[name] = live
+        return any(b_bucket >= b and t_bucket >= t for b, t, _ in live)
 
     # ------------------------------------------------------------------
     # Pre-warm

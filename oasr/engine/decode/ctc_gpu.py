@@ -51,6 +51,35 @@ def _declare_cap(out: RequestOutput, best: List[int], cap: Optional[int]) -> Req
     return out
 
 
+def stack_rows(rows: List[torch.Tensor]) -> torch.Tensor:
+    """``torch.cat(rows, 0)`` for one-row tensors, as a view when it can be one.
+
+    The streaming backend hands each stream a one-row slice of one batched
+    encoder output, and decoding concatenated them straight back -- a copy of
+    the whole ``(B, T, V)`` log-probs and a launch per tick.  When the rows are
+    consecutive rows of one contiguous tensor, in order, the batch already
+    exists and this returns a view of it; anything else is concatenated.
+    """
+    first = rows[0]
+    n = len(rows)
+    if n == 1:
+        return first
+    if first.dim() >= 1 and first.size(0) == 1 and first.is_contiguous():
+        step = first.stride(0) * first.element_size()
+        base = first.data_ptr()
+        storage = first.untyped_storage().data_ptr()
+        if all(
+            r.shape == first.shape
+            and r.stride() == first.stride()
+            and r.dtype == first.dtype
+            and r.untyped_storage().data_ptr() == storage
+            and r.data_ptr() == base + k * step
+            for k, r in enumerate(rows)
+        ):
+            return first.as_strided((n, *first.shape[1:]), first.stride())
+    return torch.cat(rows, dim=0)
+
+
 @dataclass(frozen=True)
 class CtcGpuOptions:
     """Options for ``decoder_type="ctc_cuda"``.
@@ -306,7 +335,7 @@ class CtcGpuDecodeStrategy(DecodeStrategy):
         ordered_reqs: List[Request] = []
         ordered_states = []
         for t_chunk, reqs in groups.items():
-            log_probs_batch = torch.cat(group_logp[t_chunk], dim=0)
+            log_probs_batch = stack_rows(group_logp[t_chunk])
             states = ctc_mgr.get_states([r.stream_id for r in reqs])  # type: ignore[arg-type]
             decoder.decode_chunk_batch(log_probs_batch, states)
             ordered_reqs.extend(reqs)

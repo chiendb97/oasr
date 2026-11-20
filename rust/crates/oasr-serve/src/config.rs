@@ -353,6 +353,15 @@ pub struct Cli {
     pub listen_backlog: u32,
     #[arg(long, default_value_t = 256)]
     pub max_concurrent_requests: u32,
+    /// Streaming: live streams one engine worker holds beyond its slots
+    /// (`--max-batch-size`) before it refuses new ones with `RESOURCE_EXHAUSTED`
+    /// (HTTP 503).  A stream past the slots waits for one to free, and live audio
+    /// does not wait: measured with 512 sessions on a 256-slot pool, the overflow
+    /// saw its first partial after 3.9 s (p50) and nothing told the client why.
+    /// A refusal lets a load balancer place the stream elsewhere.  The effective
+    /// cap is `min(--max-concurrent-requests, slots + this)`; inert offline.
+    #[arg(long, default_value_t = 16)]
+    pub max_waiting_streams: u32,
     /// Largest audio payload one request may carry, in MiB.  Drives **both**
     /// the HTTP body cap and the gRPC `max_decoding_message_size`, because
     /// tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same
@@ -435,6 +444,12 @@ pub struct Cli {
     /// `asyncio.gather` HTTP bursts without a measurable p50 hit.
     #[arg(long, default_value_t = 3)]
     pub admit_window_ms: u64,
+    /// Close the admission window once no admission has arrived for this many
+    /// microseconds, so a lone request pays this gap rather than the whole
+    /// window while a burst still coalesces.  ``0`` keeps the full window
+    /// (the behaviour before this flag).  Default 500 µs.
+    #[arg(long, default_value_t = 500)]
+    pub admit_gap_us: u64,
     /// Coalescing target — stop waiting early once this many envelopes
     /// have been drained.  Default 64 (matches the typical max_batch_size).
     #[arg(long, default_value_t = 64)]
@@ -476,6 +491,19 @@ impl Cli {
         match self.max_concurrent_decodes {
             Some(n) => DecodePool::new(n as usize),
             None => DecodePool::per_cpu(),
+        }
+    }
+
+    /// One worker's admission cap: `--max-concurrent-requests`, and in
+    /// streaming mode no more than the worker's slots plus
+    /// `--max-waiting-streams`.  `slots` is the engine's `max_batch_size`, which
+    /// is `None` only when the engine did not report one.
+    pub fn admission_cap(&self, streaming: bool, slots: Option<u32>) -> u32 {
+        match (streaming, slots) {
+            (true, Some(slots)) => self
+                .max_concurrent_requests
+                .min(slots.saturating_add(self.max_waiting_streams)),
+            _ => self.max_concurrent_requests,
         }
     }
 
@@ -822,6 +850,20 @@ mod tests {
     /// undeclared 4 MiB default against HTTP's explicit 256 MiB — so the same
     /// audio was accepted on one and rejected on the other, on the surface the
     /// docs recommend for offline throughput.
+    #[test]
+    fn a_streaming_worker_refuses_past_its_slots_and_a_short_queue() {
+        let c = cli(&[]);
+        assert_eq!(c.admission_cap(true, Some(32)), 48);
+        // The request cap still binds when it is the lower one.
+        assert_eq!(c.admission_cap(true, Some(1024)), 256);
+        // Offline batches whatever is queued; an unreported slot count is not
+        // guessed at.
+        assert_eq!(c.admission_cap(false, Some(32)), 256);
+        assert_eq!(c.admission_cap(true, None), 256);
+        let wide = cli(&["--max-waiting-streams", "4096"]);
+        assert_eq!(wide.admission_cap(true, Some(32)), 256);
+    }
+
     #[test]
     fn the_audio_cap_is_one_number_for_both_front_ends() {
         assert_eq!(cli(&[]).max_audio_bytes(), 256 * 1024 * 1024);

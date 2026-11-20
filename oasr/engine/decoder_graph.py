@@ -65,7 +65,7 @@ Correctness notes
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
 import torch
@@ -132,6 +132,28 @@ class _Captured:
     #: decoder pages one (an AED); ``None`` for a decoder-only LM.
     cross_lens: Optional[torch.Tensor] = None
     cross_table: Optional[torch.Tensor] = None
+    #: What each buffer was last filled from, as ``(tensor, _version)``.  The
+    #: tables are rebuilt only when a page is added (``block_table`` memoises
+    #: them) and the cross side not at all within a group, so most steps refilled
+    #: them with what they already held: two to six launches a step for nothing.
+    filled: Dict[str, Tuple[torch.Tensor, int]] = field(default_factory=dict)
+
+
+def _refill(captured: "_Captured", name: str, dst: torch.Tensor, src: torch.Tensor, fill) -> None:
+    """``fill(dst, src)`` unless ``dst`` already holds this ``src`` unchanged.
+
+    The source is held by reference, so its identity cannot be reused by a later
+    tensor, and its ``_version`` catches an in-place write.
+    """
+    seen = captured.filled.get(name)
+    if seen is not None and seen[0] is src and seen[1] == src._version:
+        return
+    fill(dst, src)
+    captured.filled[name] = (src, src._version)
+
+
+def _copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    dst.copy_(src)
 
 
 _Key = Tuple[int, int, int]
@@ -273,11 +295,11 @@ class DecoderStepGraphCache:
         captured.lens.copy_(kv.lens)
         if captured.starts is not None and kv.starts is not None:
             captured.starts.copy_(kv.starts)
-        self._fill_table(captured.table, table)
+        _refill(captured, "table", captured.table, table, self._fill_table)
         if cross is not None and cross_table is not None:
             assert captured.cross_lens is not None and captured.cross_table is not None
-            captured.cross_lens.copy_(cross.lens)
-            self._fill_table(captured.cross_table, cross_table)
+            _refill(captured, "cross_lens", captured.cross_lens, cross.lens, _copy)
+            _refill(captured, "cross_table", captured.cross_table, cross_table, self._fill_table)
         captured.graph.replay()
         # The buffer is live only until the next replay of this key.
         return captured.logits.clone()

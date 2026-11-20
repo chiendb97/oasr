@@ -54,6 +54,25 @@ def _no_conditioning(options: object) -> Dict[str, float]:
     return {}
 
 
+def resolve_batch_widths(ladder: Optional[Sequence[int]], pad: bool, cap: int) -> List[int]:
+    """The cohort widths a paged forward runs at, ascending, ``cap`` always last.
+
+    An explicit ``ladder`` wins; with the padding lane a cohort runs at the
+    smallest power of two that holds it; without it every width ``1..cap`` is a
+    width.  One definition, because the engine prices the pre-warm's graph
+    memory from these widths before the backend exists.
+    """
+    if ladder:
+        return sorted({int(b) for b in ladder if 1 <= int(b) <= cap} | {cap})
+    if not pad:
+        return list(range(1, cap + 1))
+    widths, b = [], 1
+    while b < cap:
+        widths.append(b)
+        b *= 2
+    return widths + [cap]
+
+
 @register_streaming_backend("paged")
 class PagedStreamingBackend(StreamingEncoderBackend):
     """Paged-KV + slot-CNN streaming runtime with CUDA-graph capture.
@@ -245,16 +264,9 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         it, so these are exactly the widths the graph cache needs.  Without it,
         every width ``1..cap`` is a width.
         """
-        ladder = getattr(config, "streaming_graph_batch_ladder", None)
-        if ladder:
-            return sorted({int(b) for b in ladder if 1 <= int(b) <= cap} | {cap})
-        if not self._pad_batch:
-            return list(range(1, cap + 1))
-        widths, b = [], 1
-        while b < cap:
-            widths.append(b)
-            b *= 2
-        return widths + [cap]
+        return resolve_batch_widths(
+            getattr(config, "streaming_graph_batch_ladder", None), self._pad_batch, cap
+        )
 
     @property
     def graph_batch_widths(self) -> Sequence[int]:
@@ -379,6 +391,10 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         if self._graph_cache is not None:
             self._graph_cache.release()
 
+    def set_capture_floor(self, nbytes: int) -> None:
+        if self._graph_cache is not None:
+            self._graph_cache.min_free_bytes = max(0, int(nbytes))
+
     def prewarm(
         self,
         batch_sizes: Sequence[int],
@@ -441,10 +457,15 @@ class PagedStreamingBackend(StreamingEncoderBackend):
         feat_dim = self._config.feature_config.output_dim
         dtype = self._cache_config.dtype
 
-        for B in seen:
+        # Widest and longest first.  The captures share one pool, and a capture
+        # carves its intermediates out of what earlier ones freed: narrow-first,
+        # every wider capture found only smaller blocks and grew the pool by its
+        # whole transient, so the pool held the *sum* of the intermediates
+        # instead of their maximum.
+        for B in reversed(seen):
             slot_ids = torch.arange(B, dtype=torch.long, device=device)
             xs = torch.zeros(B, window, feat_dim, dtype=dtype, device=device)
-            for bucket in buckets:
+            for bucket in reversed(buckets):
                 # Zero, not ``bucket``.  These dummy slots report
                 # ``cache_seqlens = 0``, and the encoder derives its positional
                 # index from ``offset - cache_seqlens``; passing ``bucket`` there

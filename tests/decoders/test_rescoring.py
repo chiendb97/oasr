@@ -455,3 +455,24 @@ class TestHypothesisPadding:
             SimpleNamespace(token_ids=None), hyps, 1, 3, torch.device("cpu")
         )
         assert torch.equal(got, self._reference(hyps, 3))
+
+
+class TestMemoryProjectedOncePerUtterance:
+    """The beam shares one utterance's memory: its cross-attention K/V are
+    projected once and repeated, not projected for every hypothesis."""
+
+    def test_repeating_the_projection_equals_projecting_the_repeat(self):
+        decoder, cfg = _tiny_decoder(seed=4)
+        torch.manual_seed(5)
+        B, beam, T, L = 3, 4, 11, 6
+        memory = torch.randn(B, T, cfg.encoder_output_size)
+        lens = torch.tensor([11, 7, 3])
+        ys = torch.randint(0, cfg.vocab_size - 1, (B * beam, L))
+        ys_lens = torch.randint(1, L + 1, (B * beam,))
+        with torch.no_grad():
+            want_l, want_r = decoder(
+                memory.repeat_interleave(beam, 0), lens.repeat_interleave(beam, 0), ys, ys_lens, ys
+            )
+            got_l, got_r = decoder(memory, lens, ys, ys_lens, ys, memory_repeats=beam)
+        torch.testing.assert_close(got_l, want_l, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(got_r, want_r, rtol=1e-5, atol=1e-5)

@@ -36,6 +36,19 @@ if TYPE_CHECKING:
     from .detokenize import Detokenizer
 
 
+def _read_back(*tensors: torch.Tensor) -> List[torch.Tensor]:
+    """Host copies of ``tensors``: queued together, then one stream sync.
+
+    A device-to-host ``non_blocking`` copy lands in pinned memory and is safe to
+    read once the stream has passed it; CPU tensors are returned as they are.
+    """
+    if not any(t.is_cuda for t in tensors):
+        return list(tensors)
+    copies = [t.to("cpu", non_blocking=True) for t in tensors]
+    torch.cuda.current_stream(tensors[0].device).synchronize()
+    return copies
+
+
 @register_decode_strategy("paraformer")
 class ParaformerDecodeStrategy(DecodeStrategy):
     """One-shot NAR decoding over encoder hidden states (offline only)."""
@@ -94,7 +107,10 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         predicted = self._model.predict(enc_out, enc_lengths, return_alphas=want_activity)
         acoustic_embeds, token_lens, fires = predicted[0], predicted[1], predicted[2]
         alphas = predicted[3] if want_activity else None
-        if acoustic_embeds.size(1) == 0 or int(token_lens.max().item()) < 1:
+        # ``acoustic_embeds`` has ``max(token_lens)`` rows (the predictor read
+        # that back to size it), so its width is the "any tokens?" answer and
+        # asking the device again was a second sync for the same number.
+        if acoustic_embeds.size(1) == 0:
             empty = [self._empty_output() for _ in range(B)]
             # An utterance CIF found no tokens in is exactly the case a caller
             # asking for speech activity most wants an answer to, so the
@@ -108,19 +124,41 @@ class ParaformerDecodeStrategy(DecodeStrategy):
         # Greedy per position; per-row score = sum of best log-probs over the
         # row's valid tokens (the FunASR greedy hypothesis score).
         best_lp, best_ids = log_probs.float().max(dim=-1)  # (B, U)
+        # Four copies queued behind the decoder and one wait, not four waits.
+        # Synchronous on purpose: deferring this read-back and the per-row tail
+        # behind the next micro-batch's encoder (``decode_offline_async``)
+        # measured 4-7 % *slower* on a 256-request AISHELL backlog (1,834-1,839
+        # vs 1,974-1,980 req/s with it off), because the predictor's own
+        # read-back already serialises the issue against the encoder.
+        lp_cpu, ids_cpu, lens_cpu, fires_cpu = _read_back(best_lp, best_ids, token_lens, fires)
+        outputs = self._outputs(B, lp_cpu, ids_cpu, lens_cpu, fires_cpu, requests)
+        if alphas is not None:
+            self._attach_alpha_activity(outputs, alphas, enc_lengths, requests)
+        return outputs
 
-        # One list conversion per tensor for the whole micro-batch, then plain
-        # list work per row. A per-row ``.item()`` / ``.tolist()`` and a
-        # per-token loop that built a ``TokenAlignment`` each were half of a
-        # post-processing tail that was a quarter of the offline wall at batch
-        # 64 (audit L7). The only per-row tensor ops left are the score's sum and
-        # the confidences' ``exp``. They run on the same ``[:n]`` slice as
-        # before, so both are bit-identical: a whole-batch ``exp`` may split
-        # vector and scalar lanes differently.
-        lp_cpu = best_lp.cpu()
-        ids_rows = best_ids.cpu().tolist()
-        lens = token_lens.cpu().tolist()
-        fire_rows = self._fire_frames(fires.cpu(), B)
+    def _outputs(
+        self,
+        B: int,
+        lp_cpu: torch.Tensor,
+        ids_cpu: torch.Tensor,
+        lens_cpu: torch.Tensor,
+        fires_cpu: torch.Tensor,
+        requests: Optional[List[Request]],
+    ) -> List[RequestOutput]:
+        """Per-row outputs from the host copies of one decode.
+
+        One list conversion per tensor for the whole micro-batch, then plain
+        list work per row. A per-row ``.item()`` / ``.tolist()`` and a per-token
+        loop that built a ``TokenAlignment`` each were half of a post-processing
+        tail that was a quarter of the offline wall at batch 64 (audit L7). The
+        only per-row tensor ops left are the score's sum and the confidences'
+        ``exp``. They run on the same ``[:n]`` slice as before, so both are
+        bit-identical: a whole-batch ``exp`` may split vector and scalar lanes
+        differently.
+        """
+        ids_rows = ids_cpu.tolist()
+        lens = lens_cpu.tolist()
+        fire_rows = self._fire_frames(fires_cpu, B)
         filtered = self._filtered_ids
 
         outputs: List[RequestOutput] = []
@@ -161,8 +199,6 @@ class ParaformerDecodeStrategy(DecodeStrategy):
                 words=requests is not None and wants_word_timings(requests[b]),
             )
             outputs.append(out)
-        if alphas is not None:
-            self._attach_alpha_activity(outputs, alphas, enc_lengths, requests)
         return outputs
 
     def _attach_alpha_activity(

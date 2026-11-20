@@ -339,7 +339,13 @@ prepare_offline                    prepare_streaming
 | `offline_graph_batch_buckets` | `None` | Batch widths to capture at. `None` takes `preferred_batch_size` when set, else powers of two up to `max_batch_size`. Set it *below* `max_batch_size` to exclude the widest batches, where capture is a small net loss. |
 | `offline_graph_frame_granularity` | `64` | Time-axis rounding, in feature frames. Overridden to `1` — exact, so no padding — for a fixed-window frontend. |
 | `offline_graph_max_frames` | `4096` | Refuse to capture past this padded width; longer requests run eager. |
-| `offline_graph_max_captures` | `64` | Live captures. Past this, new shapes run eager and are counted. This caps the count only. Bytes are bounded separately: a capture is kept only if the device still has `1.5 ×` the largest forward measured so far free afterwards ([§9.7](#9-performance-considerations)). |
+| `offline_graph_max_captures` | `512` | Live captures. Past this, a new shape evicts the least recently replayed capture (`offline_graph_evict`), or runs eager and is counted. At `64`, live traffic filled the cache with wide shapes within seconds and every lightly loaded batch afterwards ran eager: U2++ at 4 clients went from 323 to 1,106 req/s with 512 plus eviction. This caps the count only. Bytes are bounded separately: a capture is kept only if the device still has `1.5 ×` the largest forward measured so far free afterwards, and a shape refused for memory is asked again after 60 s ([§9.7](#9-performance-considerations)). |
+| `offline_graph_evict` | `True` | At the capture cap, evict the least recently replayed capture rather than leaving the new shape eager. |
+| `offline_graph_capture_after` | `1` | Capture a shape on its N-th sighting; earlier sightings run eager. `2` keeps one-off shapes out of the cache, but measured worse on live traffic (U2++ at 4 clients 676 vs 1,106 req/s). |
+| `offline_graph_prewarm_batches` | `None` | Batch widths to pre-capture at construction, at every frame bucket up to `offline_graph_prewarm_seconds` (default 35 s), widest first. |
+| `cuda_expandable_segments` | `True` | Set the caching allocator to expandable segments before the weights load, unless `PYTORCH_CUDA_ALLOC_CONF` already says. Measured peak reserved vs allocated fell from 30.4 to 20.5 GiB on Zipformer under mixed traffic, and capture refusals from 535 to 3. |
+| `torch_num_threads` | `None` | Intra-op CPU threads. `None` caps torch's default (one per core) at 8 unless `OMP_NUM_THREADS` is set: host-bound engines ran ~14× slower under host load with 64. |
+| `precompile_attention` | `True` | Compile, at construction, every CuTeDSL attention variant the tuning table can route the model's attention signatures to (and warm one decode for an incremental family), within `precompile_attention_budget_s` (120 s). A variant compiles in ~1.3 s on first use, which otherwise lands on a live request: Whisper-tiny's first request took 2.58 s instead of 17 ms. |
 | `long_form` | `False` | Fan a request longer than a fixed-window frontend's window out into consecutive windows, decode them through the normal batched path **in parallel**, and stitch one output. The caller sees one request id, so HTTP/gRPC need no change. Each window is at most the frontend's window long and is **cut in a pause**: the longest one the `energy` detector hears in the second half of the window (it has no weights, so nothing else needs configuring), or its quietest frame when it hears none. A pause longer than twice the `segment` preset's `speech_pad_ms` keeps that padding on each side and its middle is left out; nothing else is dropped, unlike `vad.mode="segment"`, which also leaves out what it reads as non-speech and supersedes this splitter when both are set. Cutting every 30 s wherever that fell started and ended windows in the middle of words, and Whisper answers such a window with a word or two: on 150 s recordings, Whisper large-v3 scored 9.4 % WER that way, against 1.8 % cut in pauses. `long_form_overlap_seconds` is deprecated and ignored, because the windows share no audio. |
 | `recycle_streaming_history` | `False` | At the streaming cache ceiling, recycle the oldest KV block instead of finalising the request with `finish_reason="length"`. |
 | `overlap_admit` | `False` | Offline only (`oasr-server --overlap-admit`): run each request's admission prep (waveform canonicalisation, frame-count stamp) on a daemon thread, so it overlaps `step()`. The caller gets its id back before the prep runs, so a prep failure comes back as an output with `error_stage="offline_prep"`, and `abort_request` also withdraws requests still being prepared. GIL-bound: it helps only with a deep admission backlog, and can cost a little at low concurrency. |
@@ -414,6 +420,24 @@ the engine will run (one chunk window at `max_batch_size` in streaming mode; the
 frontend's fixed window, else 30 s, in offline mode), floored at 256 MiB. The
 unspent `1 − utilization` is the headroom for what the probe cannot see: CUDA
 graph capture pools and allocator fragmentation.
+
+The streaming pre-warm's graph pool is not left to that headroom, because it
+grows with the slot count and the headroom does not: at `max_batch_size=512`
+U2++'s pre-warm needed 2.3 GiB, the derived pool left 0.6, a capture ran out of
+memory mid-way and the card ended full. Its graphs read the pool's addresses, so
+it cannot be measured before the pool exists; it is priced from the plan it will
+follow instead (`streaming_graph_reserve_bytes`): every capture keeps its input
+window and output alive (the probe's per-row I/O, times the widths it captures
+summed over the cache ladder of a stream at its block-table ceiling), plus two
+activation peaks (at least 768 MiB) of shared intermediates, and that is held
+back from the pool. The pre-warm captures widest and longest first, so later
+captures carve their intermediates from blocks earlier ones freed: narrowest
+first, the pool kept the sum of their transients (0.80 GiB at 512 slots, against
+0.11 widest first). As a backstop, a streaming capture is declined -- that shape
+runs eager and is asked again after 60 s -- when the device would be left with
+less than the eager path's reserve; and an out-of-memory streaming forward,
+which fails the cohort it was running, halves the forward width for the ticks
+after it (rotating which streams wait a tick) until 100 clean ticks pass.
 
 An AR family's prefill is measured too, because it is the one transient that
 grows with the decoder-KV budget. It is one decoder forward over every row's

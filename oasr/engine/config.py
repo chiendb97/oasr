@@ -356,6 +356,25 @@ class EngineConfig:
     # Total device-memory fraction available to derived capacities.  The
     # remainder covers capture pools, transient activations and fragmentation.
     gpu_memory_utilization: float = 0.90
+    # Map GPU memory in expandable segments (``PYTORCH_CUDA_ALLOC_CONF``
+    # ``expandable_segments:True``, process-wide) so memory the engine frees can
+    # be returned instead of stranded in fragmented segments.  An explicit
+    # ``PYTORCH_CUDA_ALLOC_CONF`` naming the setting wins.  See
+    # :func:`oasr.engine.memory.configure_allocator`.
+    cuda_expandable_segments: bool = True
+    # torch intra-op (OpenMP) threads for host-side tensor work: the CPU VAD
+    # detector, the streaming pack into pinned staging, small CPU ops in the
+    # decoders.  ``None`` caps torch's default (one per core, 64 here) at
+    # ``DEFAULT_TORCH_THREADS`` unless ``OMP_NUM_THREADS`` is set; the default
+    # made host-bound runs ~14x slower whenever other tenants loaded the CPUs.
+    # Process-wide, like torch's own setting.
+    torch_num_threads: Optional[int] = None
+    # Compile at construction every CuTeDSL attention variant the tuning table
+    # can route this model to (and run one short decode first for an
+    # autoregressive family), instead of ~1.3 s per variant on the first live
+    # request that needs it.  Bounded by the budget; what is left compiles on use.
+    precompile_attention: bool = True
+    precompile_attention_budget_s: float = 120.0
 
     # Capture steady-state streaming forwards by ``(B_active, cache_t1_bucket)``.
     # Bias inputs are tile-padded because the fused kernel reads complete tiles.
@@ -415,8 +434,27 @@ class EngineConfig:
     # Refuse to capture past this padded width.  Long-form outliers are rare and
     # are the regime where the GPU is genuinely busy anyway.
     offline_graph_max_frames: int = 4096
-    # Live offline captures, bounding graph-pool growth.  Past this, eager.
-    offline_graph_max_captures: int = 64
+    # Live offline captures, bounding graph-pool growth.  The default
+    # (power-of-two widths up to 64, 64-frame buckets up to 4096 frames) has 448
+    # keys per forward, so the old cap of 64 filled after a few minutes of mixed
+    # traffic and every later small batch ran eager: U2++ at 4 clients served
+    # 323 req/s with it and 1,026 with 512, at no backlog cost.
+    offline_graph_max_captures: int = 512
+    # Capture a key on its N-th occurrence; earlier ones run eager.  ``1``
+    # captures on first sight.  ``2`` measured worse on every model: it only
+    # moves each capture to a later live request (U2++ at 4 clients 676 vs
+    # 1,106 req/s).
+    offline_graph_capture_after: int = 1
+    # When the cache is full, release the least recently replayed capture rather
+    # than refusing new shapes for the life of the process.
+    offline_graph_evict: bool = True
+    # Capture these batch widths at every frame bucket up to
+    # ``offline_graph_prewarm_seconds`` of audio at construction, so no live
+    # request pays a capture (~30-40 ms on its batch).  ``None`` (default)
+    # captures lazily.  Costs start-up time and graph-pool memory: roughly 55
+    # frame buckets per width for 35 s at 10 ms frames.
+    offline_graph_prewarm_batches: Optional[List[int]] = None
+    offline_graph_prewarm_seconds: float = 35.0
 
     # Feature extraction
     feature_config: Optional[FeatureConfig] = None
@@ -662,6 +700,24 @@ class EngineConfig:
                 f"offline_graph_max_frames ({self.offline_graph_max_frames}) must be "
                 f">= offline_graph_frame_granularity "
                 f"({self.offline_graph_frame_granularity})"
+            )
+        if self.torch_num_threads is not None and int(self.torch_num_threads) < 1:
+            raise ValueError(f"torch_num_threads must be >= 1, got {self.torch_num_threads!r}")
+        if self.offline_graph_prewarm_batches is not None:
+            bad = [
+                b
+                for b in self.offline_graph_prewarm_batches
+                if not 1 <= int(b) <= self.max_batch_size
+            ]
+            if bad:
+                raise ValueError(
+                    f"offline_graph_prewarm_batches values must be in [1, max_batch_size="
+                    f"{self.max_batch_size}], got {bad}"
+                )
+        if self.offline_graph_capture_after < 1:
+            raise ValueError(
+                f"offline_graph_capture_after must be >= 1, got "
+                f"{self.offline_graph_capture_after!r}"
             )
         if self.offline_graph_max_captures < 1:
             raise ValueError(

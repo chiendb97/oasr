@@ -15,7 +15,7 @@ is numerically fragile in half precision.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +28,10 @@ from .config import ParaformerModelConfig
 
 
 def cif_v1(
-    hidden: torch.Tensor, alphas: torch.Tensor, threshold: float
+    hidden: torch.Tensor,
+    alphas: torch.Tensor,
+    threshold: float,
+    num_tokens: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Vectorized integrate-and-fire (FunASR ``cif_v1``).
 
@@ -40,16 +43,30 @@ def cif_v1(
         ``(B, T)`` non-negative weights.
     threshold : float
         Fire threshold; the prefix-sum formulation requires ``1.0``.
+    num_tokens : int, optional
+        Token rows to return.  ``None`` sizes them as FunASR does,
+        ``max(round(sum(alphas)))``, which reads that value back; a caller that
+        already knows how many rows it keeps passes it and saves the sync.
 
     Returns
     -------
     frames : Tensor
-        ``(B, U_max, D)`` per-token integrated embeddings, ``U_max =
-        max(round(sum(alphas)))``; rows beyond a row's own fire count are zero.
+        ``(B, U, D)`` per-token integrated embeddings, ``U = num_tokens`` or
+        ``max(round(sum(alphas)))``; rows beyond a row's own fire count are zero.
     fires : Tensor
         ``(B, T)`` — ``≥ 1`` exactly at fire positions, with the running
         integral's fractional part elsewhere (the CIF "peak" signal used for
         timestamps).
+
+    The arithmetic is FunASR's, term for term: token ``u`` integrates
+    ``P[t_u] - P[t_{u-1}] + r[t_{u-1}] h[t_{u-1}] - r[t_u] h[t_u]``, where ``P``
+    is the running integral of ``alpha * h``, ``t_u`` the frame of the ``u``-th
+    fire and ``r`` the integral's fractional part.  Only the addressing differs:
+    FunASR collects the fire frames with boolean masks, each a device-to-host
+    sync (five of them, plus a ``bool(any)``), and this gathers them at
+    positions found by ``searchsorted`` on the running fire count, so the
+    shapes are fixed and nothing is read back but ``U``.  The terms are the
+    same values combined in the same order, so the result is bit-identical.
     """
     if threshold != 1.0:
         raise ValueError(f"cif_v1 prefix-sum formulation requires threshold=1.0, got {threshold}")
@@ -61,41 +78,40 @@ def cif_v1(
     prefix_sum_floor = torch.floor(prefix_sum)
     dislocation = torch.roll(prefix_sum, 1, dims=1)
     dislocation_floor = torch.floor(dislocation)
-    dislocation_floor[:, 0] = 0
+    # ``t[:, 0] = 0`` would stage the scalar through a synchronising copy.
+    dislocation_floor[:, 0].fill_(0)
     fire_idxs = (prefix_sum_floor - dislocation_floor) > 0
 
-    fires = torch.zeros(batch_size, len_time, dtype=dtype, device=device)
-    fires[fire_idxs] = 1
-    fires = fires + prefix_sum - prefix_sum_floor
+    fires = fire_idxs.to(dtype) + prefix_sum - prefix_sum_floor
 
-    max_label_len = int(torch.round(alphas.sum(-1)).int().max().item())
-    if not bool(fire_idxs.any()):
-        return (
-            torch.zeros(batch_size, max_label_len, hidden_size, dtype=dtype, device=device),
-            fires,
-        )
+    if num_tokens is None:
+        num_tokens = int(torch.round(alphas.sum(-1)).int().max().item())
+    num_tokens = max(0, int(num_tokens))
+    if num_tokens == 0 or len_time == 0:
+        return torch.zeros(batch_size, num_tokens, hidden_size, dtype=dtype, device=device), fires
 
     prefix_sum_hidden = torch.cumsum(alphas.unsqueeze(-1) * hidden, dim=1)
-    frames = prefix_sum_hidden[fire_idxs]
-    shift_frames = torch.roll(frames, 1, dims=0)
-
-    batch_len = fire_idxs.sum(1)
-    batch_idxs = torch.cumsum(batch_len, dim=0)
-    shift_batch_idxs = torch.roll(batch_idxs, 1, dims=0)
-    shift_batch_idxs[0] = 0
-    shift_frames[shift_batch_idxs] = 0
-
     remains = fires - torch.floor(fires)
-    remain_frames = remains[fire_idxs].unsqueeze(-1) * hidden[fire_idxs]
-    shift_remain_frames = torch.roll(remain_frames, 1, dims=0)
-    shift_remain_frames[shift_batch_idxs] = 0
+
+    # The frame of each token's fire: the first frame whose running fire count
+    # reaches ``u + 1``.  Rows that fire fewer times get ``len_time`` there,
+    # clamped for the gather and zeroed by ``valid`` below.
+    fire_count = fire_idxs.to(torch.int64).cumsum(dim=1)
+    wanted = torch.arange(1, num_tokens + 1, device=device, dtype=torch.int64)
+    t_u = torch.searchsorted(fire_count, wanted.expand(batch_size, -1).contiguous())
+    valid = t_u < len_time
+    t_u = t_u.clamp_(max=len_time - 1)
+    t_d = t_u.unsqueeze(-1).expand(-1, -1, hidden_size)
+
+    frames = prefix_sum_hidden.gather(1, t_d)
+    remain_frames = remains.gather(1, t_u).unsqueeze(-1) * hidden.gather(1, t_d)
+    # The previous fire's terms, zero before a row's first token.
+    shift_frames = F.pad(frames[:, :-1], (0, 0, 1, 0))
+    shift_remain_frames = F.pad(remain_frames[:, :-1], (0, 0, 1, 0))
 
     frames = frames - shift_frames + shift_remain_frames - remain_frames
-
-    frame_fires = torch.zeros(batch_size, max_label_len, hidden_size, dtype=dtype, device=device)
-    indices = torch.arange(max_label_len, device=device).expand(batch_size, -1)
-    frame_fires[indices < batch_len.unsqueeze(1)] = frames
-    return frame_fires, fires
+    frame_fires = torch.where(valid.unsqueeze(-1), frames, frames.new_zeros(()))
+    return frame_fires.to(dtype), fires
 
 
 class CifPredictor(nn.Module):
@@ -161,9 +177,11 @@ class CifPredictor(nn.Module):
         hidden, alphas = self._append_tail(hidden, alphas, mask)
         token_num = torch.floor(alphas.sum(dim=-1))
 
-        acoustic_embeds, fires = cif_v1(hidden, alphas, self.threshold)
+        # The one read-back: how many token rows the batch keeps.  ``cif_v1``
+        # integrates exactly those rather than sizing its own and being cut.
         u_max = int(token_num.max().clamp(min=0).item())
-        return acoustic_embeds[:, :u_max, :], token_num, alphas, fires
+        acoustic_embeds, fires = cif_v1(hidden, alphas, self.threshold, num_tokens=u_max)
+        return acoustic_embeds, token_num, alphas, fires
 
     def _append_tail(
         self, hidden: torch.Tensor, alphas: torch.Tensor, mask: torch.Tensor

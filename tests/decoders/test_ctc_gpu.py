@@ -1790,3 +1790,29 @@ class TestLargeBeamFallback:
             use_paged_memory=True,
         )
         _assert_results_match(flat, paged, "beam=40 flat-vs-paged")
+
+
+class TestStackRows:
+    """Streaming decode stacks each stream's one-row slice back into a batch."""
+
+    def test_consecutive_rows_of_one_tensor_are_a_view(self):
+        from oasr.engine.decode.ctc_gpu import stack_rows
+
+        base = torch.randn(5, 3, 7)
+        rows = [base[i : i + 1] for i in range(1, 4)]
+        got = stack_rows(rows)
+        assert torch.equal(got, torch.cat(rows, 0))
+        assert got.data_ptr() == base[1].data_ptr()  # no copy
+
+    def test_anything_else_is_concatenated(self):
+        from oasr.engine.decode.ctc_gpu import stack_rows
+
+        base = torch.randn(5, 3, 7)
+        for rows in (
+            [base[2:3], base[1:2]],  # out of order
+            [base[0:1], base[2:3]],  # a gap
+            [base[0:1], torch.randn(1, 3, 7)],  # another tensor
+        ):
+            got = stack_rows(rows)
+            assert torch.equal(got, torch.cat(rows, 0))
+            assert got.data_ptr() not in {r.data_ptr() for r in rows}

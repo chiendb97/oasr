@@ -94,6 +94,11 @@ impl CmdEnvelope {
 /// async client facade.
 pub(crate) struct DispatcherShared {
     pub(crate) load: AtomicU32,
+    /// Admissions sent into the command channel that the dispatcher has not
+    /// taken in yet.  `load` is refreshed only when a tick ends, so a burst of
+    /// submits between two ticks all saw the same figure and the pool sent the
+    /// whole burst to one worker; the pool compares `load + submitted`.
+    pub(crate) submitted: AtomicU32,
     /// Set to make the thread exit at the top of its next iteration.  The
     /// channel closing does the same, but a server cannot drop every sender:
     /// each live handle holds one.
@@ -107,10 +112,19 @@ pub(crate) struct DispatcherShared {
 }
 
 impl DispatcherShared {
+    /// One submitted admission taken in by the dispatcher (or abandoned by
+    /// its sender).  Saturating: never wraps below zero.
+    pub(crate) fn release_submitted(&self) {
+        let _ = self
+            .submitted
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
     pub(crate) fn new(label: String, model: Option<&ModelInfo>) -> Self {
         let metric_labels = EngineLabels::new(&label, model);
         Self {
             load: AtomicU32::new(0),
+            submitted: AtomicU32::new(0),
             stop: AtomicBool::new(false),
             last_event_at_ms: AtomicU64::new(0),
             model_info: Mutex::new(model.cloned()),
@@ -137,6 +151,20 @@ pub struct DispatcherConfig {
     /// under HTTP-driven trickle admission.  Set to ``Duration::ZERO`` to
     /// disable (revert to the previous "step ASAP" behavior).
     pub admit_window: Duration,
+    /// Close the admission window early once no admission has arrived for
+    /// this long.  A burst of closed-loop clients lands within a few hundred
+    /// microseconds, so it still coalesces; a lone request pays this gap
+    /// instead of the whole window.  ``Duration::ZERO`` keeps the full window.
+    /// While clients answered in the last tick have not all come back, the gap
+    /// does not apply (see `window_open`); and the window holds nothing while
+    /// the engine has work in flight (see `holds_admissions`).
+    ///
+    /// Measured on U2++ with one request in flight, the full 3 ms window took
+    /// p50 from 3.3 to 7.5 ms (tokio rounds the deadline up to whole
+    /// milliseconds) and cut throughput 2.2x at 1 in flight and 1.5x at 16;
+    /// turning it off instead cost Paraformer and Whisper 15 % at 4 in flight,
+    /// whose fixed per-batch cost needs those arrivals in one batch.
+    pub admit_gap: Duration,
     /// Coalescing target.  Stop waiting early once this many envelopes
     /// have been drained.  Should be <= ``max_inbound_per_tick`` and
     /// roughly match the engine's ``max_batch_size``.
@@ -159,6 +187,7 @@ impl Default for DispatcherConfig {
             // turns 10-22-deep service batches into 32-64-deep ones at
             // concurrency=64 without a visible p50 hit.
             admit_window: Duration::from_millis(3),
+            admit_gap: Duration::from_micros(500),
             admit_threshold: 64,
             trace_dispatch: false,
         }
@@ -287,6 +316,8 @@ fn run_dispatcher(
     // (which constructs a Sleep eagerly) can find a reactor.  The guard is
     // held for the lifetime of the thread.
     let _rt_guard = rt_handle.enter();
+    // Dropped last, after `wind_down` has used the GIL for the final time.
+    let _tstate = ThreadStateKeeper::new();
 
     let ended = panic::catch_unwind(AssertUnwindSafe(|| {
         dispatch_loop(&engine, &shared, &cfg, &mut cmd_rx, &rt_handle)
@@ -302,6 +333,45 @@ fn run_dispatcher(
         }
     };
     wind_down(engine, &shared, code, reason);
+}
+
+/// This thread's Python thread state, kept alive (with the GIL released) for
+/// the dispatcher's life.
+///
+/// `Python::with_gil` on a thread Python did not create calls
+/// `PyGILState_Ensure`, which creates a `PyThreadState` when the thread has
+/// none, and `PyGILState_Release` deletes it again when the thread's count
+/// returns to zero -- so the dispatcher built and tore one down on every tick,
+/// up to a thousand times a second.  One outer `Ensure` held for the thread's
+/// life keeps the count above zero, and each tick's `with_gil` then only takes
+/// and drops the GIL on the state that already exists.
+struct ThreadStateKeeper {
+    gstate: pyo3::ffi::PyGILState_STATE,
+    saved: *mut pyo3::ffi::PyThreadState,
+}
+
+impl ThreadStateKeeper {
+    fn new() -> Self {
+        // SAFETY: the interpreter is initialised -- the engine this thread
+        // drives is a Python object -- and a freshly spawned thread holds no
+        // GIL.  `PyEval_SaveThread` releases the GIL `Ensure` took, keeping the
+        // thread state; `drop` restores it before the matching release.
+        unsafe {
+            let gstate = pyo3::ffi::PyGILState_Ensure();
+            let saved = pyo3::ffi::PyEval_SaveThread();
+            Self { gstate, saved }
+        }
+    }
+}
+
+impl Drop for ThreadStateKeeper {
+    fn drop(&mut self) {
+        // SAFETY: the pair `new` opened, closed in reverse on the same thread.
+        unsafe {
+            pyo3::ffi::PyEval_RestoreThread(self.saved);
+            pyo3::ffi::PyGILState_Release(self.gstate);
+        }
+    }
 }
 
 /// Leave nothing behind: tell every request still registered that it is over,
@@ -372,6 +442,10 @@ fn dispatch_loop(
     // that owns the GIL.
     let h = TickHandles::new(&shared.metric_labels);
     let mut next_drain = Instant::now();
+    // Requests finished whose clients have not sent another yet, and when the
+    // last of them finished; see `window_open`.
+    let mut awaited: usize = 0;
+    let mut awaited_at = Instant::now();
 
     loop {
         if shared.stop.load(Ordering::Acquire) {
@@ -393,27 +467,72 @@ fn dispatch_loop(
 
         // Briefly wait for sibling admissions when below threshold and lightly
         // loaded. Never coalesce other commands because their latency takes priority.
-        if should_coalesce(&envs, cfg, shared.load.load(Ordering::Relaxed)) {
-            let deadline = Instant::now() + cfg.admit_window;
-            while envs.len() < cfg.admit_threshold {
-                let remaining = match deadline.checked_duration_since(Instant::now()) {
-                    Some(r) if !r.is_zero() => r,
-                    _ => break,
-                };
-                match rt_handle.block_on(tokio::time::timeout(remaining, cmd_rx.recv())) {
-                    Ok(Some(env)) => {
-                        // A non-admission command ends the window immediately.
-                        let admit = is_admit(&env.cmd);
-                        envs.push(env);
-                        if !admit {
-                            break;
+        if awaited_at.elapsed() > REPLACEMENT_HORIZON {
+            // Nobody came back: these clients are gone, not thinking.
+            awaited = 0;
+        }
+        let load_now = shared.load.load(Ordering::Relaxed);
+        if should_coalesce(&envs, cfg, load_now) && holds_admissions(cfg, load_now) {
+            if cfg.admit_gap.is_zero() {
+                let deadline = Instant::now() + cfg.admit_window;
+                while envs.len() < cfg.admit_threshold {
+                    let remaining = match deadline.checked_duration_since(Instant::now()) {
+                        Some(r) if !r.is_zero() => r,
+                        _ => break,
+                    };
+                    match rt_handle.block_on(tokio::time::timeout(remaining, cmd_rx.recv())) {
+                        Ok(Some(env)) => {
+                            // A non-admission command ends the window immediately.
+                            let admit = is_admit(&env.cmd);
+                            envs.push(env);
+                            if !admit {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            info!(label = %shared.label, "command channel closed; dispatcher exit");
+                            return;
+                        }
+                        Err(_) => break, // window elapsed
+                    }
+                }
+            } else {
+                // Adaptive: keep the window open only while admissions keep
+                // arriving.  Polled with a short sleep rather than a tokio
+                // timer, which rounds every deadline up to whole milliseconds.
+                // No GIL is held here.
+                let opened = Instant::now();
+                let mut last_arrival = opened;
+                loop {
+                    if envs.len() >= cfg.admit_threshold
+                        || !window_open(
+                            opened,
+                            last_arrival,
+                            Instant::now(),
+                            envs.len(),
+                            awaited,
+                            cfg,
+                        )
+                    {
+                        break;
+                    }
+                    match cmd_rx.try_recv() {
+                        Ok(env) => {
+                            let admit = is_admit(&env.cmd);
+                            envs.push(env);
+                            last_arrival = Instant::now();
+                            if !admit {
+                                break;
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            std::thread::sleep(ADMIT_POLL);
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            info!(label = %shared.label, "command channel closed; dispatcher exit");
+                            return;
                         }
                     }
-                    Ok(None) => {
-                        info!(label = %shared.label, "command channel closed; dispatcher exit");
-                        return;
-                    }
-                    Err(_) => break, // window elapsed
                 }
             }
             // Top up with any siblings that landed during the wait but
@@ -430,25 +549,16 @@ fn dispatch_loop(
         let received_any = !envs.is_empty();
         // Count admit commands this tick *before* they're drained (effective
         // batch trace).  Cheap O(n) scan, skipped unless tracing.
-        let n_admit = if trace_enabled {
-            envs.iter()
-                .filter(|e| {
-                    matches!(
-                        e.cmd,
-                        Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. }
-                    )
-                })
-                .count() as u64
-        } else {
-            0
-        };
+        let n_admit = envs.iter().filter(|e| is_admit(&e.cmd)).count();
+        awaited = awaited.saturating_sub(n_admit);
+        let n_admit = n_admit as u64;
 
         // ---- ONE Python::with_gil for replay + step ----
         tick_events.clear();
         admit_batch.clear();
         let tick_t0 = Instant::now();
         #[allow(clippy::type_complexity)]
-        let (running, waiting, t_admit, t_step, t_extract, n_out, step_failed, engine_snapshot): (
+        let (running, waiting, t_admit, t_step, t_extract, n_out, step_failed): (
             u32,
             u32,
             Duration,
@@ -456,7 +566,6 @@ fn dispatch_loop(
             Duration,
             u64,
             bool,
-            Option<crate::engine_metrics::EngineSnapshot>,
         ) = Python::with_gil(|py| {
             let bound = engine.bind_engine(py);
 
@@ -466,6 +575,7 @@ fn dispatch_loop(
             // force a flush first so request_id ordering across the
             // CreateStreaming → FeedChunk boundary is preserved.
             let admit_t0 = Instant::now();
+            coalesce_feed_chunks(&mut envs);
             for env in envs.drain(..) {
                 match &env.cmd {
                     Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. } => {
@@ -558,21 +668,6 @@ fn dispatch_loop(
             // Refresh load after step (terminal events drop in-flight count).
             let (running, waiting) = PyEngine::load_locked(&bound);
 
-            // ---- Drain the engine's own metrics ----
-            //
-            // Inside the GIL scope the tick already owns, so it costs one
-            // Python call rather than a second acquisition — but only every
-            // DRAIN_INTERVAL, because at a kilohertz tick rate the call itself
-            // would be the expensive part and a Prometheus scrape arrives
-            // three orders of magnitude less often.  The *replay* happens
-            // after the scope, with the GIL released.
-            let engine_snapshot = if tick_t0 >= next_drain {
-                next_drain = tick_t0 + DRAIN_INTERVAL;
-                PyEngine::metrics_snapshot_locked(&bound)
-            } else {
-                None
-            };
-
             (
                 running,
                 waiting,
@@ -581,7 +676,6 @@ fn dispatch_loop(
                 t_extract,
                 n_out,
                 step_failed,
-                engine_snapshot,
             )
         });
 
@@ -589,7 +683,16 @@ fn dispatch_loop(
 
         // ---- Route events outside the GIL ----
         let route_t0 = Instant::now();
-        route_tick_events(shared, &mut tick_events);
+        // A client that just got its answer usually sends the next request:
+        // the adaptive window waits for that many before it closes.
+        // The last tick's finals, not a running sum: summed, admissions only
+        // ever took it down to zero while finals kept adding, so under steady
+        // load it drifted to the cap and every admission waited the full window.
+        let finished = route_tick_events(shared, &mut tick_events);
+        if finished > 0 {
+            awaited = finished.min(cfg.admit_threshold);
+            awaited_at = Instant::now();
+        }
         let t_route = route_t0.elapsed();
 
         // ---- Metrics ----
@@ -612,11 +715,21 @@ fn dispatch_loop(
         h.running.set(running as f64);
         h.waiting.set(waiting as f64);
 
-        // Replayed with the GIL released: pushing a few hundred samples into
-        // the exporter is pure Rust, and holding the GIL across it would block
-        // every request handler for no reason.
-        if let Some(snapshot) = engine_snapshot {
-            replay(&snapshot, &shared.metric_labels);
+        // ---- Drain the engine's own metrics ----
+        //
+        // Every DRAIN_INTERVAL, not every tick: at a kilohertz tick rate the
+        // Python call would be the expensive part, and a Prometheus scrape
+        // arrives three orders of magnitude less often.  Taken after the
+        // events are routed, so no reply waits behind it, in a GIL scope of
+        // its own; replayed with the GIL released, since pushing a few
+        // hundred samples into the exporter is pure Rust.
+        if tick_t0 >= next_drain {
+            next_drain = tick_t0 + DRAIN_INTERVAL;
+            let snapshot =
+                Python::with_gil(|py| PyEngine::metrics_snapshot_locked(&engine.bind_engine(py)));
+            if let Some(snapshot) = snapshot {
+                replay(&snapshot, &shared.metric_labels);
+            }
         }
 
         // ---- Dispatch trace accounting (diagnostics; gated by flag) ----
@@ -722,15 +835,67 @@ fn dispatch_loop(
 /// [`crate::EnginePool::pick_least_loaded`] saw the most loaded worker in the
 /// pool.  The engine's own `running + waiting`, stored at the end of every
 /// tick, is the count.
-fn route_tick_events(shared: &DispatcherShared, events: &mut Vec<Event>) {
+/// Route this tick's events; returns how many of them ended a request.
+fn route_tick_events(shared: &DispatcherShared, events: &mut Vec<Event>) -> usize {
+    let mut finished = 0;
     for evt in events.drain(..) {
+        finished += usize::from(evt.is_terminal());
         shared.router.route_blocking(evt);
     }
+    finished
 }
 
 /// Is this an admission command (as opposed to chunk / cancel / ping)?
 fn is_admit(cmd: &Cmd) -> bool {
     matches!(cmd, Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. })
+}
+
+/// How often the adaptive admission window polls the command channel.
+const ADMIT_POLL: Duration = Duration::from_micros(50);
+
+/// How long a finished request's client is expected back, at most.  A closed
+/// loop answers in about a millisecond (response, parse, next request); past
+/// this the clients are gone and a new arrival is treated as a lone one.
+const REPLACEMENT_HORIZON: Duration = Duration::from_millis(20);
+
+/// Whether the adaptive admission window is still open at `now`.
+///
+/// Never past `admit_window`.  Within it, `awaited` decides: requests finished
+/// since the last admission whose clients have not come back yet (`awaited -
+/// arrived`).  While some are outstanding the window stays open, since a
+/// client that just got its answer usually sends the next request -- that is
+/// what batches four closed-loop Paraformer clients, whose arrivals spread
+/// over more than the gap.  Once they are all in it closes at once, so a lone
+/// client's next request is not held at all.  With none awaited (the first
+/// request after idle, open-loop traffic) it stays open only while admissions
+/// keep arriving within `admit_gap`.
+fn window_open(
+    opened: Instant,
+    last_arrival: Instant,
+    now: Instant,
+    arrived: usize,
+    awaited: usize,
+    cfg: &DispatcherConfig,
+) -> bool {
+    if now.saturating_duration_since(opened) >= cfg.admit_window {
+        return false;
+    }
+    if awaited > 0 {
+        return arrived < awaited;
+    }
+    now.saturating_duration_since(last_arrival) < cfg.admit_gap
+}
+
+/// Whether the adaptive window may hold admissions at all: only while the
+/// engine has nothing in flight.  With work in flight the engine steps again
+/// at once and a new arrival joins that step anyway, so holding it only adds
+/// its wait -- measured on U2++ at 16 in flight, 806 req/s with the window
+/// against 1,085 without.  An idle engine is where batching pays: four
+/// closed-loop Paraformer clients come back to an empty engine, and starting
+/// the first alone made the other three wait out its whole batch.  The legacy
+/// fixed window (`admit_gap` zero) keeps its old rule.
+fn holds_admissions(cfg: &DispatcherConfig, load: u32) -> bool {
+    cfg.admit_gap.is_zero() || load == 0
 }
 
 /// Should the dispatcher hold this tick's envelopes open for siblings?
@@ -778,6 +943,8 @@ fn enqueue_admit_locked(
     out_admits: &mut Vec<AdmitSpec>,
     out_events: &mut Vec<Event>,
 ) {
+    // Taken in: from here it counts in `load` (or is refused) instead.
+    shared.release_submitted();
     let payload = env.payload;
     match env.cmd {
         Cmd::CreateOffline {
@@ -957,6 +1124,87 @@ fn rewrite_rejected_admits(
     }
 }
 
+/// Merge each stream's audio frames that arrived within one tick into one
+/// `FeedChunk`, so the GIL-holding replay makes one `feed_chunk` call per stream
+/// per tick instead of one per client frame (20 ms browser frames on 256 streams
+/// are ~12,800 calls a second).
+///
+/// A stream's frames stay in arrival order, merged into its first frame's place;
+/// other streams' commands are independent of it, so moving a later frame ahead
+/// of them changes nothing they can observe.  A `Cancel` or `Create*` for the
+/// same id, or its `is_last` frame, closes the merge, so nothing is ever moved
+/// across a command that could change what the audio belongs to.  Payloads are
+/// little-endian f32 and a ragged tail is dropped per call
+/// (`audio_bytes_to_numpy`), so a frame that is not whole samples is never
+/// merged: concatenated, its tail would shift every later sample.
+fn coalesce_feed_chunks(envs: &mut Vec<CmdEnvelope>) {
+    if envs.len() < 2 {
+        return;
+    }
+    let mut out: Vec<CmdEnvelope> = Vec::with_capacity(envs.len());
+    // Per output position, the payloads merged into it after its own.
+    let mut extra: Vec<Vec<Bytes>> = Vec::with_capacity(envs.len());
+    let mut open: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut merged = false;
+    for env in envs.drain(..) {
+        let key = match &env.cmd {
+            Cmd::FeedChunk {
+                request_id,
+                is_last,
+            } => Some((request_id.clone(), *is_last)),
+            Cmd::Cancel { request_id }
+            | Cmd::CreateStreaming { request_id, .. }
+            | Cmd::CreateOffline { request_id, .. } => {
+                open.remove(request_id);
+                None
+            }
+            Cmd::Ping { .. } => None,
+        };
+        if let Some((rid, last)) = key {
+            let whole =
+                env.payload.as_ref().map_or(0, Bytes::len) % std::mem::size_of::<f32>() == 0;
+            if !whole {
+                open.remove(&rid);
+                out.push(env);
+                extra.push(Vec::new());
+                continue;
+            }
+            if let Some(&i) = open.get(&rid) {
+                extra[i].push(env.payload.unwrap_or_default());
+                if last {
+                    if let Cmd::FeedChunk { is_last, .. } = &mut out[i].cmd {
+                        *is_last = true;
+                    }
+                    open.remove(&rid);
+                }
+                merged = true;
+                continue;
+            }
+            if !last {
+                open.insert(rid, out.len());
+            }
+        }
+        out.push(env);
+        extra.push(Vec::new());
+    }
+    if merged {
+        for (env, parts) in out.iter_mut().zip(extra) {
+            if parts.is_empty() {
+                continue;
+            }
+            let head = env.payload.take().unwrap_or_default();
+            let len = head.len() + parts.iter().map(Bytes::len).sum::<usize>();
+            let mut buf = bytes::BytesMut::with_capacity(len);
+            buf.extend_from_slice(&head);
+            for p in parts {
+                buf.extend_from_slice(&p);
+            }
+            env.payload = Some(buf.freeze());
+        }
+    }
+    *envs = out;
+}
+
 fn handle_nonadmit_cmd_locked<'py>(
     py: Python<'py>,
     bound: &Bound<'py, PyAny>,
@@ -1045,6 +1293,99 @@ mod tests {
         DispatcherConfig::default()
     }
 
+    fn feed(rid: &str, bytes: &[u8], last: bool) -> CmdEnvelope {
+        CmdEnvelope::new(
+            Cmd::FeedChunk {
+                request_id: rid.into(),
+                is_last: last,
+            },
+            Some(Bytes::copy_from_slice(bytes)),
+        )
+    }
+
+    fn shape(envs: &[CmdEnvelope]) -> Vec<(String, Option<bool>, Vec<u8>)> {
+        envs.iter()
+            .map(|e| {
+                let last = match &e.cmd {
+                    Cmd::FeedChunk { is_last, .. } => Some(*is_last),
+                    _ => None,
+                };
+                let rid = e.cmd.request_id().unwrap_or("").to_string();
+                (rid, last, e.payload.as_deref().unwrap_or(&[]).to_vec())
+            })
+            .collect()
+    }
+
+    /// Interleaved frames of two streams become one call each, in order.
+    #[test]
+    fn a_streams_frames_in_one_tick_are_one_feed() {
+        let mut envs = vec![
+            feed("a", &[1; 4], false),
+            feed("b", &[9; 4], false),
+            feed("a", &[2; 8], false),
+            feed("b", &[8; 4], true),
+            feed("a", &[4; 4], false),
+        ];
+        coalesce_feed_chunks(&mut envs);
+        let mut a = vec![1; 4];
+        a.extend([2; 8]);
+        a.extend([4; 4]);
+        let mut b = vec![9; 4];
+        b.extend([8; 4]);
+        assert_eq!(
+            shape(&envs),
+            vec![("a".into(), Some(false), a), ("b".into(), Some(true), b)]
+        );
+    }
+
+    /// A frame that is not whole f32 samples is passed through on its own.
+    #[test]
+    fn a_ragged_frame_is_never_merged() {
+        let mut envs = vec![
+            feed("a", &[1, 1, 1, 1], false),
+            feed("a", &[2, 2, 2], false),
+            feed("a", &[3, 3, 3, 3], false),
+            feed("a", &[4, 4, 4, 4], false),
+        ];
+        coalesce_feed_chunks(&mut envs);
+        assert_eq!(
+            shape(&envs),
+            vec![
+                ("a".into(), Some(false), vec![1, 1, 1, 1]),
+                ("a".into(), Some(false), vec![2, 2, 2]),
+                ("a".into(), Some(false), vec![3, 3, 3, 3, 4, 4, 4, 4]),
+            ]
+        );
+    }
+
+    /// A cancel, or the last frame, ends the merge: nothing moves across it.
+    #[test]
+    fn a_cancel_or_the_last_frame_closes_the_merge() {
+        let mut envs = vec![
+            feed("a", &[1; 4], false),
+            CmdEnvelope::new(
+                Cmd::Cancel {
+                    request_id: "a".into(),
+                },
+                None,
+            ),
+            feed("a", &[2; 4], false),
+            feed("c", &[5; 4], true),
+            feed("c", &[6; 4], false),
+        ];
+        coalesce_feed_chunks(&mut envs);
+        assert_eq!(
+            shape(&envs),
+            vec![
+                ("a".into(), Some(false), vec![1; 4]),
+                ("a".into(), None, vec![]),
+                ("a".into(), Some(false), vec![2; 4]),
+                ("c".into(), Some(true), vec![5; 4]),
+                ("c".into(), Some(false), vec![6; 4]),
+            ]
+        );
+    }
+
     /// A refusal is terminal but was never counted in.  Taking one off a low
     /// count wrapped it to `u32::MAX`, so the least-loaded pick saw this
     /// worker as the most loaded in the pool until the end of the tick.
@@ -1101,6 +1442,58 @@ mod tests {
             &c,
             c.max_concurrent_requests / 4
         ));
+    }
+
+    #[test]
+    fn the_adaptive_window_holds_nothing_while_the_engine_is_busy() {
+        let c = cfg();
+        assert!(holds_admissions(&c, 0));
+        assert!(!holds_admissions(&c, 3));
+        let fixed = DispatcherConfig {
+            admit_gap: Duration::ZERO,
+            ..cfg()
+        };
+        assert!(holds_admissions(&fixed, 3));
+    }
+
+    #[test]
+    fn the_adaptive_window_closes_after_a_quiet_gap() {
+        let c = cfg();
+        let t0 = Instant::now();
+        // Still inside the gap: keep waiting.
+        assert!(window_open(t0, t0, t0 + c.admit_gap / 2, 1, 0, &c));
+        // A lone request: nothing came within the gap, so the window closes
+        // long before the full window would have.
+        assert!(!window_open(t0, t0, t0 + c.admit_gap, 1, 0, &c));
+        assert!(c.admit_gap < c.admit_window);
+    }
+
+    /// Four clients just got their answers: wait for all four to come back,
+    /// past the gap, and close the moment the fourth is in.
+    #[test]
+    fn the_window_waits_for_the_clients_it_just_answered() {
+        let c = cfg();
+        let t0 = Instant::now();
+        let later = t0 + c.admit_gap * 3;
+        assert!(later < t0 + c.admit_window);
+        assert!(window_open(t0, t0, later, 2, 4, &c));
+        assert!(!window_open(t0, t0, t0, 4, 4, &c));
+        // A lone client's next request is not held at all.
+        assert!(!window_open(t0, t0, t0, 1, 1, &c));
+        // Never past the window, however many are awaited.
+        assert!(!window_open(t0, t0, t0 + c.admit_window, 1, 4, &c));
+    }
+
+    #[test]
+    fn arrivals_keep_the_window_open_up_to_its_cap() {
+        let c = cfg();
+        let t0 = Instant::now();
+        // Each arrival restarts the gap...
+        let late = t0 + c.admit_window - Duration::from_micros(10);
+        assert!(window_open(t0, late - c.admit_gap / 2, late, 3, 0, &c));
+        // ...but never past the window itself.
+        let past = t0 + c.admit_window;
+        assert!(!window_open(t0, past, past, 3, 0, &c));
     }
 
     #[test]

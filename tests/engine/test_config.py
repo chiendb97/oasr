@@ -217,6 +217,7 @@ class TestOfflineGraphValidation:
             {"offline_graph_frame_granularity": 0},
             {"offline_graph_max_frames": 8, "offline_graph_frame_granularity": 64},
             {"offline_graph_max_captures": 0},
+            {"offline_graph_capture_after": 0},
             {"offline_graph_batch_buckets": [0]},
             {"offline_graph_batch_buckets": [1, 999]},
         ],
@@ -262,3 +263,97 @@ class TestLadderConfigValidation:
         cfg = EngineConfig(ckpt_dir="/nonexistent")
         assert cfg.streaming_graph_cache_growth > 1.0
         assert cfg.streaming_graph_batch_ladder is None  # None == every width
+
+
+# --------------------------------------------------------------------------
+# The caching allocator
+# --------------------------------------------------------------------------
+
+
+class TestConfigureAllocator:
+    def test_cpu_is_left_alone(self):
+        import torch
+
+        from oasr.engine.memory import configure_allocator
+
+        assert configure_allocator(torch.device("cpu"), True) is False
+
+    def test_off_is_left_alone(self, monkeypatch):
+        import torch
+
+        from oasr.engine.memory import configure_allocator
+
+        calls = []
+        monkeypatch.setattr(
+            torch._C, "_accelerator_setAllocatorSettings", calls.append, raising=False
+        )
+        assert configure_allocator(torch.device("cuda"), False) is False
+        assert calls == []
+
+    def test_an_operator_setting_wins(self, monkeypatch):
+        import torch
+
+        from oasr.engine.memory import configure_allocator
+
+        calls = []
+        monkeypatch.setattr(
+            torch._C, "_accelerator_setAllocatorSettings", calls.append, raising=False
+        )
+        monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
+        assert configure_allocator(torch.device("cuda"), True) is False
+        assert calls == []
+
+    def test_applies_expandable_segments(self, monkeypatch):
+        import torch
+
+        from oasr.engine.memory import configure_allocator
+
+        calls = []
+        monkeypatch.setattr(
+            torch._C, "_accelerator_setAllocatorSettings", calls.append, raising=False
+        )
+        monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+        assert configure_allocator(torch.device("cuda"), True) is True
+        assert calls == ["expandable_segments:True"]
+
+
+class TestConfigureHostThreads:
+    def test_explicit_count_applies(self, monkeypatch):
+        import torch
+
+        from oasr.engine.memory import configure_host_threads
+
+        calls = []
+        monkeypatch.setattr(torch, "set_num_threads", calls.append)
+        assert configure_host_threads(3) == 3
+        assert calls == [3]
+
+    def test_default_is_capped(self, monkeypatch):
+        import torch
+
+        from oasr.engine.memory import DEFAULT_TORCH_THREADS, configure_host_threads
+
+        calls = []
+        monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+        monkeypatch.setattr(torch, "get_num_threads", lambda: 64)
+        monkeypatch.setattr(torch, "set_num_threads", calls.append)
+        assert configure_host_threads(None) == DEFAULT_TORCH_THREADS
+        assert calls == [DEFAULT_TORCH_THREADS]
+
+    def test_an_operator_choice_wins(self, monkeypatch):
+        import torch
+
+        from oasr.engine.memory import configure_host_threads
+
+        calls = []
+        monkeypatch.setenv("OMP_NUM_THREADS", "2")
+        monkeypatch.setattr(torch, "get_num_threads", lambda: 64)
+        monkeypatch.setattr(torch, "set_num_threads", calls.append)
+        assert configure_host_threads(None) is None
+        assert calls == []
+
+    def test_rejects_zero(self):
+        from oasr.engine.config import EngineConfig
+
+        with pytest.raises(ValueError):
+            EngineConfig(ckpt_dir="/nonexistent", torch_num_threads=0)

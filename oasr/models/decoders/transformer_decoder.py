@@ -206,16 +206,28 @@ class _DecoderAttention(nn.Module):
         value: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         kv_lens: Optional[torch.Tensor] = None,
+        kv_repeats: int = 1,
     ) -> torch.Tensor:
         """``mask``: bool ``(B, L_q or 1, L_k)`` — True = attend; None = full.
 
         ``kv_lens`` ``(B,)`` says the same thing for the cross-attention case
         (keys ``[0, len)`` valid) in the form the fused kernel can enforce
         without a materialized mask, so pass that instead where it applies.
+
+        ``kv_repeats``: ``key`` / ``value`` hold one row per ``kv_repeats``
+        consecutive query rows (rescoring's beam over one utterance).  They are
+        projected once per row and the projections repeated, which is a copy
+        where projecting the repeated memory was a GEMM ``kv_repeats`` times
+        larger; the repeat precedes the head split, so the attention sees the
+        layout it always did.
         """
         q = self.attn.split_heads(self.linear_q(query))
-        k = self.attn.split_kv_heads(self.linear_k(key))
-        v = self.attn.split_kv_heads(self.linear_v(value))
+        k_proj, v_proj = self.linear_k(key), self.linear_v(value)
+        if kv_repeats > 1:
+            k_proj = k_proj.repeat_interleave(kv_repeats, dim=0)
+            v_proj = v_proj.repeat_interleave(kv_repeats, dim=0)
+        k = self.attn.split_kv_heads(k_proj)
+        v = self.attn.split_kv_heads(v_proj)
         attn_mask = mask.unsqueeze(1) if mask is not None else None  # (B, 1, L_q, L_k)
         x = self.attn(q, k, v, attn_mask=attn_mask, kv_lens=kv_lens)
         return self.linear_out(self.attn.merge_heads(x))
@@ -243,13 +255,16 @@ class DecoderLayer(nn.Module):
         tgt_mask: Optional[torch.Tensor],
         memory: torch.Tensor,
         memory_lens: Optional[torch.Tensor],
+        memory_repeats: int = 1,
     ) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
         x = residual + self.self_attn(x, x, x, tgt_mask)
         residual = x
         x = self.norm2(x)
-        x = residual + self.src_attn(x, memory, memory, kv_lens=memory_lens)
+        x = residual + self.src_attn(
+            x, memory, memory, kv_lens=memory_lens, kv_repeats=memory_repeats
+        )
         residual = x
         x = self.norm3(x)
         return residual + self.feed_forward(x)
@@ -319,19 +334,26 @@ class TransformerDecoder(nn.Module):
         memory_lens: torch.Tensor,
         ys_in_pad: torch.Tensor,
         ys_in_lens: torch.Tensor,
+        memory_repeats: int = 1,
     ) -> torch.Tensor:
         """Teacher-forced decode → logits ``(B, L, V)``.
 
         Parameters
         ----------
         memory : Tensor
-            Encoder output ``(B, T_enc, D)``.
+            Encoder output ``(B / memory_repeats, T_enc, D)``.
         memory_lens : Tensor
-            ``(B,)`` valid encoder lengths (cross-attention key padding).
+            ``(B / memory_repeats,)`` valid encoder lengths (cross-attention key
+            padding).
         ys_in_pad : Tensor
             ``(B, L)`` int64 decoder input (``[sos] + hyp``, eos-padded).
         ys_in_lens : Tensor
             ``(B,)`` valid lengths of ``ys_in_pad`` (hyp length + 1).
+        memory_repeats : int
+            Consecutive label rows that share one memory row: rescoring scores a
+            beam of hypotheses against one utterance, and the cross-attention
+            projections of that utterance are computed once rather than per
+            hypothesis (see ``_DecoderAttention``).
         """
         B, L = ys_in_pad.shape
         device = ys_in_pad.device
@@ -342,10 +364,12 @@ class TransformerDecoder(nn.Module):
             pos.unsqueeze(0) < ys_in_lens.to(device).unsqueeze(1)
         ).unsqueeze(1)
         memory_lens = memory_lens.to(device)
+        if memory_repeats > 1:
+            memory_lens = memory_lens.repeat_interleave(memory_repeats, dim=0)
 
         x = self.embed[1](self.embed[0](ys_in_pad))
         for layer in self.decoders:
-            x = layer(x, tgt_mask, memory, memory_lens)
+            x = layer(x, tgt_mask, memory, memory_lens, memory_repeats)
         x = self.after_norm(x)
         return self.output_layer(x)
 
@@ -514,10 +538,14 @@ class BiTransformerDecoder(BaseDecoder):
         ys_in_pad: torch.Tensor,
         ys_in_lens: torch.Tensor,
         r_ys_in_pad: Optional[torch.Tensor] = None,
+        memory_repeats: int = 1,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Teacher-forced both directions → ``(l_logits, r_logits | None)``."""
-        l_x = self.left_decoder(memory, memory_lens, ys_in_pad, ys_in_lens)
+        """Teacher-forced both directions → ``(l_logits, r_logits | None)``.
+
+        ``memory_repeats``: see :meth:`TransformerDecoder.forward`.
+        """
+        l_x = self.left_decoder(memory, memory_lens, ys_in_pad, ys_in_lens, memory_repeats)
         r_x = None
         if self.right_decoder is not None and r_ys_in_pad is not None:
-            r_x = self.right_decoder(memory, memory_lens, r_ys_in_pad, ys_in_lens)
+            r_x = self.right_decoder(memory, memory_lens, r_ys_in_pad, ys_in_lens, memory_repeats)
         return l_x, r_x

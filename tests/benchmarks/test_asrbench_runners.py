@@ -148,6 +148,34 @@ def test_open_loop_charges_latency_from_the_schedule(data_root, tmp_path):
     assert result.summary["achieved_ratio"] < 0.5  # saturated: one row, 40 req/s max
 
 
+def test_a_duration_bound_open_loop_point_measures_after_its_warm_up(data_root, tmp_path):
+    """``warmup_requests: all`` used to be counted *inside* the duration, so a
+    slow offered rate spent the whole window warming up and measured nothing.
+    The warm-up now runs ahead of the measured span, capped at that span."""
+    out = measure(
+        data_root, tmp_path, "load",
+        {"mode": "open", "rates": [40.0], "arrival": "constant", "duration_s": 0.25},
+        SHORT, options={"base_ms": 1, "ms_per_audio_s": 0},
+    )  # fmt: skip
+    ((result, rows),) = out
+    meas = [x for x in rows if x["phase"] == "measure"]
+    warm = [x for x in rows if x["phase"] == "warmup"]
+    assert result.status == "ok" and warm and len(meas) == 10
+    assert max(x["t_sched"] for x in warm) < min(x["t_sched"] for x in meas)
+
+
+def test_a_point_whose_every_request_failed_is_a_failed_point(data_root, tmp_path):
+    """It reported ``ok``: the 512-session streaming point had 100 % errors,
+    status ``ok`` and exit code 0."""
+    out = measure(
+        data_root, tmp_path, "single", {"warmup": 0},
+        {"sampling": "first", "num_items": 3}, options={"fail_every": 1},
+    )  # fmt: skip
+    ((result, rows),) = out
+    assert rows and all(x["status"] == "failed" for x in rows)
+    assert result.status == "failed" and "every measured request failed" in result.reason
+
+
 def test_timeouts_failures_and_rejections_are_classified(data_root, tmp_path):
     out = measure(
         data_root, tmp_path, "single", {"warmup": 0},

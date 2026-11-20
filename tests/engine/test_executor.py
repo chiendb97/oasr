@@ -1348,6 +1348,53 @@ class TestStreamingIsolation:
         assert rec.finished == ["s1"]
 
 
+class TestStreamingOomBackoff:
+    """An out-of-memory forward narrows the next ones instead of repeating.
+
+    At 512 U2++ streams one OOM failed every stream in the step, and nothing
+    stopped the next tick from forwarding the same width into the same wall.
+    The failed cohort is still failed -- a partly applied batched commit cannot
+    be retried -- but the streams behind it are forwarded at half the width,
+    taking turns, and the width comes back after clean ticks.
+    """
+
+    @staticmethod
+    def _executor(max_batch_size=8):
+        ex = StreamingExecutor.__new__(StreamingExecutor)
+        ex._config = SimpleNamespace(max_batch_size=max_batch_size)
+        return ex
+
+    def test_an_oom_halves_the_width_and_every_stream_takes_its_turn(self):
+        ex = self._executor()
+        ready = [_request(f"s{i}") for i in range(8)]
+        assert ex._limit_width(ready) == ready
+        ex._note_forward(8, torch.cuda.OutOfMemoryError("CUDA out of memory"))
+        first = ex._limit_width(ready)
+        second = ex._limit_width(ready)
+        assert len(first) == len(second) == 4
+        assert {r.request_id for r in first + second} == {r.request_id for r in ready}
+
+    def test_other_failures_do_not_narrow(self):
+        ex = self._executor()
+        ex._note_forward(8, RuntimeError("BlockPool exhausted"))
+        assert ex._forward_cap is None
+
+    def test_the_width_comes_back_after_clean_ticks(self, monkeypatch):
+        import oasr.engine.executor.streaming as streaming
+
+        monkeypatch.setattr(streaming, "OOM_RECOVERY_TICKS", 2)
+        ex = self._executor(max_batch_size=8)
+        ex._note_forward(8, torch.cuda.OutOfMemoryError("CUDA out of memory"))
+        ex._note_forward(4, torch.cuda.OutOfMemoryError("CUDA out of memory"))
+        assert ex._forward_cap == 2
+        for _ in range(2):
+            ex._note_forward(2, None)
+        assert ex._forward_cap == 4
+        for _ in range(2):
+            ex._note_forward(4, None)
+        assert ex._forward_cap is None
+
+
 class TestStreamingStepDoesNotRaise:
     """The contract C6 is actually about: a failed forward must not escape step().
 

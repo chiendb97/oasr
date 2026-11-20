@@ -37,9 +37,13 @@ quantization freed 6.6 GiB, and the budget admitted 26 rows instead of 15.  Thei
 ``max_batch_size=32``, the int8 and fp8 runs had 133 prefills rejected for OOM
 between them.
 
-What the probes do **not** cover: CUDA-graph capture pools are allocated after
-them, and land inside the utilization headroom with allocator fragmentation,
-which is why the default leaves 10% of the card unspent.
+CUDA-graph capture pools are allocated after the probes.  The offline and AR
+ones land inside the utilization headroom, which is why the default leaves 10%
+of the card unspent.  The streaming pre-warm is priced up front
+(:func:`streaming_graph_reserve_bytes`), because its pool grows with the slot
+count while the headroom does not: at ``max_batch_size=512`` U2++'s pre-warm
+needed 2.3 GiB, the derived pool left it 0.6, and a capture failed mid-way with
+the card full.
 """
 
 from __future__ import annotations
@@ -86,6 +90,67 @@ _GIB = float(1024**3)
 # ---------------------------------------------------------------------------
 # Measurement
 # ---------------------------------------------------------------------------
+
+
+def configure_allocator(device: torch.device, expandable_segments: bool) -> bool:
+    """Turn on the caching allocator's expandable segments; ``True`` if applied.
+
+    The caching allocator keeps every segment it ever mapped, and a segment with
+    one live block cannot be returned.  Serving batches of many different
+    ``(B, T)`` shapes, it ends up holding 3.7-4.7x the memory the engine uses
+    (measured peak reserved vs allocated: U2++ 22.5 vs 6.0 GiB, Zipformer 29.5
+    vs 6.4, Nemotron 30.3 vs 11.0).  That is memory nothing else can have, and
+    the offline graph cache reads free VRAM to decide whether a capture fits,
+    so the fragmentation alone locked Nemotron's cache: 535 refused captures,
+    every small batch eager.  Expandable segments map and unmap pages inside
+    one growing segment instead; measured with the same traffic, Nemotron's
+    peak reserved fell 30.4 -> 20.5 GiB and its refusals 535 -> 3.
+
+    Process-wide and one-way: it applies to segments mapped after the call.  A
+    ``PYTORCH_CUDA_ALLOC_CONF`` that already names ``expandable_segments`` is
+    the operator's choice and wins either way.
+    """
+    if not expandable_segments or device.type != "cuda":
+        return False
+    import os
+
+    if "expandable_segments" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""):
+        return False
+    try:
+        setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+        if setter is None:  # torch before the accelerator-generic API
+            setter = torch.cuda.memory._set_allocator_settings
+        setter("expandable_segments:True")
+    except Exception:  # pragma: no cover - older torch, or an allocator that refuses
+        logger.warning("could not enable expandable allocator segments", exc_info=True)
+        return False
+    return True
+
+
+#: Intra-op threads the engine caps torch at when the operator set none.
+DEFAULT_TORCH_THREADS = 8
+
+
+def configure_host_threads(requested: Optional[int]) -> Optional[int]:
+    """Set torch's intra-op thread count; return what was set, or ``None``.
+
+    An explicit ``requested`` always applies.  Otherwise torch's default -- one
+    thread per core -- is capped at :data:`DEFAULT_TORCH_THREADS`, unless the
+    operator chose through ``OMP_NUM_THREADS``.  The engine's CPU tensor work is
+    small and latency-bound (a batch-1 VAD LSTM, a few-MB pack into pinned
+    staging), and fanning it out over 64 threads made host-bound runs about 14x
+    slower whenever other tenants loaded the host, against no gain on an idle one.
+    """
+    import os
+
+    if requested is not None:
+        n = int(requested)
+    elif "OMP_NUM_THREADS" in os.environ or torch.get_num_threads() <= DEFAULT_TORCH_THREADS:
+        return None
+    else:
+        n = DEFAULT_TORCH_THREADS
+    torch.set_num_threads(n)
+    return n
 
 
 def read_device_memory(device: torch.device) -> "tuple[int, int]":
@@ -200,6 +265,41 @@ class MemoryProfile:
 # ---------------------------------------------------------------------------
 
 
+#: Transient bytes of the streaming capture pool, in measured activation peaks.
+#: Measured on U2++ with the padding lane (fp16; pool minus retained inputs and
+#: outputs): captured narrowest-first, the pool kept 0.50 GiB at 32 slots, 0.64
+#: at 128 and 0.80 at 512 (a 0.42 GiB peak), because every wider capture had to
+#: grow it; widest-first, as the pre-warm now runs, 0.11 GiB at 512.  Two peaks
+#: and the floor are what a capture taken lazily, out of that order, can cost.
+GRAPH_TRANSIENT_FACTOR = 2.0
+GRAPH_TRANSIENT_FLOOR_BYTES = 768 * 1024**2
+
+
+def streaming_graph_reserve_bytes(
+    *, io_bytes_per_row: int, capture_rows: int, activation_bytes: int
+) -> int:
+    """Bytes the streaming pre-warm's graph pool will hold.
+
+    Every capture keeps its own input and output buffers alive -- a ``(B, chunk,
+    V)`` log-prob buffer is 160 KiB a row for U2++ -- so that part is the
+    per-row I/O times the rows the pre-warm captures (the sum of its widths
+    over every cache rung).  The intermediates are shared by the pool: about
+    :data:`GRAPH_TRANSIENT_FACTOR` activation peaks, never below
+    :data:`GRAPH_TRANSIENT_FLOOR_BYTES`.  Measured U2++ pools (fp16, the delta
+    over the same engine with graphs off): 0.33 / 1.17 / 2.27 GiB at 32 / 128 /
+    512 slots captured narrowest-first, 1.57 GiB at 512 widest-first.  The
+    engine prices the rows at a stream's block-table ceiling, an upper bound:
+    at 512 slots on a 32 GiB card it reserved 3.45 GiB, every one of the 140
+    pre-warm shapes captured, and 2.3 GiB stayed free (before: a capture ran
+    out of memory with 0.01 GiB left).
+    """
+    retained = max(0, int(io_bytes_per_row)) * max(0, int(capture_rows))
+    transient = max(
+        GRAPH_TRANSIENT_FLOOR_BYTES, int(GRAPH_TRANSIENT_FACTOR * max(0, int(activation_bytes)))
+    )
+    return retained + transient
+
+
 def bytes_per_kv_block(
     *,
     num_layers: int,
@@ -246,8 +346,9 @@ def derive_pool_blocks(
     *,
     min_blocks: int,
     max_blocks: int,
+    reserve_bytes: int = 0,
 ) -> PoolSizing:
-    """Size the paged-KV pool to fit ``profile.available_bytes``.
+    """Size the paged-KV pool to fit ``profile.available_bytes - reserve_bytes``.
 
     Parameters
     ----------
@@ -260,6 +361,10 @@ def derive_pool_blocks(
         (``max_batch_size * blocks_per_seq``).  Beyond this the memory is
         allocated and never handed out, so the pool is capped here even when the
         card could afford more.
+    reserve_bytes : int
+        Withheld for something allocated after the pool that the profile does
+        not see -- the streaming graph pre-warm
+        (:func:`streaming_graph_reserve_bytes`).
 
     Raises
     ------
@@ -275,14 +380,20 @@ def derive_pool_blocks(
             f"min_blocks ({min_blocks}) exceeds max_blocks ({max_blocks}); the "
             "retained history cannot be addressed by the block table"
         )
-    affordable = profile.available_bytes // bytes_per_block
+    spendable = max(0, profile.available_bytes - max(0, int(reserve_bytes)))
+    affordable = spendable // bytes_per_block
     if affordable < min_blocks:
+        reserved = (
+            f" after a {reserve_bytes / _GIB:.2f}GiB CUDA-graph reserve"
+            if reserve_bytes > 0
+            else ""
+        )
         raise ValueError(
             "cannot size the paged KV cache from VRAM: this configuration needs "
             f"at least {min_blocks} blocks "
             f"({min_blocks * bytes_per_block / _GIB:.2f}GiB) but only "
-            f"{affordable} blocks fit ({profile.available_bytes / _GIB:.2f}GiB "
-            f"available). Profile: {profile.describe()}. Lower max_batch_size, "
+            f"{affordable} blocks fit ({spendable / _GIB:.2f}GiB "
+            f"available{reserved}). Profile: {profile.describe()}. Lower max_batch_size, "
             "shorten the retained history (num_left_chunks), raise "
             "gpu_memory_utilization, or set max_num_blocks explicitly to take "
             "responsibility for the size."

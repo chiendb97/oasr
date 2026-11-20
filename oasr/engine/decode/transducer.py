@@ -550,12 +550,18 @@ class TransducerDecodeStrategy(DecodeStrategy):
             from oasr.engine.greedy_graph import GreedyLoopGraphCache
 
             joiner, decoder = self._surface()
+            # Streaming pre-warms one capture per cohort width 1..max_batch_size
+            # and offline adds a few frame capacities per width, so a fixed cap
+            # of 48 left the widest streaming cohorts eager for good: at a pool
+            # of 64, half of Nemotron's streaming loops (104 of 208).
+            pool = int(getattr(self._config, "max_batch_size", 32) or 32)
             self._loop_graphs = GreedyLoopGraphCache(
                 decoder,
                 joiner,
                 blank=int(cast(int, self._model.blank_id)),
                 max_sym=self._max_sym,
                 unroll=_TERMINATION_CHECK_STRIDE,
+                max_captures=max(48, 2 * pool + 32),
             )
         return self._loop_graphs
 
@@ -868,6 +874,13 @@ class TransducerDecodeStrategy(DecodeStrategy):
         if requests is not None or self._beam > 1 or not self._fused_enabled:
             return None
         if not (enc_out.is_cuda and enc_out.dtype in (torch.float16, torch.bfloat16)):
+            return None
+        # Before any work: a model without the stateless surface (Nemotron's LSTM
+        # predictor) latches the fused path off here, once.  ``_fused_launch``
+        # rejects such a state before it ever asks, so without this every batch
+        # computed ``encoder_proj`` and an initial state only to return ``None``
+        # and have the synchronous loop compute both again.
+        if self._fused_surface() is None:
             return None
         joiner, _decoder = self._surface()
         enc_proj = joiner.encoder_proj(enc_out)  # type: ignore[operator]
