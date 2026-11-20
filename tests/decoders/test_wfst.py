@@ -352,6 +352,34 @@ def test_toy_batched_offline_equivalence(toy_fst):
     assert list(b_tokens[0]) == _TOY_WORDS
 
 
+@pytest.mark.parametrize("thresh", [1.0, 0.6])
+def test_group_preparation_matches_the_per_row_one(toy_fst, thresh):
+    """One read-back per lane group instead of two per row; same packed frames.
+
+    ``_prepare_group`` must hand the decoder exactly the frames ``_prepare``
+    kept for each row -- the length clip and the blank skip -- in the same
+    order, padded with ``-30.0``.
+    """
+    _module()
+    from oasr.decoder.wfst_decoder import WfstDecoderOptions, WfstDecoderSearch
+
+    searcher = WfstDecoderSearch(
+        toy_fst,
+        WfstDecoderOptions(min_active_states=1, max_active_states=100, blank_skip_thresh=thresh),
+    )
+    gen = torch.Generator().manual_seed(3)
+    logp = torch.log_softmax(torch.randn(5, 17, _TOY_VOCAB, generator=gen) * 3, dim=-1)
+    logp = logp.to(torch.float16).cuda()
+    lengths = [17, 9, 0, 1, 12]
+    packed, lens = searcher._prepare_group(logp, lengths)
+    rows = [searcher._prepare(logp[b, : lengths[b]]) for b in range(5)]
+    assert lens == [r.size(0) for r in rows]
+    assert packed is not None and packed.size(1) == max(lens)
+    for b, r in enumerate(rows):
+        assert torch.equal(packed[b, : lens[b]], r)
+        assert bool((packed[b, lens[b] :] == -30.0).all())
+
+
 def _toy_strategy(toy_fst, vocab=_TOY_VOCAB, **decoder):
     """The engine's ``ctc_wfst`` strategy over a toy graph, built as the engine builds it."""
     from types import SimpleNamespace

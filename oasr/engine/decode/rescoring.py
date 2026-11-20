@@ -223,8 +223,12 @@ class CtcAedRescoringStrategy(DecodeStrategy):
         ys_in, ys_out = add_sos_eos(hyps_pad, self._sos, self._eos, _IGNORE_ID)
         ys_in_lens = hyps_lens + 1
 
-        memory = hidden.repeat_interleave(beam, dim=0)
-        memory_lens = enc_lengths.to(device).repeat_interleave(beam, dim=0)
+        # One memory row per utterance: the decoder projects its cross-attention
+        # keys and values once and repeats them over the beam, where repeating
+        # the memory itself made every layer of both directions project it
+        # ``beam`` times over.
+        memory = hidden
+        memory_lens = enc_lengths.to(device)
 
         r_ys_in = None
         use_reverse = self._reverse_weight > 0.0
@@ -233,7 +237,9 @@ class CtcAedRescoringStrategy(DecodeStrategy):
             r_ys_in, r_ys_out = add_sos_eos(r_hyps_pad, self._sos, self._eos, _IGNORE_ID)
 
         with torch.no_grad():
-            l_logits, r_logits = self._decoder(memory, memory_lens, ys_in, ys_in_lens, r_ys_in)
+            l_logits, r_logits = self._decoder(
+                memory, memory_lens, ys_in, ys_in_lens, r_ys_in, memory_repeats=beam
+            )
 
         # ---- stage 3: score fusion (vectorized WeNet math) ------------------
         l_scores = self._gather_scores(l_logits, ys_out)  # (n,)

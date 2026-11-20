@@ -309,3 +309,41 @@ class TestEndpointer:
         assert decision is not None
         assert decision.reason == "rule2"
         assert decision.terminal is False
+
+
+class TestShortRequestsSkipTheDetector:
+    """``min_audio_s``: offline ``segment`` mode decodes a short request whole.
+
+    The detector ran per request at batch 1 during admission, which capped the
+    fast models; on a short clip it mostly trims edges.  Audio wider than the
+    piece the encoder can take is never skipped -- it has to be cut somewhere.
+    """
+
+    @staticmethod
+    def _engine(min_audio_s, resplit_samples=0):
+        from types import SimpleNamespace
+
+        from oasr.engine.engine import ASREngine
+
+        engine = ASREngine.__new__(ASREngine)
+        engine._config = SimpleNamespace(vad=cfg(mode="segment", min_audio_s=min_audio_s))
+        engine._vad_resplit_samples = resplit_samples
+        return engine
+
+    def test_off_by_default(self):
+        assert not self._engine(None)._vad_skips(16000, 16000)
+
+    def test_a_short_request_skips_and_a_long_one_does_not(self):
+        engine = self._engine(10.0)
+        assert engine._vad_skips(10 * 16000, 16000)
+        assert not engine._vad_skips(10 * 16000 + 1, 16000)
+
+    def test_audio_wider_than_the_encoder_piece_is_never_skipped(self):
+        engine = self._engine(60.0, resplit_samples=30 * 16000)
+        assert engine._vad_skips(30 * 16000, 16000)
+        assert not engine._vad_skips(45 * 16000, 16000)
+
+    def test_it_is_typed_from_a_server_option_string(self):
+        assert VadConfig.coerce({"mode": "segment", "min_audio_s": "12.5"}).min_audio_s == 12.5
+        with pytest.raises(ValueError):
+            cfg(mode="segment", min_audio_s=-1)

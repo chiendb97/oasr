@@ -27,6 +27,8 @@ from oasr.cache.types import CacheConfig
 from oasr.engine.config import EngineConfig
 from oasr.engine.memory import (
     ACTIVATION_SAFETY,
+    GRAPH_TRANSIENT_FACTOR,
+    GRAPH_TRANSIENT_FLOOR_BYTES,
     MIN_ACTIVATION_RESERVE_BYTES,
     MIN_BLOCKS_PER_STREAM,
     UNMEASURED_ACTIVATION_FRACTION,
@@ -34,6 +36,7 @@ from oasr.engine.memory import (
     bytes_per_kv_block,
     derive_decode_kv_budget,
     derive_pool_blocks,
+    streaming_graph_reserve_bytes,
 )
 
 GIB = 1024**3
@@ -215,6 +218,72 @@ class TestDerivePoolBlocks:
     def test_rejects_a_floor_above_the_ceiling(self):
         with pytest.raises(ValueError, match="block table"):
             derive_pool_blocks(_profile(), self.PER_BLOCK, min_blocks=100, max_blocks=10)
+
+    def test_a_reserve_is_withheld_from_the_pool(self):
+        p = _profile(total_gib=32.0, free_gib=28.0, activation_gib=2.0)
+        free = derive_pool_blocks(p, self.PER_BLOCK, min_blocks=32, max_blocks=1 << 30)
+        held = derive_pool_blocks(
+            p, self.PER_BLOCK, min_blocks=32, max_blocks=1 << 30, reserve_bytes=3 * GIB
+        )
+        assert held.blocks == (p.available_bytes - 3 * GIB) // self.PER_BLOCK
+        assert free.blocks - held.blocks == pytest.approx(3 * GIB / self.PER_BLOCK, abs=1)
+
+    def test_a_reserve_that_leaves_too_little_says_so(self):
+        p = _profile(total_gib=32.0, free_gib=28.0, activation_gib=2.0)
+        with pytest.raises(ValueError, match="CUDA-graph reserve"):
+            derive_pool_blocks(
+                p,
+                self.PER_BLOCK,
+                min_blocks=32,
+                max_blocks=1 << 30,
+                reserve_bytes=p.available_bytes,
+            )
+
+
+class TestStreamingGraphReserve:
+    """The pre-warm's pool, priced before the paged pool takes the card.
+
+    Measured on U2++ (fp16, padding lane): the pool grew by 0.16 MiB per captured
+    row -- its ``(B, 16, 5008)`` log-probs and its input window -- plus about two
+    activation peaks.  At 512 slots it needed 2.3 GiB while the derivation left
+    0.6, and a capture failed with the card full.
+    """
+
+    def test_retained_io_scales_with_the_captured_rows(self):
+        one = streaming_graph_reserve_bytes(
+            io_bytes_per_row=170_000, capture_rows=1000, activation_bytes=GIB
+        )
+        two = streaming_graph_reserve_bytes(
+            io_bytes_per_row=170_000, capture_rows=2000, activation_bytes=GIB
+        )
+        assert two - one == 170_000 * 1000
+
+    def test_transients_are_activation_peaks_with_a_floor(self):
+        big = streaming_graph_reserve_bytes(
+            io_bytes_per_row=0, capture_rows=0, activation_bytes=GIB
+        )
+        assert big == int(GRAPH_TRANSIENT_FACTOR * GIB)
+        tiny = streaming_graph_reserve_bytes(io_bytes_per_row=0, capture_rows=0, activation_bytes=1)
+        assert tiny == GRAPH_TRANSIENT_FLOOR_BYTES
+
+    def test_the_measured_u2pp_pools_are_covered(self):
+        """The three measured pools against the estimate the engine computes.
+
+        ``rows`` is what the engine plans: powers of two plus the cap, over the
+        16 rungs of a stream at its block-table ceiling (an upper bound -- the
+        real ladders had 16, 13 and 9 rungs).
+        """
+        per_row = 171_000
+        peak_512 = int(0.42 * GIB)
+        for slots, rows, peak, measured_gib in (
+            (32, 63 * 16, peak_512 // 16, 0.33),
+            (128, 255 * 16, peak_512 // 4, 1.17),
+            (512, 1023 * 16, peak_512, 2.27),
+        ):
+            reserve = streaming_graph_reserve_bytes(
+                io_bytes_per_row=per_row, capture_rows=rows, activation_bytes=peak
+            )
+            assert reserve >= measured_gib * GIB, slots
 
 
 # ---------------------------------------------------------------------------

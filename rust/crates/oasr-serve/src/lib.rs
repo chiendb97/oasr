@@ -127,6 +127,9 @@ async fn serve(cli: Cli) -> Result<()> {
             None
         }
     };
+    if let Some(handle) = prometheus.clone() {
+        spawn_metrics_upkeep(handle);
+    }
 
     // Validate the flag early (a typo should fail before we load a model), but
     // the *authoritative* mode comes from the engine once it is built — see below.
@@ -209,10 +212,24 @@ async fn serve(cli: Cli) -> Result<()> {
         .parse()
         .expect("validated by GrpcServiceMode parse above");
 
+    let admission_cap = cli.admission_cap(
+        grpc_mode == GrpcServiceMode::Streaming,
+        model.max_batch_size,
+    );
+    if admission_cap < cli.max_concurrent_requests {
+        info!(
+            label = %cli.engine_label,
+            slots = ?model.max_batch_size,
+            max_waiting_streams = cli.max_waiting_streams,
+            admission_cap,
+            "streaming admission capped at the engine's slots plus --max-waiting-streams"
+        );
+    }
     let mut client_cfg = EngineClientConfig::new(cli.engine_label.clone());
     client_cfg.dispatcher = DispatcherConfig {
-        max_concurrent_requests: cli.max_concurrent_requests,
+        max_concurrent_requests: admission_cap,
         admit_window: Duration::from_millis(cli.admit_window_ms),
+        admit_gap: Duration::from_micros(cli.admit_gap_us),
         admit_threshold: cli.admit_threshold,
         trace_dispatch: cli.trace_dispatch,
         ..DispatcherConfig::default()
@@ -323,9 +340,14 @@ async fn serve(cli: Cli) -> Result<()> {
         .with_context(|| format!("bind http {http_bind}"))?;
     info!("HTTP listening on http://{http_bind}");
     let http_handle = tokio::spawn(async move {
-        let serve = axum::serve(http_listener, http_router).with_graceful_shutdown(async move {
-            let _ = http_shutdown_rx.recv().await;
-        });
+        // Nagle off, as gRPC already has it: an SSE token or a realtime event is
+        // its own small write, and with Nagle on the second of two back-to-back
+        // writes waits for the client's (delayed) ACK of the first.
+        let serve = axum::serve(http_listener, http_router)
+            .tcp_nodelay(true)
+            .with_graceful_shutdown(async move {
+                let _ = http_shutdown_rx.recv().await;
+            });
         if let Err(e) = serve.await {
             error!("axum serve: {e}");
         }
@@ -543,6 +565,35 @@ async fn wait_for_signal() {
     {
         let _ = signal::ctrl_c().await;
     }
+}
+
+/// How often the histogram samples are drained when nobody scrapes `/metrics`.
+const METRICS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Drain the recorder's histogram samples on a timer.
+///
+/// metrics-exporter-prometheus 0.13 keeps every raw histogram sample until a
+/// render folds it into its distribution, and nothing renders but a scrape of
+/// `/metrics`.  An unscraped server therefore grew without bound: measured
+/// about 0.38 KB per request (+35 MB over 92,000 U2++ requests), flat once
+/// scraped.  The render runs on a blocking thread, so its cost never lands on
+/// a worker that is serving requests, and its output is discarded.
+fn spawn_metrics_upkeep(handle: metrics_exporter_prometheus::PrometheusHandle) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(METRICS_UPKEEP_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick fires immediately
+        loop {
+            tick.tick().await;
+            let h = handle.clone();
+            if tokio::task::spawn_blocking(move || drop(h.render()))
+                .await
+                .is_err()
+            {
+                debug!("metrics upkeep render panicked");
+            }
+        }
+    });
 }
 
 #[cfg(test)]

@@ -212,6 +212,30 @@ class SlotStreamingBackend(StreamingEncoderBackend):
         request.slot_id = slot
         request.stream_context = None
 
+    def allocate_many(self, requests: Sequence[Request]) -> None:
+        """Admit a cohort with one zeroing kernel per state for all its slots."""
+        if len(requests) <= 1:
+            for request in requests:
+                self.allocate(request)
+            return
+        sids: List[int] = []
+        slots: List[int] = []
+        for request in requests:
+            sid = request.stream_id
+            assert sid is not None, "stream_id must be assigned before allocate"
+            sids.append(sid)
+            slots.append(self._slots.allocate())
+        try:
+            self._state.allocate_streams(sids, slots)
+        except Exception:
+            for slot in slots:
+                self._slots.free(slot)
+            raise
+        for request, sid, slot in zip(requests, sids, slots):
+            self._slot_of[sid] = slot
+            request.slot_id = slot
+            request.stream_context = None
+
     def free(self, request: Request) -> None:
         sid = request.stream_id
         if sid is None or sid not in self._slot_of:

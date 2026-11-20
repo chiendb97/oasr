@@ -181,6 +181,14 @@ class Load(Benchmark):
         n_warm = self._warmup_n()
         total = self.params.get("num_requests")
         duration = self.params.get("duration_s")
+        if duration is not None and n_warm:
+            # A duration bound measures a span of time, so the warm-up has to be
+            # time *ahead* of it: counted inside it, ``warmup_requests: all``
+            # made every arrival of a 23 s window at 7-33 req/s warm-up, and the
+            # point reported zero requests.  The requests become the time they
+            # take to arrive, capped at the measured span itself.
+            warm_s = max(warm_s, min(n_warm / rate, float(duration)))
+            n_warm = 0
         offsets = arrival_offsets(
             rate,
             process=self.params["arrival"],

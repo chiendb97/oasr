@@ -378,7 +378,9 @@ a slot. Inline, one long upload held a worker and every health check, metrics
 scrape and stream forward queued behind it. The exception is raw PCM already at
 the model's rate and at most 2^18 samples (16 s at 16 kHz): that decode is one
 pass over the body, cheaper than the hop to another thread, so it runs in place
-and the throughput path pays nothing for the pool. The waveform stays one `Vec<f32>`
+and the throughput path pays nothing for the pool. A mono 16-bit or float WAV at
+the model's rate counts as raw PCM: its header is read, and its data chunk is
+converted in the same single pass rather than sample by sample. The waveform stays one `Vec<f32>`
 from the decoder to the engine hand-off: the decoder fills it, the resampler
 reads it, and it becomes the request's bytes without a copy, so a decode's peak
 is the waveform at the source rate plus the waveform at the model's rate. The
@@ -870,8 +872,17 @@ touch the GIL.
 **Admission coalescing.** Contiguous `CreateOffline` / `CreateStreaming`
 envelopes are batched into one `add_requests_batch` Python call, which turns
 shallow service batches into deep ones under `asyncio.gather`-style bursts.
-`--admit-window-ms` waits that long after the first envelope for siblings;
-`--admit-threshold` stops coalescing early once that many have drained.
+`--admit-window-ms` waits at most that long after the first envelope for
+siblings, and `--admit-gap-us` (default 500) closes it early once no admission
+has arrived for that long: a burst of clients lands within a few hundred
+microseconds and still coalesces, while a lone request pays the gap rather than
+the whole window (`0` keeps the full window). The adaptive window holds
+admissions only while the engine has nothing in flight; with work in flight a new
+arrival joins the next step anyway. Requests the last tick finished count as
+arrivals to wait for: while fewer admissions than that have come back (within
+20 ms), the window stays open past the gap, and once they are all in it closes
+at once. `--admit-threshold` stops
+coalescing once that many have drained.
 `FeedChunk` / `Cancel` / `Ping` flush the admit batch first, to preserve
 `CreateStreaming → FeedChunk` ordering — and a `Cancel` or `FeedChunk` in hand,
 or landing mid-window, **ends** the wait, since the window used to tax the two
@@ -1129,12 +1140,13 @@ the defaults that bit hardest were the ones nobody had written down.
 |---|---|---|
 | `--max-audio-mib` | `256` | Largest audio payload per request. Drives **both** the HTTP body cap (including the multipart routes) and gRPC's `max_decoding_message_size`. One number, because tonic's undeclared 4 MiB default against HTTP's 256 MiB meant the same ~2-minute clip was accepted on REST and rejected on the surface this doc recommends for offline throughput — and axum's own 2 MiB multipart default would have reintroduced exactly that asymmetry on the upload routes. |
 | `--max-audio-seconds` | `14400` (4 h) | Longest **decoded** waveform. A separate bound because a compressed container breaks the relationship between body bytes and audio seconds: a few MiB of MP3 is hours of waveform, allocated before anything could notice. Exceeding it is `413`, never a truncated transcript. `0` disables. |
-| `--max-concurrent-decodes` | the CPU count | Unary requests decoding and resampling their audio at once, shared by both listeners; the rest wait for a slot. Decodes run on tokio's blocking pool rather than the async workers, so the bound is on CPU and on resident waveforms -- each decode holds its audio at the source and the model rate until it finishes. Short raw PCM at the model's rate bypasses the pool (see above). A decoder that panics on some input fails that request with `500` / `INTERNAL`. Minimum `1`. |
+| `--max-concurrent-decodes` | the CPU count | Unary requests decoding and resampling their audio at once, shared by both listeners; the rest wait for a slot. Decodes run on tokio's blocking pool rather than the async workers, so the bound is on CPU and on resident waveforms -- each decode holds its audio at the source and the model rate until it finishes. Short raw PCM (or mono 16-bit / float WAV) at the model's rate bypasses the pool (see above). A decoder that panics on some input fails that request with `500` / `INTERNAL`. Minimum `1`. |
 | `--served-model-name` | *(unset)* | Names the OpenAI surface's `model` field must match. Unset accepts any name — what makes a client hardcoded to `whisper-1` work after a base-URL change. Set, an unknown name is `404`. Repeatable. |
 | `--cors-allow-origin` | *(unset)* | Origins allowed to call the HTTP API from a browser; `*` allows any. No CORS layer is installed when unset. Repeatable. |
 | `--request-timeout-secs` | `300` | Deadline for one **unary** request (HTTP `speech:recognize` and the OpenAI upload routes, gRPC `Recognize`), covering time queued for an in-flight permit. HTTP answers `408`, gRPC `DEADLINE_EXCEEDED`; a client's shorter `grpc-timeout` wins. `0` disables. |
 | `--stream-idle-timeout-secs` | `300` | Aborts a streaming RPC or `/v1/realtime` session that goes this long with no inbound message (the config, audio before half-close / commit) or no decode event (after). `0` disables. Deliberately *not* a blanket deadline — that would cut off healthy long-lived streams; a live stream can only be bounded by inactivity. |
 | `--max-inflight-connections` | `4 x --max-concurrent-requests` | Requests the **process** handles at once, one budget for both listeners; the rest queue (and are eventually cut off by the timeout). A unary request takes a permit for its life; a `/v1/realtime` session or a gRPC `StreamingRecognize` holds one for its whole life and is refused when none is free (`503` / `RESOURCE_EXHAUSTED`), because a stream parked for a permit would sit outside every other bound. On HTTP the permit is taken before the body is read, so it also bounds resident bodies; on gRPC tonic has already read the message (`--max-audio-mib`) when the handler takes it. `/healthz`, `/readyz`, `/metrics` and the gRPC health service are **exempt** — a saturated server must still answer its own probes. `0` disables. |
+| `--max-waiting-streams` | `16` | Streaming only: live streams a worker accepts beyond its slots (`--max-batch-size`) before refusing new ones with `503` / `RESOURCE_EXHAUSTED`. A stream past the slots waits for one to free while its audio keeps arriving, so it falls behind real time with nothing telling the client; a refusal lets a load balancer place it elsewhere. The worker's cap is `min(--max-concurrent-requests, slots + this)`. |
 | `--shutdown-grace-secs` | `10` | How long in-flight work — requests, RPCs and realtime sessions — gets to finish after SIGTERM/SIGINT before what is left is cut. |
 | `--listen-backlog` | `4096` | Accept-queue depth of both listeners (`listen(2)`; the kernel caps it at `net.core.somaxconn`). tokio's and std's `bind` use 128, and past it the kernel drops a new connection's SYN, which the client resends only after Linux's 1 s initial retransmission timeout — so a burst of reconnecting clients bigger than the queue turned into a second of latency for whichever requests did not fit. |
 

@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _TURN_BOUNDARY = "vad_segment"
 
 
+#: Clean ticks at a reduced forward width before it doubles back (``_note_forward``).
+OOM_RECOVERY_TICKS = 100
+
+
 class StreamingExecutor(Executor):
     """Streaming inference with one encoder chunk per active stream per tick.
 
@@ -74,6 +78,15 @@ class StreamingExecutor(Executor):
     #: construction turns "VAD is off" into an AttributeError on the failure
     #: path — which is exactly the path those tests exercise.
     _vad: Optional["StreamingVadStage"] = None
+
+    # Forward-width backoff after an out-of-memory forward; ``None`` until one.
+    # The failed cohort is lost either way (see ``_fail_cohort``), but the streams
+    # behind it need not be: the next ticks forward at most this many streams,
+    # rotating which ones wait a tick, and the cap doubles back after
+    # :data:`OOM_RECOVERY_TICKS` clean ticks at it.
+    _forward_cap: Optional[int] = None
+    _clean_ticks: int = 0
+    _rotation: int = 0
 
     def __init__(
         self,
@@ -594,6 +607,44 @@ class StreamingExecutor(Executor):
         self._metrics.observe_stage("streaming.features", time.perf_counter() - t0)
         return running
 
+    def _limit_width(self, ready: List[Request]) -> List[Request]:
+        """At most ``_forward_cap`` of ``ready``, rotating which ones wait a tick.
+
+        A deferred stream keeps its features and its place; it is forwarded on
+        a later tick, so it falls behind rather than failing.
+        """
+        cap = self._forward_cap
+        if cap is None or len(ready) <= cap:
+            return ready
+        start = self._rotation % len(ready)
+        self._rotation += cap
+        return (ready[start:] + ready[:start])[:cap]
+
+    def _note_forward(self, width: int, exc: Optional[BaseException]) -> None:
+        """Move the width backoff: halve on an OOM, double back after clean ticks."""
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            self._forward_cap = max(1, width // 2)
+            self._clean_ticks = 0
+            # The failed forward's transients are garbage now; hand their blocks
+            # back so the narrower forward that follows is not short of them.
+            torch.cuda.empty_cache()
+            logger.warning(
+                "streaming forward ran out of memory at %d streams; forwarding at most "
+                "%d per tick until %d clean ticks pass",
+                width,
+                self._forward_cap,
+                OOM_RECOVERY_TICKS,
+            )
+            return
+        if exc is not None or self._forward_cap is None:
+            return
+        self._clean_ticks += 1
+        if self._clean_ticks >= OOM_RECOVERY_TICKS:
+            self._clean_ticks = 0
+            self._forward_cap *= 2
+            if self._forward_cap >= int(self._config.max_batch_size):
+                self._forward_cap = None
+
     def _forward(
         self, ready: List[Request], outputs: List[RequestOutput]
     ) -> Optional[Dict[str, torch.Tensor]]:
@@ -610,7 +661,9 @@ class StreamingExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — see _fail_cohort
             nvtx_pop()
             outputs.extend(self._fail_cohort(ready, exc, "streaming_forward"))
+            self._note_forward(len(ready), exc)
             return None
+        self._note_forward(len(ready), None)
         nvtx_pop()
         self._metrics.observe_stage("streaming.encode", time.perf_counter() - t0)
         return log_probs_map
@@ -654,6 +707,7 @@ class StreamingExecutor(Executor):
         if not running:
             return running
         ready = self._gate([r for r in running if r.has_ready_encoder_chunk(window)], outputs)
+        ready = self._limit_width(ready)
         if not ready:
             return running
         log_probs_map = self._forward(ready, outputs)
@@ -693,6 +747,7 @@ class StreamingExecutor(Executor):
           produces when a feature failure follows a successful step.
         """
         ready = self._gate([r for r in running if r.has_ready_encoder_chunk(window)], outputs)
+        ready = self._limit_width(ready)
         log_probs_map = self._forward(ready, outputs) if ready else None
         if ready and log_probs_map is None:
             ready = []
@@ -719,8 +774,8 @@ class StreamingExecutor(Executor):
             self._metrics.observe_queue_wait(m.MODE_STREAMING, newly_admitted)
             nvtx_push("allocate_stream")
             t0 = time.perf_counter()
+            self._mr.allocate_streams(newly_admitted)  # encoder KV + CNN cache
             for req in newly_admitted:
-                self._mr.allocate_stream(req)  # encoder KV + CNN cache
                 self._op.create_session(req)  # decode-side beam state
                 self._open_vad(req)  # speech-activity segmenter + endpointer
             nvtx_pop()

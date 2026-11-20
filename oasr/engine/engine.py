@@ -28,9 +28,11 @@ from .executor import (
     OfflineExecutor,
     StreamingExecutor,
 )
+from .graph_cache import cache_bucket_ladder, plan_prewarm_widths, round_up_bucket
 from .input_processor import InputProcessor
 from .longform import LongFormTracker
 from .memory import (
+    MIN_ACTIVATION_RESERVE_BYTES,
     MIN_BLOCKS_PER_STREAM,
     PREFILL_PROBE_ROWS,
     PROBE_AUDIO_SECONDS,
@@ -38,10 +40,13 @@ from .memory import (
     KvBudget,
     MemoryProfile,
     bytes_per_kv_block,
+    configure_allocator,
+    configure_host_threads,
     derive_decode_kv_budget,
     derive_pool_blocks,
     measure_peak_activation,
     read_device_memory,
+    streaming_graph_reserve_bytes,
 )
 from .metrics import (
     AUDIO_SECONDS_SKIPPED,
@@ -56,9 +61,19 @@ from .output_processor import OutputProcessor
 from .request import DecodingOptions, Request, RequestOutput
 from .scheduler import Scheduler
 from .streaming_backend import get_streaming_backend_class
+from .streaming_backend.paged import resolve_batch_widths
 from .vad_stage import OfflineVadSegmenter, StreamingVadStage
 
 logger = logging.getLogger(__name__)
+
+
+def _tensor_bytes(obj) -> int:
+    """Bytes of every tensor in ``obj`` (a tensor, or a tuple / list of them)."""
+    if isinstance(obj, torch.Tensor):
+        return int(obj.nbytes)
+    if isinstance(obj, (tuple, list)):
+        return sum(_tensor_bytes(o) for o in obj)
+    return 0
 
 
 class ASREngine:
@@ -118,6 +133,8 @@ class ASREngine:
     #: ``_longform``: the concurrency tests drive a hand-built engine through
     #: ``__new__``, and a read must not depend on construction having run.
     _memory_profile: Optional[MemoryProfile] = None
+    #: Free bytes a streaming capture must leave for the eager path (``0``: unchecked).
+    _capture_floor_bytes: int = 0
     #: The derived decoder-KV budget, with the prefill reserve it took off.
     _decode_kv_budget: Optional[KvBudget] = None
 
@@ -135,6 +152,10 @@ class ASREngine:
         # Before the weights: a device of another architecture than the one this
         # process compiles for would load them, then fail at the first kernel.
         require_device_family(device_str)
+        # Before the first large allocation, so the weights and every later
+        # segment are mapped the expandable way.
+        configure_allocator(torch.device(device_str), config.cuda_expandable_segments)
+        configure_host_threads(config.torch_num_threads)
 
         logger.info("Loading model from %s ...", config.ckpt_dir)
         # ``load_pretrained`` accepts a local checkpoint dir (the common case —
@@ -259,6 +280,17 @@ class ASREngine:
                 self._autosize_kv_pool(config, cache_spec, consumes)
             else:
                 self._check_explicit_kv_pool(config, cache_spec)
+            if self._device.type == "cuda" and bool(config.use_cuda_graphs):
+                # What a streaming capture must leave the eager path: its
+                # measured reserve plus one capture's own transients when the
+                # pool was derived; an explicit pool pays for no probe (H4), so
+                # it gets the reserve's floor.
+                profile = self._memory_profile
+                self._capture_floor_bytes = (
+                    profile.activation_reserve_bytes + profile.activation_bytes
+                    if profile is not None
+                    else MIN_ACTIVATION_RESERVE_BYTES
+                )
             cache_config = config.build_cache_config(cache_spec)
         self._model_runner = ModelRunner(
             model, config, cache_config, graph_pool=self._graph_pool, consumes=consumes
@@ -321,6 +353,7 @@ class ASREngine:
             try:
                 cap = max(1, int(config.max_batch_size))
                 backend = self._model_runner.streaming_backend
+                backend.set_capture_floor(self._capture_floor_bytes)
                 widths = getattr(backend, "graph_batch_widths", None)
                 ladder = config.streaming_graph_batch_ladder
                 if widths:
@@ -337,11 +370,9 @@ class ASREngine:
                     batch_sizes = list(range(1, cap + 1))
                 rungs = len(self._model_runner.streaming_backend.cache_bucket_ladder) or 1
                 budget = int(config.streaming_graph_max_shapes)
-                if len(batch_sizes) * rungs > budget:
-                    # Keep the low widths (the ramp, and light load) plus the cap.
+                batch_sizes, dropped = plan_prewarm_widths(batch_sizes, cap, rungs, budget)
+                if dropped:
                     keep = max(1, budget // rungs)
-                    dropped = len(batch_sizes) - keep
-                    batch_sizes = sorted(set(batch_sizes[:keep]) | {cap})
                     logger.info(
                         "streaming graph pre-warm budget %d shapes: covering batch "
                         "widths %s (%d widths left lazy; raise "
@@ -506,12 +537,68 @@ class ASREngine:
                 device,
             )
 
+        # Every attention variant the tuning table can route this model to,
+        # compiled now rather than on whichever live request first needs it.
+        if self._device.type == "cuda" and config.precompile_attention:
+            self._precompile_attention()
+
         # Last, so everything construction allocated — the model, the prewarm's
         # graphs and JIT modules — is frozen with it.  See ``gc_freeze``.
         self._gc_frozen = False
         if getattr(config, "gc_freeze", True):
             gc_freeze.freeze()
             self._gc_frozen = True
+
+    def _precompile_attention(self) -> None:
+        """Compile the attention variants live traffic can reach, before it arrives.
+
+        A CuTeDSL attention variant compiles on first use, ~1.3 s on the request
+        that needs it; which variant depends on the tuned tile for the batch,
+        query and key length, and on the key length's parity.  The start-up
+        forward only reaches one of them, so this compiles the rest of what the
+        tuning table can choose for every attention signature seen so far.  An
+        autoregressive family's decoder is only reached by a decode, which the
+        offline pre-warm never runs (Whisper's first request spent 2.1-2.2 s of
+        2.6 s compiling), so one short decode runs first.
+        """
+        t0 = time.perf_counter()
+        strategy = self._output_processor.strategy
+        if self._config.service_mode == "offline" and strategy.incremental:
+            try:
+                self._warm_one_decode()
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.warning("decode warm-up failed (first request compiles instead): %s", exc)
+        from oasr.jit.attention import precompile_fmha_variants
+
+        try:
+            compiled, refused = precompile_fmha_variants(
+                budget_s=self._config.precompile_attention_budget_s
+            )
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("attention precompile failed (variants compile on use): %s", exc)
+            return
+        logger.info(
+            "precompiled %d attention variant(s) in %.1f s (%d not servable)",
+            compiled,
+            time.perf_counter() - t0,
+            refused,
+        )
+
+    def _warm_one_decode(self) -> None:
+        """Run one short request through the whole offline path, then forget it."""
+        sr = int(self._config.feature_config.sample_rate)
+        gen = torch.Generator().manual_seed(0)
+        noise = torch.randn(sr * 2, generator=gen) * 1e-3
+        rid = self.add_request(noise, streaming=False, decoding={"max_new_tokens": 4})
+        deadline = time.perf_counter() + 120.0
+        while time.perf_counter() < deadline:
+            if any(o.finished and o.request_id == rid for o in self.step()):
+                break
+        else:  # pragma: no cover - a decode that never finishes is reported, not fatal
+            logger.warning("decode warm-up did not finish within 120 s")
+            self.abort_request(rid)
+        # The warm-up is not traffic: drop what it recorded.
+        self.metrics_snapshot()
 
     # ------------------------------------------------------------------
     # VRAM-aware capacity sizing
@@ -622,17 +709,22 @@ class ASREngine:
             dtype=config.dtype,
         )
         profile = self._profile_device_memory(config, consumes)
+        graph_reserve = self._streaming_graph_reserve(
+            config, cache_spec, profile, per_stream=per_stream, block_size=block_size
+        )
         sizing = derive_pool_blocks(
             profile,
             per_block,
             min_blocks=batch * floor_per_stream,
             max_blocks=batch * per_stream,
+            reserve_bytes=graph_reserve,
         )
         config.max_num_blocks = sizing.blocks
         logger.info(
-            "paged KV pool derived from VRAM: %s | %s",
+            "paged KV pool derived from VRAM: %s | %s | streaming graph reserve %.2fGiB",
             sizing.describe(),
             profile.describe(),
+            graph_reserve / float(1024**3),
         )
         if sizing.limited_by == "block_table" and num_left_chunks < 0:
             # The card could afford more, but no stream could address it.  Say so:
@@ -646,6 +738,52 @@ class ASREngine:
                 batch,
                 profile.available_bytes / float(1024**3),
             )
+
+    def _streaming_graph_reserve(
+        self,
+        config: EngineConfig,
+        cache_spec,
+        profile: MemoryProfile,
+        *,
+        per_stream: int,
+        block_size: int,
+    ) -> int:
+        """Bytes the streaming graph pre-warm will take, held back from the pool.
+
+        The pre-warm captures after the pool is allocated -- its graphs read the
+        pool's addresses -- so it cannot be measured first.  It is priced from the
+        same plan it will follow: :func:`resolve_batch_widths` and
+        :func:`plan_prewarm_widths` give the widths, the cache ladder of a stream
+        at its block-table ceiling gives the rungs (an upper bound: the real
+        ladder stops at the pool's fair share, which this derivation is about to
+        decide), and the probe gives the per-row I/O every capture keeps alive.
+        ``0`` when nothing will be captured.
+        """
+        if not (bool(config.use_cuda_graphs) and config.service_mode == "streaming"):
+            return 0
+        rows_io = int(getattr(self, "_probe_io_bytes_per_row", 0) or 0)
+        if not profile.activation_measured or rows_io <= 0:
+            return 0
+        cap = max(1, int(config.max_batch_size))
+        prefill = cache_spec.fixed_attention_window is not None
+        if prefill:
+            rungs = 1
+        else:
+            capacity = int(per_stream) * int(block_size)
+            if config.streaming_cache_geometry(cache_spec)[1] >= 0:
+                capacity = round_up_bucket(max(0, (int(per_stream) - 1) * int(block_size)))
+            growth = float(getattr(config, "streaming_graph_cache_growth", 1.5))
+            rungs = len(cache_bucket_ladder(capacity, growth=growth)) or 1
+        pad = config.streaming_graph_pad_batch
+        if pad is None:
+            pad = not prefill
+        widths = resolve_batch_widths(config.streaming_graph_batch_ladder, bool(pad), cap)
+        planned, _ = plan_prewarm_widths(widths, cap, rungs, int(config.streaming_graph_max_shapes))
+        return streaming_graph_reserve_bytes(
+            io_bytes_per_row=rows_io,
+            capture_rows=rungs * sum(planned),
+            activation_bytes=profile.activation_bytes,
+        )
 
     def _autosize_decode_kv_budget(self, config: EngineConfig, consumes: str) -> None:
         """Resolve ``decode_kv_budget_gib=None`` into a byte ceiling for AR decode.
@@ -726,16 +864,22 @@ class ASREngine:
         than ``ModelRunner``: the pool derivation runs before the runner exists
         (the runner is what allocates the pool), and the runner only delegates.
         """
-        reqs = self._probe_requests(config, max(1, int(config.max_batch_size)))
+        rows = max(1, int(config.max_batch_size))
+        reqs = self._probe_requests(config, rows)
         feats, lengths = self._input_processor.collate(reqs)
+        out: Any
         with torch.no_grad():
             if consumes == "hidden":
-                self._model.encode_offline(feats, lengths)
+                out = self._model.encode_offline(feats, lengths)
             elif consumes == "both":
                 hidden, _ = self._model.encode_offline(feats, lengths)
-                self._model.head(hidden)
+                out = (hidden, self._model.head(hidden))
             else:
-                self._model.forward_offline(feats, lengths)
+                out = self._model.forward_offline(feats, lengths)
+        # What one captured row keeps alive: its input window and its output.
+        # The streaming graph reserve multiplies this by the rows the pre-warm
+        # captures (see ``_streaming_graph_reserve``).
+        self._probe_io_bytes_per_row = (feats.nbytes + _tensor_bytes(out)) // rows
         if config.service_mode == "streaming":
             # ``collate`` is the *offline* ingest path; a streaming engine will
             # never touch the staging buffers it just grew, so give them back
@@ -1067,6 +1211,19 @@ class ASREngine:
         self._input_processor.check_sample_rate(sample_rate)
         return int(sample_rate)
 
+    def _vad_skips(self, samples: int, sample_rate: int) -> bool:
+        """Whether a request this long decodes whole without the detector.
+
+        ``VadConfig.min_audio_s`` asks for it; audio wider than the piece the
+        encoder takes (``_vad_resplit_samples``) is never skipped, since it has
+        to be cut somewhere and the detector is what finds the pauses.
+        """
+        vad = getattr(self._config, "vad", None)
+        limit = getattr(vad, "min_audio_s", None)
+        if limit is None or samples > float(limit) * float(sample_rate):
+            return False
+        return not (0 < self._vad_resplit_samples < samples)
+
     def _maybe_fan_out_longform(self, req: Request) -> Optional[str]:
         """Split an offline request's audio into per-window child requests.
 
@@ -1091,7 +1248,7 @@ class ASREngine:
         wave = torch.as_tensor(req.audio, dtype=torch.float32, device="cpu").reshape(-1)
 
         spans: Optional[List[Tuple[int, int]]] = None
-        if self._vad_splitter is not None:
+        if self._vad_splitter is not None and not self._vad_skips(int(wave.numel()), sample_rate):
             spans = self._vad_splitter.spans(wave)
             if spans is None and 0 < self._vad_resplit_samples < int(wave.numel()):
                 # The detector found no speech, but the audio is wider than any
@@ -1779,6 +1936,25 @@ class ASREngine:
             # forward above is the expensive warmup either way.
             if not strategy.incremental:
                 self._output_processor.decode_offline(enc_out, out_len)
+        prewarm = self._config.offline_graph_prewarm_batches
+        if prewarm:
+            # ``feats`` is the 6 s batch above: its width gives the feature
+            # dimension and, through its frame count, the frames per second.
+            fps = float(feats.size(1)) / 6.0
+            t0 = time.perf_counter()
+            taken = self._model_runner.prewarm_offline_graphs(
+                prewarm,
+                max_frames=int(fps * float(self._config.offline_graph_prewarm_seconds)) + 1,
+                feat_dim=int(feats.size(-1)),
+                dtype=feats.dtype,
+                encoder_only=consumes in ("hidden", "both"),
+            )
+            logger.info(
+                "pre-warmed %d offline graph shape(s) for batch widths %s in %.1f s",
+                taken,
+                list(prewarm),
+                time.perf_counter() - t0,
+            )
         torch.cuda.synchronize()
 
     def add_streaming_request(

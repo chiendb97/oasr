@@ -174,8 +174,13 @@ impl EngineClient {
         &self.cfg.label
     }
 
+    /// Requests this worker holds, plus admissions sent to it that its
+    /// dispatcher has not taken in yet (see `DispatcherShared::submitted`).
     pub fn load(&self) -> u32 {
-        self.shared.load.load(Ordering::Relaxed)
+        self.shared
+            .load
+            .load(Ordering::Relaxed)
+            .saturating_add(self.shared.submitted.load(Ordering::Relaxed))
     }
 
     pub fn model_info(&self) -> Option<oasr_wire::ModelInfo> {
@@ -366,10 +371,51 @@ impl EngineClient {
     }
 
     async fn send_envelope(&self, env: CmdEnvelope) -> Result<(), EngineClientError> {
+        let admission = matches!(
+            env.cmd,
+            Cmd::CreateOffline { .. } | Cmd::CreateStreaming { .. }
+        );
+        // Counted before the send, so a burst is spread across workers while
+        // it is still in flight; uncounted if the send fails or is abandoned.
+        let pending = admission.then(|| Submitted::new(&self.shared));
         self.cmd_tx.send(env).await.map_err(|_| {
             trace!(label = %self.cfg.label, "send_envelope: receiver dropped");
             EngineClientError::WorkerDown(self.cfg.label.clone())
-        })
+        })?;
+        if let Some(p) = pending {
+            // The dispatcher releases it when it takes the command in.
+            p.hand_over();
+        }
+        Ok(())
+    }
+}
+
+/// One admission counted in `DispatcherShared::submitted` until its command is
+/// in the channel; released here if it never gets there.
+struct Submitted<'a> {
+    shared: &'a DispatcherShared,
+    handed_over: bool,
+}
+
+impl<'a> Submitted<'a> {
+    fn new(shared: &'a DispatcherShared) -> Self {
+        shared.submitted.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared,
+            handed_over: false,
+        }
+    }
+
+    fn hand_over(mut self) {
+        self.handed_over = true;
+    }
+}
+
+impl Drop for Submitted<'_> {
+    fn drop(&mut self) {
+        if !self.handed_over {
+            self.shared.release_submitted();
+        }
     }
 }
 
@@ -397,6 +443,31 @@ mod tests {
 
     fn audio() -> Bytes {
         Bytes::from_static(&[0u8; 16])
+    }
+
+    /// A submit counts in the worker's load from the moment it is sent, not
+    /// from the end of the dispatcher's next tick, so a burst between two ticks
+    /// is spread over the pool; a send that never lands is not counted.
+    #[tokio::test]
+    async fn a_submit_counts_in_load_until_the_dispatcher_takes_it_in() {
+        let (client, cmd_rx) = detached(4);
+        let _a = client
+            .submit_offline(audio(), 16_000, 0, None)
+            .await
+            .unwrap();
+        let _b = client.open_streaming(16_000, 0, None).await.unwrap();
+        assert_eq!(client.load(), 2);
+        // The dispatcher's intake releases each one as it counts it in `load`.
+        client.shared.release_submitted();
+        client.shared.load.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(client.load(), 2);
+
+        drop(cmd_rx);
+        assert!(client.open_streaming(16_000, 0, None).await.is_err());
+        assert_eq!(client.load(), 2, "a failed send must not stay counted");
+        client.shared.release_submitted();
+        client.shared.release_submitted();
+        assert_eq!(client.shared.submitted.load(Ordering::Relaxed), 0);
     }
 
     /// The submit registered its event channel, then failed to send.  No

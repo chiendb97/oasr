@@ -49,6 +49,7 @@ Capture constraints
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, Hashable, List, Optional, Sequence, Set, Tuple
 
@@ -140,6 +141,29 @@ def cache_bucket_ladder(
     return sorted({r for r in rungs if 0 <= r <= cap})
 
 
+#: Seconds a capture declined for memory waits before it is asked again.
+MEMORY_RETRY_S = 60.0
+
+
+def plan_prewarm_widths(
+    widths: Sequence[int], cap: int, rungs: int, budget: int
+) -> Tuple[List[int], int]:
+    """The batch widths the streaming pre-warm captures, and how many it leaves lazy.
+
+    Every width is captured at every cache rung while ``widths x rungs`` fits
+    ``budget`` (``streaming_graph_max_shapes``); past it, the low widths (the
+    ramp, and light load) plus ``cap`` are kept.  One definition, because the
+    engine also prices the pre-warm's graph memory from it before sizing the
+    paged pool.
+    """
+    sizes = sorted({int(b) for b in widths})
+    rungs = max(1, int(rungs))
+    if len(sizes) * rungs <= int(budget):
+        return sizes, 0
+    keep = max(1, int(budget) // rungs)
+    return sorted(set(sizes[:keep]) | {int(cap)}), len(sizes) - keep
+
+
 def pick_cache_bucket(cache_t1: int, ladder: Sequence[int]) -> int:
     """Smallest rung ``>= cache_t1``; a flat 64-round when it is off the ladder.
 
@@ -184,10 +208,56 @@ class _BestEffortCapture:
         self._max_capture_failures = max(1, int(max_capture_failures))
         #: Captures that aborted.  A shape is attempted at most once.
         self.capture_failures = 0
+        #: Free device bytes a capture must leave behind for the eager path,
+        #: which the engine sets from its measured activation reserve; ``0``
+        #: does not check.  See :meth:`_short_of_memory`.
+        self.min_free_bytes = 0
+        #: Captures not attempted because the device was short of that.
+        self.memory_declines = 0
+        self._short_until: Dict[Hashable, float] = {}
 
     def _declines(self, key: Hashable) -> bool:
         """Whether ``key`` must run eager without attempting a capture."""
         return self._disabled or key in self._failed
+
+    def _short_of_memory(self, key: Hashable) -> bool:
+        """Whether capturing ``key`` now would eat the eager path's memory.
+
+        A capture's pool is memory the eager path can never use again, and the
+        eager path is what every uncaptured shape runs on.  In the review's
+        512-slot U2++ run the pre-warm ran out of memory at width 128 with the
+        card full, and the forwards after it failed with out-of-memory: 129 of
+        256 streams in one round, all 512 in the next.  A shape declined here runs eager and is
+        asked again after :data:`MEMORY_RETRY_S`, since streams finishing free
+        memory.  ``mem_get_info`` is a driver call, made only on a capture
+        attempt, never on a replay.
+        """
+        if self.min_free_bytes <= 0:
+            return False
+        now = time.monotonic()
+        until = self._short_until.get(key)
+        if until is not None and now < until:
+            return True
+        free, _total = torch.cuda.mem_get_info(self._device)
+        cached = torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(
+            self._device
+        )
+        if free + cached >= self.min_free_bytes:
+            self._short_until.pop(key, None)
+            return False
+        if not self.memory_declines:
+            logger.warning(
+                "%s graph capture declined at %s: %.2f GiB free, the eager path keeps "
+                "%.2f GiB; this shape runs eager (lower max_batch_size or "
+                "max_num_blocks to leave the graphs room)",
+                self._what,
+                key,
+                (free + cached) / float(1024**3),
+                self.min_free_bytes / float(1024**3),
+            )
+        self.memory_declines += 1
+        self._short_until[key] = now + MEMORY_RETRY_S
+        return True
 
     @torch.no_grad()
     def recover_after_failed_capture(self) -> None:
@@ -385,9 +455,14 @@ class GraphedEncoderForward(_BestEffortCapture):
         key = (B, T_input, cache_t1_bucket)
         state = self._captured.get(key)
         if state is None:
-            if self._declines(key) or len(self._captured) >= self._max_captures:
-                # Refuse to capture a shape that already failed, or once the
-                # cache is saturated; the caller runs this chunk eagerly.
+            if (
+                self._declines(key)
+                or len(self._captured) >= self._max_captures
+                or self._short_of_memory(key)
+            ):
+                # Refuse to capture a shape that already failed, once the cache
+                # is saturated, or while the capture would take the eager path's
+                # memory; the caller runs this chunk eagerly.
                 return None
             state = self._capture(
                 B,
@@ -883,6 +958,7 @@ __all__ = [
     "CACHE_BUCKET_GROWTH",
     "CACHE_BUCKET_KNEE",
     "cache_bucket_ladder",
+    "plan_prewarm_widths",
     "pick_cache_bucket",
     "round_up_bucket",
     "GraphedEncoderForward",

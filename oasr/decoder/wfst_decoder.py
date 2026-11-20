@@ -34,6 +34,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from oasr.utils.staging import to_device
+
 _lock = threading.Lock()
 _graphs: dict = {}
 _offline: Dict[tuple, "_DecoderRef"] = {}
@@ -546,27 +548,17 @@ class WfstDecoderSearch:
         flagged: List[Tuple[int, torch.Tensor]] = []  # (row, prepared log-probs)
         for start in range(0, batch, lanes):
             stop = min(start + lanes, batch)
-            # _prepare handles device/dtype/contiguity + WeNet blank-skip, per row.
-            rows = [self._prepare(enc_out[b, : lengths[b], :]) for b in range(start, stop)]
-            max_t = max((r.size(0) for r in rows), default=0)
-            if max_t == 0:
+            # Length clip + WeNet blank-skip for the whole group at once.
+            packed, lens = self._prepare_group(enc_out[start:stop], lengths[start:stop])
+            if packed is None:
                 continue  # every row emptied by blank-skip / zero length -> defaults
-            # Left-aligned, log-space-padded batch; the padded tail is ignored because
-            # each lane's frame count bounds its decode.
-            packed = rows[0].new_full((len(rows), max_t, rows[0].size(1)), -30.0)
-            lens = []
-            for i, r in enumerate(rows):
-                t = r.size(0)
-                if t > 0:
-                    packed[i, :t] = r
-                lens.append(t)
-            w, s, _, o = _run_decode_batch(mod, dec.handle, packed.contiguous(), lens)
+            w, s, _, o = _run_decode_batch(mod, dec.handle, packed, lens)
             for i in range(len(w)):
                 tokens[start + i] = w[i]
                 scores[start + i] = s[i]
                 self._batch_overflow[start + i] = o[i]
                 if o[i] & _RESCUABLE:
-                    flagged.append((start + i, rows[i]))
+                    flagged.append((start + i, packed[i, : lens[i]].contiguous()))
         if flagged:
             w, s, o = self._rescue([row for _, row in flagged], device)
             for (b, _), words, score, bits in zip(flagged, w, s, o):
@@ -597,6 +589,41 @@ class WfstDecoderSearch:
         return words, scores, overflow
 
     # -- helpers ---------------------------------------------------------------
+
+    def _prepare_group(
+        self, logp: torch.Tensor, lengths: List[int]
+    ) -> Tuple[Optional[torch.Tensor], List[int]]:
+        """:meth:`_prepare` for every row of ``logp`` ``[B, T, V]``, packed.
+
+        Returns the left-aligned, log-space-padded (``-30.0``) batch the decoder
+        takes and each row's frame count, or ``(None, lens)`` when every row came
+        out empty.  Per row, ``_prepare`` asked the device twice -- ``bool(keep.all())``
+        and a boolean gather -- so a group of 64 was 128 synchronising reads;
+        here one read fetches every row's kept count, and the kept frames are
+        scattered to their packed positions (``cumsum`` of the keep mask), with
+        the dropped ones sent to a spare column that is then cut off.  The same
+        values land in the same places, so the decode is unchanged.
+        """
+        if not logp.is_cuda:
+            logp = logp.cuda()
+        b, t_max, v = logp.shape
+        t_max = min(t_max, max(lengths, default=0))
+        x = logp[:, :t_max].float()
+        # Pinned and asynchronous: a pageable host-to-device copy would wait for
+        # everything queued on the stream first.
+        rows = to_device([min(int(n), t_max) for n in lengths], dtype=torch.long, device=x.device)
+        keep = torch.arange(t_max, device=x.device) < rows[:, None]
+        thresh = self._opts.blank_skip_thresh
+        if 0.0 < thresh < 1.0 and t_max > 0:
+            keep &= x[..., self._opts.blank] <= math.log(thresh)
+        lens = [int(n) for n in keep.sum(dim=1).tolist()]
+        width = max(lens, default=0)
+        if width == 0:
+            return None, lens
+        dest = torch.where(keep, keep.cumsum(dim=1) - 1, width)
+        packed = x.new_full((b, width + 1, v), -30.0)
+        packed.scatter_(1, dest.unsqueeze(-1).expand(-1, -1, v), x)
+        return packed[:, :width].contiguous(), lens
 
     def _prepare(self, logp: torch.Tensor) -> torch.Tensor:
         if logp.dim() != 2:

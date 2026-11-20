@@ -73,6 +73,15 @@ class StreamingEncoderBackend(ABC):
         """Allocate the per-request encoder cache on admission."""
         raise NotImplementedError
 
+    def allocate_many(self, requests: Sequence[Request]) -> None:
+        """Allocate several requests admitted in one tick (default: one at a time).
+
+        A backend whose allocation launches work per state overrides this to
+        batch it across the cohort.
+        """
+        for request in requests:
+            self.allocate(request)
+
     @abstractmethod
     def free(self, request: Request) -> None:
         """Release the per-request encoder cache on finalize/abort."""
@@ -173,6 +182,15 @@ class StreamingEncoderBackend(ABC):
         self, batch_sizes: Sequence[int], cache_t1_buckets: Optional[Sequence[int]] = None
     ) -> None:
         """Pre-capture any per-shape CUDA graphs.  Default: no-op."""
+        return None
+
+    def set_capture_floor(self, nbytes: int) -> None:
+        """Free device bytes a capture must leave for the eager path.
+
+        Default: nothing is captured, so nothing to bound.  A backend whose
+        graphs share the device with an eager fallback overrides this; see
+        ``_BestEffortCapture._short_of_memory``.
+        """
         return None
 
 

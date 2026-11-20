@@ -206,7 +206,93 @@ def _naive_cif(hidden: torch.Tensor, alphas: torch.Tensor, threshold: float = 1.
     return torch.stack(frames) if frames else torch.zeros(0, hidden.size(-1))
 
 
+def _cif_masked(hidden, alphas):
+    """FunASR's ``cif_v1`` as it was here: boolean-mask gathers, six syncs.
+
+    The oracle for the gather form, which must agree with it bit for bit.
+    """
+    device, dtype = hidden.device, hidden.dtype
+    batch_size, len_time, hidden_size = hidden.shape
+    prefix_sum = torch.cumsum(alphas, dim=1, dtype=torch.float64).to(torch.float32)
+    prefix_sum_floor = torch.floor(prefix_sum)
+    dislocation_floor = torch.floor(torch.roll(prefix_sum, 1, dims=1))
+    dislocation_floor[:, 0] = 0
+    fire_idxs = (prefix_sum_floor - dislocation_floor) > 0
+    fires = torch.zeros(batch_size, len_time, dtype=dtype, device=device)
+    fires[fire_idxs] = 1
+    fires = fires + prefix_sum - prefix_sum_floor
+    max_label_len = int(torch.round(alphas.sum(-1)).int().max().item())
+    if not bool(fire_idxs.any()):
+        return (
+            torch.zeros(batch_size, max_label_len, hidden_size, dtype=dtype, device=device),
+            fires,
+        )
+    prefix_sum_hidden = torch.cumsum(alphas.unsqueeze(-1) * hidden, dim=1)
+    frames = prefix_sum_hidden[fire_idxs]
+    shift_frames = torch.roll(frames, 1, dims=0)
+    batch_len = fire_idxs.sum(1)
+    batch_idxs = torch.cumsum(batch_len, dim=0)
+    shift_batch_idxs = torch.roll(batch_idxs, 1, dims=0)
+    shift_batch_idxs[0] = 0
+    shift_frames[shift_batch_idxs] = 0
+    remains = fires - torch.floor(fires)
+    remain_frames = remains[fire_idxs].unsqueeze(-1) * hidden[fire_idxs]
+    shift_remain_frames = torch.roll(remain_frames, 1, dims=0)
+    shift_remain_frames[shift_batch_idxs] = 0
+    frames = frames - shift_frames + shift_remain_frames - remain_frames
+    frame_fires = torch.zeros(batch_size, max_label_len, hidden_size, dtype=dtype, device=device)
+    indices = torch.arange(max_label_len, device=device).expand(batch_size, -1)
+    frame_fires[indices < batch_len.unsqueeze(1)] = frames
+    return frame_fires, fires
+
+
 class TestCif:
+    @pytest.mark.parametrize(
+        "device",
+        ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)],
+    )
+    def test_the_gather_form_is_bit_identical_to_the_masked_one(self, device):
+        """Fixed shapes and no boolean gathers, same arithmetic in the same order."""
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        from oasr.models.paraformer.predictor import cif_v1
+
+        gen = torch.Generator().manual_seed(11)
+        for trial in range(40):
+            b, t, d = 1 + trial % 5, 3 + (7 * trial) % 60, 1 + trial % 9
+            alphas = torch.rand(b, t, generator=gen) * (0.2 + 0.8 * (trial % 3) / 2)
+            # Every row fires at least once: the masked form indexes past its
+            # end when a batch's *last* row never does (pinned separately below).
+            alphas[:, 1:3] = 0.6
+            if trial % 4 == 0:
+                alphas[0] = 0.05  # a leading row that never fires is fine for both
+            hidden = torch.randn(b, t, d, generator=gen)
+            alphas, hidden = alphas.to(device), hidden.to(device)
+            want_frames, want_fires = _cif_masked(hidden, alphas)
+            got_frames, got_fires = cif_v1(hidden, alphas, 1.0)
+            assert torch.equal(got_fires, want_fires), trial
+            assert got_frames.shape == want_frames.shape, trial
+            assert torch.equal(got_frames, want_frames), trial
+            # Asked for fewer rows than FunASR sizes, it integrates exactly those.
+            u = max(0, want_frames.size(1) - 1)
+            cut, _ = cif_v1(hidden, alphas, 1.0, num_tokens=u)
+            assert torch.equal(cut, want_frames[:, :u]), trial
+
+    def test_a_silent_last_row_does_not_fail_the_batch(self):
+        """The masked form raised ``IndexError`` here, and the engine then retried
+        the batch one request at a time; each row now gets its own tokens."""
+        from oasr.models.paraformer.predictor import cif_v1
+
+        gen = torch.Generator().manual_seed(5)
+        hidden = torch.randn(2, 6, 3, generator=gen)
+        alphas = torch.tensor([[0.6, 0.6, 0.6, 0.6, 0.6, 0.6], [0.05] * 6])
+        with pytest.raises(IndexError):
+            _cif_masked(hidden, alphas)
+        frames, _ = cif_v1(hidden, alphas, 1.0)
+        alone, _ = _cif_masked(hidden[:1], alphas[:1])
+        assert torch.equal(frames[:1, : alone.size(1)], alone)
+        assert not frames[1].any()
+
     def test_cif_v1_matches_naive_loop(self):
         from oasr.models.paraformer.predictor import cif_v1
 

@@ -368,11 +368,22 @@ pub fn decode_audio(body: &[u8], opts: &DecodeOptions<'_>) -> Result<DecodedAudi
         // and it keeps WAV working with the `codecs` feature off.  Its waveform
         // is bounded by the body, so it is decoded whole and checked before
         // the conversion.
-        Route::Container(crate::codec::Container::Wav) => {
-            let wav = wav_waveform(body)?;
-            check_length(wav.samples.len(), wav.sample_rate, opts)?;
-            wav
-        }
+        Route::Container(crate::codec::Container::Wav) => match wav_pcm_view(body) {
+            // Mono 16-bit or float: the data chunk is raw PCM, converted in one
+            // bulk pass with the same arithmetic the sample iterator applies.
+            Some((enc, sample_rate, data)) => {
+                check_length(data.len() / enc.sample_width(), sample_rate, opts)?;
+                Waveform {
+                    sample_rate,
+                    samples: pcm_to_f32(data, enc)?,
+                }
+            }
+            None => {
+                let wav = wav_waveform(body)?;
+                check_length(wav.samples.len(), wav.sample_rate, opts)?;
+                wav
+            }
+        },
         // Converted while it decodes, and the ceiling checked a packet at a
         // time: a compressed body says nothing about its decoded length.
         Route::Container(other) => decode_compressed(body, other, opts)?,
@@ -422,8 +433,37 @@ pub(crate) fn linear_pass_samples(body: &[u8], opts: &DecodeOptions<'_>) -> Opti
         .is_some_and(|target| opts.source_sample_rate.is_some_and(|src| src != target));
     match route(body, opts) {
         Ok(Route::Pcm(enc)) if !converts => Some(body.len() / enc.sample_width()),
+        // A WAV whose data chunk is raw PCM at the target rate is the same
+        // single pass once its header is read; every container upload used to
+        // take the blocking-pool hop.
+        Ok(Route::Container(crate::codec::Container::Wav)) => {
+            let (enc, rate, data) = wav_pcm_view(body)?;
+            let converts = opts.target_sample_rate.is_some_and(|target| target != rate);
+            (!converts).then(|| data.len() / enc.sample_width())
+        }
         _ => None,
     }
+}
+
+/// The data chunk of a mono 16-bit integer or 32-bit float WAV, as raw PCM:
+/// its encoding, its rate and its bytes.  `None` for every other layout (more
+/// channels, other depths) and for a header whose data runs past the body,
+/// which the sample-iterating decode reports as it always has.
+fn wav_pcm_view(body: &[u8]) -> Option<(PcmEncoding, u32, &[u8])> {
+    let reader = WavReader::new(std::io::Cursor::new(body)).ok()?;
+    let spec = reader.spec();
+    if spec.channels != 1 {
+        return None;
+    }
+    let enc = match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Int, 16) => PcmEncoding::I16Le,
+        (SampleFormat::Float, 32) => PcmEncoding::F32Le,
+        _ => return None,
+    };
+    let n = reader.len() as usize;
+    let start = usize::try_from(reader.into_inner().position()).ok()?;
+    let end = start.checked_add(n.checked_mul(enc.sample_width())?)?;
+    Some((enc, spec.sample_rate, body.get(start..end)?))
 }
 
 /// Refuse a waveform of `n` samples at `rate` whose length at the rate the
@@ -737,6 +777,75 @@ mod tests {
             target_sample_rate: target,
             max_samples: None,
         }
+    }
+
+    fn write_wav_f32(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for s in samples {
+                w.write_sample(*s).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        buf
+    }
+
+    fn container_opts(target: Option<u32>) -> DecodeOptions<'static> {
+        DecodeOptions {
+            encoding: SourceEncoding::Container,
+            target_sample_rate: target,
+            ..Default::default()
+        }
+    }
+
+    /// Mono 16-bit and float WAVs are converted as raw PCM in one pass; the
+    /// result is the sample iterator's, bit for bit.
+    #[test]
+    fn a_mono_wav_decodes_as_raw_pcm_bit_identically() {
+        let ints: Vec<i16> = (0..4000)
+            .map(|i| ((i * 7919) % 65536 - 32768) as i16)
+            .collect();
+        let floats: Vec<f32> = (0..4000).map(|i| ((i as f32) * 0.37).sin()).collect();
+        for wav in [
+            write_wav_i16(&ints, 16_000, 1),
+            write_wav_f32(&floats, 16_000),
+        ] {
+            let fast = decode_audio(&wav, &container_opts(Some(16_000))).unwrap();
+            let slow = wav_waveform(&wav).unwrap().into_decoded();
+            assert_eq!(fast.sample_rate, slow.sample_rate);
+            assert_eq!(fast.samples, slow.samples);
+        }
+    }
+
+    /// At the target rate it is one linear pass, so the pool runs it inline; a
+    /// rate conversion, more channels, or a header promising more data than the
+    /// body holds keep the old path.
+    #[test]
+    fn only_a_mono_wav_at_the_target_rate_is_a_linear_pass() {
+        let mono = write_wav_i16(&[1, 2, 3, 4], 16_000, 1);
+        assert_eq!(
+            linear_pass_samples(&mono, &container_opts(Some(16_000))),
+            Some(4)
+        );
+        assert_eq!(linear_pass_samples(&mono, &container_opts(None)), Some(4));
+        assert_eq!(
+            linear_pass_samples(&mono, &container_opts(Some(8_000))),
+            None
+        );
+        let stereo = write_wav_i16(&[1, 2, 3, 4], 16_000, 2);
+        assert_eq!(
+            linear_pass_samples(&stereo, &container_opts(Some(16_000))),
+            None
+        );
+        let truncated = &mono[..mono.len() - 2];
+        assert!(wav_pcm_view(truncated).is_none());
     }
 
     #[test]

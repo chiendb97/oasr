@@ -26,7 +26,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
-from typing import Any, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 logger = logging.getLogger("oasr.jit.attention")
 
@@ -287,6 +287,14 @@ def _compiled_fmha(
     Cache space is small in practice (a handful of variants per process), so
     ``functools.cache`` is sufficient.
     """
+    # Runs only on a cache miss: remember the signature this tile is for, so
+    # :func:`precompile_fmha_variants` can compile its siblings ahead of traffic.
+    _SEEN_SIGNATURES.add(
+        _Signature(
+            head_dim, dtype_str, num_heads, num_kv_heads, has_bias, paged, block_size,
+            causal, has_seqstart,
+        )  # fmt: skip
+    )
     import cutlass
     import cutlass.cute as cute
     import torch
@@ -716,6 +724,126 @@ def fmha_kv8_refusal(
         local=local,
         has_bias=has_bias,
     )
+
+
+class _Signature(NamedTuple):
+    """An attention call's compile key minus the tile and the bias alignment."""
+
+    head_dim: int
+    dtype_str: str
+    num_heads: int
+    num_kv_heads: int
+    has_bias: bool
+    paged: bool
+    block_size: int
+    causal: bool
+    has_seqstart: bool
+
+
+#: Every signature a CuTeDSL variant has been compiled for in this process.
+_SEEN_SIGNATURES: "set[_Signature]" = set()
+
+#: The tile an untabled call runs (``oasr.functionals.attention._CUTE_DEFAULT_TILE``).
+_DEFAULT_TILE = (64, 64, 128)
+
+
+def _table_tiles(sig: _Signature, sm: int) -> "set[Tuple[int, int, int, bool]]":
+    """Every CuTeDSL ``(m, n, threads, bias_aligned)`` the tuning table can pick for *sig*.
+
+    Over every batch bucket, query class and key-length region the table holds
+    for the signature: whichever of them traffic reaches, its tile is in here.
+    """
+    from oasr.tune.database import parse_sig_key
+
+    from .attention_select import FAMILY, OP, _tier_views
+
+    want = {
+        "D": str(sig.head_dim),
+        "H": str(sig.num_heads),
+        "Hkv": str(sig.num_kv_heads),
+        "mask": "causal" if sig.causal else "none",
+        "bias": str(int(sig.has_bias)),
+        "kv": f"paged{sig.block_size}" if sig.paged else "dense",
+        "ss": str(int(sig.has_seqstart)),
+    }
+    tiles: "set[Tuple[int, int, int, bool]]" = set()
+    for _tier, table in _tier_views(sm):
+        for key, rules in table.items():
+            family, fields = parse_sig_key(key)
+            if family != FAMILY or fields.get("op") != OP:
+                continue
+            if any(str(fields.get(k)) != v for k, v in want.items()):
+                continue
+            aligned = bool(sig.has_bias) and str(fields.get("ba")) == "1"
+            for _t_hi, _cid, choice in rules:
+                if getattr(choice, "lane", None) == "cute":
+                    tiles.add((choice.m_block, choice.n_block, choice.threads, aligned))
+    return tiles
+
+
+def precompile_fmha_variants(
+    signatures: "Optional[Any]" = None, *, budget_s: Optional[float] = None
+) -> Tuple[int, int]:
+    """Compile, ahead of traffic, every CuTeDSL variant these signatures can route to.
+
+    A variant compiles on first use: about 1.3 s of MLIR generation and
+    compilation, on whichever live request first needs it.  Measured: a U2++
+    batch with a 25 s utterance took 1,194 ms where its repeats took 9 ms, and
+    Whisper's first request spent 2.1-2.2 s of 2.6 s here.  Which variant a call
+    needs depends on the tile the tuning table picks for its batch, query and key
+    length, and on the parity of its key length (``bias_aligned``) -- so it is
+    reached by traffic, not by the one start-up forward.
+
+    ``signatures`` defaults to every signature compiled so far in this process
+    (so call it after a forward per attention site has run).  ``budget_s``
+    bounds the time spent; the remaining variants then compile on first use as
+    before.  Returns ``(compiled, failed)``.
+    """
+    import time
+
+    cap = _capability_probe()[0]
+    if cap is None:
+        return 0, 0
+    sm = cap[0] * 10 + cap[1]
+    sigs = list(_SEEN_SIGNATURES if signatures is None else signatures)
+    t0 = time.perf_counter()
+    compiled = failed = 0
+    for sig in sigs:
+        variants = set(_table_tiles(sig, sm))
+        for aligned in (False, True) if sig.has_bias else (False,):
+            variants.add((*_DEFAULT_TILE, aligned))
+        for m_block, n_block, threads, aligned in sorted(variants):
+            if budget_s is not None and time.perf_counter() - t0 > budget_s:
+                logger.info(
+                    "attention precompile stopped at its %.0f s budget; the rest compile on use",
+                    budget_s,
+                )
+                return compiled, failed
+            before = _compiled_fmha.cache_info().currsize
+            try:
+                get_compiled_fmha(
+                    head_dim=sig.head_dim,
+                    dtype_str=sig.dtype_str,
+                    num_heads=sig.num_heads,
+                    num_kv_heads=sig.num_kv_heads,
+                    has_bias=sig.has_bias,
+                    paged=sig.paged,
+                    block_size=sig.block_size,
+                    m_block=m_block,
+                    n_block=n_block,
+                    num_threads=threads,
+                    bias_aligned=aligned,
+                    causal=sig.causal,
+                    has_seqstart=sig.has_seqstart,
+                )
+            except Exception as exc:  # noqa: BLE001 -- a refused tile is not a start-up error
+                failed += 1
+                logger.debug(
+                    "attention variant %s not precompiled: %s", (sig, m_block, n_block), exc
+                )
+                continue
+            compiled += _compiled_fmha.cache_info().currsize - before
+    return compiled, failed
 
 
 def get_compiled_fmha(

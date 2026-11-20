@@ -175,6 +175,26 @@ class TestFallsBack:
         _offline(strat, enc, lengths)
         assert not strat._fused_enabled and strat.fused_stats["hits"] == 0
 
+    def test_async_declines_a_stateful_predictor_before_any_work(self):
+        """An LSTM predictor (Nemotron) has no stateless surface.
+
+        The async entry used to project the encoder output and build an initial
+        state before the launch rejected that state, every batch, and the loop
+        then computed both again.  It now asks the surface first and latches.
+        """
+        model = exact_transducer(torch.bfloat16)
+        model.decoder.stateless_tensors = lambda: None
+        projected = []
+        model.joiner.encoder_proj.register_forward_hook(lambda *_: projected.append(1))
+        strat = transducer_strategy(model)
+        enc = integer_frames(2, 6, torch.bfloat16)
+        lengths = torch.tensor([6, 3], device="cuda")
+        with torch.no_grad():
+            for _ in range(3):
+                assert strat.decode_offline_async(enc, lengths) is None
+        assert not projected and not strat._fused_enabled
+        assert strat.fused_stats == {"hits": 0, "fallbacks": 0, "overflows": 0}
+
 
 class TestStreaming:
     def _stream(self, strat, streams, splits):

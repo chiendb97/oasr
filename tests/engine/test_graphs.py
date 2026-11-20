@@ -34,6 +34,7 @@ from oasr.engine.graph_cache import (
     CACHE_BUCKET_KNEE,
     cache_bucket_ladder,
     pick_cache_bucket,
+    plan_prewarm_widths,
     round_up_bucket,
 )
 from oasr.engine.offline_graph import (
@@ -42,6 +43,7 @@ from oasr.engine.offline_graph import (
     resolve_batch_buckets,
 )
 from oasr.engine.predictor_graph import PredictorStepGraphCache as Cache
+from oasr.engine.streaming_backend.paged import resolve_batch_widths
 
 # ---------------------------------------------------------------------------
 # The offline forward: shape buckets, bit-exact replay, and fallback accounting
@@ -405,6 +407,83 @@ class TestFallbackAccounting:
             )
         assert c.num_captured == 1
         assert c.fallback_saturated == 1
+
+    def test_capture_after_runs_the_first_sightings_eager(self):
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _Encoder().to(dev).eval()
+        c = _cache(frame_granularity=64, batch_buckets=[2], capture_after=2)
+        lens = torch.tensor([64, 50], device=dev, dtype=torch.int32)
+        x = torch.randn(2, 64, 16, device=dev)
+        with torch.no_grad():
+            assert c.run(FUSED, enc.forward_offline, x, lens) is None
+            assert c.num_captured == 0 and c.fallback_cold == 1
+            # The second sighting captures, and replays the same answer as eager.
+            out, out_lens = c.run(FUSED, enc.forward_offline, x, lens)
+            ref, ref_lens = enc.forward_offline(x, lens)
+        assert c.num_captured == 1 and c.captures == 1
+        assert torch.equal(out_lens, ref_lens)
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+    def test_a_key_seen_once_never_captures(self):
+        dev = torch.device("cuda")
+        enc = _Encoder().to(dev).eval()
+        c = _cache(frame_granularity=64, batch_buckets=[2], capture_after=2)
+        lens = torch.tensor([64, 50], device=dev, dtype=torch.int32)
+        with torch.no_grad():
+            for t in (64, 128, 192, 256):
+                assert (
+                    c.run(FUSED, enc.forward_offline, torch.randn(2, t, 16, device=dev), lens)
+                    is None
+                )
+        assert c.num_captured == 0 and c.fallback_cold == 4
+
+    def test_a_full_cache_evicts_the_least_recently_replayed(self):
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        enc = _Encoder().to(dev).eval()
+        c = _cache(frame_granularity=64, batch_buckets=[2], max_captures=2, evict_lru=True)
+        lens = torch.tensor([64, 50], device=dev, dtype=torch.int32)
+
+        def run(t):
+            x = torch.randn(2, t, 16, device=dev)
+            got = c.run(FUSED, enc.forward_offline, x, lens)
+            assert got is not None
+            ref = enc.forward_offline(x, lens)
+            torch.testing.assert_close(got[0], ref[0], rtol=0, atol=0)
+
+        with torch.no_grad():
+            run(64)
+            run(128)
+            run(64)  # 64 is now the most recently replayed; 128 is the LRU
+            run(192)  # full: evicts 128, not 64
+            keys = {k[2] for k in c._captured}
+            assert keys == {64, 192}
+            run(64)  # still a replay, not a recapture
+        assert c.evictions == 1
+        assert c.captures == 3
+        assert c.fallback_saturated == 0
+
+    def test_a_memory_refusal_expires(self, monkeypatch):
+        import oasr.engine.offline_graph as og
+
+        c = GraphedOfflineForward(device=torch.device("cpu"), batch_buckets=[4])
+        now = [1000.0]
+        monkeypatch.setattr(og.time, "monotonic", lambda: now[0])
+        c._over_budget[FUSED] = [(4, 256, now[0])]
+        assert c._is_over_budget((FUSED, 4, 512))  # dominates the refused shape
+        assert not c._is_over_budget((FUSED, 2, 512))  # narrower: not implied
+        now[0] += og.BUDGET_RETRY_S + 1
+        assert not c._is_over_budget((FUSED, 4, 512))
+        assert c._over_budget[FUSED] == []
+
+    def test_engine_config_turns_the_live_traffic_settings_on(self):
+        from oasr.engine.config import EngineConfig
+
+        cfg = EngineConfig(ckpt_dir="unused")
+        assert cfg.offline_graph_max_captures == 512
+        assert cfg.offline_graph_capture_after == 1
+        assert cfg.offline_graph_evict is True
 
     def test_pad_overhead_reports_the_bucketing_tax(self):
         torch.manual_seed(0)
@@ -998,6 +1077,41 @@ class TestStreamingCapturesRepairWhatTheySwallow:
         assert not cache.have(2, window, 0)
         assert _stranded_gib(dev) < 0.05
 
+    def test_a_capture_short_of_memory_runs_eager_and_is_asked_again_later(self, monkeypatch):
+        """A capture never takes the memory the eager path needs.
+
+        At 512 U2++ streams the pre-warm captured until the card was full, and
+        the next eager forward failed every stream in its step.  A floor above
+        what the device has makes every shape run eager, bit-exact, without a
+        capture attempt; once memory is back (here: the floor drops) and the
+        retry delay has passed, the shape captures.
+        """
+        import oasr.engine.graph_cache as graph_cache
+
+        dev = torch.device("cuda")
+        assert recover_from_failed_capture(dev, None)
+        want = _drive_streams(_tiny_paged_backend(graphs=False, batch=2), batch=2)
+
+        backend = _tiny_paged_backend(graphs=True, batch=2)
+        cache = backend._graph_cache  # noqa: SLF001
+        free, total = torch.cuda.mem_get_info(dev)
+        backend.set_capture_floor(total * 2)
+        got = _drive_streams(backend, batch=2)
+        assert not cache._captured and cache.capture_failures == 0  # noqa: SLF001
+        assert cache.memory_declines >= 1
+        for sid in want:
+            for w, g in zip(want[sid], got[sid]):
+                torch.testing.assert_close(g, w, rtol=0, atol=0)
+
+        backend.set_capture_floor(1)
+        # Still inside the retry delay: the verdict stands, no driver call.
+        backend.prewarm([2], cache_t1_buckets=[0])
+        assert not cache._captured  # noqa: SLF001
+        monkeypatch.setattr(graph_cache, "MEMORY_RETRY_S", 0.0)
+        cache._short_until.clear()  # noqa: SLF001
+        backend.prewarm([2], cache_t1_buckets=[0])
+        assert cache.have(2, backend.decoding_window, 0)
+
     def test_a_failed_feature_capture_runs_that_bucket_eager(self):
         from oasr.engine.config import EngineConfig
         from oasr.engine.input_processor import InputProcessor, _StreamInput
@@ -1199,6 +1313,23 @@ class TestCapturesAndReplaysABareState:
 
 
 _N_BLOCK = 64
+
+
+class TestPrewarmPlan:
+    """The widths the pre-warm captures -- also what the pool derivation prices."""
+
+    def test_every_width_when_the_budget_covers_them(self):
+        assert plan_prewarm_widths([1, 2, 4, 8], 8, rungs=16, budget=512) == ([1, 2, 4, 8], 0)
+
+    def test_over_budget_keeps_the_low_widths_and_the_cap(self):
+        sizes, dropped = plan_prewarm_widths(range(1, 65), 64, rungs=16, budget=512)
+        assert sizes == list(range(1, 33)) + [64]
+        assert dropped == 32
+
+    def test_the_padding_lane_runs_at_powers_of_two_and_the_cap(self):
+        assert resolve_batch_widths(None, True, 48) == [1, 2, 4, 8, 16, 32, 48]
+        assert resolve_batch_widths(None, False, 4) == [1, 2, 3, 4]
+        assert resolve_batch_widths([3, 9, 99], True, 16) == [3, 9, 16]
 
 
 class TestLadderShape:

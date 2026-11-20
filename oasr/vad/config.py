@@ -147,6 +147,7 @@ _STR_COERCIBLE = {
     "activity_threshold": float,
     "speech_start_timeout_s": float,
     "speech_end_timeout_s": float,
+    "min_audio_s": float,
 }
 
 
@@ -226,6 +227,13 @@ class VadConfig:
     speech_end_timeout_s : float, optional
         Close the stream this long after speech ends; reset by a new
         speech-start.
+    min_audio_s : float, optional
+        Offline ``segment`` mode: a request no longer than this decodes whole,
+        without running the detector.  The detector runs per request at batch 1
+        during admission (CPU fp32 by default), which capped the fast models at
+        960-1,335 RTFx; on short clips it mostly trims edges, a change measured
+        at 0.07 WER points or less.  Never skips audio wider than the piece the
+        encoder can take.  ``None`` (default) always runs the detector.
     """
 
     backend: Optional[str] = None
@@ -256,6 +264,8 @@ class VadConfig:
     speech_start_timeout_s: Optional[float] = None
     speech_end_timeout_s: Optional[float] = None
 
+    min_audio_s: Optional[float] = None
+
     def __post_init__(self) -> None:
         if self.mode not in MODES:
             raise ValueError(f"vad mode must be one of {list(MODES)}, got {self.mode!r}")
@@ -278,6 +288,8 @@ class VadConfig:
                 f"vad hop_ms ({self.hop_ms}) must be <= frame_ms ({self.frame_ms}); a hop "
                 "longer than the window would skip audio between frames"
             )
+        if self.min_audio_s is not None and float(self.min_audio_s) < 0:
+            raise ValueError(f"min_audio_s must be >= 0 or None, got {self.min_audio_s!r}")
         if self.max_speech_s is not None and float(self.max_speech_s) <= 0:
             raise ValueError(f"max_speech_s must be > 0 or None, got {self.max_speech_s!r}")
         for name in ("speech_start_timeout_s", "speech_end_timeout_s"):

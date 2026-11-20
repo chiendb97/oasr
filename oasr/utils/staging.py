@@ -18,7 +18,7 @@ __all__ = ["to_device"]
 
 
 def to_device(
-    values: Sequence[int],
+    values: Union[Sequence[int], Sequence[Sequence[int]]],
     *,
     dtype: torch.dtype,
     device: Union[torch.device, str],
@@ -27,9 +27,10 @@ def to_device(
 
     Parameters
     ----------
-    values : sequence of int
-        Host-side indices — slot ids, block ids, offsets, lengths.  Small: this
-        is for per-step metadata, not for payload tensors.
+    values : sequence of int, or of equal-length rows of them
+        Host-side indices — slot ids, block ids, offsets, lengths, a batch of
+        prompt ids.  Small: this is for per-step metadata, not for payload
+        tensors.
     dtype : torch.dtype
         Element type of the resulting tensor.
     device : torch.device or str
@@ -39,7 +40,7 @@ def to_device(
     Returns
     -------
     Tensor
-        ``(len(values),)`` on ``device``.  The copy is asynchronous on the
+        ``(len(values),)`` (or ``(rows, width)``) on ``device``.  The copy is asynchronous on the
         current stream; readers on that stream need no further ordering.
     """
     device = torch.device(device)
