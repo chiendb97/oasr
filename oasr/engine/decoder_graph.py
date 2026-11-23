@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import tvm_ffi
@@ -77,7 +77,7 @@ from .capture_recovery import recover_from_failed_capture
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DecoderStepGraphCache"]
+__all__ = ["DecoderLoopGraphCache", "DecoderPrefillGraphCache", "DecoderStepGraphCache"]
 
 
 class _GraphKv(PagedDecoderKv):
@@ -139,7 +139,7 @@ class _Captured:
     filled: Dict[str, Tuple[torch.Tensor, int]] = field(default_factory=dict)
 
 
-def _refill(captured: "_Captured", name: str, dst: torch.Tensor, src: torch.Tensor, fill) -> None:
+def _refill(captured: Any, name: str, dst: torch.Tensor, src: torch.Tensor, fill) -> None:
     """``fill(dst, src)`` unless ``dst`` already holds this ``src`` unchanged.
 
     The source is held by reference, so its identity cannot be reused by a later
@@ -432,6 +432,461 @@ class DecoderStepGraphCache:
             lens=lens_buf,
             table=table_buf,
             logits=logits_buf,
+            starts=starts_buf,
+            cross_lens=cross_lens_buf,
+            cross_table=cross_table_buf,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Several greedy steps per replay
+# ---------------------------------------------------------------------------
+
+
+class _LoopGraphKv(_GraphKv):
+    """A :class:`_GraphKv` whose commit advances the static lengths in place.
+
+    A single captured step leaves the advance to the host, after the replay. A
+    loop chains steps inside one graph, so each step's commit has to move the
+    lengths the next step reads, and in place, because the graph reads the
+    buffer's address.  Both decoders commit at the end of their forward.
+    """
+
+    def commit(self, t_new: int) -> None:
+        self.lens.add_(t_new)
+        self._widx = None
+
+
+@dataclass
+class _Loop:
+    """One captured greedy loop plus the buffers it reads and writes."""
+
+    graph: "torch.cuda.CUDAGraph"
+    #: ``(B, V)``: the logits the first selection reads; after a replay, the
+    #: logits of the last step, which the next selection reads.
+    logits: torch.Tensor
+    #: ``(B,)`` bool: rows choosing their first token, which some families
+    #: filter differently (Whisper's ``begin_suppress_tokens``).
+    fresh: torch.Tensor
+    #: ``(B, steps)`` int64: the token each step chose, row by row.
+    tokens: torch.Tensor
+    lens: torch.Tensor
+    table: torch.Tensor
+    starts: Optional[torch.Tensor] = None
+    cross_lens: Optional[torch.Tensor] = None
+    cross_table: Optional[torch.Tensor] = None
+    filled: Dict[str, Tuple[torch.Tensor, int]] = field(default_factory=dict)
+
+
+#: ``(logits (B, V), fresh (B,) bool or None) -> filtered logits``, out of place
+#: and in the logits' dtype.  ``fresh`` is ``None`` past a loop's first step,
+#: where no row is fresh.
+LogitsFilter = Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
+
+_LoopKey = Tuple[int, int, int, int]
+
+
+class DecoderLoopGraphCache(DecoderStepGraphCache):
+    """Greedy decoding with the selection on the device, several steps per replay.
+
+    A captured step (:class:`DecoderStepGraphCache`) still leaves the host a
+    round trip per token: filter the logits, ``argmax``, read the token back,
+    decide which rows finished, copy the next step's inputs in.  Profiled on
+    Whisper-tiny at ``B=64`` the GPU then waited on the host for about two
+    thirds of every step.  Here one replay runs ``steps`` iterations of *filter,
+    argmax, record the token, step the decoder*, feeding each token back on the
+    device, so the host does its share once per ``steps`` tokens.
+
+    A row that emits EOS inside a loop keeps stepping to the loop's end.  Its
+    later tokens are discarded and its extra K/V lands in pages it owns, freed
+    when the strategy drops the row.  The strategy keeps every row inside its
+    position budget by never asking for more steps than the row with the least
+    room left has: the generation cap is a step count, known before the replay.
+
+    Keyed ``(rows, width bucket, cross width bucket, steps)``.  The pages for all
+    ``steps`` are mapped before the replay, so the block table is fixed for its
+    duration.  On return the self-attention KV has **not** advanced on the host:
+    the caller commits ``steps``, as it commits one after a single step.
+    """
+
+    def __init__(
+        self,
+        decoder: Any,
+        manager: Any,
+        *,
+        logits_filter: LogitsFilter,
+        width_pages: int = 8,
+        max_captures: int = 256,
+        pool: Any = None,
+    ) -> None:
+        super().__init__(
+            decoder, manager, width_pages=width_pages, max_captures=max_captures, pool=pool
+        )
+        self._filter = logits_filter
+        self._loops: Dict[_LoopKey, _Loop] = {}
+        self._loop_failed: Set[_LoopKey] = set()
+
+    @property
+    def num_captured(self) -> int:
+        return len(self._loops)
+
+    def loop(
+        self,
+        state: Any,
+        logits: torch.Tensor,
+        fresh: torch.Tensor,
+        steps: int,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Run ``steps`` greedy steps from ``logits``; ``(tokens, logits)`` or ``None``.
+
+        ``tokens`` is ``(B, steps)`` and ``logits`` the last step's ``(B, V)``.
+        Both are replay buffers, valid until the next replay of this key: read
+        the tokens and clone the logits before that.  ``None`` when the state
+        or the shape is not capturable, and the caller steps eagerly.
+        """
+        parts = None if self._disabled else self._parts(state)
+        if parts is None:
+            return None
+        kv, cross = parts
+        kv.reserve(steps)  # every page the loop writes, mapped before it runs
+        table = kv.block_table()
+        cross_table = cross.block_table() if cross is not None else None
+        key = (
+            kv.batch,
+            self._bucket(table.size(1)),
+            0 if cross_table is None else self._bucket(cross_table.size(1)),
+            int(steps),
+        )
+        captured = self._loops.get(key)
+        if captured is None:
+            if key in self._loop_failed:
+                return None
+            if len(self._loops) >= self._max_captures:
+                if not self._refused:
+                    self._refused = True
+                    logger.info(
+                        "decoder loop graph cache full (%d shapes); further shapes step eager",
+                        self._max_captures,
+                    )
+                return None
+            captured = self._capture_loop(key, logits, fresh, kv, cross)
+            if captured is None:
+                return None
+            self._loops[key] = captured
+
+        captured.logits.copy_(logits)
+        captured.fresh.copy_(fresh)
+        captured.lens.copy_(kv.lens)
+        if captured.starts is not None and kv.starts is not None:
+            captured.starts.copy_(kv.starts)
+        _refill(captured, "table", captured.table, table, self._fill_table)
+        if cross is not None and cross_table is not None:
+            assert captured.cross_lens is not None and captured.cross_table is not None
+            _refill(captured, "cross_lens", captured.cross_lens, cross.lens, _copy)
+            _refill(captured, "cross_table", captured.cross_table, cross_table, self._fill_table)
+        captured.graph.replay()
+        return captured.tokens, captured.logits
+
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent."""
+        for state in self._loops.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                pass
+        self._loops.clear()
+        self._loop_failed.clear()
+        super().release()
+
+    def _capture_loop(
+        self,
+        key: _LoopKey,
+        logits: torch.Tensor,
+        fresh: torch.Tensor,
+        kv: PagedDecoderKv,
+        cross: Optional[PagedDecoderKv],
+    ) -> Optional[_Loop]:
+        rows, width, cross_width, steps = key
+        device = kv.lens.device
+        logits_buf = torch.empty_like(logits)
+        logits_buf.copy_(logits)
+        fresh_buf = torch.empty(rows, dtype=torch.bool, device=device)
+        fresh_buf.copy_(fresh)
+        tokens_buf = torch.zeros(rows, steps, dtype=torch.long, device=device)
+        lens_buf = torch.empty(rows, dtype=torch.int32, device=device)
+        lens_buf.copy_(kv.lens)
+        starts_buf: Optional[torch.Tensor] = None
+        if kv.starts is not None:
+            starts_buf = torch.empty(rows, dtype=torch.int32, device=device)
+            starts_buf.copy_(kv.starts)
+        table_buf = torch.zeros(rows, width, dtype=torch.int32, device=device)
+        self._fill_table(table_buf, kv.block_table())
+
+        graph_state: Dict[str, Any] = {
+            "kv": _LoopGraphKv(self._mgr, lens_buf, starts_buf, table_buf, kv.lens_host)
+        }
+        cross_lens_buf: Optional[torch.Tensor] = None
+        cross_table_buf: Optional[torch.Tensor] = None
+        if cross is not None:
+            cross_lens_buf = torch.empty(rows, dtype=torch.int32, device=device)
+            cross_lens_buf.copy_(cross.lens)
+            cross_table_buf = torch.zeros(rows, cross_width, dtype=torch.int32, device=device)
+            self._fill_table(cross_table_buf, cross.block_table())
+            graph_state["cross"] = _GraphKv(
+                self._mgr, cross_lens_buf, None, cross_table_buf, cross.lens_host
+            )
+
+        def _run() -> None:
+            pending = logits_buf
+            for i in range(steps):
+                # The first step alone can hold a row's first token: every row
+                # chooses one there.  Filtered and picked in the logits' own
+                # dtype: widening is exact and order-preserving and -inf exists
+                # in fp16, so the eager path's fp32 pick is the same index,
+                # without writing and re-reading a (B, V) fp32 copy every step.
+                filtered = self._filter(pending, fresh_buf if i == 0 else None)
+                token = filtered.argmax(dim=-1)
+                tokens_buf[:, i].copy_(token)
+                pending, _ = self._decoder.step(token, graph_state)
+            logits_buf.copy_(pending)
+
+        try:
+            # The warm-up runs the loop for real: it writes the K/V the replay
+            # then rewrites with the same values, from inputs copied in again.
+            with torch.no_grad():
+                _run()
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.no_grad():
+                ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
+                with tvm_ffi.use_torch_stream(ctx):
+                    _run()
+        except torch.cuda.OutOfMemoryError as exc:
+            self._disabled = True
+            recover_from_failed_capture(device, self._pool)
+            self._pool = None
+            torch.cuda.empty_cache()
+            logger.warning(
+                "decoder loop graph capture ran out of memory at rows=%d steps=%d (%s); "
+                "loop graphs are off for this engine and steps run one at a time",
+                rows,
+                steps,
+                exc,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - capture is best-effort
+            self._loop_failed.add(key)
+            recover_from_failed_capture(device, self._pool)
+            self._pool = torch.cuda.graph_pool_handle()
+            logger.warning(
+                "decoder loop graph capture failed for rows=%d width=%d steps=%d (%s); "
+                "this shape steps one at a time",
+                rows,
+                width,
+                steps,
+                exc,
+            )
+            return None
+        logger.info(
+            "captured decoder loop: rows=%d steps=%d block-table width=%d cross width=%d",
+            rows,
+            steps,
+            width,
+            cross_width,
+        )
+        return _Loop(
+            graph=graph,
+            logits=logits_buf,
+            fresh=fresh_buf,
+            tokens=tokens_buf,
+            lens=lens_buf,
+            table=table_buf,
+            starts=starts_buf,
+            cross_lens=cross_lens_buf,
+            cross_table=cross_table_buf,
+        )
+
+
+# ---------------------------------------------------------------------------
+# The prompt forward of a paged prefill
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Prefill:
+    """One captured prompt forward plus the buffers it reads and writes."""
+
+    graph: "torch.cuda.CUDAGraph"
+    ids: torch.Tensor
+    lens: torch.Tensor
+    table: torch.Tensor
+    #: ``(B, P, D)`` final-norm hidden, projected to logits by the caller.
+    hidden: torch.Tensor
+    starts: Optional[torch.Tensor] = None
+    cross_lens: Optional[torch.Tensor] = None
+    cross_table: Optional[torch.Tensor] = None
+    filled: Dict[str, Tuple[torch.Tensor, int]] = field(default_factory=dict)
+
+
+_PrefillKey = Tuple[int, int, int, int]
+
+
+class DecoderPrefillGraphCache(DecoderStepGraphCache):
+    """A paged prefill's prompt forward, captured per ``(rows, prompt, widths)``.
+
+    Profiled on Whisper-tiny, single requests spent ~45 % of their host time in
+    the prefill, ~80 % of that in the prompt forward: four prompt tokens, but
+    every layer's self- and cross-attention, norms and FFN, launched one by one.
+    The decoder splits its prefill (``supports_prefill_graphs``): the state is
+    allocated and the cross-attention K/V written eagerly, then the prompt
+    forward replays here, reading the pool through the state's block tables.
+
+    The graph outputs the final-norm **hidden**, not logits: a ``(B, P, V)``
+    buffer per batch width would hold hundreds of MiB across widths for a large
+    vocabulary, where the projection is one GEMM the caller runs eagerly, as the
+    eager prefill does.  On return the self-attention KV has **not** advanced
+    on the host: the caller commits the prompt.
+    """
+
+    def __init__(self, decoder: Any, manager: Any, *, width_pages: int = 8, **kw: Any) -> None:
+        super().__init__(decoder, manager, width_pages=width_pages, **kw)
+        self._prefills: Dict[_PrefillKey, _Prefill] = {}
+        self._prefill_failed: Set[_PrefillKey] = set()
+
+    @property
+    def num_captured(self) -> int:
+        return len(self._prefills)
+
+    def prefill(self, prompt_ids: torch.Tensor, state: Any) -> Optional[torch.Tensor]:
+        """Replay the prompt forward; the ``(B, P, D)`` hidden, or ``None``.
+
+        A replay buffer, valid until the next replay of this key.  ``None`` when
+        the state or the shape is not capturable, and the caller runs
+        ``prefill_hidden`` eagerly.
+        """
+        parts = None if self._disabled else self._parts(state)
+        if parts is None:
+            return None
+        kv, cross = parts
+        table = kv.block_table()
+        cross_table = cross.block_table() if cross is not None else None
+        key = (
+            kv.batch,
+            int(prompt_ids.size(1)),
+            self._bucket(table.size(1)),
+            0 if cross_table is None else self._bucket(cross_table.size(1)),
+        )
+        captured = self._prefills.get(key)
+        if captured is None:
+            if key in self._prefill_failed or len(self._prefills) >= self._max_captures:
+                return None
+            captured = self._capture_prefill(key, prompt_ids, kv, cross)
+            if captured is None:
+                return None
+            self._prefills[key] = captured
+        captured.ids.copy_(prompt_ids)
+        captured.lens.copy_(kv.lens)
+        if captured.starts is not None and kv.starts is not None:
+            captured.starts.copy_(kv.starts)
+        _refill(captured, "table", captured.table, table, self._fill_table)
+        if cross is not None and cross_table is not None:
+            assert captured.cross_lens is not None and captured.cross_table is not None
+            _refill(captured, "cross_lens", captured.cross_lens, cross.lens, _copy)
+            _refill(captured, "cross_table", captured.cross_table, cross_table, self._fill_table)
+        captured.graph.replay()
+        return captured.hidden
+
+    def release(self) -> None:
+        """Return the graph pool's VRAM.  Idempotent."""
+        for state in self._prefills.values():
+            try:
+                state.graph.reset()
+            except Exception:  # pragma: no cover - teardown must not raise
+                pass
+        self._prefills.clear()
+        self._prefill_failed.clear()
+        super().release()
+
+    def _capture_prefill(
+        self,
+        key: _PrefillKey,
+        prompt_ids: torch.Tensor,
+        kv: PagedDecoderKv,
+        cross: Optional[PagedDecoderKv],
+    ) -> Optional[_Prefill]:
+        rows, prompt, width, cross_width = key
+        device = kv.lens.device
+        ids_buf = torch.empty_like(prompt_ids)
+        ids_buf.copy_(prompt_ids)
+        lens_buf = torch.empty(rows, dtype=torch.int32, device=device)
+        lens_buf.copy_(kv.lens)
+        starts_buf: Optional[torch.Tensor] = None
+        if kv.starts is not None:
+            starts_buf = torch.empty(rows, dtype=torch.int32, device=device)
+            starts_buf.copy_(kv.starts)
+        table_buf = torch.zeros(rows, width, dtype=torch.int32, device=device)
+        self._fill_table(table_buf, kv.block_table())
+        # The prompt forward commits its own tokens, so the twin advances in place.
+        graph_state: Dict[str, Any] = {
+            "kv": _LoopGraphKv(self._mgr, lens_buf, starts_buf, table_buf, kv.lens_host)
+        }
+        cross_lens_buf: Optional[torch.Tensor] = None
+        cross_table_buf: Optional[torch.Tensor] = None
+        if cross is not None:
+            cross_lens_buf = torch.empty(rows, dtype=torch.int32, device=device)
+            cross_lens_buf.copy_(cross.lens)
+            cross_table_buf = torch.zeros(rows, cross_width, dtype=torch.int32, device=device)
+            self._fill_table(cross_table_buf, cross.block_table())
+            graph_state["cross"] = _GraphKv(
+                self._mgr, cross_lens_buf, None, cross_table_buf, cross.lens_host
+            )
+
+        def _run() -> torch.Tensor:
+            hidden: torch.Tensor = self._decoder.prefill_hidden(ids_buf, graph_state)
+            return hidden
+
+        try:
+            # The warm-up writes the prompt's K/V into its pages; the replay
+            # rewrites the same values from the same inputs.
+            with torch.no_grad():
+                _run()
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.no_grad():
+                ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
+                with tvm_ffi.use_torch_stream(ctx):
+                    hidden_buf = _run()
+        except torch.cuda.OutOfMemoryError as exc:
+            self._disabled = True
+            recover_from_failed_capture(device, self._pool)
+            self._pool = None
+            torch.cuda.empty_cache()
+            logger.warning(
+                "decoder prefill graph capture ran out of memory at rows=%d (%s); "
+                "prefill graphs are off for this engine",
+                rows,
+                exc,
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - capture is best-effort
+            self._prefill_failed.add(key)
+            recover_from_failed_capture(device, self._pool)
+            self._pool = torch.cuda.graph_pool_handle()
+            logger.warning(
+                "decoder prefill graph capture failed for rows=%d prompt=%d (%s); "
+                "this shape prefills eagerly",
+                rows,
+                prompt,
+                exc,
+            )
+            return None
+        logger.info("captured decoder prefill: rows=%d prompt=%d", rows, prompt)
+        return _Prefill(
+            graph=graph,
+            ids=ids_buf,
+            lens=lens_buf,
+            table=table_buf,
+            hidden=hidden_buf,
             starts=starts_buf,
             cross_lens=cross_lens_buf,
             cross_table=cross_table_buf,

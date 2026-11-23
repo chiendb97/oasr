@@ -772,7 +772,12 @@ class PagedDecoderKv(_RowIndexed):
         operands.
         """
         self._check_live()
+        # A host index (pinned, from the strategy) reads for free and ships to
+        # the device without a sync; a device one costs a read-back, which waits
+        # for everything queued on the stream -- a loop in flight included.
         order = [int(i) for i in keep.tolist()]
+        if keep.device != self.lens.device:
+            keep = keep.to(self.lens.device, non_blocking=True)
         if len(set(order)) != len(order):
             raise RuntimeError(
                 "paged decoder KV cannot expand or reorder a beam grid: a "
