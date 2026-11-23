@@ -302,8 +302,9 @@ class RequestOutput:
         Which stage failed, when ``finish_reason == "error"`` — e.g.
         ``"offline_forward"``, ``"streaming_forward"``, ``"prefill_oom"``,
         ``"decode_step"`` / ``"decode_oom"`` for an AR decode group whose step
-        failed, or ``"offline_prep"`` for a waveform that ``overlap_admit``'s
-        prep thread could not prepare.
+        failed, ``"offline_prep"`` for a waveform that ``overlap_admit``'s
+        prep thread could not prepare, or ``"vad"`` for one whose offline
+        ``vad.mode="segment"`` detector call raised.
         Set alongside ``finish_reason`` rather than folded into it so the
         serving layer's error envelope stays a stable two-value vocabulary
         while ``oasr_requests_failed_total{stage}`` still says *where*.
@@ -413,6 +414,11 @@ class Request:
         if self.priority < DEFAULT_PRIORITY:
             self.priority = DEFAULT_PRIORITY
         self.arrival_time: float = time.monotonic()
+
+        # Offline ``vad.mode="segment"``: the ``[start, end)`` sample spans the
+        # admission-time detector found, set on the VAD thread and consumed by
+        # the fan-out at the next step.  ``None``: decode the audio whole.
+        self.vad_spans: Optional[List[Tuple[int, int]]] = None
 
         # Lifecycle state
         self.state: RequestState = RequestState.WAITING

@@ -22,6 +22,7 @@ Three properties, in the order they matter:
 
 from __future__ import annotations
 
+import assets
 import pytest
 import torch
 from helpers.audio import SR, speech_corpus
@@ -173,6 +174,41 @@ class TestUpstreamParity:
             # And nothing leaked into the padding (the longest row has none).
             assert probs[i, n:].abs().sum().item() == 0.0
 
+    def test_a_ragged_batch_carries_each_rows_own_state(self, silero_vad_dir, archive):
+        """The state a ragged row hands its next call is its own, at its own length.
+
+        A streaming tick whose streams were fed different amounts is ragged, and
+        the state leaving it is what the next tick starts from.  A short row
+        stepped over its padding would still produce the right probabilities in
+        *this* call -- the recurrence is causal -- and the wrong ones in every
+        call after it.
+        """
+        torch.manual_seed(4)
+        frames = (5, 12, 8)
+        rows = [torch.randn(WINDOW * n) * 0.1 for n in frames]
+        alone = [upstream(archive, row.unsqueeze(0))[0] for row in rows]
+        first = (2, 9, 0)  # frames each row is fed in the first call; row 2 none
+
+        det = detector(silero_vad_dir)
+        state, traces = None, [[] for _ in rows]
+        for call in range(2):
+            pieces = [
+                row[: first[i] * WINDOW] if call == 0 else row[first[i] * WINDOW :]
+                for i, row in enumerate(rows)
+            ]
+            width = max(p.numel() for p in pieces)
+            padded = torch.zeros(len(rows), width)
+            for i, piece in enumerate(pieces):
+                padded[i, : piece.numel()] = piece
+            lengths = torch.tensor([p.numel() for p in pieces])
+            probs, counts, state = det.detect_streaming(padded, lengths, state)
+            for i in range(len(rows)):
+                traces[i].append(probs[i, : int(counts[i])])
+        for i, want in enumerate(alone):
+            got = torch.cat(traces[i])
+            assert got.numel() == want.numel()
+            assert (got - want).abs().max().item() < 1e-5, f"row {i} drifted"
+
     def test_the_equal_length_fast_path_matches_the_grouped_one(self, silero_vad_dir):
         """``_recur``'s two routes must not be free to disagree.
 
@@ -198,6 +234,26 @@ class TestUpstreamParity:
             torch.testing.assert_close(fast[0][i], grouped[0][i])
             torch.testing.assert_close(fast[1][:, i], grouped[1][:, i])
             torch.testing.assert_close(fast[2][:, i], grouped[2][:, i])
+
+    def test_a_batch_of_whole_files_matches_each_file_alone(self, silero_vad_dir, archive):
+        """``detect_many``, the offline splitter's one call per admission batch.
+
+        Laid out flat, not padded: every row has to get exactly its own frames,
+        from a zero state, however different the lengths -- including a row
+        too short for one frame and an empty one.
+        """
+        torch.manual_seed(3)
+        shapes = ((5, 100), (40, 0), (0, 300), (12, 511), (1, 0))
+        rows = [torch.randn(WINDOW * n + extra) * 0.1 for n, extra in shapes]
+        rows.append(torch.zeros(0))
+        got = detector(silero_vad_dir).detect_many(rows)
+        assert len(got) == len(rows)
+        for row, probs in zip(rows, got):
+            n = row.numel() // WINDOW
+            assert len(probs) == n
+            if n:
+                want = upstream(archive, row[: n * WINDOW].unsqueeze(0))[0]
+                assert (torch.tensor(probs) - want).abs().max().item() < 1e-5
 
     @pytest.mark.requires_assets("WAV_DIR")
     def test_segment_boundaries_agree_on_real_speech(self, silero_vad_dir, archive, wav_dir):
@@ -409,6 +465,65 @@ class TestEngineResolution:
         assert ratio > 0.95, f"segmentation changed the transcript: {ratio:.3f}"
 
     @pytest.mark.requires_assets("WAV_DIR")
+    @pytest.mark.requires_assets("WAV_DIR")
+    def test_the_engine_segments_off_the_admitting_thread(self, ckpt_dir, silero_vad_dir, wav_dir):
+        """Review F11: the detector ran per request on the admitting thread.
+
+        Now the request is held by the VAD thread -- counted as waiting, so the
+        dispatcher keeps stepping -- and the next step fans it out.  The
+        transcript is the VAD-off one, minus nothing: the corpus has three
+        utterances and two silences to drop.
+        """
+        from oasr.engine import ASREngine
+
+        wav, _total = _corpus_audio(wav_dir)
+        texts = {}
+        for tag, vad in (
+            ("off", None),
+            ("segment", {"mode": "segment", "backend": "silero", "model_dir": str(silero_vad_dir)}),
+        ):
+            engine = ASREngine(self.config(ckpt_dir, dtype=torch.float16, vad=vad))
+            try:
+                rid = engine.add_request(wav.reshape(-1), streaming=False)
+                if vad is not None:
+                    assert engine._vad_worker is not None
+                    assert engine._executor.num_waiting() == 0 and engine.num_waiting == 1
+                outs = [o for o in engine.run() if o.request_id == rid and o.finished]
+            finally:
+                engine.shutdown()
+            assert len(outs) == 1 and outs[0].finish_reason != "error"
+            texts[tag] = outs[0].text
+        import difflib
+
+        ratio = difflib.SequenceMatcher(a=texts["off"].split(), b=texts["segment"].split()).ratio()
+        assert ratio > 0.95, f"segmentation changed the transcript: {ratio:.3f}"
+
+    @pytest.mark.requires_assets("WAV_DIR")
+    @pytest.mark.parametrize(
+        "device",
+        ["cpu", pytest.param("cuda", marks=pytest.mark.cuda)],
+    )
+    def test_spans_of_a_batch_are_the_spans_of_each_file(self, silero_vad_dir, wav_dir, device):
+        """``spans_many`` cuts each file where ``spans`` cuts it alone."""
+        import pathlib
+
+        import soundfile as sf
+
+        from oasr.engine.vad_stage import OfflineVadSegmenter
+
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        assets.require_wavs(8)
+        wavs = [
+            torch.from_numpy(sf.read(str(p), dtype="float32")[0])
+            for p in sorted(pathlib.Path(wav_dir).glob("*.wav"))[:8]
+        ]
+        corpus, _total = _corpus_audio(wav_dir)
+        wavs.append(corpus.reshape(-1))
+        cfg = VadConfig(backend="silero", mode="segment", model_dir=str(silero_vad_dir))
+        splitter = OfflineVadSegmenter(cfg.resolve("offline"), torch.device(device))
+        assert splitter.spans_many(wavs) == [splitter.spans(w) for w in wavs]
+
     def test_it_segments_a_real_file_at_the_speech(self, ckpt_dir, silero_vad_dir, wav_dir):
         from oasr.engine import ASREngine
 

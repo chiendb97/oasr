@@ -137,6 +137,12 @@ class ASREngine:
     _capture_floor_bytes: int = 0
     #: The derived decoder-KV budget, with the prefill reserve it took off.
     _decode_kv_budget: Optional[KvBudget] = None
+    #: The threads that hold accepted requests before the executor sees them:
+    #: ``overlap_admit``'s prep and offline ``vad.mode="segment"``'s detector.
+    #: Class-level for the same reason as ``_longform``: ``abort_request`` and
+    #: ``num_waiting`` ask both, on hand-built engines too.
+    _prep: Optional[AdmissionPrep] = None
+    _vad_worker: Optional[AdmissionPrep] = None
 
     def __init__(self, config: EngineConfig) -> None:
         # Engine-wide re-entrant lock guarding scheduler queues and per-request
@@ -452,7 +458,7 @@ class ASREngine:
         self._overlap_admit: bool = bool(
             getattr(config, "overlap_admit", False) and config.service_mode == "offline"
         )
-        self._prep: Optional[AdmissionPrep] = None
+        self._prep = None
         if self._overlap_admit:
             self._prep = AdmissionPrep(self._input_processor.prepare_offline)
             self._prep.start()
@@ -515,10 +521,25 @@ class ASREngine:
         #: ``spans`` already returns nothing wider; this width also splits audio
         #: in which the detector found no speech at all.
         self._vad_resplit_samples = 0
+        #: Runs the offline detector off the admitting thread, batched across
+        #: whatever was admitted since its last call; :meth:`step` fans the
+        #: classified requests out.  The detector used to run per request on the
+        #: admitting thread -- under ``oasr-server`` the dispatcher, under the
+        #: engine lock for a batch admission -- which capped the fast models at
+        #: about 1,300 RTFx on the host and 3,000 on CUDA.
+        self._vad_worker = None
         vad_cfg = config.vad
         if vad_cfg is not None and vad_cfg.mode == "segment" and config.service_mode == "offline":
             device = torch.device(vad_cfg.device or "cpu")
+            if device.type == "cuda" and device.index is None:
+                # Pinned here: the detector runs on its own thread, whose current
+                # device is not the one this thread may have selected.
+                device = torch.device("cuda", torch.cuda.current_device())
             self._vad_splitter = OfflineVadSegmenter(vad_cfg.resolve("offline"), device)
+            self._vad_worker = AdmissionPrep.batched(
+                self._vad_prepare, max_batch=4 * max(1, int(config.max_batch_size)), name="oasr-vad"
+            )
+            self._vad_worker.start()
             if self._longform is None:
                 self._longform = LongFormTracker(
                     self._output_processor.strategy.detokenizer.token_pieces
@@ -1224,13 +1245,21 @@ class ASREngine:
             return False
         return not (0 < self._vad_resplit_samples < samples)
 
-    def _maybe_fan_out_longform(self, req: Request) -> Optional[str]:
+    def _maybe_fan_out_longform(
+        self, req: Request, vad_batch: Optional[List[Request]] = None
+    ) -> Optional[str]:
         """Split an offline request's audio into per-window child requests.
 
-        Returns the parent request id when the audio was fanned out, or ``None``
-        when it fits one window, or no splitter is configured, and ``req`` should
-        be admitted normally.  The caller sees one id either way; :meth:`step`
-        merges the children back.
+        Returns the parent request id when the request was taken -- fanned out,
+        or handed to the VAD thread -- or ``None`` when it fits one window, or
+        no splitter is configured, and ``req`` should be admitted normally.  The
+        caller sees one id either way; :meth:`step` merges the children back.
+
+        Under ``vad.mode="segment"`` a request the detector has to see is held
+        by the VAD thread (:meth:`_vad_prepare`), and the fan-out happens at
+        the next :meth:`step` that finds it classified.  ``vad_batch`` collects
+        those requests for the caller to submit together, so one admission
+        batch reaches the detector as one call.
 
         Every offline admission path calls this — :meth:`add_request` *and* the
         two batch paths the serving dispatcher uses.  Only the first did once, so
@@ -1242,14 +1271,31 @@ class ASREngine:
         """
         if self._longform is None or req.streaming:
             return None
-        from .longform import split_windows
-
-        sample_rate = req.sample_rate
         wave = torch.as_tensor(req.audio, dtype=torch.float32, device="cpu").reshape(-1)
+        if self._vad_worker is not None and not self._vad_skips(int(wave.numel()), req.sample_rate):
+            if vad_batch is None:
+                self._submit_vad([req])
+            else:
+                vad_batch.append(req)
+            return req.request_id
+        return self._fan_out(req, wave, None)
 
-        spans: Optional[List[Tuple[int, int]]] = None
-        if self._vad_splitter is not None and not self._vad_skips(int(wave.numel()), sample_rate):
-            spans = self._vad_splitter.spans(wave)
+    def _vad_prepare(self, batch: List[Request]) -> List[Optional[BaseException]]:
+        """The VAD thread's prep: one detector call for ``batch``, spans on each request.
+
+        Touches only the requests (``AdmissionPrep``'s contract): the fan-out
+        registers windows and admits them, which needs the engine lock, so it
+        waits for :meth:`_drain_vad`.
+        """
+        splitter = cast(OfflineVadSegmenter, self._vad_splitter)
+        waves = [
+            torch.as_tensor(req.audio, dtype=torch.float32, device="cpu").reshape(-1)
+            for req in batch
+        ]
+        t0 = time.perf_counter()
+        found = splitter.spans_many(waves)
+        self._metrics.observe_stage("offline.vad", time.perf_counter() - t0)
+        for req, wave, spans in zip(batch, waves, found):
             if spans is None and 0 < self._vad_resplit_samples < int(wave.numel()):
                 # The detector found no speech, but the audio is wider than any
                 # piece this engine hands its encoder: a fixed-window frontend
@@ -1257,7 +1303,49 @@ class ASREngine:
                 # memory to.  Having asked for segmentation and got a rejection
                 # is the worst of both, so cut the undivided audio below.
                 spans = [(0, int(wave.numel()))]
+            req.vad_spans = spans
+        return [None] * len(batch)
 
+    def _drain_vad(self) -> List[RequestOutput]:
+        """Fan out, or admit whole, every request the VAD thread has classified.
+
+        Runs at the head of :meth:`step`, under the engine lock.  Returns an
+        error output for each request whose detector call or admission raised.
+        """
+        worker = cast(AdmissionPrep, self._vad_worker)
+        executor = cast(OfflineExecutor, self._executor)
+        rejected: List[RequestOutput] = []
+        for req, exc in worker.drain():
+            if exc is not None:
+                rejected.append(executor.reject_prep(req, exc, stage="vad"))
+                continue
+            spans, req.vad_spans = req.vad_spans, None
+            try:
+                wave = torch.as_tensor(req.audio, dtype=torch.float32, device="cpu").reshape(-1)
+                if self._fan_out(req, wave, spans) is None:
+                    if self._overlap_admit:
+                        self._admission_prep().submit([req])
+                    else:
+                        executor.admit(req)
+            except Exception as err:  # noqa: BLE001 - answered, as on the admitting thread
+                rejected.append(executor.reject_prep(req, err))
+        return rejected
+
+    def _fan_out(
+        self, req: Request, wave: torch.Tensor, spans: Optional[List[Tuple[int, int]]]
+    ) -> Optional[str]:
+        """Admit ``wave`` as child windows: at ``spans``, else ``long_form``'s pauses.
+
+        ``None`` when there is nothing to cut (no spans, and the audio fits one
+        ``long_form`` window or there is no ``long_form`` splitter): admit
+        ``req`` whole.
+        """
+        from .longform import split_windows
+
+        tracker = self._longform
+        if tracker is None:  # pragma: no cover - only called with a tracker
+            return None
+        sample_rate = req.sample_rate
         # Window starts in samples, so the tracker sees two windows that only
         # touch as exactly touching, with no rounding to read as an overlap.
         first: List[int]
@@ -1297,7 +1385,6 @@ class ASREngine:
         ends = [(s + int(w.numel())) / float(sample_rate) for s, w in zip(first, windows)]
 
         parent_id = req.request_id
-        tracker = self._longform
         child_ids: List[str] = [tracker.child_id(parent_id, i) for i in range(len(windows))]
         if spans is not None:
             kept = sum(int(w.numel()) for w in windows)
@@ -1405,8 +1492,9 @@ class ASREngine:
             decoding=DecodingOptions.coerce(decoding),
         )
         if self._longform is not None and not streaming:
-            # Outside the lock, as before: a VAD pass over a long file would
-            # otherwise stall a step loop running on another thread.
+            # Outside the lock: ``long_form``'s splitter reads the whole file,
+            # and would otherwise stall a step loop running on another thread.
+            # A request the VAD detector has to see is handed to its thread.
             self._validate_mode(streaming)
             self._validate_decoding(req)
             fanned = self._maybe_fan_out_longform(req)
@@ -1505,16 +1593,42 @@ class ASREngine:
         if self._overlap_admit:
             return self._admit_batch_overlapped(specs)
         results: List[Dict] = []
+        vad_batch: List[Request] = []
         with self._lock:
             for spec in specs:
-                results.append(self._admit_one_checked(spec))
+                results.append(self._admit_one_checked(spec, vad_batch))
+        self._submit_vad(vad_batch)
         return results
 
-    def _admit_one_checked(self, spec: Dict) -> Dict:
+    def _submit_vad(self, requests: List[Request]) -> None:
+        """Send requests to the detector together, so they share one call.
+
+        To its thread, unless the engine is idle: then the admitting thread
+        has nothing else to step, and the hand-off would only add latency (the
+        serving dispatcher polls an engine with nothing to step every 2 ms, so
+        a lone request waited for the poll after its detector finished).
+        Either way the next step fans them out.
+        """
+        if not requests:
+            return
+        worker = cast(AdmissionPrep, self._vad_worker)
+        with self._lock:
+            idle = (
+                not self._executor.num_running()
+                and not self._executor.num_waiting()
+                and not self._num_admit_inflight()
+            )
+        if idle:
+            worker.prepare_inline(requests)
+        else:
+            worker.submit(requests)
+
+    def _admit_one_checked(self, spec: Dict, vad_batch: Optional[List[Request]] = None) -> Dict:
         """Build + admit one spec, converting any rejection into a result dict.
 
         Caller holds ``self._lock``.  ``request_id`` is echoed even on failure so
-        the caller can attribute the error without guessing.
+        the caller can attribute the error without guessing.  A request the
+        detector has to see is appended to ``vad_batch`` for the caller to submit.
         """
         rid = spec.get("request_id")
         try:
@@ -1529,7 +1643,7 @@ class ASREngine:
             )
             self._validate_mode(streaming)
             self._validate_decoding(req)
-            fanned = self._maybe_fan_out_longform(req)
+            fanned = self._maybe_fan_out_longform(req, vad_batch)
             if fanned is None:
                 self._executor.admit(req)
         except Exception as exc:
@@ -1555,6 +1669,7 @@ class ASREngine:
         spec is never queued for prep.
         """
         reqs: List[Request] = []
+        vad_batch: List[Request] = []
         results: List[Dict] = []
         for spec in specs:
             rid = spec.get("request_id")
@@ -1570,7 +1685,7 @@ class ASREngine:
                 self._validate_mode(req.streaming)  # reads immutable executor.streaming
                 self._validate_decoding(req)
                 # Queues its windows for prep itself.
-                fanned = self._maybe_fan_out_longform(req)
+                fanned = self._maybe_fan_out_longform(req, vad_batch)
                 if fanned is None:
                     # Raise here, not on the prep thread, where it would only be logged.
                     self._input_processor.check_audio_duration(req.audio)
@@ -1582,6 +1697,7 @@ class ASREngine:
             results.append({"request_id": req.request_id})
         if reqs:
             self._admission_prep().submit(reqs)
+        self._submit_vad(vad_batch)
         return results
 
     def _drain_prepared(self) -> List[RequestOutput]:
@@ -1608,18 +1724,30 @@ class ASREngine:
             raise RuntimeError("overlap_admit is off; there is no admission prep")
         return prep
 
+    @property
+    def _admits_off_thread(self) -> bool:
+        """Whether accepted requests can be held by a thread the executor cannot see."""
+        return self._prep is not None or self._vad_worker is not None
+
     def _num_admit_inflight(self) -> int:
-        return self._admission_prep().in_flight
+        """Requests accepted and still held by the prep or VAD thread."""
+        n = 0
+        for held in (self._prep, self._vad_worker):
+            if held is not None:
+                n += held.in_flight
+        return n
 
     def _abort_admitted(self, request_id: str) -> None:
         """Abort one executor-level request, wherever admission has got to.
 
-        Under ``overlap_admit`` it may still be held for prep, which the
-        executor cannot see.  The executor is asked as well, since an id can
-        be reused.
+        Under ``overlap_admit`` it may still be held for prep, and under offline
+        ``vad.mode="segment"`` by the detector's thread, neither of which the
+        executor can see.  The executor is asked as well, since an id can be
+        reused.
         """
-        if self._overlap_admit:
-            self._admission_prep().withdraw(request_id)
+        for held in (self._vad_worker, self._prep):
+            if held is not None:
+                held.withdraw(request_id)
         self._executor.abort(request_id)
 
     def shutdown(self) -> None:
@@ -1634,8 +1762,9 @@ class ASREngine:
         the garbage collector never will.  Measured: 3.24 GiB stranded per
         offline Nemotron engine before this released the pools.
         """
-        if self._prep is not None:
-            self._prep.stop()
+        for held in (self._vad_worker, self._prep):
+            if held is not None:
+                held.stop()
         try:
             self._executor.shutdown()
         except Exception:  # pragma: no cover - defensive; shutdown must not raise
@@ -2202,10 +2331,15 @@ class ASREngine:
         """Execute one engine step — one call into the configured executor."""
         with self._lock:
             rejected: List[RequestOutput] = []
+            if self._vad_worker is not None:
+                # Fan out what the detector classified since the last step.
+                # First, so under ``overlap_admit`` its windows are on their way
+                # to the prep thread before that thread's results are drained.
+                rejected = self._drain_vad()
             if self._overlap_admit:
                 # Admit requests the prep thread finished preparing since the
                 # last step (cheap scheduler enqueue under the lock we hold).
-                rejected = self._drain_prepared()
+                rejected += self._drain_prepared()
             nvtx_push("engine.step")
             outputs = self._executor.step()
             nvtx_pop()
@@ -2250,7 +2384,7 @@ class ASREngine:
         try:
             if self._executor.num_running() or self._executor.num_waiting():
                 return
-            if self._overlap_admit and self._num_admit_inflight():
+            if self._num_admit_inflight():
                 return
             self._input_processor.trim_pinned_audio()
         except Exception:  # pragma: no cover - defensive
@@ -2283,12 +2417,12 @@ class ASREngine:
         returns; use :meth:`step` in a loop instead if you need concurrent
         submission while draining.
 
-        With ``overlap_admit`` the prep thread runs lock-free, so this loops
-        per-step (releasing the lock between steps) and waits for in-flight
-        admission prep to drain rather than holding the lock across the whole
-        run.
+        With ``overlap_admit``, or offline ``vad.mode="segment"``, a thread
+        holds requests lock-free before the executor sees them, so this loops
+        per-step (releasing the lock between steps) and waits for them to drain
+        rather than holding the lock across the whole run.
         """
-        if self._overlap_admit:
+        if self._admits_off_thread:
             return self._run_overlapped()
         with self._lock:
             final_outputs: List[RequestOutput] = []
@@ -2465,13 +2599,12 @@ class ASREngine:
     def num_waiting(self) -> int:
         """Requests in the waiting queue (admission pending).
 
-        Includes requests accepted into the admission-prep queue but not yet
-        visible to the scheduler (``overlap_admit``), so callers — notably the
-        Rust dispatcher's idle check — don't treat the engine as idle while
-        admission prep is still in flight.
+        Includes requests accepted but not yet visible to the scheduler -- held
+        by the admission-prep thread (``overlap_admit``) or the offline
+        detector's (``vad.mode="segment"``) -- so callers, notably the Rust
+        dispatcher's idle check, don't treat the engine as idle while they are
+        in flight.
         """
         with self._lock:
             n = self._executor.num_waiting()
-        if self._overlap_admit:
-            n += self._num_admit_inflight()
-        return n
+        return n + self._num_admit_inflight()

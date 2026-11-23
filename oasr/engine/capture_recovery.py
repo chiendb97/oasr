@@ -54,6 +54,8 @@ from typing import Any, Optional
 
 import torch
 
+from oasr.utils.capture_guard import capture_guard
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -95,7 +97,7 @@ def restore_rng_after_failed_capture(device: torch.device) -> bool:
         with torch.cuda.device(device):
             probe = torch.empty(1, device=device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with capture_guard(), torch.cuda.graph(graph):
                 probe.fill_(0)
             torch.cuda.synchronize(device)
     except Exception as exc:  # pragma: no cover - the recovery itself failing

@@ -229,11 +229,12 @@ class VadConfig:
         speech-start.
     min_audio_s : float, optional
         Offline ``segment`` mode: a request no longer than this decodes whole,
-        without running the detector.  The detector runs per request at batch 1
-        during admission (CPU fp32 by default), which capped the fast models at
-        960-1,335 RTFx; on short clips it mostly trims edges, a change measured
-        at 0.07 WER points or less.  Never skips audio wider than the piece the
-        encoder can take.  ``None`` (default) always runs the detector.
+        without running the detector.  On short clips the detector mostly trims
+        edges, a change measured at 0.07 WER points or less, and skipping it
+        saves its cost (batched across requests, but on the host by default
+        still well below a fast encoder's throughput).  Never skips audio wider
+        than the piece the encoder can take.  ``None`` (default) always runs the
+        detector.
     """
 
     backend: Optional[str] = None

@@ -75,6 +75,8 @@ from typing import Callable, Dict, Hashable, Optional, Sequence, Set, Tuple
 import torch
 import tvm_ffi
 
+from oasr.utils.capture_guard import capture_guard
+
 from .capture_recovery import recover_from_failed_capture
 from .memory import ACTIVATION_SAFETY, MIN_ACTIVATION_RESERVE_BYTES, read_device_memory
 from .offline_graph import BUDGET_RETRY_S
@@ -471,7 +473,7 @@ class NarDecodeGraphs:
         graph = torch.cuda.CUDAGraph()
         # torch types the pool handle as an opaque ``_POOL_HANDLE``.
         ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
-        with tvm_ffi.use_torch_stream(ctx):
+        with capture_guard(), tvm_ffi.use_torch_stream(ctx):
             outputs = run()
         torch.cuda.synchronize(self._device)
         return graph, tuple(outputs)

@@ -143,6 +143,8 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set,
 import torch
 import tvm_ffi
 
+from oasr.utils.capture_guard import capture_guard
+
 from .capture_recovery import recover_from_failed_capture
 from .memory import ACTIVATION_SAFETY, MIN_ACTIVATION_RESERVE_BYTES, read_device_memory
 
@@ -649,7 +651,7 @@ class GraphedOfflineForward:
             graph = torch.cuda.CUDAGraph()
             pool = torch.cuda.graph_pool_handle()
             ctx = torch.cuda.graph(graph, pool=pool)  # type: ignore[arg-type]
-            with tvm_ffi.use_torch_stream(ctx):
+            with capture_guard(), tvm_ffi.use_torch_stream(ctx):
                 fn(feats, lens)
             torch.cuda.synchronize(self._device)
         except Exception as exc:
@@ -795,7 +797,7 @@ class GraphedOfflineForward:
         # torch types the pool handle as an opaque ``_POOL_HANDLE``; the engine
         # passes the ``(int, int)`` tuple it actually is.
         ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
-        with tvm_ffi.use_torch_stream(ctx):
+        with capture_guard(), tvm_ffi.use_torch_stream(ctx):
             out, out_lengths = fn(features, lengths)
         torch.cuda.synchronize(self._device)
         return graph, out, out_lengths

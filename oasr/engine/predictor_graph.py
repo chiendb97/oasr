@@ -52,6 +52,8 @@ from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 
+from oasr.utils.capture_guard import capture_guard
+
 from .capture_recovery import capture_warmup_stream, recover_from_failed_capture
 
 logger = logging.getLogger("oasr.engine.predictor_graph")
@@ -267,7 +269,10 @@ class PredictorStepGraphCache:
             graph = torch.cuda.CUDAGraph()
             # torch types the pool handle as an opaque ``_POOL_HANDLE``; the
             # engine passes the ``(int, int)`` tuple it actually is.
-            with torch.cuda.graph(graph, pool=self._pool):  # type: ignore[arg-type]
+            with (
+                capture_guard(),
+                torch.cuda.graph(graph, pool=self._pool),  # type: ignore[arg-type]
+            ):
                 stepped = self._predictor.advance(facing, tok_buf, emit_buf)
                 # Write the new state back into the buffers the graph reads, so
                 # the next replay continues from it with no copy.

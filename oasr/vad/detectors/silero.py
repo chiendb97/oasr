@@ -54,8 +54,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections import defaultdict
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -93,6 +92,39 @@ _HIDDEN = 128
 
 #: Filenames tried, in order, when ``model_dir`` names a directory.
 _CANDIDATES = ("silero_vad.jit", "silero_vad.pt", "silero_vad.pth", "model.pt")
+
+#: Frames embedded per slice: bounds the front half's intermediates, about
+#: 12 KB a frame (the reflect-padded window, the spectrum and four convs).
+_EMBED_FRAMES = 8192
+
+#: Which frames of an ``unfold`` view are real: all (``None``), a row index
+#: into a 2-D view, or a ``(rows, frames)`` pair into a 3-D one.
+_FrameIndex = Union[None, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+
+
+def _real_frames(lens: torch.Tensor, total: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(row, frame)`` of every real frame, row by row, on ``lens``'s device.
+
+    Expanded on the device from the per-row counts, so a call moves ``B``
+    integers instead of building, pinning and copying ``N`` of them.
+    """
+    device = lens.device
+    rows = torch.repeat_interleave(
+        torch.arange(lens.numel(), device=device), lens, output_size=total
+    )
+    firsts = torch.repeat_interleave(torch.cumsum(lens, 0) - lens, lens, output_size=total)
+    return rows, torch.arange(total, device=device) - firsts
+
+
+def _stage(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A host index on ``device``, copied from pinned memory without a stream drain.
+
+    A pageable copy to the GPU waits for everything queued on the stream, and
+    the streaming detector is issued behind the encoder forward.
+    """
+    if device.type != "cuda":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
 
 
 def silero_framing(config: VadConfig) -> VadFraming:
@@ -206,6 +238,39 @@ class SileroVadNet(nn.Module):
         # The encoder's strides collapse the frame axis to one step per window.
         return hidden.reshape(hidden.size(0), self.hidden_size)
 
+    def embed_frames(self, windows: torch.Tensor, index: _FrameIndex) -> torch.Tensor:
+        """``embed`` over the frames of ``windows`` that ``index`` names, in order.
+
+        ``windows`` is an ``unfold`` view, ``(G, width)`` or ``(B, F, width)``,
+        which costs nothing until it is read.  ``index`` names the real frames:
+        ``None`` (all of them), a ``(N,)`` row index for the 2-D form, or a
+        ``(rows, frames)`` pair for the 3-D one.  Gathering only those keeps a
+        ragged batch's padding out of the front half -- reshaping the view
+        would copy every padded window first -- and gathering in slices bounds
+        the intermediates (about 12 KB a frame), so an hour of audio is not one
+        1.4 GB spectrogram.
+        """
+        if index is None:
+            flat = windows.reshape(-1, windows.size(-1))
+            total = int(flat.size(0))
+        else:
+            total = int(index[0].numel()) if isinstance(index, tuple) else int(index.numel())
+
+        def gather(start: int, stop: int) -> torch.Tensor:
+            if index is None:
+                return flat[start:stop]
+            if isinstance(index, tuple):
+                return windows[index[0][start:stop], index[1][start:stop]]
+            return windows.index_select(0, index[start:stop])
+
+        if total <= _EMBED_FRAMES:
+            return self.embed(gather(0, total).contiguous())
+        out = windows.new_empty(total, self.hidden_size)
+        for start in range(0, total, _EMBED_FRAMES):
+            stop = min(total, start + _EMBED_FRAMES)
+            out[start:stop] = self.embed(gather(start, stop).contiguous())
+        return out
+
     def _recur(
         self,
         sequence: torch.Tensor,
@@ -215,36 +280,68 @@ class SileroVadNet(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Step the LSTM per row, for exactly that row's number of frames.
 
-        Rows are grouped by frame count and each group runs as **one** sequence
-        call, rather than looping the whole batch a step at a time and masking:
-        a masked per-step loop would be correct too, but it hands the recurrent
-        kernel a length-one sequence every time and turns the one part of this
-        model that is genuinely sequential into ``F`` launches per stream.  In
-        steady state every stream is fed the same chunk, so there is one group --
-        and then the grouping machinery is pure identity work: gathering every
-        row in order, scattering it back, and copying a state that was never
-        permuted.  That case is taken directly.  It is not a micro-optimisation
-        of a rare path but the common one: the pool is fed the same chunk every
-        tick, so the fast path is what runs, and the general path below is what
-        makes a ragged tick correct.
+        One recurrence for the whole batch, ragged or not: ``lengths`` packs
+        the rows (``oasr.layers.LSTM``), so each row advances its own number of
+        frames and ends on its own state.  Grouping rows by frame count and
+        running one call per group did the same, but a ragged batch is one
+        group per row -- an offline admission batch always is, and so is a
+        streaming tick whose streams were fed different amounts -- and then the
+        one sequential part of this model ran once per row.
         """
-        batch, n_frames, _ = sequence.shape
-        if n_frames and all(int(count) == n_frames for count in frame_lengths):
-            out, (new_h, new_c) = self.lstm(sequence, (hidden, cell))
-            return out, new_h, new_c
-        outputs = sequence.new_zeros(batch, n_frames, self.hidden_size)
-        groups: Dict[int, List[int]] = defaultdict(list)
-        for row, count in enumerate(frame_lengths):
-            if count > 0:
-                groups[int(count)].append(row)
-        for count, rows in groups.items():
-            index = torch.tensor(rows, dtype=torch.long, device=sequence.device)
-            state = (hidden.index_select(1, index), cell.index_select(1, index))
-            out, (new_h, new_c) = self.lstm(sequence.index_select(0, index)[:, :count], state)
-            outputs[index, :count] = out
-            hidden = hidden.index_copy(1, index, new_h)
-            cell = cell.index_copy(1, index, new_c)
-        return outputs, hidden, cell
+        out, (new_h, new_c) = self.lstm(sequence, (hidden, cell), lengths=frame_lengths)
+        return out, new_h, new_c
+
+    def frame_probabilities(
+        self,
+        windows: torch.Tensor,
+        index: _FrameIndex,
+        counts: Sequence[int],
+        hidden: torch.Tensor,
+        cell: torch.Tensor,
+        slots: Optional[torch.Tensor] = None,
+        final_state: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Speech probability of every real frame, rows concatenated in order.
+
+        The frames ``index`` names in ``windows`` (see :meth:`embed_frames`)
+        are row 0's ``counts[0]`` frames, then row 1's, and so on; ``hidden``
+        and ``cell`` are ``(1, len(counts), hidden)``.  Returns ``(probs (N,),
+        hidden, cell)`` with ``N = sum(counts)``.  Only the recurrence needs a
+        ``(row, frame)`` layout, so only it is padded: ``slots`` is where each
+        frame sits in it (``row * max(counts) + frame``, on the device), built
+        here when the caller has not already.
+
+        ``final_state=False`` is for a caller that discards the state (a whole
+        waveform from a zero state): a ragged batch then runs as one plain
+        recurrence over the padding.  The recurrence is causal, so every real
+        frame's output is exactly its own; only the returned state is not --
+        a short row's ran on past its end.  The packed call that keeps it right
+        is host-bound in cuDNN (1.1-2.9 ms at 64 rows of 20-200 frames, against
+        0.36 ms for the plain one), so it is paid only where the state matters.
+        """
+        counts = [int(n) for n in counts]
+        batch, longest = len(counts), max(counts, default=0)
+        embedded = self.embed_frames(windows, index)
+        if all(n == longest for n in counts):
+            sequence = embedded.view(batch, longest, self.hidden_size)
+            outputs, hidden, cell = self._recur(sequence, counts, hidden, cell)
+            flat = outputs.reshape(-1, self.hidden_size)
+        else:
+            if slots is None:
+                lens = _stage(torch.tensor(counts, dtype=torch.int64), embedded.device)
+                rows, frames = _real_frames(lens, int(embedded.size(0)))
+                slots = rows * longest + frames
+            sequence = embedded.new_zeros(batch * longest, self.hidden_size)
+            sequence.index_copy_(0, slots, embedded)
+            outputs, hidden, cell = self._recur(
+                sequence.view(batch, longest, self.hidden_size),
+                counts if final_state else [longest] * batch,
+                hidden,
+                cell,
+            )
+            flat = outputs.reshape(-1, self.hidden_size).index_select(0, slots)
+        probs = self.output_activation(self.head(self.activation(flat)))
+        return probs.reshape(-1), hidden, cell
 
     def forward(
         self,
@@ -255,20 +352,28 @@ class SileroVadNet(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(B, F, window + context)`` windows → ``(B, F)`` speech probabilities.
 
-        ``frame_lengths`` is a **host** sequence: it drives the grouping above,
-        which is control flow, and reading it off the device inside the model
-        would put a synchronisation in the step loop.  The detector runs on the
-        host by default anyway, so nothing is read back that was not already
-        there.
+        ``frame_lengths`` is a **host** sequence: it decides which frames are
+        real, which is control flow, and reading it off the device inside the
+        model would put a synchronisation in the step loop.  Frames past a
+        row's length come back as zero.
         """
         batch, n_frames, _ = windows.shape
-        if n_frames == 0:
-            return windows.new_zeros(batch, 0), hidden, cell
-        embedded = self.embed(windows.reshape(batch * n_frames, windows.size(-1)))
-        sequence = embedded.reshape(batch, n_frames, self.hidden_size)
-        outputs, hidden, cell = self._recur(sequence, frame_lengths, hidden, cell)
-        probs = self.output_activation(self.head(self.activation(outputs)))
-        return probs.squeeze(-1), hidden, cell
+        counts = [int(n) for n in frame_lengths]
+        if n_frames == 0 or not any(counts):
+            return windows.new_zeros(batch, n_frames), hidden, cell
+        if all(n == n_frames for n in counts):
+            probs, hidden, cell = self.frame_probabilities(windows, None, counts, hidden, cell)
+            return probs.view(batch, n_frames), hidden, cell
+        # The gather pair, then the recurrence's slots (rows as wide as the
+        # longest one) and the output's (as wide as ``windows``).
+        lens = _stage(torch.tensor(counts, dtype=torch.int64), windows.device)
+        rows, frames = _real_frames(lens, sum(counts))
+        flat, hidden, cell = self.frame_probabilities(
+            windows, (rows, frames), counts, hidden, cell, slots=rows * max(counts) + frames
+        )
+        probs = flat.new_zeros(batch * n_frames)
+        probs.index_copy_(0, rows * n_frames + frames, flat)
+        return probs.view(batch, n_frames), hidden, cell
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +522,9 @@ class SileroDetector(SpeechDetector):
             )
         self._framing = framing
         self._context = _GEOMETRY[int(config.sample_rate)][1]
+        #: :meth:`detect_many`'s reused host buffer and zero pads.
+        self._staging: Optional[torch.Tensor] = None
+        self._zero_pads: Dict[int, torch.Tensor] = {}
         net = SileroVadNet(int(config.sample_rate))
         net.load_state_dict(load_silero_weights(model_dir, int(config.sample_rate)))
         self._net = net.to(device=self._device, dtype=self._dtype).eval()
@@ -436,6 +544,25 @@ class SileroDetector(SpeechDetector):
     @property
     def net(self) -> SileroVadNet:
         return self._net
+
+    def _zeros(self, samples: int) -> torch.Tensor:
+        pad = self._zero_pads.get(samples)
+        if pad is None:
+            pad = self._zero_pads[samples] = torch.zeros(samples, dtype=self._dtype)
+        return pad
+
+    def _host_buffer(self, samples: int) -> torch.Tensor:
+        """:meth:`detect_many`'s flat layout on the host, reused across calls.
+
+        Only the first call that needs a size pays for it: a fresh 100 MB
+        buffer is mostly page faults.  Reuse is safe because a host call is
+        finished when it returns.
+        """
+        buf = self._staging
+        if buf is None or buf.numel() < samples:
+            size = max(samples, 2 * (0 if buf is None else buf.numel()))
+            buf = self._staging = torch.empty(size, dtype=self._dtype)
+        return buf[:samples]
 
     # -- state ---------------------------------------------------------------
 
@@ -482,6 +609,76 @@ class SileroDetector(SpeechDetector):
         """
         probs, frame_lengths, _ = self.detect_streaming(waveform, lengths, None)
         return probs, frame_lengths
+
+    @torch.no_grad()
+    def detect_many(self, waves: Sequence[torch.Tensor]) -> List[List[float]]:
+        """Whole waveforms of any lengths, from a zero state, in one call.
+
+        Laid out flat rather than padded: row ``i`` owns
+        ``(frames_i + 1) * window`` samples of one buffer, its (zero) left
+        context and then its whole frames, so every row's frame ``k`` is the
+        same ``unfold`` window, and only real frames are gathered from it.  A
+        padded batch of an admission's utterances is mostly padding (the
+        longest of 64 random LibriSpeech utterances is ~4x their mean), and
+        each padded sample would be copied to the device, cut into windows and
+        run through the front half.  The recurrence runs once over the padded
+        batch: from a zero state with the state discarded, padding past a row's
+        end changes none of its frames (:meth:`SileroVadNet.frame_probabilities`).
+        One read-back for the whole call.
+        """
+        hop, context = self._framing.hop, self._context
+        counts = [max(0, (int(w.numel()) - hop) // hop + 1) for w in waves]
+        rows: List[List[float]] = [[] for _ in waves]
+        live = [i for i, n in enumerate(counts) if n > 0]
+        if not live:
+            return rows
+        lens = [counts[i] for i in live]
+        firsts = [0] * len(live)  # each row's first window, in windows of the buffer
+        for j in range(1, len(live)):
+            firsts[j] = firsts[j - 1] + lens[j - 1] + 1
+        # Row by row: its (zero) left context, its whole frames, then zeros to
+        # the next window boundary.  On the GPU each row is copied straight
+        # into its place, in one call (an engine's request audio is usually
+        # page-locked already, so the copies are DMAs with no host pass); on
+        # the host, one ``cat`` into a reused buffer.
+        samples = (firsts[-1] + lens[-1] + 1) * hop
+        sources = [waves[i].reshape(-1)[: counts[i] * hop] for i in live]
+        small = torch.tensor(lens + firsts, dtype=torch.int64)
+        device = self._device or torch.device("cpu")
+        if device.type == "cuda":
+            flat = torch.zeros(samples, dtype=self._dtype, device=device)
+            places = [
+                flat[first * hop + context : first * hop + context + src.numel()]
+                for first, src in zip(firsts, sources)
+            ]
+            torch._foreach_copy_(places, sources, non_blocking=True)
+            small = small.pin_memory().to(device, non_blocking=True)
+        else:
+            lead, tail = self._zeros(context), self._zeros(hop - context)
+            parts: List[torch.Tensor] = []
+            for src in sources:
+                parts += [lead, src, tail]
+            flat = torch.cat(parts, out=self._host_buffer(samples))
+        windows = flat.unfold(0, context + hop, hop)
+        lens_d, firsts_d = small[: len(live)], small[len(live) :]
+        total = sum(lens)
+        rows_d, frames_d = _real_frames(lens_d, total)
+        state = self.new_state(len(live))
+        probs, _h, _c = self._net.frame_probabilities(
+            windows,
+            firsts_d[rows_d] + frames_d,
+            lens,
+            state.hidden,
+            state.cell,
+            slots=rows_d * max(lens) + frames_d,
+            final_state=False,
+        )
+        values = probs.to("cpu").tolist()
+        offset = 0
+        for i, n in zip(live, lens):
+            rows[i] = values[offset : offset + n]
+            offset += n
+        return rows
 
     @torch.no_grad()
     def detect_streaming(

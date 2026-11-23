@@ -105,6 +105,97 @@ class TestRecurrentCpu:
         assert repacked[0].data_ptr() != packed_ih.data_ptr()
 
 
+_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+class TestRaggedLengths:
+    """``LSTM(lengths=...)``: one recurrence over rows of different lengths.
+
+    The oracle is ``nn.LSTM`` on a ``PackedSequence``, the same semantics by an
+    independent route: each row stepped only over its own frames, ending on its
+    own state.  A row stepped over its padding instead would still return
+    plausible numbers -- and carry a state for audio it never heard into its
+    next call, which is what the Silero detector's streaming rows do.
+    """
+
+    COUNTS = [3, 9, 0, 7, 3]
+
+    def _model(self, device, batch_first, layers):
+        torch.manual_seed(5)
+        ours = LSTM(6, 10, num_layers=layers, batch_first=batch_first).to(device)
+        reference = nn.LSTM(6, 10, num_layers=layers, batch_first=batch_first).to(device)
+        _copy_to_reference(ours, reference)
+        batch, steps = len(self.COUNTS), max(self.COUNTS)
+        shape = (batch, steps, 6) if batch_first else (steps, batch, 6)
+        x = torch.randn(shape, device=device)
+        state = (
+            torch.randn(layers, batch, 10, device=device),
+            torch.randn(layers, batch, 10, device=device),
+        )
+        return ours, reference, x, state
+
+    @pytest.mark.parametrize("device", _DEVICES)
+    @pytest.mark.parametrize("batch_first", [False, True], ids=["time_major", "batch_first"])
+    @pytest.mark.parametrize("layers", [1, 2])
+    def test_it_matches_a_packed_nn_lstm(self, device, batch_first, layers):
+        from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+        ours, reference, x, (h, c) = self._model(device, batch_first, layers)
+        with torch.no_grad():
+            out, (h_n, c_n) = ours(x, (h, c), lengths=self.COUNTS)
+            live = [b for b, n in enumerate(self.COUNTS) if n]
+            dim = 0 if batch_first else 1
+            index = torch.tensor(live, device=device)
+            packed = pack_padded_sequence(
+                x.index_select(dim, index),
+                [self.COUNTS[b] for b in live],
+                batch_first=batch_first,
+                enforce_sorted=False,
+            )
+            want, (want_h, want_c) = reference(
+                packed, (h.index_select(1, index), c.index_select(1, index))
+            )
+            want, _ = pad_packed_sequence(
+                want, batch_first=batch_first, total_length=max(self.COUNTS)
+            )
+        # TF32 in cuDNN on the GPU, for both sides but not identically.
+        tolerance = {} if device == "cpu" else {"atol": 2e-3, "rtol": 2e-3}
+        torch.testing.assert_close(out.index_select(dim, index), want, **tolerance)
+        torch.testing.assert_close(h_n.index_select(1, index), want_h, **tolerance)
+        torch.testing.assert_close(c_n.index_select(1, index), want_c, **tolerance)
+        for b, n in enumerate(self.COUNTS):
+            row = out[b] if batch_first else out[:, b]
+            assert row[n:].abs().sum().item() == 0.0, "an output past the row's length"
+        empty = self.COUNTS.index(0)
+        assert torch.equal(h_n[:, empty], h[:, empty]) and torch.equal(c_n[:, empty], c[:, empty])
+
+    @pytest.mark.parametrize("device", _DEVICES)
+    def test_every_row_at_full_length_is_the_plain_call(self, device):
+        ours, _reference, x, state = self._model(device, True, 2)
+        full = [x.shape[1]] * x.shape[0]
+        with torch.no_grad():
+            got, (got_h, got_c) = ours(x, state, lengths=full)
+            want, (want_h, want_c) = ours(x, state)
+        assert torch.equal(got, want) and torch.equal(got_h, want_h)
+        assert torch.equal(got_c, want_c)
+
+    def test_lengths_are_checked(self):
+        ours, _reference, x, state = self._model("cpu", True, 1)
+        with pytest.raises(ValueError, match="entries for a batch"):
+            ours(x, state, lengths=[1, 2])
+        with pytest.raises(ValueError, match="must lie in"):
+            ours(x, state, lengths=[1, 2, 3, 4, 99])
+
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    def test_a_ragged_call_on_the_fused_kernels_is_refused(self):
+        """They step every row the same number of times; a silent per-length
+        loop would hide that the kernel does not exist (AGENTS.md rule 3)."""
+        ours = LSTM(8, 8).cuda().half()
+        with pytest.raises(NotImplementedError, match="no CUDA fp16/bf16 kernel"):
+            ours(torch.randn(5, 2, 8, device="cuda").half(), lengths=[3, 5])
+
+
 def _lstm_layer_formula(sequence, hidden, cell, weight_ih, weight_hh, bias_ih, bias_hh):
     """The LSTM recurrence, written out, one timestep at a time.
 
