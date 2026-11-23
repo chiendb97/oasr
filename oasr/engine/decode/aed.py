@@ -21,7 +21,7 @@ slot; ``task`` and ``language`` replace their corresponding SOT ids.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 import torch
 
@@ -99,6 +99,7 @@ class AedDecodeStrategy(IncrementalArStrategy):
         # Python list on every step.
         self._suppress_idx: Dict[torch.device, torch.Tensor] = {}
         self._begin_suppress_idx: Dict[torch.device, torch.Tensor] = {}
+        self._begin_suppress_mask: Dict[Tuple[torch.device, int], torch.Tensor] = {}
 
         # -- word timings ------------------------------------------------
         # Declared from what *this* decoder can do: the alignment is a DTW over
@@ -137,20 +138,27 @@ class AedDecodeStrategy(IncrementalArStrategy):
         # with the token has the signal.
         has_token = getattr(self._mcfg, "no_speech_token_id", None) is not None
         no_speech = has_token and any(wants_speech_activity(r) for r in requests)
+        # capacity → the decoder preallocates its KV buffers and every step
+        # writes its own row's slot in place.  It is also what makes the state
+        # mergeable: a cat-grown cache has no room to hold rows at different
+        # offsets.  One per row, so a paged row reserves its own cap rather than
+        # its batch's longest (see ``_row_capacity``).
+        capacity = [self._row_capacity(prompt_ids.size(1), m) for m in max_new]
+        graphs = self._prefill_cache()
         with torch.no_grad():
-            # capacity → the decoder preallocates its KV buffers and every step
-            # writes its own row's slot in place.  It is also what makes the
-            # state mergeable: a cat-grown cache has no room to hold rows at
-            # different offsets.  One per row, so a paged row reserves its own
-            # cap rather than its batch's longest (see ``_row_capacity``).
-            logits, state = self._decoder().prefill(
-                enc_out,
-                prompt_ids,
-                capacity=[self._row_capacity(prompt_ids.size(1), m) for m in max_new],
-                kv_manager=self.kv_manager(),
-                **({"all_positions": True} if no_speech else {}),
-                **self._kv_cache_kwargs(),
-            )
+            if graphs is None:
+                logits, state = self._decoder().prefill(
+                    enc_out,
+                    prompt_ids,
+                    capacity=capacity,
+                    kv_manager=self.kv_manager(),
+                    **({"all_positions": True} if no_speech else {}),
+                    **self._kv_cache_kwargs(),
+                )
+            else:
+                logits, state = self._prefill_captured(graphs, enc_out, prompt_ids, capacity)
+                if not no_speech:
+                    logits = logits[:, -1]
         no_speech_logits = None
         if no_speech:
             # Whisper predicts ``<|nospeech|>`` in place of the language token,
@@ -163,6 +171,40 @@ class AedDecodeStrategy(IncrementalArStrategy):
         return Prefill(
             state=state, logits=logits, max_new=max_new, no_speech_logits=no_speech_logits
         )
+
+    def _prefill_captured(
+        self,
+        graphs: Any,
+        enc_out: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        capacity: List[int],
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """``decoder.prefill(..., all_positions=True)`` with the prompt forward replayed.
+
+        The state and the cross-attention K/V are built eagerly; the prompt
+        forward replays from a graph keyed by the batch width, or runs eagerly
+        when that shape is not served.  The same ops either way, so the same
+        logits.
+        """
+        decoder = self._decoder()
+        state = decoder.prefill_state(
+            enc_out,
+            prompt_ids,
+            capacity=capacity,
+            kv_manager=self.kv_manager(),
+            **self._kv_cache_kwargs(),
+        )
+        try:
+            hidden = graphs.prefill(prompt_ids, state)
+            if hidden is None:
+                hidden = decoder.prefill_hidden(prompt_ids, state)
+            else:
+                # The replay committed its twin; this is the host's half.
+                state["kv"].commit(prompt_ids.size(1))
+            return decoder.project(hidden), state
+        except Exception:
+            self._release(state)
+            raise
 
     def _prompt_for(self, request: Request) -> List[int]:
         """This request's SOT sequence, with its task / language slots applied.
@@ -272,6 +314,39 @@ class AedDecodeStrategy(IncrementalArStrategy):
         out = logits.clone()
         out[row_idx.unsqueeze(1), ids.unsqueeze(0)] = -torch.inf
         return out
+
+    def _loop_filter(self) -> Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]:
+        """:meth:`_process_logits` with the fresh rows given as a device mask.
+
+        The same values: the suppress list by ``index_fill``, and the begin list
+        on the fresh rows by a ``masked_fill`` over a ``(V,)`` mask where the
+        eager path indexes the rows it found on the host.  The index tensor and
+        the mask are built by the loop's warm-up, before its capture, and kept
+        here for as long as the graph reads them.
+        """
+
+        def suppress(logits: torch.Tensor, fresh: Optional[torch.Tensor]) -> torch.Tensor:
+            if self._suppress:
+                logits = logits.index_fill(
+                    1, self._ids(self._suppress_idx, self._suppress, logits), -torch.inf
+                )
+            if fresh is None or not self._begin_suppress:
+                return logits
+            begin = self._begin_mask(logits)
+            return logits.masked_fill(fresh.unsqueeze(1) & begin.unsqueeze(0), -torch.inf)
+
+        return suppress
+
+    def _begin_mask(self, like: torch.Tensor) -> torch.Tensor:
+        """``(V,)`` bool, True at the ``begin_suppress_tokens``; one per device and width."""
+        key = (like.device, int(like.size(-1)))
+        mask = self._begin_suppress_mask.get(key)
+        if mask is None:
+            ids = self._ids(self._begin_suppress_idx, self._begin_suppress, like)
+            mask = torch.zeros(key[1], dtype=torch.bool, device=like.device)
+            mask.index_fill_(0, ids, True)
+            self._begin_suppress_mask[key] = mask
+        return mask
 
     @staticmethod
     def _ids(

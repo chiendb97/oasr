@@ -434,6 +434,21 @@ class TestStepBudget:
         assert b.deadline_s is None
         assert b.take() and b.take() and b.take() and not b.take()
 
+    def test_a_launch_of_several_steps_is_charged_each_step(self):
+        """A decode loop runs several steps per graph launch.  The tick's step
+        cap counts them all; the deadline is asked once per launch, as it is
+        once per single step."""
+        b = StepBudget(max_steps=10)
+        assert b.take_up_to(4) == 4 and b.used == 4
+        assert b.take_up_to(8) == 6  # capped by what is left
+        assert b.take_up_to(1) == 0 and b.used == 10
+
+    def test_a_launch_past_the_deadline_is_not_started(self):
+        b = StepBudget.for_tick(max_steps=100, max_tick_ms=5.0)
+        assert b.take_up_to(8) == 8  # the first launch is always granted
+        time.sleep(0.02)
+        assert b.take_up_to(8) == 0
+
 
 class TestTickBudget:
     """Tick-level composition of the budget with admission (C1 + C4)."""

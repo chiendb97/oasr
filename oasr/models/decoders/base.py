@@ -102,6 +102,13 @@ class BaseDecoder(nn.Module, ABC):
     #: static buffer. Per-group side caches make graph capture unsafe.
     supports_step_graphs: ClassVar[bool] = False
 
+    #: True when a paged prefill splits into ``prefill_state`` (allocation and
+    #: anything shaped by the input's length, eager) and ``prefill_hidden`` (the
+    #: prompt forward, reading only pool pages and the state's row vectors), with
+    #: ``project`` turning its hidden into logits.  The engine then captures the
+    #: prompt forward as a CUDA graph per batch width.
+    supports_prefill_graphs: ClassVar[bool] = False
+
     #: Quantized KV-cache formats :meth:`prefill` can store when handed a
     #: ``kv_cache_dtype`` (``EngineConfig.quantization.kv_cache``; ``"fp8_e4m3"``
     #: is the one that exists).  Declared for the same reason as

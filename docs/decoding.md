@@ -339,7 +339,66 @@ whisper-tiny offline: paged + graphs **1.96×** at `B = 32` and **3.08×** at
 without the capture). Beam search does not page its KV at all, so it never
 reaches this path.
 
-## Beam search
+### Several steps per launch, read one launch behind
+
+A captured step still leaves the host one round trip per token: filter the
+logits, `argmax`, read the token back, decide which rows finished, copy the next
+step's inputs in. Profiled on Whisper-tiny at 64 rows, the GPU waited on the host
+for about two thirds of every step. The decoder loop graph
+(`DecoderLoopGraphCache`) replays `loop_steps` (8) greedy steps per launch, with
+the family's logits filter, the `argmax` and the token feedback on the device. The
+host reads the tokens once per launch, and with `loop_readahead` (on) it reads
+each launch's tokens while the GPU runs the next one.
+
+Three rules keep this the same decode:
+
+* **No row runs past its cap.** The cap is a step count, known before a launch, so
+  a launch never has more steps than the row with the least room has left,
+  counting the tokens still in flight.
+* **A row ends at its first EOS.** Whatever it chose after that is dropped, and
+  its extra K/V lands in pages it owns, freed when the row is retired one launch
+  later.
+* **A row is fresh for one launch only.** Whisper's `begin_suppress_tokens` hold
+  EOT, so treating a row as fresh again because its first tokens are still in
+  flight forbade EOS on its next launch, and rows ran on past their end ("…
+  Xavier. You"). The mask comes from the launches, not from the tokens read.
+
+**It pays only where a step is host-bound,** so every batch-width bucket starts on
+single steps and the first 8 are timed. A bucket loops from then on only if the
+median step's host time is at least a quarter of its GPU time. Measured medians:
+Whisper-tiny 0.43–0.62, Whisper large-v3 0.03–0.14, Qwen2-Audio-7B 0.02. Two
+simpler designs were measured and dropped. A fixed eight steps for every model
+cost large-v3 30 % of single-request latency (72 → 94 ms), because each finishing
+row wastes up to a launch of ~2 ms steps. A width tuned from timings kept
+capturing new `(rows, width)` shapes on live traffic and halved Whisper-tiny's
+backlog. Timing the loops themselves, instead of single steps, captured loop
+graphs that a GPU-bound model then never used: Qwen2-Audio's warm-up took 10 s
+instead of 4.5. `loop_steps=0` is the A/B (single steps throughout).
+
+The AED prefill's prompt forward is captured too (`DecoderPrefillGraphCache`,
+for a decoder that declares `supports_prefill_graphs`). The state is allocated
+and the cross-attention K/V written eagerly, then the prompt forward replays,
+keyed by the batch width, since Whisper's prompt and encoder window are fixed. It
+outputs the final-norm hidden rather than logits, so a capture holds `B × P × D`
+instead of `B × P × V`.
+
+Measured on an RTX 5090, in process, LibriSpeech test-clean under 30 s, two
+interleaved rounds against the previous release:
+
+| Model | backlog req/s | single request p50 |
+|---|---|---|
+| Whisper-tiny (fp16, 64 rows) | 795–826 → **1,085–1,089** | 8.8–9.0 → **6.3–6.4 ms** |
+| Whisper large-v3 (fp16, 32 rows) | 36.5 → 36.1 | 71.6 → 71.6 ms |
+| Qwen2-Audio-7B (bf16, 16 rows) | 13.1 → 13.1 | 209–210 → 209–210 ms |
+
+Large-v3 and Qwen2-Audio decide not to loop, and their transcripts are
+unchanged. Whisper-tiny's first-pass transcripts are identical to the
+single-step path's on all 256 utterances and on 64 single requests. Later passes
+differ on at most two utterances, by a punctuation mark or a capital. A row
+that ends stays in the batch until a later launch reads it, which changes the
+shapes its neighbours run at, and the single-step path already moves one of the
+two between its own passes.
+
 
 Both AR shapes have beam search, and the two implementations differ for a reason
 worth understanding before adding a third.

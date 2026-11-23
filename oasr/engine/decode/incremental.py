@@ -22,14 +22,16 @@ extra encoder/prefill pass, at the cost of first-token latency.
 from __future__ import annotations
 
 import logging
+import time
 from abc import abstractmethod
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from oasr.cache import DecoderKvExhausted
+from oasr.cache import DecoderKvExhausted, PagedDecoderKv
 from oasr.models.base import first_compute_parameter
+from oasr.utils.staging import to_device
 
 from ..generation import select_next_tokens
 from ..request import DecodingOptions, Request, RequestOutput
@@ -59,6 +61,28 @@ logger = logging.getLogger(__name__)
 #: Sentinel for "the KV pool has not been decided yet" — ``None`` is a real
 #: answer there (dense storage), so it cannot double as "unresolved".
 _UNSET = object()
+
+
+#: Single steps timed per batch-width bucket before deciding whether looping pays.
+_TIMED_STEPS = 8
+
+#: Loop only where a single step's host time is at least this fraction of its
+#: GPU time (see :meth:`IncrementalArStrategy._loop_pays`).  Measured medians:
+#: Whisper tiny 0.43-0.62, Whisper large-v3 0.03-0.14, Qwen2-Audio-7B 0.02.
+_HOST_TO_STEP = 0.25
+
+
+def _rows_bucket(rows: int) -> int:
+    """Power-of-two bucket of a batch width: a step's GPU time grows with it."""
+    bucket = 1
+    while bucket < rows:
+        bucket *= 2
+    return bucket
+
+
+def _identity_filter(logits: torch.Tensor, fresh: Optional[torch.Tensor]) -> torch.Tensor:
+    del fresh
+    return logits
 
 
 def _held_bytes(obj: Any, seen: Optional[set] = None, depth: int = 0) -> int:
@@ -127,6 +151,13 @@ class ArGroup:
     #: generated token — so a row that finishes forty steps later would have
     #: nothing left to read.
     no_speech: List[Optional[float]] = field(default_factory=list)
+    #: The tokens of the loop launched last, still on their way to the host
+    #: (``loop_readahead``): read when the next loop is launched, or drained
+    #: first by anything that changes the rows.
+    pending_read: Optional["_LoopRead"] = None
+    #: ``(rows, started, ended, host seconds)`` of the last single step, timed
+    #: toward the loop verdict for its width; read once the step has finished.
+    timed_step: Optional[Tuple[int, Any, Any, float]] = None
 
     def __post_init__(self) -> None:
         if not self.tokens:
@@ -176,6 +207,18 @@ class ArGroup:
         self.no_speech = self.no_speech + other.no_speech
         self.state = state
         self.last_logits = logits
+
+
+@dataclass(eq=False)
+class _LoopRead:
+    """One launched loop's tokens on their way to the host."""
+
+    #: The group's rows at launch, in order: the rows of ``tokens``.
+    requests: List[Request]
+    #: ``(B, steps)`` int64 in pinned memory, valid once ``landed`` has passed.
+    tokens: torch.Tensor
+    landed: Optional["torch.cuda.Event"]
+    steps: int
 
 
 @dataclass
@@ -297,6 +340,34 @@ class ArOptions:
         ),
     )
 
+    loop_steps: int = option(
+        8,
+        doc=(
+            "Greedy steps per decoder graph launch where looping pays.  A looping "
+            "group runs on the device: the logits filter, the argmax and the "
+            "token feedback are in the graph, and the host reads tokens back once "
+            "per launch instead of once per token.  It pays where a step is "
+            "host-bound (Whisper tiny: +31-37 % backlog, -29 % single-request "
+            "latency) and not where it is GPU-bound (Whisper large-v3, "
+            "Qwen2-Audio-7B), so each batch width starts on single steps, times "
+            "8 of them, and loops from then on only if the host's time per step "
+            "is at least a quarter of the GPU's.  A row that ends mid-launch "
+            "computes to the launch's end and those tokens are dropped.  0 never "
+            "loops (the A/B).  Sampled rows and beam search always step singly."
+        ),
+    )
+
+    loop_readahead: bool = option(
+        True,
+        doc=(
+            "When looping, launch a group's next loop before reading the last "
+            "one's tokens, so the host's work per loop (finishing rows, mapping "
+            "pages, detokenizing) runs while the GPU decodes.  A row that ends in "
+            "one loop then also runs the next, whose tokens are dropped.  0 reads "
+            "every loop's tokens before launching the next (the A/B)."
+        ),
+    )
+
     def __post_init__(self) -> None:
         if self.max_new_tokens < 1:
             raise ValueError(f"max_new_tokens must be >= 1, got {self.max_new_tokens!r}")
@@ -314,6 +385,8 @@ class ArOptions:
             raise ValueError(
                 f"step_graph_width_pages must be >= 1, got {self.step_graph_width_pages!r}"
             )
+        if self.loop_steps < 0:
+            raise ValueError(f"loop_steps must be >= 0, got {self.loop_steps!r}")
         if self.step_graph_max_captures < 1:
             raise ValueError(
                 f"step_graph_max_captures must be >= 1, got {self.step_graph_max_captures!r}"
@@ -346,12 +419,26 @@ class IncrementalArStrategy(DecodeStrategy):
         #: Error finals for groups that failed outside :meth:`advance` (a merge
         #: during :meth:`begin_offline`), handed out by the next ``advance``.
         self._failed: List[RequestOutput] = []
+        #: Finals produced outside :meth:`advance` -- rows a merge or an abort
+        #: found finished while draining a loop's tokens -- handed out by the
+        #: next ``advance``.
+        self._ready: List[RequestOutput] = []
         #: Paged decoder-KV pool, or ``None`` for dense storage; ``_UNSET`` until
         #: the first prefill decides (see :meth:`kv_manager`).
         self._kv_manager: Any = _UNSET
         #: Decoder-step graph cache, or ``None`` when steps run eager; ``_UNSET``
         #: until the first step decides (see :meth:`_step_graphs`).
         self._graphs: Any = _UNSET
+        #: Multi-step greedy loop graph cache, or ``None``; ``_UNSET`` until the
+        #: first greedy step decides (see :meth:`_loop_cache`).
+        self._loop_graphs: Any = _UNSET
+        #: Prefill prompt-forward graph cache, or ``None``; ``_UNSET`` until the
+        #: first prefill decides (see :meth:`_prefill_cache`).
+        self._prefill_graphs: Any = _UNSET
+        #: Per rows bucket: the host-to-GPU time ratio of each single step timed,
+        #: and once decided, whether looping pays (see :meth:`_loop_pays`).
+        self._step_ratios: Dict[int, List[float]] = {}
+        self._loop_verdict: Dict[int, bool] = {}
 
     # ------------------------------------------------------------------
     # Hooks
@@ -381,6 +468,24 @@ class IncrementalArStrategy(DecodeStrategy):
         new tensor instead (``index_fill`` / ``masked_fill``).
         """
         return logits
+
+    def _loop_filter(
+        self,
+    ) -> Optional[Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]]:
+        """:meth:`_process_logits` as a capturable function, or ``None``.
+
+        ``(logits (B, V), fresh (B,) bool or None) -> logits``, out of place, in
+        the logits' dtype (fp32 on the eager path, the decoder's on the loop's)
+        and free of host reads, where ``fresh`` marks the rows choosing their first
+        token (``None`` when none can).  The multi-step loop runs it inside a CUDA
+        graph, so it may not consult the group.  The default is the identity, and
+        only for a family that kept the default :meth:`_process_logits`: a family
+        that filters must say how to do it on the device, or it keeps stepping one
+        token at a time rather than having its filter skipped.
+        """
+        if type(self)._process_logits is IncrementalArStrategy._process_logits:
+            return _identity_filter
+        return None
 
     def _decoder(self):
         """The batched incremental decoder surface (``prefill``/``step``/``select``)."""
@@ -670,6 +775,142 @@ class IncrementalArStrategy(DecodeStrategy):
             )
         return self._graphs
 
+    def _loop_cache(self):
+        """The multi-step greedy loop graph cache, or ``None`` when steps run singly.
+
+        Exactly where single steps capture (paged KV, a decoder that declares
+        ``supports_step_graphs``, CUDA, ``step_graphs`` on), with ``loop_steps``
+        at least 1 and a family whose logits filter runs on the device
+        (:meth:`_loop_filter`).
+        """
+        if self._loop_graphs is not _UNSET:
+            return self._loop_graphs
+        self._loop_graphs = None
+        steps = int(getattr(self.options, "loop_steps", 0))
+        logits_filter = self._loop_filter()
+        if steps >= 1 and logits_filter is not None and self._step_graphs() is not None:
+            from ..decoder_graph import DecoderLoopGraphCache
+
+            self._loop_graphs = DecoderLoopGraphCache(
+                self._decoder(),
+                self.kv_manager(),
+                logits_filter=logits_filter,
+                width_pages=int(getattr(self.options, "step_graph_width_pages", 8)),
+                # Rows are an exact key and walk down one at a time as a group
+                # finishes, and the step count is a key too.
+                max_captures=4 * int(getattr(self.options, "step_graph_max_captures", 64)),
+            )
+        return self._loop_graphs
+
+    def _prefill_cache(self):
+        """The prefill prompt-forward graph cache, or ``None`` when prefills run eager.
+
+        Where steps capture, for a decoder that declares
+        ``supports_prefill_graphs``.
+        """
+        if self._prefill_graphs is not _UNSET:
+            return self._prefill_graphs
+        if self.kv_manager() is None:
+            # Dense storage -- or the memory probe's prefill, which forces it for
+            # the call.  Deciding now would resolve the step graphs against a
+            # dense state and keep that answer for the life of the engine.
+            return None
+        self._prefill_graphs = None
+        decoder = self._decoder()
+        if bool(getattr(decoder, "supports_prefill_graphs", False)) and self._step_graphs():
+            from ..decoder_graph import DecoderPrefillGraphCache
+
+            self._prefill_graphs = DecoderPrefillGraphCache(
+                decoder,
+                self.kv_manager(),
+                width_pages=int(getattr(self.options, "step_graph_width_pages", 8)),
+                max_captures=int(getattr(self.options, "step_graph_max_captures", 64)),
+            )
+        return self._prefill_graphs
+
+    def _loops(self, group: Any) -> bool:
+        """Whether ``group`` decodes through the loop graph.
+
+        Greedy rows only: a beam group reorders its rows every step, and a
+        sampled draw is not a function of the logits the graph could replay.
+        And only where it pays (:meth:`_loop_pays`).
+        """
+        if isinstance(group, ArBeamGroup) or not group.requests:
+            return False
+        if int(getattr(self.options, "loop_steps", 0)) < 1:
+            return False
+        if any(o is not None and o.sampling for o in group.opts):
+            return False
+        return self._loop_cache() is not None and self._loop_pays(len(group.requests))
+
+    def _loop_width(self, group: Any) -> int:
+        """Steps the next launch for ``group`` runs: ``loop_steps``, 1 if it does not loop.
+
+        Never more than the row with the least generation room has left, so no
+        row writes past its position budget (the cap is a step count, known
+        before the launch).  A fixed width, not a tuned one: the width is part of
+        a loop graph's key, and widths that followed timings kept capturing new
+        shapes on live traffic (Whisper tiny's backlog halved).
+        """
+        if not self._loops(group):
+            return 1
+        room = int(min(m - len(t) for m, t in zip(group.max_new, group.tokens)))
+        return max(1, min(int(getattr(self.options, "loop_steps", 1)), room))
+
+    def _loop_pays(self, rows: int) -> bool:
+        """Whether looping pays at this batch width, from timed single steps.
+
+        A loop saves the host's per-step work and costs the steps a finishing
+        row computes past its end, so it pays where a step is host-bound and
+        not where it is GPU-bound.  On a single step the two add up: at a host
+        time half the GPU's, the GPU idles a third of the time, which a loop
+        recovers, against ~0.3 of a step per row wasted at its end.  Measured on
+        an RTX 5090, the median single step's host time over its GPU time is
+        0.43-0.62 for Whisper tiny at 16-64 rows, where a loop took the backlog
+        +30 % and single-request latency -29 %, and 0.03-0.14 for Whisper
+        large-v3, where it gained nothing and a fixed eight steps per launch
+        cost 30 % of single-request latency.
+
+        So every width starts on single steps (whose graphs a GPU-bound model
+        needs anyway), the first :data:`_TIMED_STEPS` of each width bucket are
+        timed (a step that captured a graph is not a sample), and the bucket
+        loops from then on if the median step's host ms is at least
+        :data:`_HOST_TO_STEP` times its GPU ms.  Deciding on loops instead
+        captured loop graphs a GPU-bound model never used: Qwen2-Audio's warm-up
+        took 10 s instead of 4.5.  An undecided bucket follows the nearest
+        decided one.
+        """
+        bucket = _rows_bucket(rows)
+        verdict = self._loop_verdict.get(bucket)
+        if verdict is not None:
+            return verdict
+        ratios = self._step_ratios.get(bucket)
+        if ratios is not None and len(ratios) >= _TIMED_STEPS:
+            # The median: one step that compiled a kernel or aligned a long
+            # transcript is a host outlier, not the step's cost.
+            ratio = sorted(ratios)[len(ratios) // 2]
+            verdict = ratio >= _HOST_TO_STEP
+            self._loop_verdict[bucket] = verdict
+            logger.info(
+                "%s: %d-row decode groups %s (host time %.2fx GPU time per step)",
+                self.decode_type,
+                bucket,
+                (
+                    f"loop up to {int(getattr(self.options, 'loop_steps', 0))} steps per launch"
+                    if verdict
+                    else "step one token per launch"
+                ),
+                ratio,
+            )
+            return verdict
+        if self._loop_verdict:
+            nearest = min(
+                self._loop_verdict,
+                key=lambda b: (abs(b.bit_length() - bucket.bit_length()), b),
+            )
+            return self._loop_verdict[nearest]
+        return False
+
     def _step(self, tokens: torch.Tensor, state: Any) -> Tuple[torch.Tensor, Any]:
         """One batched decoder step, replayed from a graph where one exists.
 
@@ -904,6 +1145,11 @@ class IncrementalArStrategy(DecodeStrategy):
         for group in self._groups:
             if isinstance(group, ArBeamGroup) or not can_merge(group.state, fresh.state):
                 continue
+            # The rows a loop in flight ends must leave before the join: its
+            # tokens are listed by the rows it was launched with.
+            self._drain(group, self._ready)
+            if not group.requests:
+                continue
             logits = torch.cat([group.last_logits, fresh.last_logits], dim=0)
             try:
                 merged = merge(group.state, fresh.state)
@@ -944,7 +1190,7 @@ class IncrementalArStrategy(DecodeStrategy):
         )
 
     def has_pending(self) -> bool:
-        return bool(self._groups) or bool(self._failed)
+        return bool(self._groups) or bool(self._failed) or bool(self._ready)
 
     def advance(self, budget: "StepBudget") -> List[RequestOutput]:
         """Advance the groups round-robin within ``budget``, one group at a time.
@@ -954,18 +1200,22 @@ class IncrementalArStrategy(DecodeStrategy):
         was off the queue with its pages still held, and the exception left
         ``step()`` and failed every request in flight through the dispatcher.
         """
-        outputs: List[RequestOutput] = self._failed
-        self._failed = []
+        outputs: List[RequestOutput] = self._failed + self._ready
+        self._failed, self._ready = [], []
         advanced: List[ArGroup] = []
-        while self._groups and budget.take():
-            # Round-robin: pop the front group, advance it one batched step,
-            # re-queue it at the back if it still has active rows.
+        while self._groups:
+            # Round-robin: advance the front group one launch -- one batched
+            # step, or several when it loops on the device -- and re-queue it
+            # at the back if it still has active rows.
+            steps = budget.take_up_to(self._loop_width(self._groups[0]))
+            if not steps:
+                break
             group = self._groups.pop(0)
             try:
                 if isinstance(group, ArBeamGroup):
                     self._advance_beam_group(group, outputs)
                 else:
-                    self._advance_group(group, outputs)
+                    self._advance_group(group, outputs, steps)
             except Exception as exc:  # noqa: BLE001 — one group must not take the tick
                 outputs.extend(self._fail_group(group, exc, outputs))
                 continue
@@ -1018,6 +1268,8 @@ class IncrementalArStrategy(DecodeStrategy):
             logger.exception("%s: releasing a failed group's decoder KV raised", self.decode_type)
         group.state = {}
         group.requests = []
+        if isinstance(group, ArGroup):
+            group.pending_read = None
         return [
             RequestOutput(
                 request_id=req.request_id,
@@ -1030,16 +1282,41 @@ class IncrementalArStrategy(DecodeStrategy):
             for req in failed
         ]
 
-    def _advance_group(self, group: ArGroup, outputs: List[RequestOutput]) -> None:
+    def _advance_group(self, group: ArGroup, outputs: List[RequestOutput], steps: int = 1) -> None:
+        """Advance ``group`` by ``steps`` tokens per row.
+
+        Several steps run as one loop graph when :meth:`_loop_width` allowed
+        them; a loop the cache cannot serve (a shape it refused, a capture that
+        failed) falls back to that many single steps, which the budget already
+        paid for.
+        """
+        if self._loops(group) and self._advance_group_loop(group, outputs, steps):
+            return
+        # A single step reads its token at once, so it starts from tokens read.
+        self._drain(group, outputs)
+        for _ in range(steps):
+            if not group.requests:
+                return
+            self._advance_group_once(group, outputs)
+
+    def _advance_group_once(self, group: ArGroup, outputs: List[RequestOutput]) -> None:
         """Select one token per active row, retire finished rows, take one step.
 
         Finals go into ``outputs`` as rows finish, before the ``select`` and the
         step, so a step that then fails cannot take them with it.
         """
+        t0 = time.perf_counter()
         logits = self._process_logits(group.last_logits.float(), group)
         next_tokens = select_next_tokens(logits, group.opts)  # (B_active,)
 
+        t_wait = time.perf_counter()
         toks = next_tokens.cpu().tolist()
+        waited = time.perf_counter() - t_wait
+        # The read above waited out the step this group took last, so its GPU
+        # time can be read now.
+        timed, group.timed_step = group.timed_step, None
+        if timed is not None:
+            self._note_step(*timed)
         finished_rows: List[int] = []
         reasons: Dict[int, str] = {}
         for row, tok in enumerate(toks):
@@ -1052,23 +1329,187 @@ class IncrementalArStrategy(DecodeStrategy):
                     finished_rows.append(row)
                     reasons[row] = "length"
 
+        keep_idx = self._retire_rows(group, finished_rows, reasons, outputs)
+        if keep_idx is not None:
+            next_tokens = next_tokens.index_select(0, keep_idx)
+        if not group.requests:
+            return
+        rows = len(group.requests)
+        started: Optional["torch.cuda.Event"] = None
+        graphs = self._step_graphs()
+        captured = graphs.num_captured if graphs is not None else 0
+        if self._times_steps(group, rows):
+            started = torch.cuda.Event(enable_timing=True)
+            started.record()
+        with torch.no_grad():
+            group.last_logits, group.state = self._step(next_tokens, group.state)
+        # A step that captured its graph spent its host time capturing -- a
+        # 7B's capture is hundreds of milliseconds -- and is not a sample: two
+        # of them made Qwen2-Audio's steps look host-bound.
+        if started is not None and (graphs is None or graphs.num_captured == captured):
+            ended = torch.cuda.Event(enable_timing=True)
+            ended.record()
+            group.timed_step = (rows, started, ended, time.perf_counter() - t0 - waited)
+
+    def _times_steps(self, group: ArGroup, rows: int) -> bool:
+        """Whether this step is timed toward a loop verdict for its width."""
+        if not group.last_logits.is_cuda or self._loop_cache() is None:
+            return False
+        return _rows_bucket(rows) not in self._loop_verdict
+
+    def _note_step(
+        self,
+        rows: int,
+        started: "torch.cuda.Event",
+        ended: "torch.cuda.Event",
+        host_s: float,
+    ) -> None:
+        """Fold one timed single step into its width bucket's means."""
+        bucket = _rows_bucket(rows)
+        if bucket in self._loop_verdict:
+            return
+        gpu_ms = max(started.elapsed_time(ended), 1e-3)
+        self._step_ratios.setdefault(bucket, []).append(host_s * 1e3 / gpu_ms)
+
+    def _advance_group_loop(self, group: ArGroup, outputs: List[RequestOutput], steps: int) -> bool:
+        """``steps`` greedy steps in one loop-graph replay; ``False`` if not served.
+
+        The loop has already fed every row's tokens back by the time they are
+        read, so the state and the pending logits are those after the last step
+        for every row.  A row ends at its first EOS or at its cap; whatever it
+        chose after that is dropped with it.
+
+        With ``loop_readahead`` the tokens are read one launch late: this loop is
+        launched first, then the previous one's tokens are read and its finished
+        rows retired while the GPU runs this one.
+        """
+        cache = self._loop_cache()
+        if cache is None:
+            return False
+        ahead = bool(getattr(self.options, "loop_readahead", False))
+        previous = group.pending_read
+        if previous is not None:
+            # No row may run past its cap counting the tokens still in flight;
+            # a loop that would have to waits for them to be read.
+            room = min(m - len(t) for m, t in zip(group.max_new, group.tokens))
+            if room - previous.steps < steps:
+                self._drain(group, outputs)
+                previous = None
+                if not group.requests:
+                    return True
+                room = min(m - len(t) for m, t in zip(group.max_new, group.tokens))
+                steps = min(steps, room)
+        device = group.last_logits.device
+        # A row is choosing its first token only if no launch has chosen one
+        # for it: a row in the loop still in flight has, though its tokens are
+        # not read yet.  Treating it as fresh re-applies the first-position
+        # filter -- Whisper's begin-suppress list holds EOT -- one launch late.
+        launched = {id(req) for req in previous.requests} if previous is not None else set()
+        fresh = to_device(
+            [not t and id(req) not in launched for req, t in zip(group.requests, group.tokens)],
+            dtype=torch.bool,
+            device=device,
+        )
+        with torch.no_grad():
+            served = cache.loop(group.state, group.last_logits, fresh, steps)
+        if served is None:
+            return False
+        tokens, logits = served
+        group.state["kv"].commit(steps)
+        group.last_logits = logits.clone()  # a replay buffer; the next replay reuses it
+        landed: Optional["torch.cuda.Event"] = None
+        if tokens.is_cuda:
+            # Into pinned memory behind the loop, ahead of any later replay.
+            host = tokens.to("cpu", non_blocking=True)
+            landed = torch.cuda.Event()
+            landed.record(torch.cuda.current_stream(tokens.device))
+        else:  # pragma: no cover - a loop cache only exists on CUDA
+            host = tokens.clone()
+        group.pending_read = _LoopRead(list(group.requests), host, landed, steps)
+        if previous is not None:
+            self._collect_read(group, previous, outputs)
+        if not ahead:
+            self._drain(group, outputs)
+        return True
+
+    def _drain(self, group: ArGroup, outputs: List[RequestOutput]) -> None:
+        """Read ``group``'s in-flight loop tokens now, finishing whatever they end."""
+        read, group.pending_read = group.pending_read, None
+        if read is not None:
+            self._collect_read(group, read, outputs)
+
+    def _collect_read(
+        self, group: ArGroup, read: "_LoopRead", outputs: List[RequestOutput]
+    ) -> None:
+        """Append one loop's tokens to the rows still in ``group``; retire the
+        rows they finish.
+
+        ``read`` lists its rows as they were at launch.  Rows retired since (by
+        an earlier read, an abort) are skipped; the rest are found by identity,
+        since retiring removes rows and reorders none.
+        """
+        if read.landed is not None:
+            read.landed.synchronize()  # the one wait for the device per loop
+        chosen_rows = read.tokens.tolist()
+        index = {id(req): row for row, req in enumerate(group.requests)}
+        finished_rows: List[int] = []
+        reasons: Dict[int, str] = {}
+        for req, chosen in zip(read.requests, chosen_rows):
+            row = index.get(id(req))
+            if row is None:
+                continue
+            generated = group.tokens[row]
+            for tok in chosen:
+                if self._is_eos(tok):
+                    finished_rows.append(row)
+                    reasons[row] = "stop"
+                    break
+                generated.append(tok)
+                if len(generated) >= group.max_new[row]:
+                    finished_rows.append(row)
+                    reasons[row] = "length"
+                    break
+        pending = group.pending_read
+        keep_idx = self._retire_rows(group, sorted(finished_rows), reasons, outputs)
+        if keep_idx is not None:
+            group.last_logits = group.last_logits.index_select(0, keep_idx)
+        group.pending_read = pending if group.requests else None
+
+    def _retire_rows(
+        self,
+        group: ArGroup,
+        finished_rows: List[int],
+        reasons: Dict[int, str],
+        outputs: List[RequestOutput],
+    ) -> Optional[torch.Tensor]:
+        """Finalize ``finished_rows`` and drop them from the group.
+
+        Returns the device index of the rows kept, for the caller to apply to
+        what it holds per row, or ``None`` when no row finished or none is left.
+        """
         for row in finished_rows:
             outputs.append(self._finalize_row(group, row, reasons[row]))
-        if finished_rows:
-            keep = [r for r in range(len(group.requests)) if r not in finished_rows]
-            group.keep_rows(keep)
-            if keep:
-                keep_idx = torch.tensor(keep, dtype=torch.long, device=next_tokens.device)
-                group.state = self._decoder().select(group.state, keep_idx)
-                next_tokens = next_tokens.index_select(0, keep_idx)
-            else:
-                # Every row finished together, so no ``select`` runs to hand the
-                # group's storage back; the group itself is about to be dropped.
-                self._release(group.state)
-
-        if group.requests:
-            with torch.no_grad():
-                group.last_logits, group.state = self._step(next_tokens, group.state)
+        if not finished_rows:
+            return None
+        keep = [r for r in range(len(group.requests)) if r not in finished_rows]
+        group.keep_rows(keep)
+        if not keep:
+            # Every row finished together, so no ``select`` runs to hand the
+            # group's storage back; the group itself is about to be dropped.
+            self._release(group.state)
+            return None
+        device = group.last_logits.device
+        keep_idx = to_device(keep, dtype=torch.long, device=device)
+        kv = group.state.get("kv") if isinstance(group.state, dict) else None
+        if isinstance(kv, PagedDecoderKv) and device.type == "cuda":
+            # Paged rows take their index on the host: a device one is read back,
+            # and that read waits for a loop still in flight.
+            group.state = self._decoder().select(
+                group.state, torch.tensor(keep, dtype=torch.long).pin_memory()
+            )
+        else:
+            group.state = self._decoder().select(group.state, keep_idx)
+        return keep_idx
 
     # ------------------------------------------------------------------
     # Beam advance
@@ -1302,6 +1743,10 @@ class IncrementalArStrategy(DecodeStrategy):
         for group in self._groups:
             if request not in group.requests:
                 continue
+            if not isinstance(group, ArBeamGroup):
+                self._drain(group, self._ready)
+                if request not in group.requests:
+                    break  # the loop in flight had already finished it
             row = group.requests.index(request)
             keep = [r for r in range(len(group.requests)) if r != row]
             if isinstance(group, ArBeamGroup):
@@ -1333,6 +1778,20 @@ class IncrementalArStrategy(DecodeStrategy):
                 self._release(group.state)
             break
         self._groups = [g for g in self._groups if g.requests]
+        # The aborted request's own final, if the drain produced one, is moot.
+        self._ready = [out for out in self._ready if out.request_id != request.request_id]
+
+    def release_graphs(self) -> None:
+        """Release the decode graphs, after any loop still running has finished.
+
+        A loop launched with ``loop_readahead`` may still be executing, and its
+        tokens' copy with it; the pool its graph replays from is what this frees.
+        """
+        if torch.cuda.is_available() and any(
+            getattr(g, "pending_read", None) is not None for g in self._groups
+        ):
+            torch.cuda.synchronize()
+        super().release_graphs()
 
     # ------------------------------------------------------------------
     # One-shot / streaming surfaces (not applicable to AR families)

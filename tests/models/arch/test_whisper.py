@@ -671,6 +671,373 @@ class TestWhisperStepGraphs:
 
 
 # ---------------------------------------------------------------------------
+# Several greedy steps per replay (the decoder loop graph)
+# ---------------------------------------------------------------------------
+
+
+def _loop_strategy(loop_steps, *, suppress_eos=False, readahead=True, device="cuda"):
+    """The AED strategy over a tiny fp16 Whisper with paged KV and graphs on."""
+    from oasr.engine.config import EngineConfig
+    from oasr.engine.decode.aed import AedDecodeStrategy
+    from oasr.engine.decode.detokenize import Detokenizer
+
+    torch.manual_seed(7)
+    suppress = [0, 1, 61] if suppress_eos else [0, 1]
+    cfg = _tiny_config(
+        d_model=128, decoder_attention_heads=2, max_target_positions=64, suppress_tokens=suppress
+    )
+    model = WhisperModel(cfg).eval().to(device=device, dtype=torch.float16)
+    strat = AedDecodeStrategy(
+        EngineConfig(ckpt_dir="x", device=device, dtype=torch.float16, max_decode_slots=8),
+        Detokenizer(None, None),
+        model,
+    )
+    strat.options = replace(
+        strat.options, loop_steps=loop_steps, loop_readahead=readahead, kv_block_tokens=16
+    )
+    # Loop at every width from the first step: these tests are about the loop,
+    # not about the timing that decides whether to use it.
+    strat._loop_verdict = {1 << i: True for i in range(8)}
+    return strat
+
+
+def _drive_to_finals(strat, caps, enc):
+    from oasr.engine.generation import StepBudget
+    from oasr.engine.request import DecodingOptions, Request
+
+    requests = [
+        Request(
+            audio=torch.zeros(16000),
+            request_id=f"r{i}",
+            streaming=False,
+            decoding=None if cap is None else DecodingOptions(max_new_tokens=cap),
+        )
+        for i, cap in enumerate(caps)
+    ]
+    strat.begin_offline(requests, enc, torch.tensor([enc.size(1)] * len(requests)))
+    finals = {}
+    for _ in range(200):
+        if not strat.has_pending():
+            break
+        for out in strat.advance(StepBudget(max_steps=32)):
+            if out.finished:
+                finals[out.request_id] = (out.tokens[0], out.finish_reason)
+    assert not strat.has_pending()
+    return finals
+
+
+@pytest.mark.cuda
+class TestWhisperLoopGraphs:
+    """Greedy steps replayed several at a time, with the selection on the device.
+
+    The contract is the single-step path's: the same tokens and the same finish
+    reasons.  Equality is exact when every row also leaves the batch at the same
+    step on both paths, because the decoder then runs the same shapes and so the
+    same kernels throughout; a row that ends mid-loop stays in the batch to the
+    loop's end, which changes the shapes its neighbours run at.
+    """
+
+    @staticmethod
+    def _enc(strat, rows):
+        cfg = strat._mcfg
+        g = torch.Generator(device="cuda").manual_seed(11)
+        return torch.randn(
+            rows,
+            cfg.max_source_positions,
+            cfg.d_model,
+            device="cuda",
+            dtype=torch.float16,
+            generator=g,
+        )
+
+    def test_caps_on_loop_boundaries_decode_exactly_as_single_steps(self):
+        """Every row runs to its cap (EOS suppressed), each cap a multiple of the
+        loop width, so the batch shrinks at the same steps on both paths."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        caps = [4, 12, 20, None]
+        single = _loop_strategy(0, suppress_eos=True)
+        want = _drive_to_finals(single, caps, self._enc(single, len(caps)))
+        # A fixed width (no read-ahead, so no timing-driven widths): every launch
+        # is four steps and rows leave exactly where single steps leave them.
+        looped = _loop_strategy(4, suppress_eos=True, readahead=False)
+        got = _drive_to_finals(looped, caps, self._enc(looped, len(caps)))
+        assert got == want
+        assert single._loop_cache() is None
+        assert looped._loop_graphs is not None and looped._loop_graphs.num_captured > 0
+        assert [len(want[f"r{i}"][0]) for i in range(3)] == [4, 12, 20]
+        assert {reason for _, reason in want.values()} == {"length"}
+
+    def test_a_cap_inside_a_loop_shortens_the_loop(self):
+        """A cap that is not a multiple of the loop width ends that row on its own
+        step, with ``finish_reason="length"`` and exactly its cap of tokens."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        strat = _loop_strategy(8, suppress_eos=True)
+        finals = _drive_to_finals(strat, [3, 11], self._enc(strat, 2))
+        assert [len(finals[r][0]) for r in ("r0", "r1")] == [3, 11]
+        assert {reason for _, reason in finals.values()} == {"length"}
+        # The first launch is r0's room; none is wider than loop_steps.  (Which
+        # widths follow depends on when the read-ahead learns r0 has ended.)
+        steps = {key[3] for key in strat._loop_graphs._loops}  # noqa: SLF001
+        assert 3 in steps and max(steps) <= 8
+
+    def test_free_running_rows_keep_their_tokens(self):
+        """With EOS live, rows end where the model says.  A row that ends mid-loop
+        changes its neighbours' batch for the rest of that loop, so this holds the
+        transcripts to the single-step path's on the strength of the shapes being
+        tiny and the logits far from ties, and requires the same finish reasons."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        caps = [None] * 6
+        single = _loop_strategy(0)
+        want = _drive_to_finals(single, caps, self._enc(single, len(caps)))
+        looped = _loop_strategy(8)
+        got = _drive_to_finals(looped, caps, self._enc(looped, len(caps)))
+        assert got == want
+
+    def test_every_page_comes_back(self):
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        strat = _loop_strategy(8)
+        mgr = strat.kv_manager()
+        free0 = mgr.pool.num_free_blocks
+        _drive_to_finals(strat, [None, 5, 9], self._enc(strat, 3))
+        assert mgr.pool.num_free_blocks == free0 and mgr.num_active() == 0
+
+
+@pytest.mark.cuda
+class TestWhisperPrefillGraphs:
+    """The prefill's prompt forward replayed from a graph must be the same prefill:
+    the same logits, and the same K/V written, which the steps after it read."""
+
+    def _prefill_then_step(self, dec, mgr, enc, prompt, cache=None, steps=5):
+        with torch.no_grad():
+            if cache is None:
+                logits, state = dec.prefill(
+                    enc, prompt, capacity=40, kv_manager=mgr, all_positions=True
+                )
+            else:
+                state = dec.prefill_state(enc, prompt, capacity=40, kv_manager=mgr)
+                hidden = cache.prefill(prompt, state)
+                assert hidden is not None, "the prefill was not captured"
+                state["kv"].commit(prompt.size(1))
+                logits = dec.project(hidden)
+            out = [logits.float().cpu()]
+            token = logits[:, -1].argmax(dim=-1)
+            for _ in range(steps):
+                step_logits, state = dec.step(token, state)
+                out.append(step_logits.float().cpu())
+                token = step_logits.argmax(dim=-1)
+        state["kv"].free()
+        state["cross"].free()
+        return out
+
+    def test_replayed_prefill_matches_eager_exactly(self):
+        from oasr.engine.decoder_graph import DecoderPrefillGraphCache
+
+        dec, mgr, enc, prompt, _ = TestWhisperStepGraphs._setup(rows=3)
+        cache = DecoderPrefillGraphCache(dec, mgr)
+        for rows in (3, 2, 3):  # two widths, and a replay after another capture
+            want = self._prefill_then_step(dec, mgr, enc[:rows], prompt[:rows])
+            got = self._prefill_then_step(dec, mgr, enc[:rows], prompt[:rows], cache)
+            for a, b in zip(want, got):
+                assert torch.equal(a, b)
+        assert cache.num_captured == 2
+        assert mgr.num_active() == 0
+
+    def test_the_memory_probe_leaves_the_graphs_undecided(self):
+        """The engine probes the prefill's memory with the KV forced dense.  The
+        graph caches must not settle on 'no graphs' during that call."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        strat = _loop_strategy(8)
+        cfg = strat._mcfg
+        enc = torch.randn(
+            2, cfg.max_source_positions, cfg.d_model, device="cuda", dtype=torch.float16
+        )
+        strat.probe_prefill(enc, torch.tensor([enc.size(1)] * 2))
+        assert strat._prefill_cache() is not None
+        assert strat._step_graphs() is not None
+        assert strat._loop_cache() is not None
+
+
+class TestLoopBookkeeping:
+    """What the strategy does with a loop's tokens, without a GPU: a stand-in
+    cache hands back fixed tokens, and the decoder's ``select`` is recorded."""
+
+    @staticmethod
+    def _group(strat, rows, max_new):
+        from oasr.engine.decode.incremental import ArGroup
+
+        class _Kv:
+            def __init__(self):
+                self.committed = []
+
+            def commit(self, steps):
+                self.committed.append(steps)
+
+        return ArGroup(
+            requests=[object() for _ in range(rows)],
+            state={"kv": _Kv()},
+            last_logits=torch.arange(rows, dtype=torch.float32)[:, None].expand(rows, 4).clone(),
+            max_new=list(max_new),
+            opts=[None] * rows,
+        )
+
+    def test_eos_and_caps_end_rows_inside_a_loop(self):
+        strat = TestTaskAndLanguagePrompt._strategy(_tiny_config())
+        eos = strat._eos
+        tokens = torch.tensor([[5, 6, eos, 7], [8, 9, 10, 11], [3, 4, 5, 6]])
+
+        class _Cache:
+            num_captured = 0
+
+            def loop(self, state, logits, fresh, steps):
+                assert steps == 4 and fresh.tolist() == [True, True, True]
+                return tokens, torch.full_like(logits, 9.0)
+
+        strat._loop_graphs = _Cache()
+        strat.options = replace(strat.options, loop_readahead=False)
+        selected = []
+        strat._finalize_row = lambda group, row, reason: (row, reason, list(group.tokens[row]))
+        decoder = strat._decoder()
+        decoder.select = lambda state, keep: selected.append(keep.tolist()) or state
+        group = self._group(strat, 3, max_new=[10, 3, 10])
+        outputs = []
+        assert strat._advance_group_loop(group, outputs, 4)
+        # Row 0 stops at EOS without it; row 1 hits its cap of 3 mid-loop.
+        assert outputs == [(0, "stop", [5, 6]), (1, "length", [8, 9, 10])]
+        assert selected == [[2]]
+        assert group.tokens == [[3, 4, 5, 6]]
+        assert group.state["kv"].committed == [4]
+        assert group.last_logits.shape == (1, 4) and float(group.last_logits[0, 0]) == 9.0
+
+    def test_read_ahead_reads_each_loop_one_launch_late(self):
+        """With ``loop_readahead`` a launch reads the *previous* launch's tokens.
+        A row they finish is retired then, and the second launch's tokens for it
+        -- computed past its end -- are skipped when they are read."""
+        strat = TestTaskAndLanguagePrompt._strategy(_tiny_config())
+        eos = strat._eos
+        launches = iter(
+            [
+                torch.tensor([[5, eos], [8, 9]]),  # row 0 ends here
+                torch.tensor([[1, 2], [10, 11]]),  # row 0's are past its end
+                torch.tensor([[12, 13]]),
+            ]
+        )
+
+        class _Cache:
+            num_captured = 0
+
+            def loop(self, state, logits, fresh, steps):
+                return next(launches), torch.zeros_like(logits)
+
+        strat._loop_graphs = _Cache()
+        strat._finalize_row = lambda group, row, reason: (row, reason, list(group.tokens[row]))
+        strat._decoder().select = lambda state, keep: state
+        group = self._group(strat, 2, max_new=[10, 10])
+        outputs = []
+        assert strat._advance_group_loop(group, outputs, 2)
+        assert outputs == [] and group.tokens == [[], []]  # nothing read yet
+        assert strat._advance_group_loop(group, outputs, 2)
+        assert outputs == [(0, "stop", [5])]
+        assert group.tokens == [[8, 9]]
+        assert strat._advance_group_loop(group, outputs, 2)
+        assert group.tokens == [[8, 9, 10, 11]]  # row 0's second launch skipped
+        strat._drain(group, outputs)
+        assert group.tokens == [[8, 9, 10, 11, 12, 13]]
+
+    def test_a_row_is_fresh_for_one_launch_only(self):
+        """The first-position filter (Whisper's begin-suppress list, which holds
+        EOT) applies to the launch that chooses a row's first token and to no
+        other.  Under read-ahead the second launch goes out before the first
+        one's tokens are read, so "no tokens yet" alone would call the row fresh
+        again and forbid EOS on its first step: rows ran on past their end."""
+        strat = TestTaskAndLanguagePrompt._strategy(_tiny_config())
+        seen = []
+
+        class _Cache:
+            num_captured = 0
+
+            def loop(self, state, logits, fresh, steps):
+                seen.append(fresh.tolist())
+                return torch.full((logits.size(0), steps), 7), torch.zeros_like(logits)
+
+        strat._loop_graphs = _Cache()
+        strat._finalize_row = lambda group, row, reason: (row, reason)
+        group = self._group(strat, 2, max_new=[50, 50])
+        for _ in range(3):
+            assert strat._advance_group_loop(group, [], 2)
+        assert seen == [[True, True], [False, False], [False, False]]
+
+    def test_the_device_filter_is_the_eager_filter(self):
+        """The loop's capturable filter, given the fresh rows as a mask, must give
+        exactly what ``_process_logits`` gives from the group's token lists:
+        suppress ids everywhere, begin-suppress ids on the fresh rows only."""
+        from oasr.engine.decode.incremental import ArGroup
+
+        strat = TestTaskAndLanguagePrompt._strategy(_tiny_config())  # [0, 1], begin [2]
+        logits = torch.randn(3, 8, generator=torch.Generator().manual_seed(3))
+        group = ArGroup(
+            requests=[object()] * 3,
+            state={},
+            last_logits=logits,
+            max_new=[5] * 3,
+            opts=[None] * 3,
+            tokens=[[7], [], []],
+        )
+        want = strat._process_logits(logits, group)
+        fresh = torch.tensor([False, True, True])
+        got = strat._loop_filter()(logits, fresh)
+        assert torch.equal(got, want)
+        # Past a loop's first step no row is fresh.
+        assert torch.equal(strat._loop_filter()(logits, None)[:, 2], logits[:, 2])
+
+    def test_a_width_loops_only_once_its_steps_show_it_host_bound(self):
+        """Every width starts on single steps; once a width bucket has timed
+        enough of them, it loops if the median step's host ms is at least a
+        quarter of its GPU ms.  A GPU-bound step (Whisper large-v3) gains nothing from a loop and
+        pays the steps a finishing row wastes."""
+        from oasr.engine.decode.incremental import _TIMED_STEPS
+
+        strat = TestTaskAndLanguagePrompt._strategy(_tiny_config())
+        assert not strat._loop_pays(1) and not strat._loop_pays(40)  # untimed
+        strat._step_ratios = {
+            1: [0.15] * (_TIMED_STEPS - 1) + [40.0],  # GPU-bound, one capture-sized outlier
+            64: [5.0] * _TIMED_STEPS,  # host-bound
+            8: [0.15] * (_TIMED_STEPS - 1),  # still being timed
+        }
+        assert not strat._loop_pays(1)
+        assert strat._loop_pays(40)  # bucket 64
+        # Bucket 8 follows the nearest decided bucket (1 and 64 are three
+        # doublings away; ties go to the narrower).
+        assert strat._loop_pays(5) is strat._loop_verdict[1]
+        strat._step_ratios[1] = [9.0] * _TIMED_STEPS
+        assert not strat._loop_pays(1), "a verdict is kept, not re-litigated"
+
+    def test_loop_width_respects_the_tightest_row_and_sampling(self):
+        from oasr.engine.request import DecodingOptions
+
+        strat = TestTaskAndLanguagePrompt._strategy(_tiny_config())
+        strat._loop_graphs = object()  # a cache exists
+        strat._loop_verdict = {2: True}  # and loops pay at this width
+        group = self._group(strat, 2, max_new=[10, 5])
+        group.tokens = [[1, 2, 3], [1, 2]]
+        assert strat._loop_width(group) == 3  # row 1 has 3 tokens left
+        strat.options = replace(strat.options, loop_steps=2)
+        assert strat._loop_width(group) == 2
+        group.opts = [None, DecodingOptions(temperature=0.7)]
+        assert strat._loop_width(group) == 1 and not strat._loops(group)
+        strat._loop_graphs = None
+        group.opts = [None, None]
+        assert strat._loop_width(group) == 1 and not strat._loops(group)
+        strat._loop_graphs = object()
+        strat.options = replace(strat.options, loop_steps=0)
+        assert not strat._loops(group)
+
+
+# ---------------------------------------------------------------------------
 # Per-request task and language
 # ---------------------------------------------------------------------------
 

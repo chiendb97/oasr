@@ -1023,6 +1023,55 @@ class TestStepGraphs:
         for a, b in zip(eager, replayed):
             torch.testing.assert_close(a, b, atol=0, rtol=0)
 
+    def _greedy(self, lm, mgr, loops=None, steps=24, width=4):
+        """Greedy tokens from a left-padded batch, single steps or ``width`` per replay."""
+        B, P = 2, 20
+        torch.manual_seed(5)
+        ids = torch.randint(0, 128, (B, P), device="cuda")
+        valid = torch.ones(B, P, dtype=torch.bool, device="cuda")
+        valid[1, :4] = False
+        chosen = []
+        with torch.no_grad():
+            logits, state = lm.prefill(lm.embed_tokens(ids), valid, capacity=64, kv_manager=mgr)
+            fresh = torch.ones(B, dtype=torch.bool, device="cuda")
+            for _ in range(steps // (width if loops is not None else 1)):
+                if loops is not None:
+                    served = loops.loop(state, logits, fresh, width)
+                    assert served is not None, "the loop was not captured"
+                    tokens, logits = served
+                    state["kv"].commit(width)
+                    chosen.append(tokens.cpu())
+                    logits = logits.clone()
+                else:
+                    token = logits.float().argmax(dim=-1)
+                    chosen.append(token[:, None].cpu())
+                    logits, state = lm.step(token, state)
+                fresh = torch.zeros_like(fresh)
+            last = logits.float().cpu()
+        state["kv"].free()
+        return torch.cat(chosen, dim=1), last
+
+    @pytest.mark.parametrize("head_dim", [32, 128])
+    def test_a_device_loop_chooses_what_single_steps_choose(self, head_dim):
+        """Greedy steps replayed four at a time from one graph, the token fed back
+        on the device: the same tokens and the same final logits, bit for bit,
+        across a page boundary and with a left-padded row."""
+        from oasr.engine.decoder_graph import DecoderLoopGraphCache
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs CUDA")
+        lm = self._lm(head_dim)
+        want_tokens, want_logits = self._greedy(lm, self._manager(lm), None)
+        mgr = self._manager(lm)
+        loops = DecoderLoopGraphCache(
+            lm, mgr, logits_filter=lambda logits, fresh: logits, width_pages=2
+        )
+        got_tokens, got_logits = self._greedy(lm, mgr, loops)
+        assert torch.equal(got_tokens, want_tokens)
+        torch.testing.assert_close(got_logits, want_logits, atol=0, rtol=0)
+        assert loops.num_captured >= 1
+        assert mgr.num_active() == 0
+
     def _interleaved(self, lm, mgr, graphs, steps=24):
         """Two live states of *different* row counts, stepped alternately.
 

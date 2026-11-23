@@ -278,7 +278,7 @@ extension cookbook for each axis.
 | `oasr/engine/offline_graph.py` | CUDA-graph capture of the offline forward, keyed `(B_bucket, T_bucket)` |
 | `oasr/engine/nar_graph.py` | CUDA-graph capture of Paraformer's CIF predictor and NAR decoder: two graphs, keyed `(B, T)` and `(B, T, U_bucket)`, with the token counts read back between them |
 | `oasr/engine/memory.py` | VRAM-aware capacity derivation (paged pool, AR decoder KV) |
-| `oasr/engine/decoder_graph.py` | CUDA-graph capture of one AR decoder step (needs paged decoder KV) |
+| `oasr/engine/decoder_graph.py` | CUDA-graph capture of the AR decoder (needs paged decoder KV): one step, a multi-step greedy loop with the selection on the device, and an AED prefill's prompt forward |
 | `oasr/cache/decoder_state.py` | Per-row decoder KV — dense capacity buffers and paged — that both AR decoder surfaces thread |
 | `oasr/models/base.py` | `BaseAsrModel` / `BaseEncoder` / `CacheSpec` / `LoadReport` |
 | `oasr/models/interfaces.py` | `CAPABILITIES` — what each decode family requires of a model |

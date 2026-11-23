@@ -76,3 +76,17 @@ class StepBudget:
             return False
         self.used += 1
         return True
+
+    def take_up_to(self, steps: int) -> int:
+        """Consume up to ``steps`` steps run as **one** launch; how many were granted.
+
+        For a decode loop that replays several steps per graph launch.  The
+        launch is started or not as a whole, so the deadline is checked once,
+        exactly as :meth:`take` checks it, and ``max_steps`` caps how many steps
+        it may run.  ``0`` means the tick is spent.
+        """
+        if not self.take():
+            return 0
+        extra = min(max(0, int(steps) - 1), self.max_steps - self.used)
+        self.used += extra
+        return 1 + extra

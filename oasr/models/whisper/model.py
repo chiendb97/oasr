@@ -329,6 +329,9 @@ class WhisperDecoder(BaseDecoder):
     #: True for the paged state only — a dense one still carries per-group
     #: cross K/V, and the graph cache refuses such a state (``capturable``).
     supports_step_graphs = True
+    #: The prompt is the fixed SOT sequence and the cross window is the fixed
+    #: encoder width, so a paged prefill's prompt forward keys on the batch alone.
+    supports_prefill_graphs = True
     #: fp8 KV: both halves — the self-attention cache and the cross-attention
     #: K/V, which on a large checkpoint is most of a row's footprint — dense or
     #: paged.  The alignment pass (:meth:`cross_attention`) keeps the served
@@ -363,7 +366,21 @@ class WhisperDecoder(BaseDecoder):
         is_prefill: bool,
         collect: Optional["_CrossAttnCollector"] = None,
     ) -> torch.Tensor:
-        """Shared prefill/step forward over ``ids (B, T)``.
+        """Shared prefill/step forward over ``ids (B, T)`` → ``(B, T, V)`` logits."""
+        return self.project(self._forward_hidden(ids, state, is_prefill, collect))
+
+    def project(self, hidden: torch.Tensor) -> torch.Tensor:
+        """The tied vocabulary projection: ``(..., D)`` hidden → ``(..., V)`` logits."""
+        return hidden @ self.embed_tokens.weight.t()
+
+    def _forward_hidden(
+        self,
+        ids: torch.Tensor,
+        state: Dict[str, Any],
+        is_prefill: bool,
+        collect: Optional["_CrossAttnCollector"] = None,
+    ) -> torch.Tensor:
+        """Shared prefill/step forward over ``ids (B, T)`` → final-norm hidden ``(B, T, D)``.
 
         Each row starts at **its own** position — ``DecoderKv`` derives both the
         position ids and the KV write offsets from the same per-row length — which
@@ -393,8 +410,7 @@ class WhisperDecoder(BaseDecoder):
         layers = [cast(_DecoderLayer, layer) for layer in self.layers]
         if not layers:
             kv.commit(T)
-            x = self.layer_norm(x)
-            return x @ self.embed_tokens.weight.t()
+            return self.layer_norm(x)
 
         residual = x
         h = layers[0].self_attn_layer_norm(x)
@@ -420,7 +436,7 @@ class WhisperDecoder(BaseDecoder):
             else:
                 x = self.layer_norm.forward_add(ff, residual)
         kv.commit(T)
-        return x @ self.embed_tokens.weight.t()  # tied projection → (B, T, V)
+        return x
 
     @torch.no_grad()
     def cross_attention(
@@ -497,6 +513,32 @@ class WhisperDecoder(BaseDecoder):
         quantized here.  The prompt attends its own fresh self-attention K/V in
         the served dtype and the cross K/V through the fp8 read, like every step.
         """
+        state = self.prefill_state(
+            enc_out,
+            prompt_ids,
+            capacity=capacity,
+            kv_manager=kv_manager,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+        logits = self.project(self.prefill_hidden(prompt_ids, state))
+        return (logits if all_positions else logits[:, -1]), state
+
+    def prefill_state(
+        self,
+        enc_out: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        capacity: Union[int, Sequence[int], None] = None,
+        kv_manager: Optional["DecoderKVCacheManager"] = None,
+        kv_cache_dtype: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """:meth:`prefill` up to the prompt forward: the KV state, cross K/V written.
+
+        The self-attention KV is allocated (its prompt's pages mapped, nothing
+        written yet) and the cross-attention K/V projected and stored, so
+        :meth:`prefill_hidden` only has to run the prompt.  Split out because the
+        engine captures that second half as a CUDA graph when the state is
+        paged: everything it reads is then a pool page or a static buffer.
+        """
         n = len(self.layers)
         layers = [cast(_DecoderLayer, layer) for layer in self.layers]
         B, P = prompt_ids.shape
@@ -536,8 +578,15 @@ class WhisperDecoder(BaseDecoder):
 
                     k, v = quantize_kv(k), quantize_kv(v)
                 state["cross_k"][i], state["cross_v"][i] = k, v
-        logits = self._forward_tokens(prompt_ids, state, is_prefill=True)
-        return (logits if all_positions else logits[:, -1]), state
+        return state
+
+    def prefill_hidden(self, prompt_ids: torch.Tensor, state: Dict[str, Any]) -> torch.Tensor:
+        """The prompt forward of a prefill → final-norm hidden ``(B, P, D)``.
+
+        Writes the prompt's self-attention K/V and commits it.  Logits are
+        :meth:`project` of this, over every position, as :meth:`prefill` does.
+        """
+        return self._forward_hidden(prompt_ids, state, is_prefill=True)
 
     def step(
         self, tokens: torch.Tensor, state: Dict[str, Any]

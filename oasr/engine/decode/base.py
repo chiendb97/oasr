@@ -678,7 +678,13 @@ class DecodeStrategy(ABC):
     #: Attributes a family may hold a CUDA-graph cache in (each with ``release()``).
     #: A cache missing here is skipped by both callers: a tuning reload leaves it
     #: replaying the old kernels, and shutdown leaves its pool held.
-    _GRAPH_CACHE_ATTRS = ("_graphs", "_pred_graphs", "_loop_graphs", "_beam_graphs")
+    _GRAPH_CACHE_ATTRS = (
+        "_graphs",
+        "_pred_graphs",
+        "_loop_graphs",
+        "_beam_graphs",
+        "_prefill_graphs",
+    )
 
     def release_graphs(self) -> None:
         """Release every captured decode graph this family holds.
