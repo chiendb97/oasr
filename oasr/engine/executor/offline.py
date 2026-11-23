@@ -351,16 +351,24 @@ class OfflineExecutor(Executor):
         when either the budget or the model's per-row footprint is unknown, so
         an unmeasurable model keeps today's slot-only behaviour rather than
         being throttled by a guess.
+
+        A strategy that counts its own rows (``kv_admissible_rows``: the AR
+        families admitting by expected length, which swap rows out when they
+        outgrow it) answers for the rows in flight.  One prefill is still held
+        to the rows the budget fits at their ceilings, because that is how many
+        rows' prefill memory the budget reserved (``derive_decode_kv_budget``).
         """
         budget_gib = self._decode_kv_budget_gib
-        if not budget_gib:
-            return None
-        per_row = strategy.kv_bytes_per_row()
+        per_row = strategy.kv_bytes_per_row() if budget_gib else None
+        total = int(budget_gib * (1024**3)) if budget_gib else 0
+        own = getattr(strategy, "kv_admissible_rows", None)
+        rows = own() if callable(own) else None
+        if rows is not None:
+            return min(int(rows), total // int(per_row)) if per_row else int(rows)
         if not per_row:
             return None
-        total = int(budget_gib * (1024**3))
-        in_flight = len(self._pending) * per_row
-        return max(0, (total - in_flight) // per_row)
+        in_flight = len(self._pending) * int(per_row)
+        return max(0, (total - in_flight) // int(per_row))
 
     def _batch_wide_enough(self) -> bool:
         """Whether the waiting queue should be prefilled now, or held to widen.

@@ -159,12 +159,15 @@ class LlmDecodeStrategy(IncrementalArStrategy):
         with torch.no_grad():
             # capacity → the LM preallocates its KV buffers and steps write
             # in place (no per-step cache re-copy).  One per row, so a paged
-            # row reserves its own cap rather than its batch's longest.
+            # row reserves its own cap rather than its batch's longest, and
+            # holds pages for its own prompt rather than the batch's longest
+            # (``valid_lens``: whole pages of left padding are not its own).
             logits, state = self._decoder().prefill(
                 inputs,
                 valid,
                 capacity=[self._row_capacity(inputs.size(1), m) for m in max_new],
                 kv_manager=self.kv_manager(),
+                valid_lens=totals,
                 **self._kv_cache_kwargs(),
             )
         return Prefill(state=state, logits=logits, max_new=max_new)

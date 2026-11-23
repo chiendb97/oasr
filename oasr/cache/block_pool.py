@@ -209,6 +209,35 @@ class BlockPool:
             self._k_scale_pool.index_fill_(1, idx, 0.0)
             self._v_scale_pool.index_fill_(1, idx, 0.0)
 
+    def read_blocks(self, block_ids: List[int]) -> Tuple[torch.Tensor, ...]:
+        """Copies of the given blocks across every layer, as raw bytes on the pool's device.
+
+        One tensor per backing pool -- K, V and, for a quantized pool, their
+        scales -- each ``(num_layers, len(block_ids), ...)`` with the element
+        bytes as the last axis (``uint8``), so every dtype, fp8 included, takes
+        the same ``index_select``.  :meth:`write_blocks` puts them back.  This is
+        how an AR decoder row is swapped out of the pool and in again.
+        """
+        idx = to_device(block_ids, dtype=torch.long, device=self._k_pool.device)
+        return tuple(part.view(torch.uint8).index_select(1, idx) for part in self._parts())
+
+    def write_blocks(self, block_ids: List[int], data: Tuple[torch.Tensor, ...]) -> None:
+        """Overwrite the given blocks with what :meth:`read_blocks` returned for others."""
+        parts = self._parts()
+        if len(data) != len(parts):
+            raise ValueError(
+                f"write_blocks got {len(data)} tensors for a pool of {len(parts)} parts"
+            )
+        idx = to_device(block_ids, dtype=torch.long, device=self._k_pool.device)
+        for part, src in zip(parts, data):
+            part.view(torch.uint8).index_copy_(1, idx, src.to(part.device))
+
+    def _parts(self) -> List[torch.Tensor]:
+        parts = [self._k_pool, self._v_pool]
+        if self._k_scale_pool is not None and self._v_scale_pool is not None:
+            parts += [self._k_scale_pool, self._v_scale_pool]
+        return parts
+
     # ------------------------------------------------------------------
     # Tensor access
     # ------------------------------------------------------------------

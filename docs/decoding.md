@@ -279,16 +279,17 @@ present the same surface, so neither decoder branches on the choice.
 | | Where | Merge costs | Notes |
 |---|---|---|---|
 | `dense` | a `(B, H_kv, cap, D)` buffer per group | a copy of both caches | what beam search uses regardless |
-| `paged` | one persistent `BlockPool`, one block table per row | nothing — the tables concatenate | a row holds only the pages it filled; required for step graphs |
+| `paged` | one persistent `BlockPool`, one block table per row | nothing — the tables concatenate | a row holds only the pages it filled; required for step graphs and for admission by expected length |
 | `auto` (default) | whichever of the two the family can *use* | — | paged exactly when steps will be captured |
 
 **`auto` is a trade, not a preference.** Paged storage costs **3%** on
 Qwen2-Audio-7B and **9%** on whisper-tiny — the block-table indirection, one
 gather per layer per step plus a paged loader that gathers rows where the dense
-one reads a run — and it buys no extra *admission* capacity, because each row's
-ceiling is reserved either way. What it buys is a pool allocated once for the
-process instead of a capacity buffer per prefill, a merge that moves no K/V, and
-addresses stable enough to capture a step into a CUDA graph. The first of those
+one reads a run. What it buys is a pool allocated once for the
+process instead of a capacity buffer per prefill, a merge that moves no K/V,
+addresses stable enough to capture a step into a CUDA graph, and admission by
+expected rather than maximum length (below), since only a row of a pool can be
+swapped out and back. The first of those
 does flatten the peak — a dense `select` `index_select`s the whole capacity
 buffer, so its transient grows with rows × capacity (2804 MiB at 8 rows on the
 7B, against 323 MiB paged plus a fixed 2120 MiB pool) — but the one that pays for
@@ -311,16 +312,64 @@ read goes through the fused kernel where dense went through SDPA: whisper-tiny's
 gate moved 3.73 → 3.67 (two fewer errors), `kv_storage="dense"` still gives 3.73
 exactly, and paged eager equals paged replayed.
 
-The pool reserves each row's whole position budget **at admission**
-(`DecoderKVCacheManager.can_admit`) because there is no eviction to fall back on:
-a pool that can run out mid-generation runs out several seconds into a request
-that is already half-answered. Optimistic admission — reserving what rows are
-*using* rather than what they could use — is what would turn paging into a
-capacity win, and it needs preemption to be safe.
-
 Beam search stays dense: a paged row's pages are its own, so the repeated-index
 `select` that expands and reorders a beam grid would alias two slots onto one
 page, and `PagedDecoderKv.select` refuses rather than corrupting.
+
+### Admission by expected length
+
+A row's position budget is its prompt plus `max_new_tokens`, and a transcript
+is a few dozen tokens against a cap of hundreds. Reserving the whole budget at
+admission (`kv_admission="ceiling"`, `DecoderKVCacheManager.can_admit` checking
+every live row's ceiling) means growth can never fail, and it means most of the
+pool is reserved and never written: Qwen2-Audio-7B held about 10 rows of
+`max_batch_size=32`, on a decode that is weight-bandwidth bound and wants rows.
+
+`kv_admission="expected"` (the default) admits by what rows actually reach, and
+makes room when they outgrow it:
+
+- **The expectation.** Once 8 rows have finished, a new row is charged the mean
+  pool pages the last 256 finished rows held at their end, and a live row what it
+  holds plus its expected remaining growth (the mean tokens generated, less what
+  it has) plus a page for its next launch. Before that, every row is charged its
+  ceiling, as before. `IncrementalArStrategy.kv_admissible_rows` answers the
+  executor with that count; one prefill is still held to the rows the
+  `decode_kv_budget_gib` affords at their ceilings, because that is how many rows'
+  prefill transient the budget reserved.
+- **Preemption.** Before each launch, the strategy checks that the pages the
+  launch will map are free. While they are not, the **most recently admitted**
+  row anywhere is swapped out: its pages are copied to host memory
+  (`PagedDecoderKv.export_row`) and freed, and its tokens, detokenizer state and
+  pending logits move with it. The oldest rows therefore always make progress.
+  The last row in flight is never swapped out: alone, it would come back to the
+  same pool and swap itself out again. It also cannot outgrow a pool the budget
+  sized for at least one row at its ceiling. A prefill whose prompts do not fit
+  makes room the same way instead of rejecting the batch.
+- **Resumption.** At the start of each `advance`, swapped-out rows come back
+  oldest first while their pages and expected growth fit beside what the live rows
+  are committed to (`PagedDecoderKv.restore`), and merge into a running group. The
+  K/V come back byte for byte, so a resumed row decodes the tokens it would have.
+  No new row is admitted while one waits.
+- **Left padding.** A speech-LLM prefill left-pads every row to its batch's
+  longest prompt. A row's whole pages of padding map to the pool's one scratch
+  page instead of pages of its own (`DecoderKVCacheManager.create(lead=...)`),
+  so a 2 s clip batched with a 30 s one holds its own footprint. The padding is
+  never read unmasked (it lies before the row's `kv_starts`), and the logits are
+  bit-identical.
+
+Dense storage and beam search keep `"ceiling"`: only a paged row can be swapped
+out and back. `kv_admission="ceiling"` is the A/B.
+
+Measured on Qwen2-Audio-7B (bf16, RTX 5090, a 1,000-utterance LibriSpeech
+backlog, `max_batch_size=32`): rows in flight went from 10.9 to 20.8 on average,
+and backlog throughput rose 1.14×. Single-request latency is unchanged, and the
+LJSpeech-200 WER gate is identical (5.67 %). After this change the pool no longer
+sets the width: at least a third of its pages stayed free. What sets it is
+admission itself: one prefill per admitting tick, capped at the rows the budget
+fits at their ceilings, because that is how much prefill memory it reserved.
+Preemption is the safety net for traffic that outgrows the expectation: a backlog
+sorted shortest first, whose long clips arrive after short ones set a small
+expectation, swapped 2 rows and finished every request.
 
 ### Decoder-step CUDA graphs
 

@@ -42,9 +42,16 @@ from oasr.functionals.kv_quant import QuantizedKv, kv_cache_dtype, quantize_kv_s
 from .paged_kv import flat_write_index
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .decoder_kv import DecoderKVCacheManager
+    from .decoder_kv import DecoderKVCacheManager, SwappedSlot
 
-__all__ = ["DecoderKv", "PagedDecoderKv", "build_kv", "build_cross_kv", "consume_cat_rows"]
+__all__ = [
+    "DecoderKv",
+    "PagedDecoderKv",
+    "SwappedRow",
+    "build_kv",
+    "build_cross_kv",
+    "consume_cat_rows",
+]
 
 #: Capacity-buffer growth granularity, in tokens.  Growth is a safety valve —
 #: the strategies size ``cap`` from the batch's generation cap — so this only
@@ -493,6 +500,21 @@ class DecoderKv(_RowIndexed):
         )
 
 
+@dataclass
+class SwappedRow:
+    """One row of a :class:`PagedDecoderKv` on the host (:meth:`PagedDecoderKv.export_row`)."""
+
+    slot: "SwappedSlot"
+    #: The row's ``lens`` entry: its next write index.
+    lens: int
+    #: Its ``starts`` entry, or ``None`` for a state without left padding.
+    start: Optional[int]
+
+    @property
+    def pages(self) -> int:
+        return self.slot.pages
+
+
 class PagedDecoderKv(_RowIndexed):
     """Row-indexed self-attention KV paged out of a shared block pool.
 
@@ -552,6 +574,7 @@ class PagedDecoderKv(_RowIndexed):
         prefill_len: int,
         capacity: Union[int, Sequence[int]],
         starts: Optional[torch.Tensor] = None,
+        starts_host: Optional[Sequence[int]] = None,
     ) -> "PagedDecoderKv":
         """Reserve one slot per row, with pages for the prompt already mapped.
 
@@ -563,26 +586,47 @@ class PagedDecoderKv(_RowIndexed):
         pool is checked against every live slot's *ceiling* first, so a batch
         that could run the pool out several seconds into generation is refused
         here instead; and anything already registered is rolled back, so a
-        refused batch leaks no pages.
+        refused batch leaks no pages.  An ``overcommit`` manager checks only the
+        prompt's pages, and its caller makes room when one does not fit.
+
+        ``starts_host`` is ``starts`` on the host.  Given, and with a scratch
+        page in the pool, each row's whole pages of left padding map to the
+        scratch page rather than pages of its own (``DecoderKVCacheManager.create``):
+        a batch is as long as its longest prompt, and a short row otherwise held
+        the long one's footprint.
         """
         from .decoder_kv import DecoderKvExhausted
 
         slots: List[str] = []
         caps = _row_capacities(capacity, batch_size, int(prefill_len))
+        block = int(manager.pool.config.block_size_frames)
+        if starts_host is not None and manager.has_scratch:
+            if len(starts_host) != batch_size:
+                raise ValueError(f"starts_host has {len(starts_host)} rows for {batch_size}")
+            leads = [max(0, int(s)) // block for s in starts_host]
+        else:
+            leads = [0] * batch_size
         try:
-            for cap in caps:
+            for cap, lead in zip(caps, leads):
                 max_new = cap - int(prefill_len)
-                if not manager.can_admit(max_new, int(prefill_len)):
+                if not manager.can_admit(max_new, int(prefill_len), lead):
+                    claim = (
+                        "the prompts need more"
+                        if manager.overcommit
+                        else "the live slots' ceilings claim the rest"
+                    )
                     raise DecoderKvExhausted(
                         f"decoder KV pool cannot admit {batch_size} more row(s) at "
                         f"up to {max(caps)} positions each: "
                         f"{manager.pool.num_free_blocks}/{manager.pool.num_blocks} "
-                        "blocks free and the live slots' ceilings claim the rest. "
+                        f"blocks free and {claim}. "
                         "Lower max_decode_slots or max_new_tokens, or raise "
                         "decode_kv_budget_gib."
                     )
                 slot = f"ar-{next(cls._slot_ids)}"
-                manager.create(slot, max_new_tokens=max_new, prefill_len=int(prefill_len))
+                manager.create(
+                    slot, max_new_tokens=max_new, prefill_len=int(prefill_len), lead=lead
+                )
                 slots.append(slot)
         except Exception:
             for slot in slots:
@@ -603,6 +647,59 @@ class PagedDecoderKv(_RowIndexed):
         for slot in self.slots:
             self._mgr.free(slot)
         self.slots = []
+
+    def export_row(self, row: int) -> "SwappedRow":
+        """Copy row ``row``'s pages and offsets to host memory; the row stays.
+
+        The first half of swapping a row out of the pool: a ``select`` that
+        drops the row frees its pages afterwards.  :meth:`restore` is the other
+        half.
+        """
+        self._check_live()
+        start = None if self.starts is None else int(self.starts[row].item())
+        return SwappedRow(self._mgr.export_slot(self.slots[row]), self.lens_host[row], start)
+
+    @classmethod
+    def restore(
+        cls,
+        manager: "DecoderKVCacheManager",
+        rows: Sequence["SwappedRow"],
+        device: torch.device,
+    ) -> "PagedDecoderKv":
+        """A state over fresh pages holding ``rows`` exactly as they were exported.
+
+        Raises ``RuntimeError`` when the pool cannot hold them, having taken
+        nothing.
+        """
+        if not rows:
+            raise ValueError("restore needs at least one row")
+        if len({r.start is None for r in rows}) != 1:
+            raise ValueError("rows to restore together must share a padding discipline")
+        slots: List[str] = []
+        try:
+            for r in rows:
+                slot = f"ar-{next(cls._slot_ids)}"
+                manager.import_slot(slot, r.slot)
+                slots.append(slot)
+        except Exception:
+            for slot in slots:
+                manager.free(slot)
+            raise
+        lens = [int(r.lens) for r in rows]
+        starts = None
+        if rows[0].start is not None:
+            starts = torch.tensor([int(r.start or 0) for r in rows], dtype=torch.int32).to(device)
+        return cls(manager, slots, torch.tensor(lens, dtype=torch.int32).to(device), lens, starts)
+
+    def held_pages(self, row: int) -> int:
+        """Pool pages row ``row`` holds (its scratch lead not counted)."""
+        return self._mgr.held_blocks(self.slots[row])
+
+    def growth_pages(self, row: int, t_new: int) -> int:
+        """Pages row ``row`` must map before ``t_new`` more positions are written."""
+        slot = self.slots[row]
+        need = -(-(self._mgr.seqlen(slot) + int(t_new)) // self._block_size)
+        return max(0, need - self._mgr.num_blocks(slot))
 
     def __del__(self) -> None:
         """Backstop for a group dropped without a ``select`` or a ``free``.
@@ -843,6 +940,7 @@ def build_kv(
     manager: Optional["DecoderKVCacheManager"] = None,
     starts: Optional[torch.Tensor] = None,
     kv_cache: Optional[str] = None,
+    starts_host: Optional[Sequence[int]] = None,
 ) -> Any:
     """Storage for one freshly prefilled group — paged when a pool is given.
 
@@ -854,7 +952,9 @@ def build_kv(
 
     ``cap`` is each row's position budget, one for the batch or one per row, and
     never less than ``prefill_len``.  A dense cache is one buffer, so it is as
-    wide as the widest row; a paged one reserves each row's own.
+    wide as the widest row; a paged one reserves each row's own.  ``starts_host``
+    (``starts`` read on the host, no sync) lets a paged one map whole pages of
+    left padding to the pool's scratch page (``PagedDecoderKv.create``).
     """
     if kv_cache == "auto":
         kv_cache = None
@@ -882,6 +982,7 @@ def build_kv(
         prefill_len=prefill_len,
         capacity=caps,
         starts=starts,
+        starts_host=starts_host,
     )
 
 
