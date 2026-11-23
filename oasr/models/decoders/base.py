@@ -65,6 +65,27 @@ class StatelessPredictorTensors:
 
 
 @dataclass(frozen=True)
+class RecurrentPredictorTensors:
+    """What a fused greedy step reads from an LSTM predictor.
+
+    The prediction is the top layer's hidden state after an embedding lookup of
+    the emitted label and one step of a stacked LSTM (PyTorch's gate order:
+    input, forget, cell, output), its state ``(h, c)`` per layer.  The weights
+    are the layers' own parameters: ``weight_ih[l]`` ``(4H, H)`` -- the
+    embedding width is the hidden size -- ``weight_hh[l]`` ``(4H, H)``, and the
+    two biases per layer, or ``None`` for a bias-free LSTM.
+    """
+
+    embedding: torch.Tensor  # (V, H)
+    weight_ih: Tuple[torch.Tensor, ...]
+    weight_hh: Tuple[torch.Tensor, ...]
+    bias_ih: Optional[Tuple[torch.Tensor, ...]]
+    bias_hh: Optional[Tuple[torch.Tensor, ...]]
+    hidden_size: int
+    blank_id: int
+
+
+@dataclass(frozen=True)
 class AdditiveJoinerTensors:
     """What a fused greedy step reads from an additive joiner.
 
@@ -230,6 +251,15 @@ class TransducerPredictor(BaseDecoder):
         """Split a batched state back into per-stream states (inverse of
         :meth:`stack_states`)."""
         raise NotImplementedError
+
+    def recurrent_tensors(self) -> Optional[RecurrentPredictorTensors]:
+        """The tensors a fused LSTM greedy decode reads, or ``None``.
+
+        Declared, as :meth:`stateless_tensors` is: only a predictor whose step is
+        exactly an embedding lookup and a stacked LSTM, with state ``(prediction,
+        h, c)`` where the prediction is the top layer's ``h``, returns them.
+        """
+        return None
 
     def stateless_tensors(self) -> Optional[StatelessPredictorTensors]:
         """The tensors a fused greedy decode reads, or ``None``.

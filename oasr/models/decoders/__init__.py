@@ -20,6 +20,7 @@ from .base import (
     DecoderState,
     Joiner,
     PredictionNetwork,
+    RecurrentPredictorTensors,
     StatelessPredictorTensors,
     TransducerPredictor,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "DecoderState",
     "Joiner",
     "PredictionNetwork",
+    "RecurrentPredictorTensors",
     "StatelessPredictorTensors",
     "TransducerPredictor",
     "TransformerDecoder",

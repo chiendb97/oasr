@@ -6,7 +6,9 @@
 #include <limits>
 #include <oasr/transducer/beam_decode.cuh>
 #include <oasr/transducer/beam_topk.cuh>
+#include <oasr/transducer/greedy_cluster.cuh>
 #include <oasr/transducer/greedy_decode.cuh>
+#include <oasr/transducer/lstm_greedy.cuh>
 
 #include "tvm_ffi_utils.h"
 
@@ -38,7 +40,7 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
                              TensorView dec_proj_in, TensorView w_out_t, Optional b_out,
                              TensorView emb, Optional conv_w, TensorView w_dp_t, Optional b_dp,
                              int64_t vocab, int64_t group, int64_t max_sym, int64_t blank,
-                             int64_t activation, int64_t rows_per_cta) {
+                             int64_t activation, int64_t rows_per_cta, int64_t cluster) {
     CHECK_INPUT(enc_proj);
     CHECK_DIM(3, enc_proj);
     CHECK_LAST_DIM_CONTIGUOUS_INPUT(enc_proj);
@@ -183,8 +185,15 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
         p.max_sym = static_cast<int>(max_sym);
         p.blank = static_cast<int>(blank);
         p.activation = static_cast<int>(activation);
-        cudaError_t status =
-            transducer::StatelessGreedyDecode<c_type>(p, static_cast<int>(rows_per_cta), stream);
+        TVM_FFI_ICHECK(cluster == 0 || cluster == 1 || cluster == 2 || cluster == 4 ||
+                       cluster == 8 || cluster == 16)
+            << "cluster must be 0 (auto), 1 (one CTA per row group) or 2, 4, 8, 16; got "
+            << cluster;
+        const int c =
+            cluster == 0 ? transducer::statelessGreedyAutoCluster(p) : static_cast<int>(cluster);
+        cudaError_t status = c > 1 ? transducer::StatelessGreedyClusterDecode<c_type>(p, c, stream)
+                                   : transducer::StatelessGreedyDecode<c_type>(
+                                         p, static_cast<int>(rows_per_cta), stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
             << "stateless greedy decode failed: " << cudaGetErrorString(status);
         return true;
@@ -462,4 +471,184 @@ bool stateless_greedy_fits(int64_t J, int64_t D) {
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "stateless greedy fit query failed: " << cudaGetErrorString(status);
     return fits;
+}
+
+// Greedy-decode `enc_proj` with an LSTM predictor from the state `(h_in, c_in,
+// dec_proj_in)`: one cooperative launch over `grid` CTAs (0 = one per SM).  The
+// LSTM's weights are stacked per layer -- `w_ih`, `w_hh` (L, 4H, H), gates i, f,
+// g, o; `bias` (L, 2, 4H) as (b_ih, b_hh) or none -- and every other weight is
+// the model's own.  `workspace` is a byte tensor of lstm_greedy_workspace_bytes.
+void lstm_greedy_decode(TensorView tokens, TensorView frames, Optional probs, TensorView counts,
+                        TensorView h_out, TensorView c_out, TensorView dec_proj_out,
+                        TensorView workspace, TensorView enc_proj, TensorView lengths,
+                        TensorView h_in, TensorView c_in, TensorView dec_proj_in, TensorView emb,
+                        TensorView w_ih, TensorView w_hh, Optional bias, TensorView w_dp,
+                        Optional b_dp, TensorView w_out, Optional b_out, int64_t vocab,
+                        int64_t max_sym, int64_t blank, int64_t grid) {
+    CHECK_INPUT(enc_proj);
+    CHECK_DIM(3, enc_proj);
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(enc_proj);
+    const int64_t B = enc_proj.size(0);
+    const int64_t J = enc_proj.size(2);
+    TVM_FFI_ICHECK(B >= 0 && B <= transducer::kLstmMaxRows)
+        << "the fused LSTM decode takes at most " << transducer::kLstmMaxRows << " rows; got " << B;
+    TVM_FFI_ICHECK(enc_proj.size(1) <= std::numeric_limits<int>::max())
+        << "enc_proj has more frames than an int counts";
+    TVM_FFI_ICHECK(J % 8 == 0) << "joiner dim must be a multiple of 8; got " << J;
+    TVM_FFI_ICHECK(enc_proj.stride(0) % 8 == 0 && enc_proj.stride(1) % 8 == 0)
+        << "enc_proj row strides must be multiples of 8 elements";
+    check_vec16(enc_proj, "enc_proj");
+
+    CHECK_INPUT(lengths);
+    CHECK_CONTIGUOUS_INPUT(lengths);
+    TVM_FFI_ICHECK(is_dtype(lengths, dl_int64) && lengths.ndim() == 1 && lengths.size(0) == B)
+        << "lengths must be int64 of shape (B,)";
+
+    CHECK_INPUT(w_ih);
+    CHECK_CONTIGUOUS_INPUT(w_ih);
+    CHECK_DIM(3, w_ih);
+    const int64_t L = w_ih.size(0);
+    const int64_t H = w_ih.size(2);
+    TVM_FFI_ICHECK(L >= 1 && L <= transducer::kLstmMaxLayers && w_ih.size(1) == 4 * H && H % 8 == 0)
+        << "w_ih must be (L, 4H, H) with 1 <= L <= " << transducer::kLstmMaxLayers
+        << " and H a multiple of 8";
+    CHECK_INPUT(w_hh);
+    CHECK_CONTIGUOUS_INPUT(w_hh);
+    TVM_FFI_ICHECK(w_hh.ndim() == 3 && w_hh.size(0) == L && w_hh.size(1) == 4 * H &&
+                   w_hh.size(2) == H)
+        << "w_hh must be (L, 4H, H) like w_ih";
+    if (bias.has_value()) {
+        const TensorView bv = bias.value();
+        CHECK_INPUT(bv);
+        CHECK_CONTIGUOUS_INPUT(bv);
+        TVM_FFI_ICHECK(bv.ndim() == 3 && bv.size(0) == L && bv.size(1) == 2 && bv.size(2) == 4 * H)
+            << "bias must be (L, 2, 4H): each layer's (b_ih, b_hh)";
+    }
+    CHECK_INPUT(emb);
+    CHECK_CONTIGUOUS_INPUT(emb);
+    TVM_FFI_ICHECK(emb.ndim() == 2 && emb.size(1) == H && emb.size(0) >= vocab)
+        << "emb must be (>= V, H): the LSTM's input is its hidden size";
+    check_vec16(emb, "emb");
+    CHECK_INPUT(w_dp);
+    CHECK_CONTIGUOUS_INPUT(w_dp);
+    TVM_FFI_ICHECK(w_dp.ndim() == 2 && w_dp.size(0) == J && w_dp.size(1) == H)
+        << "w_dp must be the (J, H) decoder projection";
+    check_vec16(w_dp, "w_dp");
+    CHECK_INPUT(w_out);
+    CHECK_CONTIGUOUS_INPUT(w_out);
+    TVM_FFI_ICHECK(w_out.ndim() == 2 && w_out.size(1) == J && w_out.size(0) >= vocab &&
+                   vocab >= 1 && vocab <= transducer::kLstmMaxVocab)
+        << "w_out must be the (>= V, J) joiner head, V in [1, " << transducer::kLstmMaxVocab << "]";
+    check_vec16(w_out, "w_out");
+
+    for (const TensorView* t : {&h_in, &c_in, &h_out, &c_out}) {
+        CHECK_INPUT(*t);
+        CHECK_CONTIGUOUS_INPUT(*t);
+        TVM_FFI_ICHECK(t->ndim() == 3 && t->size(0) == L && t->size(1) == B && t->size(2) == H)
+            << "hidden and cell states must be (L, B, H)";
+    }
+    for (const TensorView* t : {&dec_proj_in, &dec_proj_out}) {
+        CHECK_INPUT(*t);
+        CHECK_CONTIGUOUS_INPUT(*t);
+        TVM_FFI_ICHECK(t->ndim() == 2 && t->size(0) == B && t->size(1) == J)
+            << "dec_proj must be (B, J)";
+    }
+    CHECK_INPUT(tokens);
+    CHECK_CONTIGUOUS_INPUT(tokens);
+    TVM_FFI_ICHECK(is_dtype(tokens, dl_int32) && tokens.ndim() == 2 && tokens.size(0) == B)
+        << "tokens must be int32 of shape (B, cap)";
+    const int64_t cap = tokens.size(1);
+    CHECK_INPUT(frames);
+    CHECK_CONTIGUOUS_INPUT(frames);
+    TVM_FFI_ICHECK(is_dtype(frames, dl_int32) && frames.ndim() == 2 && frames.size(0) == B &&
+                   frames.size(1) == cap)
+        << "frames must be int32 of shape (B, cap)";
+    CHECK_INPUT(counts);
+    CHECK_CONTIGUOUS_INPUT(counts);
+    TVM_FFI_ICHECK(is_dtype(counts, dl_int32) && counts.ndim() == 1 && counts.size(0) == B)
+        << "counts must be int32 of shape (B,)";
+    if (probs.has_value()) {
+        const TensorView pr = probs.value();
+        CHECK_INPUT(pr);
+        CHECK_CONTIGUOUS_INPUT(pr);
+        TVM_FFI_ICHECK(is_dtype(pr, dl_float32) && pr.ndim() == 2 && pr.size(0) == B &&
+                       pr.size(1) == cap)
+            << "probs must be float32 of shape (B, cap)";
+    }
+    const int G = transducer::lstmGreedyGrid(static_cast<int>(vocab), static_cast<int>(grid));
+    TVM_FFI_ICHECK(G >= 1) << "no grid for the fused LSTM decode";
+
+    cudaStream_t stream = get_stream(enc_proj.device());
+    DISPATCH_DLPACK_HALF_DTYPE(enc_proj.dtype(), c_type, [&] {
+        for (const TensorView* t : {&h_in, &c_in, &h_out, &c_out, &dec_proj_in, &dec_proj_out, &emb,
+                                    &w_ih, &w_hh, &w_dp, &w_out}) {
+            TVM_FFI_ICHECK(t->dtype().code == enc_proj.dtype().code &&
+                           t->dtype().bits == enc_proj.dtype().bits)
+                << "every floating-point operand must share enc_proj's dtype";
+        }
+        CHECK_INPUT(workspace);
+        TVM_FFI_ICHECK(
+            static_cast<size_t>(workspace.numel()) * (workspace.dtype().bits / 8) >=
+            transducer::lstmGreedyWorkspace<c_type>(static_cast<int>(B), static_cast<int>(H),
+                                                    static_cast<int>(L), static_cast<int>(J), G)
+                .total)
+            << "workspace is smaller than lstm_greedy_workspace_bytes";
+        TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(workspace.data_ptr()) % 256 == 0)
+            << "workspace must be 256-byte aligned";
+        transducer::LstmGreedyParams<c_type> p{};
+        p.enc_proj = static_cast<const c_type*>(enc_proj.data_ptr());
+        p.enc_stride_b = enc_proj.stride(0);
+        p.enc_stride_t = enc_proj.stride(1);
+        p.num_frames = static_cast<int>(enc_proj.size(1));
+        p.lengths = static_cast<const int64_t*>(lengths.data_ptr());
+        p.h_in = static_cast<const c_type*>(h_in.data_ptr());
+        p.c_in = static_cast<const c_type*>(c_in.data_ptr());
+        p.dec_proj_in = static_cast<const c_type*>(dec_proj_in.data_ptr());
+        p.emb = static_cast<const c_type*>(emb.data_ptr());
+        const c_type* wi = static_cast<const c_type*>(w_ih.data_ptr());
+        const c_type* wh = static_cast<const c_type*>(w_hh.data_ptr());
+        const c_type* bs = OptionalDataPtr<const c_type>(bias);
+        for (int l = 0; l < L; ++l) {
+            p.w_ih[l] = wi + static_cast<int64_t>(l) * 4 * H * H;
+            p.w_hh[l] = wh + static_cast<int64_t>(l) * 4 * H * H;
+            p.b_ih[l] = bs != nullptr ? bs + static_cast<int64_t>(l) * 2 * 4 * H : nullptr;
+            p.b_hh[l] = bs != nullptr ? bs + (static_cast<int64_t>(l) * 2 + 1) * 4 * H : nullptr;
+        }
+        p.w_dp = static_cast<const c_type*>(w_dp.data_ptr());
+        p.b_dp = OptionalDataPtr<const c_type>(b_dp);
+        p.w_out = static_cast<const c_type*>(w_out.data_ptr());
+        p.b_out = OptionalDataPtr<const c_type>(b_out);
+        p.tokens = static_cast<int32_t*>(tokens.data_ptr());
+        p.frames = static_cast<int32_t*>(frames.data_ptr());
+        p.probs = OptionalDataPtr<float>(probs);
+        p.counts = static_cast<int32_t*>(counts.data_ptr());
+        p.h_out = static_cast<c_type*>(h_out.data_ptr());
+        p.c_out = static_cast<c_type*>(c_out.data_ptr());
+        p.dec_proj_out = static_cast<c_type*>(dec_proj_out.data_ptr());
+        p.B = static_cast<int>(B);
+        p.E = static_cast<int>(H);
+        p.H = static_cast<int>(H);
+        p.L = static_cast<int>(L);
+        p.J = static_cast<int>(J);
+        p.V = static_cast<int>(vocab);
+        p.cap = static_cast<int>(cap);
+        p.max_sym = static_cast<int>(max_sym);
+        p.blank = static_cast<int>(blank);
+        cudaError_t status =
+            transducer::LstmGreedyDecode<c_type>(p, workspace.data_ptr(), G, stream);
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "fused LSTM greedy decode failed: " << cudaGetErrorString(status);
+        return true;
+    });
+}
+
+// Workspace bytes of a fused LSTM decode of `batch` rows on `grid` CTAs (0 =
+// one per SM, as the decode picks it for `vocab`).  The same for fp16 and bf16.
+int64_t lstm_greedy_workspace_bytes(int64_t batch, int64_t hidden, int64_t layers, int64_t joiner,
+                                    int64_t vocab, int64_t grid) {
+    const int G = transducer::lstmGreedyGrid(static_cast<int>(vocab), static_cast<int>(grid));
+    return static_cast<int64_t>(transducer::lstmGreedyWorkspace<__half>(
+                                    static_cast<int>(batch), static_cast<int>(hidden),
+                                    static_cast<int>(layers), static_cast<int>(joiner), G)
+                                    .total);
 }

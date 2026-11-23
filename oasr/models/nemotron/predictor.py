@@ -37,7 +37,12 @@ from oasr.layers import (
 )
 
 from ..base import align_out_features, init_pad_rows
-from ..decoders.base import Joiner, TransducerPredictor
+from ..decoders.base import (
+    AdditiveJoinerTensors,
+    Joiner,
+    RecurrentPredictorTensors,
+    TransducerPredictor,
+)
 
 __all__ = ["NemotronPromptProjector", "NemotronRnntJoint", "NemotronRnntPredictor"]
 
@@ -125,6 +130,25 @@ class NemotronRnntPredictor(TransducerPredictor):
             torch.where(keep_state, new_c, c),
         )
 
+    def recurrent_tensors(self) -> Optional[RecurrentPredictorTensors]:
+        """The embedding and the LSTM's layers, for the fused greedy decode."""
+        lstm = self.lstm
+        layers = range(self.num_layers)
+        # The kernel stacks every layer's input weight, so the embedding width
+        # must be the hidden size (it is on every released checkpoint).
+        if lstm.input_size != self.hidden_size:
+            return None
+        biased = bool(lstm.bias)
+        return RecurrentPredictorTensors(
+            embedding=self.embedding.weight,
+            weight_ih=tuple(getattr(lstm, f"weight_ih_l{i}") for i in layers),
+            weight_hh=tuple(getattr(lstm, f"weight_hh_l{i}") for i in layers),
+            bias_ih=tuple(getattr(lstm, f"bias_ih_l{i}") for i in layers) if biased else None,
+            bias_hh=tuple(getattr(lstm, f"bias_hh_l{i}") for i in layers) if biased else None,
+            hidden_size=self.hidden_size,
+            blank_id=self.blank_id,
+        )
+
     def stack_states(self, states: Sequence[LstmState]) -> LstmState:
         return (
             torch.cat([s[0] for s in states], dim=0),
@@ -167,6 +191,23 @@ class NemotronRnntJoint(Joiner):
         self.head = Linear(decoder_dim, align_out_features(vocab_size))
         self.relu = Relu()
         init_pad_rows(self.head, vocab_size)
+
+    def additive_tensors(self) -> Optional[AdditiveJoinerTensors]:
+        """The head and decoder projection the fused greedy decode reads.
+
+        ``None`` when either is quantized: the kernel multiplies the layers' own
+        half-precision weights, and a quantized layer no longer has them.
+        """
+        if self.head.quant_method is not None or self.decoder_proj.quant_method is not None:
+            return None
+        return AdditiveJoinerTensors(
+            output_weight=self.head.weight,
+            output_bias=self.head.bias,
+            vocab_size=self.vocab_size,
+            activation="relu",
+            decoder_proj_weight=self.decoder_proj.weight,
+            decoder_proj_bias=self.decoder_proj.bias,
+        )
 
     def forward(
         self,

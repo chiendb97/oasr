@@ -106,11 +106,14 @@ from .functionals.scaled_mm import scaled_mm, scaled_mm_quant
 from .functionals.softmax import log_softmax, masked_softmax, softmax
 from .functionals.topk import topk
 from .functionals.transducer import (
+    LstmGreedyResult,
+    LstmGreedyWeights,
     StatelessGreedyResult,
     StatelessGreedyWeights,
     transducer_beam_decode,
     transducer_beam_topk,
     transducer_greedy_decode,
+    transducer_lstm_greedy_decode,
 )
 from .layers import (
     LSTM,
@@ -291,6 +294,9 @@ __all__ = [
     "transducer_beam_decode",
     "transducer_beam_topk",
     "transducer_greedy_decode",
+    "transducer_lstm_greedy_decode",
+    "LstmGreedyResult",
+    "LstmGreedyWeights",
     "StatelessGreedyResult",
     "StatelessGreedyWeights",
     "rfft",

@@ -112,6 +112,61 @@ the loop instead of failing its launch.
   are `record_stream`-ed; `tests/decoders/test_transducer_fused.py` congests the
   main stream on purpose to keep both orderings honest. It only pays when a
   second batch is waiting — neutral with one batch in flight.
+* **A small batch is decoded by a cluster per row** (sm_90+,
+  `include/oasr/transducer/greedy_cluster.cuh`). One CTA per row is bound by how
+  fast one SM pulls the two decode weights out of L2 — 1 MB on the icefall
+  transducer, ~8 µs a step, 70 % of a batch-1 request's GPU time on one SM of
+  170. For a batch up to 32 the launcher instead gives each row a thread-block
+  cluster of up to 16 CTAs: both GEMVs' outputs are dealt to the cluster in
+  blocks of 32, a CTA keeps its share of the weights in shared memory when it
+  fits, and the candidates and decoder-projection slices cross the cluster with
+  `st.async` into each CTA's shared memory, completing on an mbarrier. (A cluster
+  barrier that orders those stores compiles to a GPU-scope `MEMBAR` on sm_120 and
+  cost 0.58 µs a round with a global store in flight, against 0.22 µs.) Every CTA
+  reduces the same candidates the same way, so all of them take the same
+  decision without another exchange. An output's arithmetic is the one-CTA
+  kernel's own fmaf chain — the same 16 K slices, summed in the same order — so
+  tokens, frames and predictor state are **bit-identical** to it on any weights,
+  and a row's result does not depend on the batch it came in or the kernel its
+  batch got; a tracked posterior may move in its last bits. On real LibriSpeech
+  decode inputs the kernel is 5.7× at batch 1–8 (16 CTAs), 3.1× at 16, 2.0× at
+  32; a batch-1 Zipformer request goes from 4.59 to 3.08 ms p50. Past batch 32
+  the one-CTA kernel stays, leaving the next batch's encoder the rest of the GPU.
+  `oasr.transducer_greedy_decode(..., cluster=C)` pins a size (`1` = one CTA).
+
+### An LSTM predictor's greedy decode is one cooperative launch
+
+NeMo's RNN-T (Nemotron) carries recurrent state, so the kernel above does not
+apply; its loop, even replayed from graphs, runs a dozen small kernels a step —
+~53 µs a step and two thirds of a batch-1 request's GPU time. A predictor that
+declares its layers (`TransducerPredictor.recurrent_tensors()`: an embedding and
+a stacked LSTM, gates i, f, g, o, prediction = the top layer's `h`) with an
+additive ReLU joint (`Joiner.additive_tensors()`, declined when the head or the
+decoder projection is quantized) is decoded instead by
+`oasr.transducer_lstm_greedy_decode`
+(`include/oasr/transducer/lstm_greedy.cuh`) for a batch of at most 4.
+
+A step there reads the 16.75 MB vocabulary head, and an emission also the two
+LSTM layers (13.1 MB), far more than one SM — or one cluster — streams quickly,
+so the kernel is one cooperative launch over every SM, its rows in lockstep:
+each CTA owns a share of the vocabulary, of the hidden units (all four gates of
+each, so the cell update stays local) and of the decoder projection, and the
+CTAs meet at a grid-wide barrier after the joiner (the argmax travels as a
+round-tagged 64-bit `atomicMax`, so it needs no exchange of its own), after each
+LSTM layer and after the projection. Whatever shared memory the buffers leave
+holds the CTA's vocabulary rows for the whole launch — at batch 1 on Nemotron
+~72 of each CTA's ~77, so a step streams ~5 rows from L2 instead of all of them.
+Every rounding point of the loop is kept (fp32 gates, the cell stored rounded
+while `h = round(o · tanh(c))` uses the unrounded cell, the joiner input rounded
+before its ReLU, logits rounded before the argmax); the dot products accumulate
+in their own order. Each output is one warp's dot product in a fixed order, so a
+row's result does not depend on the grid size or the batch it shares.
+
+On the LJSpeech-200 manifest (RTX 5090, fp16, a backlog of batches) RTFx goes
+from 596 to 1,264 at batch 1 (p50 11.2 → 5.1 ms), 1.78× at 2, 1.58× at 3 and
+1.45× at 4, and WER stays 2.62 % (69S 9D 11I) at every width. Past 4 rows the
+graph-replayed loop serves. The launch is cooperative, so it waits for whatever
+else occupies the GPU to drain; it is not issued on the side stream.
 
 ## Per-family options
 
