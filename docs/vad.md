@@ -183,10 +183,27 @@ in the dependency set, and the weights are remapped at construction. A plain
 `torch.save` of either the upstream tensors or the converted ones works too.
 
 **Placement.** Waveform detectors run on the **host** by default — the audio
-arrives there, and moving them to the GPU adds a device synchronisation inside
-the step loop. ASR-derived detectors run beside the tensors they read, on the
-engine's device. `vad.device` overrides both; CUDA is worth measuring for a
-large streaming pool on a server whose GPU has headroom.
+arrives there. ASR-derived detectors run beside the tensors they read, on the
+engine's device. `vad.device` overrides both. On CUDA a waveform detector runs
+on a stream of its own, at high priority: it shares the GPU with the encoder,
+and Silero's recurrence is a chain of one small kernel per 32 ms frame, each of
+which would otherwise queue behind the encoder's. Offline `segment` mode is
+where CUDA pays most: the detector is batched across requests (below), so its
+GPU time is a small fraction of the encoder's, while on the host it caps the
+fast models' throughput.
+
+**When it runs.** Offline, a request the detector has to see is classified in
+batches: on the admitting thread when the engine is idle (a lone request pays
+no hand-off), otherwise by a thread of the detector's own, which takes
+everything admitted since its last call as one call. The next engine step fans
+each request out at its spans. A held request counts as waiting, an abort
+reaches it, and a detector failure comes back as an error output with
+`error_stage="vad"`. Silero lays a batch out flat and packs its recurrence, so
+utterances of different lengths cost neither padding nor one call each. In
+streaming, a detector that gates the encoder (`segment`) runs at the top of
+the tick, because the gate needs its verdict before the forward; any other
+runs behind the forward, while the encoder is on the GPU, and its events and
+endpoint still land in the same tick.
 
 ### ASR-derived detectors and the silence floor
 
@@ -341,6 +358,7 @@ request** rather than returning a response with the field quietly missing.
 | `oasr_engine_vad_segments_total` | segments produced |
 | `oasr_engine_audio_seconds_skipped_total` | encoder work segmentation avoided |
 | `oasr_engine_stage_host_seconds{stage="streaming.vad"}` | per-tick cost |
+| `oasr_engine_stage_host_seconds{stage="offline.vad"}` | per detector call in offline `segment` mode (one call per batch of requests) |
 
 ## Adding a detector
 

@@ -125,6 +125,26 @@ class SpeechDetector(ABC):
             "registered against an ASR tensor, so the engine must feed it that instead"
         )
 
+    def detect_many(self, waves: Sequence[torch.Tensor]) -> List[List[float]]:
+        """Several whole waveforms → one host list of probabilities each.
+
+        The offline splitter's entry point: one call for every request an
+        admission batch sends through the detector, with one read-back.  This
+        default pads the waveforms into one :meth:`detect` call; a detector
+        whose cost follows the padding (a recurrent one) lays them out itself.
+        """
+        if not waves:
+            return []
+        sizes = [int(w.numel()) for w in waves]
+        batch = torch.zeros(len(waves), max(sizes), dtype=torch.float32)
+        for row, (wave, size) in enumerate(zip(waves, sizes)):
+            batch[row, :size] = wave.reshape(-1)
+        device = self._device or torch.device("cpu")
+        probs, frame_lengths = self.detect(
+            batch.to(device), torch.tensor(sizes, dtype=torch.int64, device=device)
+        )
+        return as_rows(probs, frame_lengths)
+
     def detect_streaming(
         self,
         waveform: torch.Tensor,

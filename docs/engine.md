@@ -677,11 +677,14 @@ request, so both executors contain it instead.
 
 Terminal outputs carry `finish_reason="error"` plus `RequestOutput.error_stage`,
 which becomes the `stage` label on the `oasr_requests_failed_total` metric
-(`offline_prep`, `offline_forward`, `offline_oom`, `prefill_oom`, `decode_step`,
+(`offline_prep`, `vad`, `offline_forward`, `offline_oom`, `prefill_oom`, `decode_step`,
 `decode_oom`, `streaming_forward`, `streaming_features`) — see [serving.md](serving.md).
 `offline_prep` is specific to `overlap_admit`. Without it, a waveform that
 cannot be prepared raises to the admitting caller. With it, the caller already
-has the request id, so the failure is answered as an output.
+has the request id, so the failure is answered as an output. `vad` is the same
+for offline `vad.mode="segment"`, whose detector runs batched, off the
+admitting thread unless the engine is idle ([vad.md](vad.md)); a request it
+holds counts as waiting and can be aborted.
 
 ## 9. Performance Considerations
 

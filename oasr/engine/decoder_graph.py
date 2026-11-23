@@ -72,6 +72,7 @@ import torch
 import tvm_ffi
 
 from oasr.cache import PagedDecoderKv
+from oasr.utils.capture_guard import capture_guard
 
 from .capture_recovery import recover_from_failed_capture
 
@@ -392,7 +393,7 @@ class DecoderStepGraphCache:
                 # torch types the pool handle as an opaque ``_POOL_HANDLE``;
                 # the engine passes the ``(int, int)`` tuple it actually is.
                 ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
-                with tvm_ffi.use_torch_stream(ctx):
+                with capture_guard(), tvm_ffi.use_torch_stream(ctx):
                     logits_buf = _run()
         except torch.cuda.OutOfMemoryError as exc:
             # Treat capture OOM as process-wide and stop retrying costly warmups.
@@ -659,7 +660,7 @@ class DecoderLoopGraphCache(DecoderStepGraphCache):
             graph = torch.cuda.CUDAGraph()
             with torch.no_grad():
                 ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
-                with tvm_ffi.use_torch_stream(ctx):
+                with capture_guard(), tvm_ffi.use_torch_stream(ctx):
                     _run()
         except torch.cuda.OutOfMemoryError as exc:
             self._disabled = True
@@ -854,7 +855,7 @@ class DecoderPrefillGraphCache(DecoderStepGraphCache):
             graph = torch.cuda.CUDAGraph()
             with torch.no_grad():
                 ctx = torch.cuda.graph(graph, pool=self._pool)  # type: ignore[arg-type]
-                with tvm_ffi.use_torch_stream(ctx):
+                with capture_guard(), tvm_ffi.use_torch_stream(ctx):
                     hidden_buf = _run()
         except torch.cuda.OutOfMemoryError as exc:
             self._disabled = True

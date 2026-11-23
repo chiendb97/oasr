@@ -15,7 +15,7 @@ import math
 import numbers
 import warnings
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -584,11 +584,120 @@ class LSTM(_RecurrentBase):
         )
         return output, final_h.squeeze(0), final_c.squeeze(0)
 
+    def _ragged_steps(
+        self, lengths: Sequence[int], batch_size: int, steps: int
+    ) -> Optional[List[int]]:
+        """Per-row step counts, or ``None`` when every row runs all ``steps``."""
+        counts = [int(n) for n in lengths]
+        if len(counts) != batch_size:
+            raise ValueError(f"lengths has {len(counts)} entries for a batch of {batch_size}")
+        if any(n < 0 or n > steps for n in counts):
+            raise ValueError(f"lengths must lie in [0, {steps}], got {counts}")
+        return None if all(n == steps for n in counts) else counts
+
+    def _forward_ragged(
+        self,
+        input: torch.Tensor,
+        initial_h: torch.Tensor,
+        initial_c: torch.Tensor,
+        counts: List[int],
+        batch_first: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One packed recurrence over rows that take different numbers of steps.
+
+        ``torch.lstm``'s packed form is what ``nn.LSTM`` runs for a
+        ``PackedSequence`` (cuDNN's variable-length RNN on CUDA): at step ``t``
+        it advances only the rows still running, so each row's final state is
+        the one after its own last step.  Padding a short row out instead and
+        stepping it with the rest would run its recurrence over the padding,
+        and the state it then carries into its next call describes audio it
+        never heard.
+
+        The packed layout is built from host-side counts rather than with
+        ``pack_padded_sequence``, which moves its sort permutation to the device
+        with a pageable copy: that copy waits for everything queued on the
+        stream, so a call issued behind an encoder forward would wait for it.
+        Only the row order and ``batch_sizes`` cross, staged; the gather index,
+        one entry per real step, is expanded from them on the input's device.
+        """
+        steps = input.shape[1 if batch_first else 0]
+        batch = len(counts)
+        hidden = self.hidden_size
+        output = input.new_zeros((batch, steps, hidden) if batch_first else (steps, batch, hidden))
+        h_n, c_n = initial_h.clone(), initial_c.clone()
+        # Longest first, ties in row order: the packed form's batch at step t
+        # is a prefix of this order, which is what ``batch_sizes`` describes.
+        live = sorted((b for b in range(batch) if counts[b] > 0), key=lambda b: -counts[b])
+        if not live:
+            return output, h_n, c_n
+        lens = torch.tensor([counts[b] for b in live], dtype=torch.int64)
+        longest, total = int(lens[0]), int(lens.sum())
+        # Rows still running at step t: lens is descending, so it is the count
+        # of lens > t, which -lens (ascending) answers by bisection.
+        batch_sizes = torch.searchsorted(-lens, -torch.arange(longest), right=False)
+        small = torch.cat([torch.tensor(live, dtype=torch.int64), batch_sizes])
+        if input.is_cuda:
+            small = small.pin_memory().to(input.device, non_blocking=True)
+        rows_dev, sizes_dev = small[: len(live)], small[len(live) :]
+        # The packed data order: step-major, and within a step the first
+        # batch_sizes[t] rows of ``live``.
+        firsts = torch.cumsum(sizes_dev, 0) - sizes_dev
+        step_idx = torch.repeat_interleave(
+            torch.arange(longest, device=input.device), sizes_dev, output_size=total
+        )
+        slot_idx = torch.arange(total, device=input.device) - torch.repeat_interleave(
+            firsts, sizes_dev, output_size=total
+        )
+        row_stride, step_stride = (steps, 1) if batch_first else (1, batch)
+        flat_dev = rows_dev[slot_idx] * row_stride + step_idx * step_stride
+
+        data = input.reshape(-1, input.shape[-1]).index_select(0, flat_dev)
+        h0 = initial_h.index_select(1, rows_dev)
+        c0 = initial_c.index_select(1, rows_dev)
+        final_h: List[torch.Tensor] = []
+        final_c: List[torch.Tensor] = []
+        for layer in range(self.num_layers):
+            params = [getattr(self, f"weight_ih_l{layer}"), getattr(self, f"weight_hh_l{layer}")]
+            bias_ih, bias_hh = self._biases(layer)
+            if bias_ih is not None and bias_hh is not None:
+                params += [bias_ih, bias_hh]
+            data, layer_h, layer_c = torch.lstm(
+                data,
+                batch_sizes,
+                [h0[layer : layer + 1], c0[layer : layer + 1]],
+                params,
+                bias_ih is not None,
+                1,  # num_layers: looped here, as on the padded route
+                0.0,  # dropout: applied between layers below
+                False,  # train
+                False,  # bidirectional: refused at construction
+            )
+            final_h.append(layer_h[0])
+            final_c.append(layer_c[0])
+            data = self._drop_between_layers(data, layer)
+        output.view(-1, hidden).index_copy_(0, flat_dev, data)
+        h_n.index_copy_(1, rows_dev, torch.stack(final_h))
+        c_n.index_copy_(1, rows_dev, torch.stack(final_c))
+        return output, h_n, c_n
+
     def forward(
         self,
         input: torch.Tensor,
         hx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        lengths: Optional[Sequence[int]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Run the recurrence; ``nn.LSTM``'s signature plus ``lengths``.
+
+        ``lengths`` is a host-side step count per batch row, each in
+        ``[0, T]``: row ``b`` is stepped exactly ``lengths[b]`` times, its
+        outputs past that are zero, and its final state is the one after its
+        own last step (a row of length 0 keeps ``hx``).  It is the padded form
+        of a ``PackedSequence``, and it runs a ragged batch as one recurrence
+        rather than one per distinct length.  Every row at ``T`` is the plain
+        call.  Ragged rows are served on the torch route (CPU / fp32); the fused
+        CUDA kernels step every row the same number of times, so a ragged call
+        in fp16 / bf16 on CUDA raises.
+        """
         input, batch_size, unbatched, kernel_batch_first = self._normalize_input(input)
         if hx is None:
             initial_h = self._normalize_h(None, input, batch_size, unbatched, "hidden[0]")
@@ -598,6 +707,28 @@ class LSTM(_RecurrentBase):
                 raise RuntimeError("hx for LSTM must be a (hidden, cell) pair")
             initial_h = self._normalize_h(hx[0], input, batch_size, unbatched, "hidden[0]")
             initial_c = self._normalize_h(hx[1], input, batch_size, unbatched, "hidden[1]")
+
+        counts = (
+            None
+            if lengths is None
+            else self._ragged_steps(
+                lengths, batch_size, input.shape[1 if kernel_batch_first else 0]
+            )
+        )
+        if counts is not None:
+            if use_recurrent_kernel(input):
+                raise NotImplementedError(
+                    "LSTM(lengths=...) with rows of different lengths has no CUDA "
+                    "fp16/bf16 kernel: the fused recurrent kernels step every row "
+                    "the same number of times. Run the ragged call in fp32, or call "
+                    "once per distinct length."
+                )
+            output, h_n, c_n = self._forward_ragged(
+                input, initial_h, initial_c, counts, kernel_batch_first
+            )
+            if unbatched:
+                return output.squeeze(1), (h_n.squeeze(1), c_n.squeeze(1))
+            return output, (h_n, c_n)
 
         output = input
         kernel = use_recurrent_kernel(input)

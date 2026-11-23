@@ -62,6 +62,7 @@ from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.state import SlotStateCache
 from oasr.features import FeatureConfig, build_extractor
 from oasr.features.batched import supports_batched_fbank, supports_batched_mfcc
+from oasr.utils.capture_guard import capture_guard
 
 from .capture_recovery import recover_from_failed_capture
 
@@ -610,7 +611,10 @@ class GraphedEncoderForward(_BestEffortCapture):
             # to the active capture stream so the cute kernel's launch is
             # captured into ``graph`` (rather than escaping to the default
             # stream and tripping ``cudaErrorIllegalAddress`` on replay).
-            with tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)):
+            with (
+                capture_guard(),
+                tvm_ffi.use_torch_stream(torch.cuda.graph(graph, pool=self._pool)),
+            ):
                 output_buf = _run()
         except Exception as exc:  # noqa: BLE001 - capture is best-effort
             # Repair the allocator first: the restore below allocates.
@@ -936,7 +940,7 @@ class GraphedFeatureExtraction(_BestEffortCapture):
             torch.cuda.synchronize(device)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self._pool):
+            with capture_guard(), torch.cuda.graph(graph, pool=self._pool):
                 feats_out = _run()
         except Exception as exc:  # noqa: BLE001 - capture is best-effort
             self._capture_failed(bucket, exc)

@@ -162,3 +162,87 @@ def test_stop_ends_the_thread_and_is_idempotent():
     prep.stop()
     assert thread is not None and not thread.is_alive()
     prep.stop()
+
+
+def test_a_stopped_thread_can_be_started_again():
+    calls = []
+    prep = AdmissionPrep(lambda req: calls.append(req.request_id))
+    prep.start()
+    prep.stop()
+    prep.submit([_req("a")])
+    prep.start()
+    try:
+        _wait_done(prep, 1)
+    finally:
+        prep.stop()
+    assert calls == ["a"]
+
+
+# ---------------------------------------------------------------------------
+# The batched form: offline ``vad.mode="segment"``'s detector thread
+# ---------------------------------------------------------------------------
+
+
+def _batched(prepare, max_batch=8):
+    return AdmissionPrep.batched(prepare, max_batch=max_batch, name="test-batched")
+
+
+def test_one_submission_is_one_batch_and_a_backlog_is_cut_at_max_batch():
+    """Everything queued goes together, so a burst shares one detector call."""
+    seen = []
+    prep = _batched(
+        lambda batch: seen.append([r.request_id for r in batch]) or [None] * len(batch), 3
+    )
+    prep.submit([_req("a"), _req("b")])
+    prep.submit([_req("c"), _req("d"), _req("e")])
+    prep.start()  # started after both: the thread finds them all queued
+    try:
+        _wait_done(prep, 5)
+    finally:
+        prep.stop()
+    assert seen == [["a", "b", "c"], ["d", "e"]]
+    assert [r.request_id for r, e in prep.drain() if e is None] == ["a", "b", "c", "d", "e"]
+
+
+def test_a_batch_that_raises_fails_each_of_its_requests():
+    def prepare(batch):
+        raise RuntimeError("detector down")
+
+    prep = _batched(prepare)
+    prep.start()
+    try:
+        prep.submit([_req("a"), _req("b")])
+        _wait_done(prep, 2)
+    finally:
+        prep.stop()
+    drained = prep.drain()
+    assert [r.request_id for r, _ in drained] == ["a", "b"]
+    assert all(isinstance(e, RuntimeError) for _, e in drained)
+    assert prep.in_flight == 0
+
+
+def test_a_batch_reports_each_requests_own_failure():
+    prep = _batched(lambda batch: [None, ValueError("bad"), None][: len(batch)])
+    prep.submit([_req("a"), _req("b"), _req("c")])
+    prep.start()
+    try:
+        _wait_done(prep, 3)
+    finally:
+        prep.stop()
+    errors = {r.request_id: e for r, e in prep.drain()}
+    assert errors["a"] is None and errors["c"] is None
+    assert isinstance(errors["b"], ValueError)
+
+
+def test_a_withdrawn_request_leaves_its_batch_before_the_batch_is_prepared():
+    seen = []
+    prep = _batched(lambda batch: seen.append([r.request_id for r in batch]) or [None] * len(batch))
+    prep.submit([_req("gone"), _req("kept")])
+    prep.withdraw("gone")
+    prep.start()
+    try:
+        _wait_done(prep, 1)
+    finally:
+        prep.stop()
+    assert seen == [["kept"]]
+    assert prep.in_flight == 1

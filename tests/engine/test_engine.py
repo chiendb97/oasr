@@ -644,10 +644,18 @@ class _FakeExecutor:
     def __init__(self):
         self.admitted = []
         self.requests = []
+        #: Pretend work in flight, so admission sees a busy engine.
+        self.busy = 0
 
     def admit(self, request):
         self.admitted.append(request.request_id)
         self.requests.append(request)
+
+    def num_running(self):
+        return self.busy
+
+    def num_waiting(self):
+        return 0
 
 
 class _FakeStrategy:
@@ -769,10 +777,7 @@ def test_bulk_admission_clamps_a_negative_priority(overlap):
     ]
     results = eng.add_requests_batch_checked(specs)
     assert all("error" not in r for r in results)
-    if overlap:
-        admitted = [eng._prep._todo.get_nowait() for _ in specs]
-    else:
-        admitted = eng._executor.requests
+    admitted = _queued_requests(eng._prep) if overlap else eng._executor.requests
     assert [r.priority for r in admitted] == [0, 4]
 
 
@@ -906,18 +911,41 @@ def _fan_out_engine(*, overlap=False, window_s=1.0, spans=None, pieces=None):
         if pieces is None
         else SimpleNamespace(pieces=lambda wave: pieces)
     )
-    eng._vad_splitter = None if spans is None else SimpleNamespace(spans=lambda wave: spans)
+    eng._vad_splitter = None
+    if spans is not None:
+        from oasr.engine.admission_prep import AdmissionPrep
+
+        eng._vad_splitter = SimpleNamespace(spans_many=lambda waves: [spans for _ in waves])
+        # Not started: ``_classify`` runs its pass in the test's thread.
+        eng._vad_worker = AdmissionPrep.batched(eng._vad_prepare, max_batch=8, name="test-vad")
     eng._vad_resplit_samples = 0
-    eng._metrics = SimpleNamespace(incr=lambda *a: None)
+    eng._metrics = SimpleNamespace(incr=lambda *a: None, observe_stage=lambda *a: None)
     return eng
+
+
+def _queued_requests(prep):
+    """The requests queued for a prep thread, in order."""
+    reqs = []
+    while not prep._todo.empty():
+        reqs.extend(prep._todo.get_nowait())
+    return reqs
 
 
 def _queued(eng):
     """The ids queued for the prep thread, in order."""
-    ids = []
-    while not eng._prep._todo.empty():
-        ids.append(eng._prep._todo.get_nowait().request_id)
-    return ids
+    return [req.request_id for req in _queued_requests(eng._prep)]
+
+
+def _classify(eng):
+    """One pass of the VAD thread, run here, then the step's fan-out of what it found.
+
+    An idle engine classified at admission, so the thread may have nothing queued.
+    """
+    worker = eng._vad_worker
+    if not worker._todo.empty():
+        worker._run_batch(worker._next_batch())
+    with eng._lock:
+        return eng._drain_vad()
 
 
 @pytest.mark.parametrize("overlap", [False, True], ids=["admit", "overlap_admit"])
@@ -952,6 +980,9 @@ def test_bulk_admission_segments_at_the_vad_spans(overlap):
         [{"request_id": "file", "audio": torch.zeros(48000), "streaming": False}]
     )
     assert results == [{"request_id": "file"}]
+    # Held by the detector's thread until a step fans it out.
+    assert eng._executor.admitted == [] and eng._num_admit_inflight() == 1
+    assert _classify(eng) == []
     admitted = _queued(eng) if overlap else eng._executor.admitted
     assert admitted == [eng._longform.child_id("file", i) for i in range(2)]
 
@@ -977,9 +1008,88 @@ def test_the_fan_out_registers_where_each_window_ends(pieces, spans, expected):
     eng.add_requests_batch_checked(
         [{"request_id": "long", "audio": torch.zeros(40000), "streaming": False}]
     )
+    if spans is not None:
+        _classify(eng)
     entry = eng._longform._pending["long"]
     assert entry.window_starts_s == [s / 16000 for s, _ in expected]
     assert entry.window_ends_s == [e / 16000 for _, e in expected]
+
+
+def test_one_admission_batch_is_one_detector_call():
+    """Offline ``segment`` mode classifies a whole admission batch at once.
+
+    Regression (review F11): the detector ran once per request on the admitting
+    thread -- the server's dispatcher, under the engine lock for a batch -- at
+    batch 1, which capped the fast models at about 1,300 RTFx.
+    """
+    eng = _fan_out_engine(spans=[(0, 8000), (24000, 40000)])
+    eng._executor.busy = 1  # a busy engine: the detector's thread takes them
+    calls = []
+    eng._vad_splitter = SimpleNamespace(
+        spans_many=lambda waves: calls.append(len(waves)) or [[(0, 8000)] for _ in waves]
+    )
+    results = eng.add_requests_batch_checked(
+        [{"request_id": f"r{i}", "audio": torch.zeros(40000), "streaming": False} for i in range(3)]
+    )
+    assert [r["request_id"] for r in results] == ["r0", "r1", "r2"]
+    assert calls == [] and eng._vad_worker.in_flight == 3, "held, not yet classified"
+    _classify(eng)
+    assert calls == [3]
+    assert eng._executor.admitted == [eng._longform.child_id(f"r{i}", 0) for i in range(3)]
+    assert eng._num_admit_inflight() == 0
+
+
+def test_an_idle_engine_classifies_on_the_admitting_thread():
+    """With nothing else to step, the hand-off to the detector's thread is pure
+    latency: the dispatcher polls an engine with no work every 2 ms.  The
+    request is still held until a step fans it out, as from the thread."""
+    eng = _fan_out_engine(spans=[(0, 8000)])
+    calls = []
+    eng._vad_splitter = SimpleNamespace(
+        spans_many=lambda waves: calls.append(len(waves)) or [[(0, 8000)] for _ in waves]
+    )
+    eng.add_requests_batch_checked(
+        [{"request_id": f"r{i}", "audio": torch.zeros(40000), "streaming": False} for i in (0, 1)]
+    )
+    assert calls == [2], "classified at admission, as one call"
+    assert eng._vad_worker._todo.empty() and eng._num_admit_inflight() == 2
+    with eng._lock:
+        assert eng._drain_vad() == []
+    assert eng._executor.admitted == [eng._longform.child_id(f"r{i}", 0) for i in (0, 1)]
+    eng._executor.busy = 1  # now busy: the next one goes to the thread
+    eng.add_request(torch.zeros(40000), request_id="r2", streaming=False)
+    assert calls == [2] and eng._vad_worker.in_flight == 1
+
+
+def test_an_abort_reaches_a_request_the_detector_holds():
+    """Withdrawn from the VAD thread, so it is neither classified nor decoded."""
+    eng = _fan_out_engine(spans=[(0, 8000)])
+    eng._executor.busy = 1
+    eng.add_request(torch.zeros(40000), request_id="gone", streaming=False)
+    eng.add_request(torch.zeros(40000), request_id="kept", streaming=False)
+    assert eng._num_admit_inflight() == 2
+    eng.abort_request("gone")
+    assert eng._num_admit_inflight() == 1
+    _classify(eng)
+    assert eng._executor.admitted == [eng._longform.child_id("kept", 0)]
+
+
+def test_a_detector_failure_is_answered_with_an_error():
+    """The caller already holds the id, so the failure comes back as an output."""
+    eng = _fan_out_engine(spans=[(0, 8000)])
+
+    def broken(waves):
+        raise RuntimeError("detector down")
+
+    eng._vad_splitter = SimpleNamespace(spans_many=broken)
+    eng._executor = _PreppedExecutor()
+    eng._executor.busy = 1
+    eng.add_request(torch.zeros(40000), request_id="file", streaming=False)
+    outs = _classify(eng)
+    assert [(o.request_id, o.finish_reason, o.error_stage) for o in outs] == [
+        ("file", "error", "vad")
+    ]
+    assert eng._num_admit_inflight() == 0 and not eng._longform
 
 
 def test_a_rejected_long_request_registers_no_windows():
@@ -1041,10 +1151,10 @@ class _PreppedExecutor(_AbortingExecutor):
         self.prepared.append(request.request_id)
         self._ready.append(request)
 
-    def reject_prep(self, request, exc):
+    def reject_prep(self, request, exc, **kw):
         from oasr.engine.executor.offline import OfflineExecutor
 
-        return OfflineExecutor.reject_prep(self, request, exc)
+        return OfflineExecutor.reject_prep(self, request, exc, **kw)
 
     def _reject(self, request, reason, stage="unknown"):
         from oasr.engine.executor.offline import OfflineExecutor
@@ -1160,9 +1270,9 @@ def test_overlapped_admission_answers_a_failed_prep_with_an_error():
 
 def test_a_window_whose_prep_fails_fails_its_file():
     """A window's error output is stitched into its parent, like a forward failure."""
-    eng = _overlap_engine(lambda req: None, window_s=1.0)
-    child = eng._longform.child_id("long", 1)
-    eng._prep._prepare = _refuse({child})
+    refused = set()
+    eng = _overlap_engine(_refuse(refused), window_s=1.0)
+    refused.add(eng._longform.child_id("long", 1))
     try:
         eng.add_request(torch.zeros(40000), request_id="long", streaming=False)
         _wait_prepared(eng, 3)

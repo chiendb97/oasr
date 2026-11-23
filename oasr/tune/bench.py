@@ -57,6 +57,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from oasr.utils.capture_guard import capture_guard
+
 __all__ = [
     "BenchPolicy",
     "Arm",
@@ -355,7 +357,7 @@ def _capture(calls: Sequence[Callable[[], Any]], warmup: int) -> torch.cuda.CUDA
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with capture_guard(), torch.cuda.graph(graph):
         for c in calls:
             c()
     torch.cuda.synchronize()

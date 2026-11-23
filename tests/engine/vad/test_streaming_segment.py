@@ -377,6 +377,58 @@ class TestIncrementalAudioFeed:
         assert "a" not in st._audio and st.state("a") is None
 
 
+class TestWhereTheWaveformDetectorRuns:
+    """Ahead of the forward only when it gates; behind it otherwise (review F11).
+
+    At the top of the tick it held the host with the GPU queue empty.  Only the
+    gate needs its verdict before the forward; the events and the endpoint are
+    read after the decode, so behind the forward the detector overlaps the
+    encoder and still lands in the same tick.
+    """
+
+    @staticmethod
+    def _tick(*, gates: bool, lookahead: bool):
+        calls = []
+        req = SimpleNamespace(
+            request_id="r",
+            has_ready_encoder_chunk=lambda window: True,
+            state=None,
+            audio_final=False,
+            cache_exhausted=False,
+            has_pending_audio=True,
+        )
+        ex = StreamingExecutor.__new__(StreamingExecutor)
+        ex._vad = SimpleNamespace(
+            needs_audio=True,
+            gates_encoder=gates,
+            advance_audio=lambda running: calls.append("vad"),
+            endpointed=lambda rid: None,
+        )
+        ex._scheduler = SimpleNamespace(schedule_streaming=lambda: ([], [req]))
+        ex._metrics = SimpleNamespace(observe_stage=lambda *a: None)
+        ex._config = SimpleNamespace(decoding_window=WINDOW)
+        ex._lookahead = lookahead
+        ex._extract_features = lambda running, outputs: calls.append("extract") or running
+        ex._gate = lambda ready, outputs: ready
+        ex._limit_width = lambda ready: ready
+        ex._forward = lambda ready, outputs: calls.append("forward") or {}
+        ex._decode = lambda ready, log_probs, outputs: calls.append("decode") or True
+        ex.step()
+        return calls
+
+    @pytest.mark.parametrize("lookahead", [True, False], ids=["pipelined", "serial"])
+    def test_a_gating_detector_runs_before_the_forward(self, lookahead):
+        calls = self._tick(gates=True, lookahead=lookahead)
+        assert calls.count("vad") == 1
+        assert calls.index("vad") < calls.index("forward")
+
+    @pytest.mark.parametrize("lookahead", [True, False], ids=["pipelined", "serial"])
+    def test_any_other_runs_behind_the_forward_and_before_the_decode(self, lookahead):
+        calls = self._tick(gates=False, lookahead=lookahead)
+        assert calls.count("vad") == 1
+        assert calls.index("forward") < calls.index("vad") < calls.index("decode")
+
+
 class TestNbestRefusal:
     """The refusal itself, without a checkpoint.
 

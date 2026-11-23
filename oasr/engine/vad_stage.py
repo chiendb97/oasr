@@ -20,22 +20,28 @@ three components:
   it, which is what makes :meth:`StreamingVadStage.should_encode` a gate rather
   than a report.  ``vad.mode="segment"`` is the mode that uses the second.
 
-Waveform detectors run on **CPU by default**, in both flows.  The one that can
-pre-segment today is a few pooling ops over audio that is already on the host, so
-a device round trip buys nothing and costs a synchronisation — on the admitting
-(dispatcher, GIL-holding) thread offline, and inside the step loop streaming.
-Set ``VadConfig.device`` to move it once a detector exists that is worth the trip.
+Waveform detectors run on **CPU by default**, in both flows: the audio is on the
+host, and ``energy`` is a few pooling ops over it.  ``VadConfig.device`` moves
+one to the GPU, where it gets a high-priority stream of its own -- Silero's
+recurrence is a chain of small kernels that would otherwise queue behind the
+encoder's -- so its read-back never waits for encoder work.  Offline, the
+splitter is called once per *batch* of requests (:meth:`spans_many`), off the
+step loop unless the engine is idle (``ASREngine._submit_vad``); per request at
+batch 1 on the admitting thread it capped the fast models' throughput.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
+import threading
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from oasr.utils.capture_guard import capture_guard
 from oasr.vad import (
     SPEECH_STARTED,
     EndpointDecision,
@@ -68,6 +74,12 @@ class OfflineVadSegmenter:
         Where the detector runs.
     """
 
+    #: Padded ``(row, frame)`` slots one detector call may hold.  The recurrence
+    #: is the one step that needs that layout (a sorted batch keeps it nearly
+    #: full); 65,536 slots is ~35 minutes of Silero frames, 64 MiB of LSTM
+    #: input and output.  A single longer waveform still runs alone.
+    BATCH_SLOTS = 1 << 16
+
     def __init__(self, config: VadConfig, device: torch.device) -> None:
         self._cfg = config
         self._device = device
@@ -78,6 +90,16 @@ class OfflineVadSegmenter:
             if config.max_speech_s is None
             else max(1, int(float(config.max_speech_s) * int(config.sample_rate)))
         )
+        #: The detector's own stream on CUDA.  The offline detector runs on the
+        #: VAD admission thread, and its read-back must wait for its own kernels
+        #: only, not for the encoder work queued on the engine's stream.
+        self._stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device, priority=-3) if device.type == "cuda" else None
+        )
+        #: One detector call at a time: the admitting thread classifies when the
+        #: engine is idle and the VAD thread when it is not, and the two may
+        #: overlap for the length of one call.  The detector reuses its buffers.
+        self._call_lock = threading.Lock()
 
     @property
     def detector(self) -> SpeechDetector:
@@ -90,11 +112,48 @@ class OfflineVadSegmenter:
 
     def _probabilities(self, waveform: torch.Tensor) -> List[float]:
         """The detector's per-frame speech probability over the whole waveform."""
-        wav = waveform.reshape(1, -1).to(device=self._device, dtype=torch.float32)
-        lengths = torch.tensor([wav.size(1)], dtype=torch.int64, device=self._device)
-        probs, frame_lengths = self._detector.detect(wav, lengths)
-        rows = as_rows(probs, frame_lengths)
-        return rows[0] if rows else []
+        return self.probabilities_many([waveform])[0]
+
+    def probabilities_many(self, waveforms: Sequence[torch.Tensor]) -> List[List[float]]:
+        """Per-frame speech probabilities of every waveform, in as few calls as fit.
+
+        Shortest first, so each call's rows are of similar length and its
+        padded recurrence layout (:data:`BATCH_SLOTS`) is mostly real frames.
+        """
+        waves = [torch.as_tensor(w, dtype=torch.float32).reshape(-1) for w in waveforms]
+        out: List[List[float]] = [[] for _ in waves]
+        if not waves:
+            return out
+        frame = max(1.0, float(self._detector.seconds_per_frame) * float(self._cfg.sample_rate))
+        order = sorted(range(len(waves)), key=lambda i: int(waves[i].numel()))
+        group: List[int] = []
+        for i in order:
+            frames = int(waves[i].numel() / frame) + 1
+            if group and (len(group) + 1) * frames > self.BATCH_SLOTS:
+                self._detect_group(waves, group, out)
+                group = []
+            group.append(i)
+        self._detect_group(waves, group, out)
+        return out
+
+    def _detect_group(
+        self, waves: List[torch.Tensor], group: List[int], out: List[List[float]]
+    ) -> None:
+        if not group:
+            return
+        batch = [waves[i] for i in group]
+        with self._call_lock:
+            if self._stream is None:
+                rows = self._detector.detect_many(batch)
+            else:
+                # Possibly off the step thread, so never inside a graph capture:
+                # the step thread's captures run in global mode, where this
+                # call's allocations and read-back would fail and take the
+                # capture down with them.
+                with capture_guard(), torch.cuda.stream(self._stream):
+                    rows = self._detector.detect_many(batch)
+        for i, row in zip(group, rows):
+            out[i] = row
 
     def _segments_from(self, probs: List[float], total_samples: int) -> List[SpeechSegment]:
         if not probs:
@@ -135,11 +194,21 @@ class OfflineVadSegmenter:
         longest pause (:meth:`_cut`).  It is a pause between words
         rather than the arbitrary frame the segmenter stopped at.
         """
-        total_samples = int(waveform.numel())
+        return self.spans_many([waveform])[0]
+
+    def spans_many(
+        self, waveforms: Sequence[torch.Tensor]
+    ) -> List[Optional[List[Tuple[int, int]]]]:
+        """:meth:`spans` of every waveform, with the detector batched across them."""
+        probs = self.probabilities_many(waveforms)
+        return [self._spans_from(p, int(w.numel())) for w, p in zip(waveforms, probs)]
+
+    def _spans_from(
+        self, probs: List[float], total_samples: int
+    ) -> Optional[List[Tuple[int, int]]]:
         if total_samples <= 0:
             return None
         rate = float(self._cfg.sample_rate)
-        probs = self._probabilities(waveform)
         pairs: List[Tuple[int, int]] = []
         for segment in self._segments_from(probs, total_samples):
             start = max(0, int(round(segment.start * rate)))
@@ -320,9 +389,19 @@ class StreamingVadStage:
     ) -> None:
         self._cfg = config
         self._spf = float(seconds_per_frame)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self._device = device
         self._detector = build_detector(
             config, device=device, seconds_per_frame=seconds_per_frame, **(detector_kwargs or {})
+        )
+        #: The detector's own stream on CUDA, at high priority.  The detector
+        #: runs behind the encoder forward unless it gates, and on the engine's
+        #: stream its read-back would wait for that forward; a recurrent
+        #: detector is also a chain of small kernels, each of which would queue
+        #: behind the encoder's.  Per-stream state lives on this stream only.
+        self._stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device, priority=-3) if device.type == "cuda" else None
         )
         self._states: Dict[str, StreamVadState] = {}
         #: Audio fed but not yet classified, per stream.  Keyed independently of
@@ -415,9 +494,14 @@ class StreamingVadStage:
         endpointer = Endpointer(cfg, self.seconds_per_frame) if wants_endpoint else None
         state = StreamVadState(segmenter, endpointer)
         if self._stateful:
-            state.detector_state = self._detector.new_state(1)
+            with self._on_stream():
+                state.detector_state = self._detector.new_state(1)
         self._states[request_id] = state
         return state
+
+    def _on_stream(self) -> Any:
+        """Where the detector's device work goes: its own stream, if it has one."""
+        return contextlib.nullcontext() if self._stream is None else torch.cuda.stream(self._stream)
 
     def close(self, request_id: str) -> None:
         self._states.pop(request_id, None)
@@ -568,24 +652,33 @@ class StreamingVadStage:
             for slot, buf in enumerate(buffers):
                 batch[slot, : buf.numel()] = buf
         lengths = torch.tensor(sizes, dtype=torch.int64)
-        batch = batch.to(self._device)
-        lengths = lengths.to(self._device)
-
-        stacked = self._detector.stack_states([st.detector_state for st in states])
-        probs, frame_lengths, new_state = self._detector.detect_streaming(batch, lengths, stacked)
-        rows = as_rows(probs, frame_lengths)
-        per_stream = self._detector.unstack_states(new_state, len(states))
+        with self._on_stream():
+            batch = batch.to(self._device)
+            lengths = lengths.to(self._device)
+            stacked = self._detector.stack_states([st.detector_state for st in states])
+            probs, frame_lengths, new_state = self._detector.detect_streaming(
+                batch, lengths, stacked
+            )
+            rows = as_rows(probs, frame_lengths)
+            per_stream = self._detector.unstack_states(new_state, len(states))
 
         for index, state in enumerate(states):
             state.detector_state = per_stream[index]
             row = rows[index] if index < len(rows) else []
             consumed = len(row) * self._hop
             buf = buffers[index]
-            # ``clone``, not a view: the remainder is under one analysis window
-            # wide, but a slice of ``buf`` keeps the *whole* concatenated buffer's
-            # storage alive — which for a stream fed a complete waveform at
-            # admission is the entire utterance, held for the life of the stream.
-            state.carry = buf[consumed:].clone() if consumed else buf
+            if consumed >= buf.numel():
+                # The steady state when chunks are whole frames: nothing left.
+                state.carry = None
+            elif consumed:
+                # ``clone``, not a view: the remainder is under one analysis
+                # window wide, but a slice of ``buf`` keeps the *whole*
+                # concatenated buffer's storage alive — which for a stream fed a
+                # complete waveform at admission is the entire utterance, held
+                # for the life of the stream.
+                state.carry = buf[consumed:].clone()
+            else:
+                state.carry = buf
             if row:
                 self._consume_row(state, row)
 

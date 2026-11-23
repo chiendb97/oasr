@@ -239,17 +239,28 @@ class StreamingExecutor(Executor):
         nvtx_pop()
         self._metrics.observe_stage("streaming.vad", time.perf_counter() - t0)
 
-    def _advance_audio_vad(self, running: List[Request]) -> None:
-        """Classify newly fed audio before the encoder is asked to run.
+    @property
+    def _audio_vad_gates(self) -> bool:
+        """Whether the waveform detector has to run before this tick's forward."""
+        return self._vad is not None and self._vad.needs_audio and self._vad.gates_encoder
 
-        This is the half of the tick that makes ``vad.mode="segment"`` possible:
-        the detector is ahead of the encoder rather than behind it, so the gate
-        has a verdict for the window about to be dispatched.  Failure is
-        swallowed for the same reason the post-decode advance swallows it —
-        speech activity is metadata, and a detector that raises must not cost the
-        stream its transcript.  What it *does* cost is the gate's verdict, and an
-        absent verdict means "encode", so the stream degrades to plain streaming
-        rather than to dropped audio.
+    def _advance_audio_vad(self, running: List[Request]) -> None:
+        """Classify newly fed audio with the waveform detector.
+
+        Where in the tick depends on what reads the verdict.  The gate
+        (``vad.mode="segment"``) decides which windows the encoder sees, so
+        there the detector runs **ahead** of the forward: that is what makes the
+        gate a gate.  Otherwise only the events and the endpoint read it, and
+        both are consumed after the decode, so it runs **behind** the forward,
+        while the encoder is on the GPU -- at the top of the tick it held the
+        host with the GPU queue empty (review F11).  Same audio, same verdicts,
+        same tick either way.
+
+        Failure is swallowed for the same reason the post-decode advance
+        swallows it — speech activity is metadata, and a detector that raises
+        must not cost the stream its transcript.  What it *does* cost is the
+        gate's verdict, and an absent verdict means "encode", so the stream
+        degrades to plain streaming rather than to dropped audio.
         """
         if self._vad is None or not self._vad.needs_audio or not running:
             return
@@ -708,9 +719,11 @@ class StreamingExecutor(Executor):
             return running
         ready = self._gate([r for r in running if r.has_ready_encoder_chunk(window)], outputs)
         ready = self._limit_width(ready)
+        log_probs_map = self._forward(ready, outputs) if ready else None
+        if not self._audio_vad_gates:
+            self._advance_audio_vad(running)  # behind the forward, ahead of the decode
         if not ready:
             return running
-        log_probs_map = self._forward(ready, outputs)
         if log_probs_map is None or not self._decode(ready, log_probs_map, outputs):
             return [r for r in running if r.state is not RequestState.FINISHED]
         return running
@@ -754,6 +767,10 @@ class StreamingExecutor(Executor):
             running = [r for r in running if r.state is not RequestState.FINISHED]
 
         running = self._extract_features(running, outputs)
+        if not self._audio_vad_gates:
+            # Behind the forward like the extract, and ahead of the decode, so
+            # this tick's events still ride on this tick's outputs.
+            self._advance_audio_vad(running)
 
         if ready and log_probs_map is not None:
             alive = [r for r in ready if r.state is not RequestState.FINISHED]
@@ -784,11 +801,13 @@ class StreamingExecutor(Executor):
         if not running:
             return outputs
 
-        # Ahead of the encoder, so the gate has a verdict for the window that is
-        # about to be dispatched.  Newly admitted streams already have their
+        # Ahead of the encoder when it gates, so the gate has a verdict for the
+        # window that is about to be dispatched; otherwise the step order runs
+        # it behind the forward.  Newly admitted streams already have their
         # policy state (``_open_vad`` ran above), and a stream fed at ``admit``
         # has audio queued from before that.
-        self._advance_audio_vad(running)
+        if self._audio_vad_gates:
+            self._advance_audio_vad(running)
 
         window = self._config.decoding_window
         if self._lookahead:

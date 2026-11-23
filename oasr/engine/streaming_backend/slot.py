@@ -54,6 +54,7 @@ import torch
 
 from oasr.cache.slot_pool import StreamSlotPool
 from oasr.cache.state import SlotStateCache
+from oasr.utils.capture_guard import capture_guard
 from oasr.utils.staging import to_device
 
 from ..capture_recovery import capture_warmup_stream, recover_from_failed_capture
@@ -377,7 +378,7 @@ class SlotStreamingBackend(StreamingEncoderBackend):
             torch.cuda.current_stream().wait_stream(side)
             torch.cuda.synchronize(device)
             ctx = torch.cuda.graph(c.graph, pool=self._pool)  # type: ignore[arg-type]
-            with tvm_ffi.use_torch_stream(ctx):
+            with capture_guard(), tvm_ffi.use_torch_stream(ctx):
                 c.out = self._run(c.xs, c.lens, c.slots)
             torch.cuda.synchronize(device)
         except torch.cuda.OutOfMemoryError:

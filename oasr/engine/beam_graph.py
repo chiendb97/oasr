@@ -52,6 +52,8 @@ from typing import Any, Dict, Optional, Set, Tuple
 import torch
 import tvm_ffi
 
+from oasr.utils.capture_guard import capture_guard
+
 from .capture_recovery import capture_warmup_stream, recover_from_failed_capture
 from .decode.transducer_beam import beam_search_step, step_constants
 from .greedy_graph import _MIN_T_CAP, _t_capacity
@@ -278,7 +280,7 @@ class BeamLoopGraphCache:
             torch.cuda.current_stream().wait_stream(side)
             torch.cuda.synchronize()
             ctx = torch.cuda.graph(c.graph, pool=self._pool)  # type: ignore[arg-type]
-            with tvm_ffi.use_torch_stream(ctx):
+            with capture_guard(), tvm_ffi.use_torch_stream(ctx):
                 self._body(c)
             torch.cuda.synchronize()
         except torch.cuda.OutOfMemoryError:

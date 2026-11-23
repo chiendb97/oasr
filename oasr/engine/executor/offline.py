@@ -292,14 +292,17 @@ class OfflineExecutor(Executor):
             outputs.extend(self.run(batch))
         return outputs
 
-    def reject_prep(self, request: Request, exc: BaseException) -> RequestOutput:
-        """Terminal output for a request whose ``overlap_admit`` prep raised.
+    def reject_prep(
+        self, request: Request, exc: BaseException, *, stage: str = "offline_prep"
+    ) -> RequestOutput:
+        """Terminal output for a request whose admission-thread prep raised.
 
-        Without ``overlap_admit`` the same exception reaches the admitting
-        caller.  With it, the caller already holds the id, so this output is the
-        only way to tell them.
+        ``overlap_admit``'s prep (``stage="offline_prep"``) or the offline
+        detector of ``vad.mode="segment"`` (``"vad"``).  Done on the admitting
+        thread, the same exception would reach the caller; on a prep thread the
+        caller already holds the id, so this output is the only way to tell them.
         """
-        return self._reject(request, f"{type(exc).__name__}: {exc}", stage="offline_prep")
+        return self._reject(request, f"{type(exc).__name__}: {exc}", stage=stage)
 
     def _reject(self, request: Request, reason: str, stage: str = "unknown") -> RequestOutput:
         """Terminal output for a request the executor could not run.
