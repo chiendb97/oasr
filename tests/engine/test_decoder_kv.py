@@ -564,3 +564,182 @@ class TestFp8Storage:
                 dtype=torch.float32,
             )
             mgr_fp.get_kv_scale_view(0)
+
+
+# ---------------------------------------------------------------------------
+# Expected-length admission: scratch lead pages, overcommit, swapping rows out
+# ---------------------------------------------------------------------------
+
+_CPU = torch.device("cpu")
+
+
+def _scratch_mgr(blocks=16, block_tokens=4, *, overcommit=False, dtype=torch.float32, dim=8):
+    pool = DecoderKVCacheManager.build_pool(
+        num_layers=2,
+        n_kv_head=2,
+        head_dim=dim,
+        block_tokens=block_tokens,
+        max_num_blocks=blocks,
+        device=_CPU,
+        dtype=dtype,
+        scratch_blocks=1,
+    )
+    return DecoderKVCacheManager(pool, overcommit=overcommit)
+
+
+def _left_padded(mgr, starts, prefill_len, capacity, *, lead=True):
+    return PagedDecoderKv.create(
+        mgr,
+        len(starts),
+        _CPU,
+        prefill_len=prefill_len,
+        capacity=capacity,
+        starts=torch.tensor(starts, dtype=torch.int32),
+        starts_host=list(starts) if lead else None,
+    )
+
+
+def _fill(kv, lengths, dim, seed=0):
+    """One prefill of ``lengths[0]`` positions, then a step per later entry, random K/V."""
+    g = torch.Generator().manual_seed(seed)
+    for t_new in lengths:
+        data = torch.randn(kv.batch, 2, t_new, dim, generator=g) * 3
+        kv.mask_kwargs(t_new)
+        for layer in range(kv.num_layers):
+            kv.append(layer, data, data + 1)
+        kv.commit(t_new)
+
+
+def _row_bytes(mgr, kv, row):
+    """Every pool byte of row ``row``'s valid window, read through its block table.
+
+    Raw bytes of K, V and (fp8) their scales, for every layer, position by
+    position from ``starts`` to ``lens``: equal only if each position reads back
+    exactly what was written, wherever its page now is.
+    """
+    table = kv.block_table()
+    start = 0 if kv.starts is None else int(kv.starts[row])
+    out = []
+    for t in range(start, kv.lens_host[row]):
+        parts = mgr.pool.read_blocks([int(table[row, t // mgr.block_tokens])])
+        out.append(torch.cat([p[:, 0, t % mgr.block_tokens].reshape(-1) for p in parts]))
+    return torch.stack(out)
+
+
+class TestScratchLead:
+    """A left-padded row maps its whole pages of padding to the scratch page.
+
+    Every row of a prefill is as long as the batch's longest prompt; without
+    this a 2 s clip batched with a 30 s one held the 30 s footprint.
+    """
+
+    def test_a_short_row_holds_its_own_prompt_not_the_longest(self):
+        mgr = _scratch_mgr(blocks=16)
+        kv = _left_padded(mgr, [0, 8], prefill_len=10, capacity=14)
+        assert kv.held_pages(0) == 3 and kv.held_pages(1) == 1
+        assert mgr.num_blocks(kv.slots[1]) == 3, "the table still spans the padded prompt"
+        assert mgr.pool.num_free_blocks == 16 - 4
+
+    def test_the_valid_window_reads_back_as_without_lead_pages(self):
+        starts = [1, 6]
+        ref_mgr, mgr = _scratch_mgr(), _scratch_mgr()
+        ref = _left_padded(ref_mgr, starts, prefill_len=10, capacity=16, lead=False)
+        kv = _left_padded(mgr, starts, prefill_len=10, capacity=16)
+        assert kv.held_pages(1) < ref.held_pages(1)
+        for state in (ref, kv):
+            _fill(state, [10, 1, 1, 1], dim=8)
+        for row in range(2):
+            assert torch.equal(_row_bytes(mgr, kv, row), _row_bytes(ref_mgr, ref, row))
+
+    def test_freeing_returns_only_its_own_pages(self):
+        mgr = _scratch_mgr(blocks=8)
+        kv = _left_padded(mgr, [9], prefill_len=12, capacity=12)
+        assert mgr.pool.num_free_blocks == 7, "three table pages, two of them the scratch page"
+        kv.free()
+        assert mgr.pool.num_free_blocks == 8
+
+    def test_without_a_scratch_page_a_row_holds_its_padding(self, mgr):
+        kv = _left_padded(mgr, [9], prefill_len=12, capacity=12)
+        assert kv.held_pages(0) == 3
+
+    def test_a_lead_must_leave_the_row_a_page_of_its_own(self):
+        mgr = _scratch_mgr()
+        with pytest.raises(ValueError, match="page of its own"):
+            mgr.create("x", max_new_tokens=4, prefill_len=8, lead=2)
+
+
+class TestOvercommit:
+    """An overcommitting pool admits a row when its prompt's pages are free."""
+
+    def test_the_prompt_not_the_ceiling_is_what_admission_checks(self):
+        ceiling, overcommit = _scratch_mgr(blocks=4), _scratch_mgr(blocks=4, overcommit=True)
+        # One row whose ceiling is all 4 pages (kept alive: a dropped state frees them).
+        held = [
+            PagedDecoderKv.create(m, 1, _CPU, prefill_len=1, capacity=16)
+            for m in (ceiling, overcommit)
+        ]
+        assert not ceiling.can_admit(max_new_tokens=12, prefill_len=4)
+        assert overcommit.can_admit(max_new_tokens=12, prefill_len=4)
+        assert not overcommit.can_admit(max_new_tokens=0, prefill_len=16), "4 pages, 3 free"
+        assert len(held) == 2
+
+    def test_a_refused_prompt_takes_nothing(self):
+        mgr = _scratch_mgr(blocks=4, overcommit=True)
+        held = PagedDecoderKv.create(mgr, 1, _CPU, prefill_len=8, capacity=8)
+        with pytest.raises(Exception, match="the prompts need more"):
+            PagedDecoderKv.create(mgr, 2, _CPU, prefill_len=5, capacity=8)  # 2 + 2 of 2 free
+        assert mgr.pool.num_free_blocks == 2 and mgr.num_active() == 1
+        assert held.batch == 1
+
+    def test_growth_past_the_pool_raises_instead_of_corrupting(self):
+        mgr = _scratch_mgr(blocks=2, overcommit=True)
+        kv = PagedDecoderKv.create(mgr, 1, _CPU, prefill_len=4, capacity=64)
+        _fill(kv, [4, 1, 1, 1, 1], dim=8)
+        with pytest.raises(RuntimeError, match="exhausted"):
+            _fill(kv, [1] * 4, dim=8)
+
+
+class TestSwapping:
+    """A row copied out of the pool and back reads exactly what it wrote."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn], ids=["fp32", "fp8"])
+    def test_a_row_swapped_out_and_back_reads_the_same(self, dtype):
+        mgr = _scratch_mgr(blocks=16, dtype=dtype, dim=16)
+        kv = _left_padded(mgr, [0, 5], prefill_len=9, capacity=20)
+        _fill(kv, [9, 1, 1], dim=16)
+        want = _row_bytes(mgr, kv, 1)
+        swapped = kv.export_row(1)
+        assert swapped.lens == 11 and swapped.start == 5 and swapped.slot.lead == 1
+        kept = kv.select(torch.tensor([0]))
+        free = mgr.pool.num_free_blocks
+        back = PagedDecoderKv.restore(mgr, [swapped], _CPU)
+        assert mgr.pool.num_free_blocks == free - swapped.pages
+        assert back.lens_host == [11] and back.starts.tolist() == [5]
+        assert torch.equal(_row_bytes(mgr, back, 0), want)
+        # It goes on generating beside the row that stayed.
+        merged = kept.merge(back)
+        _fill(merged, [1], dim=16, seed=3)
+        assert merged.lens_host == [12, 12]
+
+    def test_a_restore_the_pool_cannot_hold_takes_nothing(self):
+        mgr = _scratch_mgr(blocks=4)
+        kv = PagedDecoderKv.create(mgr, 1, _CPU, prefill_len=8, capacity=8)
+        _fill(kv, [8], dim=8)
+        swapped = kv.export_row(0)
+        kv.free()
+        hog = PagedDecoderKv.create(mgr, 1, _CPU, prefill_len=12, capacity=12)
+        with pytest.raises(RuntimeError, match="exhausted"):
+            PagedDecoderKv.restore(mgr, [swapped], _CPU)
+        assert mgr.pool.num_free_blocks == 1 and mgr.num_active() == 1
+        assert hog.batch == 1
+
+    def test_the_lead_survives_the_round_trip(self):
+        mgr = _scratch_mgr(blocks=8)
+        kv = _left_padded(mgr, [9], prefill_len=12, capacity=12)
+        _fill(kv, [12], dim=8)
+        swapped = kv.export_row(0)
+        kv.free()
+        back = PagedDecoderKv.restore(mgr, [swapped], _CPU)
+        scratch = mgr.pool.scratch_block_ids[0]
+        assert back.block_table()[0, :2].tolist() == [scratch, scratch]
+        assert back.held_pages(0) == 1 and mgr.pool.num_free_blocks == 7

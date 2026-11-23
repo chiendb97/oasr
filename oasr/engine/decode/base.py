@@ -655,6 +655,16 @@ class DecodeStrategy(ABC):
         """
         return None
 
+    def kv_admissible_rows(self) -> Optional[int]:
+        """New rows the strategy's own decoder-KV accounting can take now, or ``None``.
+
+        ``None`` (the default) leaves admission to the executor's byte budget,
+        which charges every row :meth:`kv_bytes_per_row`.  A strategy that
+        admits rows by their *expected* footprint and makes room when they
+        outgrow it answers here instead (the AR families' ``kv_admission``).
+        """
+        return None
+
     # -- streaming session lifecycle --------------------------------------
     def create_session(self, request: Request) -> None:
         """Allocate per-request decode state on admission.  Default: no-op."""

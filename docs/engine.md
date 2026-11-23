@@ -364,7 +364,7 @@ Only read by `incremental` decode families — see [decoding.md](decoding.md).
 | `max_tick_ms` | 25 | Wall-clock cap per tick. **This is the knob that bounds latency**, not the step count. `0` disables. |
 | `max_decode_slots` | `max_batch_size` | In-flight AR requests before admission pauses. |
 | `decode_admit_window_ms` | 0 | Coalesce near-simultaneous arrivals into one decode group. Costs up to one window of first-token latency for an isolated request, so it is off by default. |
-| `decode_kv_budget_gib` | derived | Byte ceiling for AR decoder KV. `0` disables the budget; `None` derives it — see [§6.1](#61-vram-aware-capacity-sizing). Admission waits while the budget affords no further row and a row is in flight to free one; with nothing in flight it admits one regardless. |
+| `decode_kv_budget_gib` | derived | Byte ceiling for AR decoder KV. `0` disables the budget; `None` derives it — see [§6.1](#61-vram-aware-capacity-sizing). Admission waits while the budget affords no further row and a row is in flight to free one; with nothing in flight it admits one regardless. With paged KV and the AR families' default `kv_admission="expected"`, rows in flight are counted by their expected footprint instead of their ceiling ([decoding.md](decoding.md#admission-by-expected-length)), and the budget caps one prefill at the rows it affords at their ceilings. |
 
 ### Streaming chunking
 

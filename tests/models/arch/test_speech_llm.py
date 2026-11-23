@@ -1318,3 +1318,135 @@ class TestDecoderCacheIsKernelSafe:
             outs.append(torch.stack(toks))
         for i, o in enumerate(outs[1:], 1):
             assert torch.equal(o, outs[0]), f"run {i} disagrees with run 0"
+
+
+# ---------------------------------------------------------------------------
+# Expected-length admission (kv_admission='expected') on the real LM
+# ---------------------------------------------------------------------------
+
+
+class TestLeftPaddingOnTheScratchPage:
+    """A row's whole pages of left padding map to the pool's scratch page.
+
+    Every row of a prefill is as long as its batch's longest prompt, so a short
+    clip batched with a 30 s one held the long footprint.  The padding is never
+    read unmasked, so moving it changes no logit -- on the CUDA kernels, eager
+    and replayed, which load the scratch page for the masked tiles.
+    """
+
+    @pytest.mark.cuda
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.parametrize("graphs", [False, True], ids=["eager", "graphs"])
+    def test_no_logit_changes(self, graphs):
+        from oasr.cache.decoder_kv import DecoderKVCacheManager
+        from oasr.engine.decoder_graph import DecoderStepGraphCache
+
+        lm = TestStepGraphs._lm()
+        cfg = lm._cfg
+        B, P, steps = 3, 70, 20
+        torch.manual_seed(7)
+        ids = torch.randint(0, 128, (B, P), device="cuda")
+        valid = torch.ones(B, P, dtype=torch.bool, device="cuda")
+        valid[1, :37] = False  # two whole pages of padding, and five positions
+        valid[2, :64] = False  # four whole pages
+        lens = valid.sum(1).tolist()
+        feed = torch.randint(0, 128, (B, steps), device="cuda")
+
+        def run(lead):
+            mgr = DecoderKVCacheManager(
+                DecoderKVCacheManager.build_pool(
+                    num_layers=cfg.text_num_hidden_layers,
+                    n_kv_head=cfg.text_num_key_value_heads,
+                    head_dim=cfg.text_head_dim,
+                    block_tokens=16,
+                    max_num_blocks=64,
+                    device=torch.device("cuda"),
+                    dtype=torch.float16,
+                    scratch_blocks=1,
+                )
+            )
+            cache = DecoderStepGraphCache(lm, mgr, width_pages=1) if graphs else None
+            with torch.no_grad():
+                logits, state = lm.prefill(
+                    lm.embed_tokens(ids),
+                    valid,
+                    capacity=P + steps + 1,
+                    kv_manager=mgr,
+                    valid_lens=lens if lead else None,
+                )
+                held = [state["kv"].held_pages(b) for b in range(B)]
+                out = [logits.float().cpu()]
+                for t in range(steps):
+                    if cache is None:
+                        logits, state = lm.step(feed[:, t], state)
+                    else:
+                        logits = cache.step(feed[:, t], state["kv"])
+                        assert logits is not None, "step was not captured"
+                        state["kv"].commit(1)
+                    out.append(logits.float().cpu())
+            state["kv"].free()
+            return torch.stack(out), held
+
+        padded, held_padded = run(lead=False)
+        scratch, held_scratch = run(lead=True)
+        assert torch.equal(padded, scratch)
+        assert held_padded == [5, 5, 5]
+        assert held_scratch == [5, 3, 1]
+
+
+@needs_tiny
+class TestSwappedRowsOnTheLm:
+    """A row swapped out of the pool resumes with the K/V it left with.
+
+    The real tiny LM on the paged fp32 path, three rows of very different
+    prompt lengths, one swapped out mid-generation and back.
+    """
+
+    def _strategy(self):
+        from oasr.engine.config import EngineConfig
+        from oasr.engine.decode import Detokenizer, build_decode_strategy
+        from oasr.models.loaders import load_pretrained
+        from oasr.tokenizers import build_tokenizer
+
+        loaded = load_pretrained(SPEECH_LLM_TINY, device="cpu", dtype=torch.float32)
+        cfg = EngineConfig(
+            ckpt_dir=SPEECH_LLM_TINY,
+            service_mode="offline",
+            max_new_tokens=24,
+            decode_options={"kv_storage": "paged", "step_graphs": False},
+        )
+        detok = Detokenizer(tokenizer=build_tokenizer(loaded.tokenizer_spec))
+        return build_decode_strategy("llm", cfg, detok, loaded.model), loaded.model
+
+    def _decode(self, swap_at):
+        from oasr.engine.generation import StepBudget
+        from oasr.engine.request import Request
+
+        strategy, model = self._strategy()
+        torch.manual_seed(11)
+        mel = torch.tensor([3000, 1500, 400])
+        with torch.no_grad():
+            enc, lens = model.encode_offline(torch.randn(3, 3000, 128), mel)
+        reqs = [Request(audio=None, request_id=f"r{i}", streaming=False) for i in range(3)]
+        strategy.begin_offline(reqs, enc, lens)
+        kv = strategy._groups[0].state["kv"]
+        held = [kv.held_pages(b) for b in range(3)]
+        finals, tick = {}, 0
+        while strategy.has_pending():
+            if tick == swap_at:
+                assert strategy._preempt_youngest([])
+                assert [p.request.request_id for p in strategy._preempted] == ["r2"]
+            for out in strategy.advance(StepBudget(max_steps=2)):
+                if out.finished:
+                    finals[out.request_id] = out.tokens[0]
+            tick += 1
+        pool = strategy.kv_manager().pool
+        assert pool.num_free_blocks == pool.num_blocks
+        return finals, held, strategy.preemptions
+
+    def test_a_swapped_row_decodes_the_same_tokens(self):
+        want, held, _ = self._decode(swap_at=None)
+        got, _, swaps = self._decode(swap_at=3)
+        assert swaps == 1
+        assert held[0] > held[1] > held[2], "each row holds its own prompt, not the longest"
+        assert got == want

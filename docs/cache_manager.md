@@ -445,10 +445,16 @@ The **decoder** K/V of the autoregressive families is the second growing kind, o
 its own pool with its own policy: it grows one token per step and never evicts,
 so `DecoderKVCacheManager` allocates a page as a row crosses a boundary and frees
 the whole row when the request finishes. Two consequences follow from having no
-eviction. Admission must reserve each row's declared ceiling
-(`can_admit`) — a pool that can run out mid-generation fails a request that is
-already half-answered, where refusing at admission is one rejected batch with a
-reason. And a row's pages are its own, so the repeated-index `select` that
+eviction. Growth must never find the pool empty — a pool that runs out
+mid-generation fails a request that is already half-answered. Either admission
+reserves each row's declared ceiling (`can_admit`, `kv_admission="ceiling"`), or
+an `overcommit` manager admits a row when its prompt's pages are free and the
+strategy, which budgets rows by their expected length, swaps the most recently
+admitted row's pages to host memory before any launch that would run the pool
+out (`export_slot` / `import_slot`; see
+[decoding.md](decoding.md#admission-by-expected-length)). A left-padded row maps
+its whole pages of padding to the pool's scratch page (`create(lead=...)`), so it
+holds its own prompt, not its batch's longest. And a row's pages are its own, so the repeated-index `select` that
 expands a beam grid would alias two slots onto one page;
 `PagedDecoderKv.select` refuses, and beam search runs on dense per-group buffers
 instead. This pool is what `kv_storage="auto"` (the default) selects for a

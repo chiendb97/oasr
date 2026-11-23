@@ -21,15 +21,28 @@ extra encoder/prefill pass, at the cost of first-token latency.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 from abc import abstractmethod
+from collections import deque
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 
-from oasr.cache import DecoderKvExhausted, PagedDecoderKv
+from oasr.cache import DecoderKvExhausted, PagedDecoderKv, SwappedRow
 from oasr.models.base import first_compute_parameter
 from oasr.utils.staging import to_device
 
@@ -71,6 +84,13 @@ _TIMED_STEPS = 8
 #: Whisper tiny 0.43-0.62, Whisper large-v3 0.03-0.14, Qwen2-Audio-7B 0.02.
 _HOST_TO_STEP = 0.25
 
+#: Finished rows whose footprint the expected-length admission averages over.
+_FOOTPRINT_WINDOW = 256
+
+#: Finished rows needed before their mean replaces the ceiling as the expected
+#: footprint of a row; until then admission reserves each row's ceiling.
+_FOOTPRINT_MIN_ROWS = 8
+
 
 def _rows_bucket(rows: int) -> int:
     """Power-of-two bucket of a batch width: a step's GPU time grows with it."""
@@ -83,6 +103,16 @@ def _rows_bucket(rows: int) -> int:
 def _identity_filter(logits: torch.Tensor, fresh: Optional[torch.Tensor]) -> torch.Tensor:
     del fresh
     return logits
+
+
+def _paged_parts(state: Any) -> Optional[Dict[str, PagedDecoderKv]]:
+    """``state`` when every part of it is paged -- a row of it can be swapped out
+    and restored byte for byte -- else ``None``."""
+    if not isinstance(state, dict) or not state:
+        return None
+    if all(isinstance(part, PagedDecoderKv) for part in state.values()):
+        return state
+    return None
 
 
 def _held_bytes(obj: Any, seen: Optional[set] = None, depth: int = 0) -> int:
@@ -158,6 +188,9 @@ class ArGroup:
     #: ``(rows, started, ended, host seconds)`` of the last single step, timed
     #: toward the loop verdict for its width; read once the step has finished.
     timed_step: Optional[Tuple[int, Any, Any, float]] = None
+    #: Per-row admission order: when the pool runs short, the highest is
+    #: swapped out first, so the oldest rows always make progress.
+    seq: List[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.tokens:
@@ -168,6 +201,8 @@ class ArGroup:
             self.align_enc = [None] * len(self.requests)
         if not self.no_speech:
             self.no_speech = [None] * len(self.requests)
+        if not self.seq:
+            self.seq = [0] * len(self.requests)
 
     def fresh_rows(self) -> List[int]:
         """Rows that have not generated a token yet.
@@ -190,6 +225,7 @@ class ArGroup:
         self.detok_state = [self.detok_state[r] for r in keep]
         self.align_enc = [self.align_enc[r] for r in keep]
         self.no_speech = [self.no_speech[r] for r in keep]
+        self.seq = [self.seq[r] for r in keep]
 
     def extend(self, other: "ArGroup", state: Dict[str, Any], logits: torch.Tensor) -> None:
         """Absorb ``other``'s rows, given the already-joined decoder state.
@@ -205,6 +241,7 @@ class ArGroup:
         self.detok_state = self.detok_state + other.detok_state
         self.align_enc = self.align_enc + other.align_enc
         self.no_speech = self.no_speech + other.no_speech
+        self.seq = self.seq + other.seq
         self.state = state
         self.last_logits = logits
 
@@ -219,6 +256,32 @@ class _LoopRead:
     tokens: torch.Tensor
     landed: Optional["torch.cuda.Event"]
     steps: int
+
+
+@dataclass(eq=False)
+class _Preempted:
+    """A row swapped out of the decoder-KV pool, everything it needs to go on.
+
+    Its K/V are on the host (one :class:`~oasr.cache.SwappedRow` per paged part
+    of the state) and its pending logits on the device; the host lists are the
+    row's own entries from its group, moved here unchanged.
+    """
+
+    request: Request
+    seq: int
+    parts: Dict[str, "SwappedRow"]
+    #: ``(1, V)``: what the row's next token is chosen from.
+    logits: torch.Tensor
+    tokens: List[int]
+    max_new: int
+    opts: Optional[DecodingOptions]
+    detok_state: Dict[str, Any]
+    align_enc: Optional[torch.Tensor]
+    no_speech: Optional[float]
+
+    @property
+    def pages(self) -> int:
+        return sum(part.pages for part in self.parts.values())
 
 
 @dataclass
@@ -291,12 +354,12 @@ class ArOptions:
             "graphs become expressible (they need addresses that outlive a "
             "batch).  'auto' (default) pages exactly where that last point pays "
             "for the block-table indirection: a decoder that declares "
-            "supports_step_graphs, with step_graphs on.  Paged alone costs a few "
-            "percent for the block-table indirection and buys no extra admission "
-            "capacity (each row's ceiling is reserved either way), so 'auto' does "
-            "not choose it for a family that cannot capture — even though it does "
-            "flatten the peak, since a dense select index_selects the whole "
-            "capacity buffer.  Beam search is dense regardless: "
+            "supports_step_graphs, with step_graphs on.  Paged storage is also "
+            "what kv_admission='expected' needs, since only a row of a pool can "
+            "be swapped out and back; dense storage reserves each row's ceiling.  "
+            "Paged alone costs a few percent for the block-table indirection, so "
+            "'auto' does not choose it for a family that cannot capture.  Beam "
+            "search is dense regardless: "
             "a paged row's pages are its own, and expanding a beam grid would "
             "alias two slots onto one."
         ),
@@ -304,6 +367,21 @@ class ArOptions:
     kv_block_tokens: int = option(
         16,
         doc="Tokens per page in the paged decoder-KV pool.  Inert when kv_storage='dense'.",
+    )
+    kv_admission: str = option(
+        "expected",
+        doc=(
+            "How rows are admitted against the paged decoder-KV pool.  'ceiling' "
+            "reserves every row's prompt + max_new_tokens up front, so growth can "
+            "never fail; a transcript is a few dozen tokens against a cap of "
+            "hundreds, so most of the pool is reserved and never written "
+            "(Qwen2-Audio-7B held ~10 rows of max_batch_size 32).  'expected' "
+            "(default) admits rows by the footprint finished rows actually "
+            "reached, and when the rows in flight outgrow the guess, swaps the "
+            "most recently admitted ones to host memory until the rest fit, "
+            "resuming each byte for byte once there is room again.  Inert for "
+            "dense storage and beam search, which keep 'ceiling'."
+        ),
     )
     step_graphs: bool = option(
         True,
@@ -381,6 +459,10 @@ class ArOptions:
             )
         if self.kv_block_tokens < 1:
             raise ValueError(f"kv_block_tokens must be >= 1, got {self.kv_block_tokens!r}")
+        if self.kv_admission not in ("expected", "ceiling"):
+            raise ValueError(
+                f"kv_admission must be 'expected' or 'ceiling', got {self.kv_admission!r}"
+            )
         if self.step_graph_width_pages < 1:
             raise ValueError(
                 f"step_graph_width_pages must be >= 1, got {self.step_graph_width_pages!r}"
@@ -439,6 +521,16 @@ class IncrementalArStrategy(DecodeStrategy):
         #: and once decided, whether looping pays (see :meth:`_loop_pays`).
         self._step_ratios: Dict[int, List[float]] = {}
         self._loop_verdict: Dict[int, bool] = {}
+        #: Expected-length admission (``kv_admission='expected'``): rows swapped
+        #: out of the pool, waiting for room; the admission order rows are
+        #: preempted in reverse of; and what recent rows finished at -- pool
+        #: pages held, tokens generated -- which is the expectation.
+        self._preempted: List[_Preempted] = []
+        self._admitted = itertools.count()
+        self._finished_pages: Deque[int] = deque(maxlen=_FOOTPRINT_WINDOW)
+        self._finished_tokens: Deque[int] = deque(maxlen=_FOOTPRINT_WINDOW)
+        #: Rows swapped out so far (and resumed), for logs and tests.
+        self.preemptions = 0
 
     # ------------------------------------------------------------------
     # Hooks
@@ -603,10 +695,10 @@ class IncrementalArStrategy(DecodeStrategy):
     def _resolve_storage(self, decoder: Any) -> str:
         """``kv_storage``, with ``'auto'`` answered for this decoder.
 
-        Paging is not free — the block-table indirection costs a few percent —
-        and on its own it buys no capacity while admission reserves each row's
-        ceiling.  What it buys is *step graphs*, which need addresses that
-        outlive a batch.  So ``auto`` pages exactly where that trade closes: a
+        Paging is not free — the block-table indirection costs a few percent.
+        What it buys is *step graphs*, which need addresses that outlive a
+        batch, and expected-length admission, which swaps rows of a pool out
+        and back.  So ``auto`` pages exactly where the first trade closes: a
         decoder that will capture its steps — an AED included, because paged
         storage pages its cross-attention K/V too.  A family that cannot
         capture keeps the dense buffer it was already paying nothing for.
@@ -722,11 +814,14 @@ class IncrementalArStrategy(DecodeStrategy):
             max_batch_size=rows,
             device=param.device,
             dtype=pool_dtype,
+            # Where a row's whole pages of left padding point (``starts_host``).
+            scratch_blocks=1,
         )
+        overcommit = self._expected_admission()
         gib = (per_token * blocks * block_tokens) / float(1024**3)
         logger.info(
             "decoder-KV pool: %d blocks x %d tokens (%.2f GiB, %s) for up to %d rows "
-            "of %d positions%s",
+            "of %d positions%s; rows admitted by their %s length",
             blocks,
             block_tokens,
             gib,
@@ -734,8 +829,15 @@ class IncrementalArStrategy(DecodeStrategy):
             rows,
             self._position_budget(),
             f" + a {cross_len}-frame cross-attention window" if cross_len else "",
+            "expected" if overcommit else "maximum",
         )
-        return DecoderKVCacheManager(pool)
+        return DecoderKVCacheManager(pool, overcommit=overcommit)
+
+    def _expected_admission(self) -> bool:
+        """``kv_admission='expected'``, where it applies: greedy rows (paged storage)."""
+        return str(getattr(self.options, "kv_admission", "ceiling")) == "expected" and (
+            self._beam == 1
+        )
 
     # ------------------------------------------------------------------
     # Decoder-step CUDA graphs
@@ -1022,6 +1124,254 @@ class IncrementalArStrategy(DecodeStrategy):
         return 8
 
     # ------------------------------------------------------------------
+    # Expected-length admission and preemption (kv_admission='expected')
+    # ------------------------------------------------------------------
+
+    def _overcommits(self) -> bool:
+        """Whether rows are admitted by expected length: the pool overcommits."""
+        if self._kv_manager is _UNSET and not self._expected_admission():
+            return False
+        manager = self.kv_manager()
+        return manager is not None and bool(manager.overcommit)
+
+    def _pool_manager(self) -> "DecoderKVCacheManager":
+        """The paged pool's manager, where :meth:`_overcommits` said there is one."""
+        manager = self.kv_manager()
+        if manager is None:  # pragma: no cover - callers ask _overcommits() first
+            raise RuntimeError(f"{self.decode_type}: the decoder KV is not paged")
+        return manager
+
+    def kv_admissible_rows(self) -> Optional[int]:
+        """New rows the decoder-KV pool can take now, counted by expected footprint.
+
+        ``None`` unless rows are admitted by expected length; the executor then
+        charges every row its ceiling (:meth:`kv_bytes_per_row`), as it always
+        has.  Here each live row is charged the pages it holds, what it is still
+        expected to grow (the mean tokens finished rows generated, less what it
+        has), and a page for its next launch; each new row the mean pages
+        finished rows held at their end, and one more.  Until
+        :data:`_FOOTPRINT_MIN_ROWS` rows have finished, the expectation is the
+        ceiling.
+
+        Nothing is admitted while a swapped-out row waits: it was admitted
+        first, and a new row would take the pages it is waiting for.
+        """
+        if not self._overcommits():
+            return None
+        if self._preempted:
+            return 0
+        pool = self._pool_manager().pool
+        spare = pool.num_blocks - self._committed_pages()
+        return max(0, spare // (self._expected_row_pages() + 1))
+
+    def _expected_new_tokens(self) -> Optional[int]:
+        """Mean tokens a finished row generated, or ``None`` before there are enough."""
+        if len(self._finished_tokens) < _FOOTPRINT_MIN_ROWS:
+            return None
+        return -(-sum(self._finished_tokens) // len(self._finished_tokens))
+
+    def _expected_row_pages(self) -> int:
+        """Pool pages a new row is expected to hold at its end."""
+        if len(self._finished_pages) < _FOOTPRINT_MIN_ROWS:
+            spec = getattr(self._model, "decoder_cache_spec", None)
+            return int(self._pages_per_row(spec)) if spec is not None else 1
+        return max(1, -(-sum(self._finished_pages) // len(self._finished_pages)))
+
+    def _remaining_tokens(self, generated: int, cap: int) -> int:
+        """Tokens a row ``generated`` tokens in is still expected to generate."""
+        expected = self._expected_new_tokens()
+        target = cap if expected is None else min(expected, cap)
+        return max(0, target - generated)
+
+    def _committed_pages(self) -> int:
+        """Pages the rows in flight hold, are expected to grow into, and need next."""
+        total = 0
+        for group in self._groups:
+            parts = _paged_parts(group.state)
+            if parts is None or isinstance(group, ArBeamGroup):
+                continue
+            kv = parts.get("kv")
+            for row in range(len(group.requests)):
+                total += 1 + sum(part.held_pages(row) for part in parts.values())
+                if kv is not None:
+                    rest = self._remaining_tokens(len(group.tokens[row]), group.max_new[row])
+                    total += kv.growth_pages(row, rest)
+        return total
+
+    def _make_room(self, group: ArGroup, steps: int, outputs: List[RequestOutput]) -> bool:
+        """Swap rows out until ``group``'s next launch has the pages it will map.
+
+        Returns whether ``group`` still has rows to launch.  The most recently
+        admitted row anywhere goes first, this group's own included, so the
+        oldest rows always make progress.  A no-op unless rows are admitted by
+        expected length.
+
+        The last row in flight is never swapped out: alone, it would only come
+        back to the same pool and swap itself out again.  It cannot outgrow a
+        pool the budget sized to hold at least one row at its ceiling; if it
+        does anyway, this raises :class:`DecoderKvExhausted` and the caller
+        fails its group (``decode_oom``).
+        """
+        if isinstance(group, ArBeamGroup) or not self._overcommits():
+            return bool(group.requests)
+        pool = self._pool_manager().pool
+        while group.requests and self._launch_pages(group, steps) > pool.num_free_blocks:
+            if not self._preempt_youngest(outputs, keep_one=True):
+                raise DecoderKvExhausted(
+                    f"decoder KV pool ({pool.num_blocks} pages) cannot hold the last "
+                    f"row in flight past {self._launch_pages(group, steps)} more pages"
+                )
+        return bool(group.requests)
+
+    @staticmethod
+    def _launch_pages(group: ArGroup, steps: int) -> int:
+        """Pages ``group``'s rows map to write ``steps`` more positions each."""
+        kv = group.state.get("kv") if isinstance(group.state, dict) else None
+        if not isinstance(kv, PagedDecoderKv):
+            return 0
+        return sum(kv.growth_pages(row, steps) for row in range(len(group.requests)))
+
+    def _preempt_youngest(self, outputs: List[RequestOutput], *, keep_one: bool = False) -> bool:
+        """Swap the most recently admitted row out of the pool; ``False`` if there is none.
+
+        ``keep_one`` leaves the last row in flight where it is.  The row's group
+        reads its tokens in flight first, which may finish the row instead --
+        that frees its pages just the same.
+        """
+        victim: Optional[Tuple[ArGroup, Request, int]] = None
+        live = 0
+        for group in self._groups:
+            if isinstance(group, ArBeamGroup) or _paged_parts(group.state) is None:
+                continue
+            live += len(group.requests)
+            for req, seq in zip(group.requests, group.seq):
+                if victim is None or seq > victim[2]:
+                    victim = (group, req, seq)
+        if victim is None or (keep_one and live <= 1):
+            return False
+        group, req, _ = victim
+        self._drain(group, outputs)
+        row = next((i for i, r in enumerate(group.requests) if r is req), None)
+        if row is not None:
+            self._preempt(group, row)
+        self._groups = [g for g in self._groups if g.requests]
+        return True
+
+    def _preempt(self, group: ArGroup, row: int) -> None:
+        """Move row ``row`` of ``group`` out of the pool and the group, onto the host."""
+        parts = _paged_parts(group.state)
+        if parts is None:  # pragma: no cover - callers only pick paged rows
+            raise RuntimeError("only a paged decoder state can be swapped out")
+        swapped = {name: part.export_row(row) for name, part in parts.items()}
+        record = _Preempted(
+            request=group.requests[row],
+            seq=group.seq[row],
+            parts=swapped,
+            logits=group.last_logits[row : row + 1].clone(),
+            tokens=group.tokens[row],
+            max_new=group.max_new[row],
+            opts=group.opts[row],
+            detok_state=group.detok_state[row],
+            align_enc=group.align_enc[row],
+            no_speech=group.no_speech[row],
+        )
+        keep = [r for r in range(len(group.requests)) if r != row]
+        group.keep_rows(keep)
+        if keep:
+            device = group.last_logits.device
+            host = torch.tensor(keep, dtype=torch.long)
+            # A host index for the paged select, as ``_retire_rows`` passes one.
+            group.state = self._decoder().select(
+                group.state, host.pin_memory() if device.type == "cuda" else host
+            )
+            group.last_logits = group.last_logits.index_select(
+                0, to_device(keep, dtype=torch.long, device=device)
+            )
+        else:
+            self._release(group.state)
+            group.state = {}
+        self._preempted.append(record)
+        self.preemptions += 1
+        logger.info(
+            "%s: decoder-KV pool short; swapped request %s out (%d pages, %d tokens "
+            "generated), %d row(s) waiting to resume",
+            self.decode_type,
+            record.request.request_id,
+            record.pages,
+            len(record.tokens),
+            len(self._preempted),
+        )
+
+    def _resume_preempted(self) -> None:
+        """Swap waiting rows back in, oldest first, while there is room for them.
+
+        Room means the pages it held, its expected growth and a page for its
+        next launch, beside what the rows in flight are committed to.  With
+        nothing in flight, a row resumes as soon as its pages are free, which
+        is always: it held them before.
+        """
+        if not self._preempted:
+            return
+        manager = self._pool_manager()
+        pool = manager.pool
+        block = manager.block_tokens
+        self._preempted.sort(key=lambda p: p.seq)
+        while self._preempted:
+            record = self._preempted[0]
+            need = record.pages + 1
+            kv = record.parts.get("kv")
+            if kv is not None:
+                rest = self._remaining_tokens(len(record.tokens), record.max_new)
+                table = kv.slot.lead + kv.slot.pages
+                need += max(0, -(-(kv.slot.seqlen + rest) // block) - table)
+            busy = any(g.requests for g in self._groups)
+            if record.pages > pool.num_free_blocks or (
+                busy and need > pool.num_blocks - self._committed_pages()
+            ):
+                return
+            device = record.logits.device
+            restored: Dict[str, PagedDecoderKv] = {}
+            try:
+                for name, part in record.parts.items():
+                    restored[name] = PagedDecoderKv.restore(manager, [part], device)
+            except Exception as exc:  # pragma: no cover - the pages were checked free
+                for state in restored.values():
+                    state.free()
+                logger.warning("%s: resuming a swapped-out row failed: %s", self.decode_type, exc)
+                return
+            self._preempted.pop(0)
+            group = ArGroup(
+                requests=[record.request],
+                state=dict(restored),
+                last_logits=record.logits,
+                max_new=[record.max_new],
+                opts=[record.opts],
+                tokens=[record.tokens],
+                detok_state=[record.detok_state],
+                align_enc=[record.align_enc],
+                no_speech=[record.no_speech],
+                seq=[record.seq],
+            )
+            try:
+                absorbed = self._absorb(group)
+            except Exception as exc:  # noqa: BLE001 - as for a fresh prefill
+                self._failed.extend(self._fail_group(group, exc))
+                continue
+            if not absorbed:
+                self._groups.append(group)
+
+    def _record_footprints(self, group: ArGroup, finished_rows: Sequence[int]) -> None:
+        """Note what finished rows held at their end: the next rows' expectation."""
+        if not finished_rows or not self._overcommits():
+            return
+        parts = _paged_parts(group.state)
+        if parts is None:
+            return
+        for row in finished_rows:
+            self._finished_pages.append(sum(part.held_pages(row) for part in parts.values()))
+            self._finished_tokens.append(len(group.tokens[row]))
+
+    # ------------------------------------------------------------------
     # Per-request generation cap
     # ------------------------------------------------------------------
 
@@ -1094,7 +1444,7 @@ class IncrementalArStrategy(DecodeStrategy):
         enc_out: torch.Tensor,
         enc_lengths: torch.Tensor,
     ) -> None:
-        plan = self._prefill(requests, enc_out, enc_lengths)
+        plan = self._prefill_making_room(requests, enc_out, enc_lengths)
         opts = [getattr(r, "decoding", None) for r in requests]
         if self._beam > 1:
             self._groups.append(self._make_beam_group(requests, plan, opts))
@@ -1118,9 +1468,30 @@ class IncrementalArStrategy(DecodeStrategy):
             opts=opts,
             align_enc=align_enc,
             no_speech=self.prefill_no_speech(requests, plan.no_speech_logits),
+            seq=[next(self._admitted) for _ in requests],
         )
         if not self._absorb(fresh):
             self._groups.append(fresh)
+
+    def _prefill_making_room(
+        self, requests: List[Request], enc_out: torch.Tensor, enc_lengths: torch.Tensor
+    ) -> Prefill:
+        """:meth:`_prefill`, swapping rows out while the prompts' pages are not free.
+
+        Expected-length admission counted these rows at the footprint an average
+        row ends at, and their prompts can need more pages than are free right
+        now.  The rows in flight then make room, most recently admitted first,
+        as they do for each other's growth; the alternative is rejecting
+        requests whose only fault was arriving while the pool was busy.  The
+        pool refuses a prompt before the forward runs and takes nothing, so a
+        retry repeats only the prompt's assembly.
+        """
+        while True:
+            try:
+                return self._prefill(requests, enc_out, enc_lengths)
+            except DecoderKvExhausted:
+                if not self._overcommits() or not self._preempt_youngest(self._ready):
+                    raise
 
     def _absorb(self, fresh: ArGroup) -> bool:
         """Join ``fresh`` into a group that is already generating, if it can.
@@ -1190,7 +1561,9 @@ class IncrementalArStrategy(DecodeStrategy):
         )
 
     def has_pending(self) -> bool:
-        return bool(self._groups) or bool(self._failed) or bool(self._ready)
+        return (
+            bool(self._groups) or bool(self._failed) or bool(self._ready) or bool(self._preempted)
+        )
 
     def advance(self, budget: "StepBudget") -> List[RequestOutput]:
         """Advance the groups round-robin within ``budget``, one group at a time.
@@ -1199,18 +1572,35 @@ class IncrementalArStrategy(DecodeStrategy):
         rows get error finals and its KV goes back.  Without that, the group
         was off the queue with its pages still held, and the exception left
         ``step()`` and failed every request in flight through the dispatcher.
+
+        Under expected-length admission, rows swapped out earlier come back
+        first when there is room, and each launch first makes sure the pages it
+        will map are free (:meth:`_make_room`).
         """
         outputs: List[RequestOutput] = self._failed + self._ready
         self._failed, self._ready = [], []
+        self._resume_preempted()
+        outputs.extend(self._failed)
+        self._failed = []
         advanced: List[ArGroup] = []
         while self._groups:
             # Round-robin: advance the front group one launch -- one batched
             # step, or several when it loops on the device -- and re-queue it
             # at the back if it still has active rows.
-            steps = budget.take_up_to(self._loop_width(self._groups[0]))
+            front = self._groups[0]
+            steps = budget.take_up_to(self._loop_width(front))
             if not steps:
                 break
-            group = self._groups.pop(0)
+            try:
+                runnable = self._make_room(front, steps, outputs)
+            except Exception as exc:  # noqa: BLE001 — a swap that failed takes its group only
+                self._groups = [g for g in self._groups if g is not front]
+                outputs.extend(self._fail_group(front, exc, outputs))
+                continue
+            if not runnable:
+                continue  # every row it had was swapped out; it is off the queue
+            self._groups = [g for g in self._groups if g is not front]
+            group = front
             try:
                 if isinstance(group, ArBeamGroup):
                     self._advance_beam_group(group, outputs)
@@ -1487,6 +1877,7 @@ class IncrementalArStrategy(DecodeStrategy):
         Returns the device index of the rows kept, for the caller to apply to
         what it holds per row, or ``None`` when no row finished or none is left.
         """
+        self._record_footprints(group, finished_rows)
         for row in finished_rows:
             outputs.append(self._finalize_row(group, row, reasons[row]))
         if not finished_rows:
@@ -1740,6 +2131,10 @@ class IncrementalArStrategy(DecodeStrategy):
     def free_session(self, request: Request) -> None:
         # A request whose group already failed holds no KV, only its error final.
         self._failed = [out for out in self._failed if out.request_id != request.request_id]
+        # Nor does one swapped out of the pool: its K/V are host tensors.
+        if any(p.request is request for p in self._preempted):
+            self._preempted = [p for p in self._preempted if p.request is not request]
+            return
         for group in self._groups:
             if request not in group.requests:
                 continue

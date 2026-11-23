@@ -9,8 +9,14 @@ from oasr.cache.attention_cache import AttentionCacheManager
 from oasr.cache.block_pool import BlockPool
 from oasr.cache.cnn_cache import CnnCacheManager
 from oasr.cache.ctc_state import CtcStateCacheManager
-from oasr.cache.decoder_kv import DecoderKVCacheManager, DecoderKvExhausted
-from oasr.cache.decoder_state import DecoderKv, PagedDecoderKv, build_cross_kv, build_kv
+from oasr.cache.decoder_kv import DecoderKVCacheManager, DecoderKvExhausted, SwappedSlot
+from oasr.cache.decoder_state import (
+    DecoderKv,
+    PagedDecoderKv,
+    SwappedRow,
+    build_cross_kv,
+    build_kv,
+)
 from oasr.cache.paged_kv import PagedKVCache
 from oasr.cache.recurrent_state import (
     RecurrentContinuousBatcher,
@@ -42,6 +48,8 @@ __all__ = [
     "DecoderKvExhausted",
     "DecoderKv",
     "PagedDecoderKv",
+    "SwappedRow",
+    "SwappedSlot",
     "build_kv",
     "build_cross_kv",
     "StreamContext",

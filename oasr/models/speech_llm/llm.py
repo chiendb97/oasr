@@ -215,6 +215,7 @@ class Qwen2Lm(BaseDecoder):
         capacity: Union[int, Sequence[int], None] = None,
         kv_manager: Optional["DecoderKVCacheManager"] = None,
         kv_cache_dtype: Optional[str] = None,
+        valid_lens: Optional[Sequence[int]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Start generation over a **left-padded** embedded prompt.
 
@@ -238,9 +239,16 @@ class Qwen2Lm(BaseDecoder):
         The prompt is quantized into the cache as it is written but attends its
         own fresh K/V -- causal and left-padded -- in the served dtype; every
         step reads the fp8 cache.
+
+        ``valid_lens`` (optional): ``valid.sum(1)`` on the host, which the caller
+        already has.  A paged row then maps its whole pages of left padding to
+        the pool's scratch page instead of holding pages of its own, so a short
+        prompt batched with a long one holds its own footprint, not the long
+        one's.
         """
         B, P, _ = inputs_embeds.shape
         n = len(self.layers)
+        starts_host = None if valid_lens is None else [P - int(v) for v in valid_lens]
         kv = build_kv(
             n,
             B,
@@ -253,6 +261,7 @@ class Qwen2Lm(BaseDecoder):
             # the ``(B, P)`` grid, so the valid window is ``[P - len, len)``.
             starts=(P - valid.sum(dim=1)).to(torch.int32),
             kv_cache=kv_cache_dtype,
+            starts_host=starts_host,
         )
         # HF masked-generate positions: cumsum - 1, pads clamped to 0.  For the
         # real (right-flush) region that is exactly ``lens - starts`` counted from
