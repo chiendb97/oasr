@@ -11,7 +11,7 @@ void stateless_greedy_decode(TensorView tokens, TensorView frames, Optional prob
                              TensorView dec_proj_in, TensorView w_out_t, Optional b_out,
                              TensorView emb, Optional conv_w, TensorView w_dp_t, Optional b_dp,
                              int64_t vocab, int64_t group, int64_t max_sym, int64_t blank,
-                             int64_t activation, int64_t rows_per_cta);
+                             int64_t activation, int64_t rows_per_cta, int64_t cluster);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_greedy_decode, stateless_greedy_decode);
 
@@ -37,3 +37,18 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_beam_fits, stateless_beam_fits);
 bool stateless_greedy_fits(int64_t J, int64_t D);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(stateless_greedy_fits, stateless_greedy_fits);
+
+void lstm_greedy_decode(TensorView tokens, TensorView frames, Optional probs, TensorView counts,
+                        TensorView h_out, TensorView c_out, TensorView dec_proj_out,
+                        TensorView workspace, TensorView enc_proj, TensorView lengths,
+                        TensorView h_in, TensorView c_in, TensorView dec_proj_in, TensorView emb,
+                        TensorView w_ih, TensorView w_hh, Optional bias, TensorView w_dp,
+                        Optional b_dp, TensorView w_out, Optional b_out, int64_t vocab,
+                        int64_t max_sym, int64_t blank, int64_t grid);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lstm_greedy_decode, lstm_greedy_decode);
+
+int64_t lstm_greedy_workspace_bytes(int64_t batch, int64_t hidden, int64_t layers, int64_t joiner,
+                                    int64_t vocab, int64_t grid);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(lstm_greedy_workspace_bytes, lstm_greedy_workspace_bytes);

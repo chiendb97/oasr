@@ -37,10 +37,13 @@ one is amortized and the first is not.
 **The fused path.**  When the predictor and joiner declare the tensors a fused
 step reads (:meth:`TransducerPredictor.stateless_tensors` /
 :meth:`Joiner.additive_tensors` -- icefall's stateless predictor and additive
-joiner do; a recurrent predictor does not), the whole loop is one kernel launch,
-:func:`oasr.transducer_greedy_decode`, and the host waits once per batch.  The
-loop below, graph-replayed or eager, is what every other surface runs, and what a
-batch whose emissions overflow the kernel's buffer falls back to.
+joiner do), the whole loop is one kernel launch,
+:func:`oasr.transducer_greedy_decode`, and the host waits once per batch.  An LSTM
+predictor that declares its layers (:meth:`TransducerPredictor.recurrent_tensors`,
+NeMo's RNN-T) with an additive joiner gets the same for a small batch:
+:func:`oasr.transducer_lstm_greedy_decode`, one cooperative launch over every
+SM.  The loop below, graph-replayed or eager, is what every other surface runs,
+and what a batch whose emissions overflow a kernel's buffer falls back to.
 """
 
 from __future__ import annotations
@@ -79,7 +82,12 @@ from .transducer_beam import (
 )
 
 if TYPE_CHECKING:
-    from oasr.functionals.transducer import StatelessGreedyResult, StatelessGreedyWeights
+    from oasr.functionals.transducer import (
+        LstmGreedyResult,
+        LstmGreedyWeights,
+        StatelessGreedyResult,
+        StatelessGreedyWeights,
+    )
     from oasr.models.base import BaseAsrModel
     from oasr.models.decoders.base import Joiner, TransducerPredictor
 
@@ -162,7 +170,7 @@ class _FusedReadback:
     per-token Python is building the lists the caller returns.
     """
 
-    def __init__(self, res: "StatelessGreedyResult", track: bool) -> None:
+    def __init__(self, res: "StatelessGreedyResult | LstmGreedyResult", track: bool) -> None:
         self._cap = int(res.tokens.size(1))
         self._track = track
         parts = [res.counts[:, None], res.tokens] + ([res.frames] if track else [])
@@ -233,7 +241,9 @@ class TransducerOptions:
             "Decode a greedy batch with one fused kernel launch "
             "(oasr.transducer_greedy_decode) when the model's predictor and joiner "
             "declare the tensors it reads -- a stateless label-window predictor and "
-            "an additive joiner, in half precision -- and, under beam search, every "
+            "an additive joiner, in half precision -- or, for an LSTM predictor and "
+            "a batch of at most 4, with one cooperative launch over every SM "
+            "(oasr.transducer_lstm_greedy_decode); and, under beam search, every "
             "frame of a chunk with one launch too (oasr.transducer_beam_decode, "
             "beam_size <= 8).  A beam search the kernel cannot take runs each "
             "frame's log-softmax, score add and top-k as one kernel "
@@ -345,6 +355,12 @@ class TransducerDecodeStrategy(DecodeStrategy):
         self._fused_weights: Optional["StatelessGreedyWeights"] = None
         self._fused_versions: Tuple[int, ...] = ()
         self._fused_enabled = bool(self.options.fused)
+        # The LSTM predictor's fused decode reads its own view of the model and
+        # latches off on its own: a model without the stateless surface turns the
+        # flag above off, and that must not take this one with it.
+        self._lstm_weights: Optional["LstmGreedyWeights"] = None
+        self._lstm_versions: Tuple[int, ...] = ()
+        self._lstm_enabled = bool(self.options.fused)
         #: Where :meth:`decode_offline_async` issues the fused decode; created on
         #: first use, once, so it never strands a cuBLAS workspace per call.
         self._side_stream: Optional[torch.cuda.Stream] = None
@@ -411,6 +427,15 @@ class TransducerDecodeStrategy(DecodeStrategy):
             if parsed is not None:
                 hyps_f, marks_f = parsed
                 return hyps_f, marks_f, fused.window, fused.dec_proj
+            self.fused_stats["overflows"] += 1
+
+        lstm = self._lstm_launch(enc_proj, lengths, state, dec_proj, track)
+        if lstm is not None:
+            parsed = _FusedReadback(lstm, track).result()
+            if parsed is not None:
+                hyps_l, marks_l = parsed
+                # The prediction is the top layer's hidden state.
+                return hyps_l, marks_l, (lstm.h[-1], lstm.h, lstm.c), lstm.dec_proj
             self.fused_stats["overflows"] += 1
 
         if not track:
@@ -726,6 +751,93 @@ class TransducerDecodeStrategy(DecodeStrategy):
             lengths.to(device=enc_proj.device, dtype=torch.long),
             state.contiguous(),
             dec_proj.contiguous(),
+            weights,
+            max_sym=self._max_sym,
+            track=track,
+        )
+        return res
+
+    def _lstm_surface(self) -> Optional["LstmGreedyWeights"]:
+        """The fused LSTM decode's weights; ``None`` if this model's surface does
+        not declare them (then never asked again).  Rebuilt when a source
+        parameter is written, as :meth:`_fused_surface` is."""
+        if not self._lstm_enabled:
+            return None
+        joiner, decoder = self._surface()
+        pred = getattr(decoder, "recurrent_tensors", lambda: None)()
+        join = getattr(joiner, "additive_tensors", lambda: None)()
+        if pred is None or join is None or join.activation != "relu":
+            self._lstm_enabled = False
+            return None
+        sources = (
+            pred.embedding,
+            *pred.weight_ih,
+            *pred.weight_hh,
+            *(pred.bias_ih or ()),
+            *(pred.bias_hh or ()),
+            join.decoder_proj_weight,
+            join.decoder_proj_bias,
+            join.output_weight,
+            join.output_bias,
+        )
+        versions = tuple(-1 if t is None else int(t._version) for t in sources)
+        if self._lstm_weights is None or versions != self._lstm_versions:
+            from oasr.functionals.transducer import LstmGreedyWeights
+
+            self._lstm_weights = LstmGreedyWeights.prepare(
+                embedding=pred.embedding,
+                weight_ih=pred.weight_ih,
+                weight_hh=pred.weight_hh,
+                bias_ih=pred.bias_ih,
+                bias_hh=pred.bias_hh,
+                decoder_proj_weight=join.decoder_proj_weight,
+                decoder_proj_bias=join.decoder_proj_bias,
+                output_weight=join.output_weight,
+                output_bias=join.output_bias,
+                vocab=join.vocab_size,
+                blank=pred.blank_id,
+            )
+            self._lstm_versions = versions
+        return self._lstm_weights
+
+    def _lstm_launch(
+        self,
+        enc_proj: torch.Tensor,
+        lengths: torch.Tensor,
+        state: Any,
+        dec_proj: torch.Tensor,
+        track: bool,
+    ) -> Optional["LstmGreedyResult"]:
+        """Queue the fused LSTM greedy decode, or ``None`` when it cannot serve
+        this call (a stateless predictor, a batch past
+        :data:`~oasr.functionals.transducer.LSTM_GREEDY_MAX_ROWS`, fp32, ...)."""
+        if not self._lstm_enabled:
+            return None
+        if not (
+            enc_proj.is_cuda
+            and enc_proj.dtype in (torch.float16, torch.bfloat16)
+            and isinstance(state, tuple)
+            and len(state) == 3
+            and all(isinstance(x, torch.Tensor) and x.dtype == enc_proj.dtype for x in state)
+            and dec_proj.dtype == enc_proj.dtype
+        ):
+            return None
+        weights = self._lstm_surface()
+        if weights is None:
+            return None
+        if not weights.supports(enc_proj):
+            self.fused_stats["fallbacks"] += 1
+            return None
+        from oasr.functionals.transducer import transducer_lstm_greedy_decode
+
+        self.fused_stats["hits"] += 1
+        _out, h, c = state
+        res: "LstmGreedyResult" = transducer_lstm_greedy_decode(
+            enc_proj,
+            lengths.to(device=enc_proj.device, dtype=torch.long),
+            h,
+            c,
+            dec_proj,
             weights,
             max_sym=self._max_sym,
             track=track,

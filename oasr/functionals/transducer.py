@@ -7,7 +7,15 @@ runs the greedy loop for its rows on the device -- joiner, argmax, emit/advance,
 and on an emission the predictor step -- so the host waits once per batch
 instead of driving ~25 small kernels per decode step.  See
 ``include/oasr/transducer/greedy_decode.cuh`` for the kernel and its numerical
-contract.
+contract.  A small batch is decoded by a thread-block cluster per row instead
+(sm_90+, ``include/oasr/transducer/greedy_cluster.cuh``): the same arithmetic,
+each CTA of the cluster reading its share of the weights.
+
+:func:`transducer_lstm_greedy_decode` is the greedy decode for an LSTM
+predictor (NeMo's RNN-T): one cooperative launch over every SM decodes a small
+batch, the CTAs meeting at grid-wide barriers between the joiner, each LSTM
+layer and the decoder projection (``include/oasr/transducer/lstm_greedy.cuh``).
+It reads the model through :class:`LstmGreedyWeights`.
 
 :func:`transducer_beam_decode` is the same for modified beam search: one launch
 runs every frame of a chunk, a CTA per utterance holding its ``k`` hypotheses
@@ -41,6 +49,9 @@ __all__ = [
     "GEMV_TILE",
     "K_STAGE",
     "JOINER_ACTIVATIONS",
+    "LSTM_GREEDY_MAX_ROWS",
+    "LstmGreedyResult",
+    "LstmGreedyWeights",
     "StatelessGreedyResult",
     "StatelessGreedyWeights",
     "beam_walk_buffer",
@@ -49,6 +60,7 @@ __all__ = [
     "transducer_beam_topk_supports",
     "transducer_greedy_decode",
     "transducer_greedy_capacity",
+    "transducer_lstm_greedy_decode",
 ]
 
 #: Joiner nonlinearities the kernel implements, by the id it is passed.
@@ -254,6 +266,7 @@ def transducer_greedy_decode(
     capacity: Optional[int] = None,
     track: bool = False,
     rows_per_cta: int = 0,
+    cluster: int = 0,
     out: Optional[StatelessGreedyResult] = None,
 ) -> StatelessGreedyResult:
     """Greedy-decode ``enc_proj`` from the predictor state ``(window, dec_proj)``.
@@ -280,6 +293,15 @@ def transducer_greedy_decode(
         Also return each emission's posterior (frames are always returned).
     rows_per_cta : int
         Rows each CTA decodes; ``0`` lets the launcher pick from the batch width.
+        Applies to the one-CTA kernel only.
+    cluster : int
+        CTAs per row: ``1`` keeps the one-CTA kernel, ``2`` / ``4`` / ``8`` /
+        ``16`` decode each row with a thread-block cluster of that many CTAs,
+        each reading its share of the two weights (sm_90+, ``V <= 65535``), and
+        ``0`` lets the launcher pick -- a cluster for a batch up to 32 that one
+        resident wave of them covers, else one CTA.  Tokens, frames and the
+        final predictor state do not depend on it; a tracked posterior can
+        differ in its last bits (its logsumexp is combined in another order).
     out : StatelessGreedyResult, optional
         Preallocated outputs (destination-passing).  Its ``window`` / ``dec_proj``
         may alias the inputs.
@@ -322,6 +344,7 @@ def transducer_greedy_decode(
         int(w.blank),
         int(JOINER_ACTIVATIONS[w.activation]),
         int(rows_per_cta),
+        int(cluster),
     )
     return out
 
@@ -509,3 +532,227 @@ def transducer_beam_decode(
         int(cluster),
     )
     return context_out, scores_out, parents, labels
+
+
+#: Rows one fused LSTM decode takes (``kLstmMaxRows``): its rows advance in
+#: lockstep, and past a handful the strategy's graph-replayed loop is batched as
+#: well as it gets.
+LSTM_GREEDY_MAX_ROWS = 4
+#: Largest vocabulary the fused LSTM decode takes: a token is 16 bits of its
+#: argmax key.
+LSTM_GREEDY_MAX_VOCAB = 65535
+
+
+@dataclass(frozen=True)
+class LstmGreedyWeights:
+    """The tensors an LSTM-predictor greedy step reads.
+
+    Build it with :meth:`prepare`.  The LSTM's per-layer weights are stacked into
+    ``(L, 4H, H)`` (and the biases into ``(L, 2, 4H)``, each layer's ``b_ih``
+    then ``b_hh``), once; the embedding, decoder projection and joiner head are
+    the model's own tensors.
+    """
+
+    emb: torch.Tensor  # (>= V, H)
+    w_ih: torch.Tensor  # (L, 4H, H)
+    w_hh: torch.Tensor  # (L, 4H, H)
+    bias: Optional[torch.Tensor]  # (L, 2, 4H)
+    w_dp: torch.Tensor  # (J, H)
+    b_dp: Optional[torch.Tensor]
+    w_out: torch.Tensor  # (>= V, J)
+    b_out: Optional[torch.Tensor]
+    vocab: int
+    blank: int
+
+    @classmethod
+    def prepare(
+        cls,
+        *,
+        embedding: torch.Tensor,
+        weight_ih: Tuple[torch.Tensor, ...],
+        weight_hh: Tuple[torch.Tensor, ...],
+        bias_ih: Optional[Tuple[torch.Tensor, ...]],
+        bias_hh: Optional[Tuple[torch.Tensor, ...]],
+        decoder_proj_weight: torch.Tensor,
+        decoder_proj_bias: Optional[torch.Tensor],
+        output_weight: torch.Tensor,
+        output_bias: Optional[torch.Tensor],
+        vocab: int,
+        blank: int,
+    ) -> "LstmGreedyWeights":
+        """Stack an LSTM predictor's layers for the kernel.  Copies the LSTM
+        weights; call it once per model, not per decode."""
+        with torch.no_grad():
+            bias = None
+            if bias_ih is not None and bias_hh is not None:
+                bias = torch.stack(
+                    [torch.stack([bi, bh]) for bi, bh in zip(bias_ih, bias_hh)]
+                ).contiguous()
+            return cls(
+                emb=embedding.contiguous(),
+                w_ih=torch.stack(list(weight_ih)).contiguous(),
+                w_hh=torch.stack(list(weight_hh)).contiguous(),
+                bias=bias,
+                w_dp=decoder_proj_weight.contiguous(),
+                b_dp=decoder_proj_bias,
+                w_out=output_weight.contiguous(),
+                b_out=output_bias,
+                vocab=int(vocab),
+                blank=int(blank),
+            )
+
+    @property
+    def hidden(self) -> int:
+        return int(self.w_hh.size(2))
+
+    @property
+    def layers(self) -> int:
+        return int(self.w_hh.size(0))
+
+    def supports(self, enc_proj: torch.Tensor) -> bool:
+        """Whether :func:`transducer_lstm_greedy_decode` can decode ``enc_proj``:
+        half precision throughout, at most :data:`LSTM_GREEDY_MAX_ROWS` rows,
+        dims multiples of 8, a vocabulary within :data:`LSTM_GREEDY_MAX_VOCAB`,
+        and an LSTM of at most four layers whose input is its hidden size."""
+        dtype = enc_proj.dtype
+        J = int(enc_proj.size(-1))
+        H = self.hidden
+        return bool(
+            enc_proj.is_cuda
+            and enc_proj.dim() == 3
+            and dtype in (torch.float16, torch.bfloat16)
+            and all(
+                t.dtype == dtype for t in (self.emb, self.w_ih, self.w_hh, self.w_dp, self.w_out)
+            )
+            and int(enc_proj.size(0)) <= LSTM_GREEDY_MAX_ROWS
+            and 1 <= self.layers <= 4
+            and int(self.w_ih.size(2)) == H
+            and int(self.emb.size(1)) == H
+            and H % 8 == 0
+            and J % 8 == 0
+            and int(self.w_out.size(1)) == J
+            and tuple(self.w_dp.shape) == (J, H)
+            and 1 <= self.vocab <= LSTM_GREEDY_MAX_VOCAB
+        )
+
+
+@dataclass
+class LstmGreedyResult:
+    """Device-side outputs of one fused LSTM decode; ``counts`` as in
+    :class:`StatelessGreedyResult`."""
+
+    tokens: torch.Tensor  # (B, cap) int32
+    frames: torch.Tensor  # (B, cap) int32
+    probs: Optional[torch.Tensor]  # (B, cap) float32, only when tracked
+    counts: torch.Tensor  # (B,) int32
+    h: torch.Tensor  # (L, B, H) final hidden state
+    c: torch.Tensor  # (L, B, H) final cell state
+    dec_proj: torch.Tensor  # (B, J) decoder projection of h[L - 1]
+
+
+@functools.cache
+def _lstm_workspace_bytes(
+    device: int, batch: int, hidden: int, layers: int, joiner: int, vocab: int, grid: int
+) -> int:
+    with torch.cuda.device(device):
+        return int(
+            _get_transducer_module().lstm_greedy_workspace_bytes(
+                batch, hidden, layers, joiner, vocab, grid
+            )
+        )
+
+
+@oasr_api
+def transducer_lstm_greedy_decode(
+    enc_proj: torch.Tensor,
+    lengths: torch.Tensor,
+    h: torch.Tensor,
+    c: torch.Tensor,
+    dec_proj: torch.Tensor,
+    weights: LstmGreedyWeights,
+    *,
+    max_sym: int,
+    capacity: Optional[int] = None,
+    track: bool = False,
+    grid: int = 0,
+    out: Optional[LstmGreedyResult] = None,
+) -> LstmGreedyResult:
+    """Greedy-decode ``enc_proj`` with an LSTM predictor from ``(h, c, dec_proj)``.
+
+    Parameters
+    ----------
+    enc_proj : Tensor
+        ``(B, T, J)`` encoder output in joiner space, fp16/bf16, last dim
+        contiguous, ``B <=`` :data:`LSTM_GREEDY_MAX_ROWS`.
+    lengths : Tensor
+        ``(B,)`` valid frames per row, clamped to ``[0, T]`` on the device.
+    h, c : Tensor
+        ``(L, B, H)`` the LSTM's hidden and cell state to start from.
+    dec_proj : Tensor
+        ``(B, J)`` the decoder projection of ``h[L - 1]``.
+    weights : LstmGreedyWeights
+    max_sym : int
+        Cap on emissions at one frame before advancing.
+    capacity : int, optional
+        Emissions recorded per row; :func:`transducer_greedy_capacity` of ``T``
+        by default.  Overflow is reported through ``counts``.
+    track : bool
+        Also return each emission's posterior.
+    grid : int
+        CTAs to run on; ``0`` = one per SM.  All of them must be resident at
+        once (a cooperative launch), so the decode waits for the GPU to drain
+        whatever else occupies it.
+
+    The decision rule and every rounding point are the op-by-op loop's; the dot
+    products accumulate in their own order (see
+    ``include/oasr/transducer/lstm_greedy.cuh``).
+    """
+    B, T, J = (int(d) for d in enc_proj.shape)
+    device = enc_proj.device
+    if lengths.dtype != torch.int64:
+        lengths = lengths.to(torch.int64)
+    if out is None:
+        cap = transducer_greedy_capacity(T) if capacity is None else int(capacity)
+        out = LstmGreedyResult(
+            tokens=torch.empty(B, cap, dtype=torch.int32, device=device),
+            frames=torch.empty(B, cap, dtype=torch.int32, device=device),
+            probs=torch.empty(B, cap, dtype=torch.float32, device=device) if track else None,
+            counts=torch.empty(B, dtype=torch.int32, device=device),
+            h=torch.empty_like(h),
+            c=torch.empty_like(c),
+            dec_proj=torch.empty_like(dec_proj),
+        )
+    if B == 0:
+        return out
+    w = weights
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    nbytes = _lstm_workspace_bytes(int(index), B, w.hidden, w.layers, J, w.vocab, int(grid))
+    workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    _get_transducer_module().lstm_greedy_decode(
+        out.tokens,
+        out.frames,
+        out.probs if track else None,
+        out.counts,
+        out.h,
+        out.c,
+        out.dec_proj,
+        workspace,
+        enc_proj,
+        lengths,
+        h.contiguous(),
+        c.contiguous(),
+        dec_proj.contiguous(),
+        w.emb,
+        w.w_ih,
+        w.w_hh,
+        w.bias,
+        w.w_dp,
+        w.b_dp,
+        w.w_out,
+        w.b_out,
+        int(w.vocab),
+        int(max_sym),
+        int(w.blank),
+        int(grid),
+    )
+    return out

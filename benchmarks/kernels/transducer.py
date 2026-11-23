@@ -21,6 +21,14 @@ starting state, which is close to what a real BPE transducer does (~0.2 emission
 per encoder frame); the decode's cost is its step count, so a model that emitted
 everywhere or nowhere would measure a different workload.
 
+``lstm_greedy``: the same three arms for an LSTM predictor (NeMo's RNN-T,
+Nemotron's shapes by default): ``cuda`` is
+:func:`oasr.transducer_lstm_greedy_decode`, one cooperative launch over every
+SM; ``graph`` and ``torch`` the strategy's loop replayed from CUDA graphs and
+eager.  The kernel keeps the loop's rounding points but not its accumulation
+orders, so on random weights the ``cuda`` arm is informational;
+``tests/kernels/test_transducer_lstm_greedy.py`` holds it to the loop's tokens.
+
 ``beam_topk``: one modified-beam-search frame's selection after the joiner --
 ``cuda`` is :func:`oasr.transducer_beam_topk`, ``torch`` the composition it
 replaces in ``beam_search_step`` (float cast, ``log_softmax``, score add,
@@ -52,7 +60,7 @@ import torch
 
 from benchmarks.core.driver import Work, params_of
 
-SUBROUTINES = ["greedy", "beam_topk", "beam_decode"]
+SUBROUTINES = ["greedy", "lstm_greedy", "beam_topk", "beam_decode"]
 
 #: Shapes of the icefall Zipformer transducer (joiner/decoder 512, BPE-500,
 #: context 2, group 4).  ``frames`` 250 is a ~10 s utterance at 25 Hz; 16 is a
@@ -63,6 +71,12 @@ DEFAULT_CONFIGS: Dict[str, list] = {
         {"batch": 16, "frames": 250, "joiner": 512, "decoder": 512, "vocab": 500},
         {"batch": 64, "frames": 250, "joiner": 512, "decoder": 512, "vocab": 500},
         {"batch": 64, "frames": 16, "joiner": 512, "decoder": 512, "vocab": 500},
+    ],
+    # Nemotron's predictor (2-layer LSTM, hidden 640) and joint (640 -> 13088):
+    # a ~7 s utterance at 12.5 Hz, at the batch widths the kernel serves.
+    "lstm_greedy": [
+        {"batch": 1, "frames": 90, "joiner": 640, "decoder": 640, "vocab": 13088},
+        {"batch": 4, "frames": 90, "joiner": 640, "decoder": 640, "vocab": 13088},
     ],
     # A chunk of the icefall transducer's beam search: a ~10 s utterance, a
     # small batch, and a streaming chunk.
@@ -81,7 +95,12 @@ DEFAULT_CONFIGS: Dict[str, list] = {
 }
 
 REF_BACKEND = "torch"
-TOLERANCES = {"greedy": (0.0, 0.0), "beam_topk": (0.0, 0.0), "beam_decode": (0.0, 0.0)}
+TOLERANCES = {
+    "greedy": (0.0, 0.0),
+    "lstm_greedy": (0.0, 0.0),
+    "beam_topk": (0.0, 0.0),
+    "beam_decode": (0.0, 0.0),
+}
 NON_GATING_BACKENDS = frozenset({"cuda"})
 
 _CONTEXT = 2
@@ -243,6 +262,83 @@ def _beam_decode_fns(cfg: dict, dtype: torch.dtype) -> Dict[str, Callable[[], An
     return {"cuda": fused, "graph": graphed, "torch": eager}
 
 
+def _lstm_model(cfg: dict, dtype: torch.dtype):
+    from oasr.models.nemotron.predictor import NemotronRnntJoint, NemotronRnntPredictor
+    from oasr.models.transducer import TransducerModel
+
+    torch.manual_seed(0)
+    vocab = cfg["vocab"]
+    decoder = NemotronRnntPredictor(vocab, cfg["decoder"], num_layers=2, blank_id=vocab - 1)
+    joiner = NemotronRnntJoint(cfg["joiner"], cfg["decoder"], vocab)
+    model = TransducerModel(torch.nn.Identity(), decoder, joiner, blank_id=vocab - 1)
+    with torch.no_grad():
+        # Spread the logits: at the default init they sit within ~0.2 of each
+        # other across 13k tokens, every step is a near-tie, and the arms'
+        # trajectories part at the first ulp of difference.
+        joiner.head.weight.mul_(30.0)
+    return model.to(device="cuda", dtype=dtype).eval()
+
+
+def _calibrate_lstm_blank(model, enc: torch.Tensor) -> None:
+    """Bias blank so it wins ~4 steps in 5, measured over states the predictor
+    reaches after 0..15 random emissions -- the start state alone let a drifting
+    random-weight LSTM emit at the per-frame cap (see :func:`_calibrate_blank`)."""
+    joiner, decoder = model.joiner, model.decoder
+    gen = torch.Generator(device=enc.device).manual_seed(1)
+    blank = int(model.blank_id)
+    with torch.no_grad():
+        B = enc.size(0)
+        state = decoder.init_state(B, enc.device)
+        projs = []
+        emit = torch.ones(B, dtype=torch.bool, device=enc.device)
+        for _ in range(16):
+            projs.append(joiner.decoder_proj(decoder.predict(state)))
+            tok = torch.randint(0, blank, (B,), generator=gen, device=enc.device)
+            state = decoder.advance(state, tok, emit)
+        dec_proj = torch.stack(projs, dim=1)  # (B, S, J)
+        enc_proj = joiner.encoder_proj(enc)  # (B, T, J)
+        logits = joiner(
+            enc_proj[:, :, None], dec_proj[:, None], project_input=False
+        ).float()  # (B, T, S, V)
+        others = torch.cat([logits[..., :blank], logits[..., blank + 1 :]], dim=-1)
+        margin = others.amax(-1) - logits[..., blank]
+        joiner.head.bias[blank] += torch.quantile(margin.flatten().float(), 0.8).to(
+            joiner.head.bias.dtype
+        )
+
+
+def _lstm_greedy_fns(cfg: dict, dtype: torch.dtype) -> Dict[str, Callable[[], Any]]:
+    model = _lstm_model(cfg, dtype)
+    enc = torch.randn(cfg["batch"], cfg["frames"], cfg["joiner"], device="cuda", dtype=dtype)
+    _calibrate_lstm_blank(model, enc)
+    lengths = torch.full((cfg["batch"],), cfg["frames"], dtype=torch.long, device="cuda")
+    eager = _strategy(model, decode_options={"fused": False})
+    graphed = _strategy(
+        model,
+        use_cuda_graphs=True,
+        use_transducer_cuda_graphs=True,
+        decode_options={"fused": False},
+    )
+    fused = _strategy(model)
+
+    def run(strat) -> torch.Tensor:
+        state, dec_proj = strat._init_state(cfg["batch"], enc.device)
+        with torch.no_grad():
+            hyps, _, _, _ = strat._greedy_loop(enc, lengths, state, dec_proj)
+        return _padded(hyps)
+
+    def run_fused() -> torch.Tensor:
+        before = dict(fused.fused_stats)
+        out = run(fused)
+        if fused.fused_stats["hits"] == before["hits"] or (
+            fused.fused_stats["overflows"] != before["overflows"]
+        ):
+            raise RuntimeError(f"fused LSTM decode did not serve this batch: {fused.fused_stats}")
+        return out
+
+    return {"cuda": run_fused, "graph": lambda: run(graphed), "torch": lambda: run(eager)}
+
+
 def build_fns(
     subroutine: str, cfg: dict, dtype: torch.dtype, args: argparse.Namespace
 ) -> Dict[str, Callable[[], Any]]:
@@ -253,6 +349,8 @@ def build_fns(
         return _beam_topk_fns(cfg, dtype)
     if subroutine == "beam_decode":
         return _beam_decode_fns(cfg, dtype)
+    if subroutine == "lstm_greedy":
+        return _lstm_greedy_fns(cfg, dtype)
     model = _model(cfg, dtype)
     enc = torch.randn(cfg["batch"], cfg["frames"], cfg["joiner"], device="cuda", dtype=dtype)
     _calibrate_blank(model, enc)
