@@ -25,9 +25,9 @@ be importable by the active interpreter.  There is no Python serving process —
 the former ZMQ worker was replaced by the in-process PyO3 engine.
 
 The engine runs **in-process** via PyO3 — one Python `ASREngine` per
-`oasr-server` process.  Multi-GPU scale is achieved by launching N
-`oasr-server` processes (each with `CUDA_VISIBLE_DEVICES` set), not by
-multiplexing inside one process.
+`oasr-server` process.  Multi-GPU scale is one process per GPU, not
+multiplexing inside one process; `--gpus` starts and routes to them from one
+command ([Multi-GPU topology](#multi-gpu-topology)).
 
 ## Workspace layout
 
@@ -38,7 +38,7 @@ multiplexing inside one process.
 | `oasr-asr` | Audio decode (WAV via `hound`, raw PCM) to f32 mono `bytes::Bytes`, plus sample-rate conversion (`resample.rs`, windowed-sinc via `rubato`). |
 | `oasr-server-http` | axum routes (Google STT v1-shaped REST). |
 | `oasr-server-grpc` | tonic `oasr.speech.v1.Speech` service plus the standard `grpc.health.v1.Health` service. Proto in `rust/proto/oasr_speech_v1.proto`. |
-| `oasr-serve` | Mode-agnostic serving core: `Cli` + `run(cli)` — builds the engine, the tokio runtime, and both listeners. Shared by the binary and the extension module. |
+| `oasr-serve` | Mode-agnostic serving core: `Cli` + `run(cli, argv, relaunch)` — builds the engine, the tokio runtime, and both listeners; with `--gpus`, the launcher instead (`src/launcher/`: replica processes, the per-request router, merged metrics). Shared by the binary and the extension module. |
 | `oasr-server` | Standalone binary: thin `main.rs` → `oasr_serve::run`; pulls `oasr-engine-client` with `auto-initialize`. |
 | `oasr-core` | cdylib `oasr._core` PyO3 module: `#[pymodule]` exposing `serve(argv)` → `oasr_serve::run` under `allow_threads`; pulls `oasr-engine-client` with `extension-module`. Built by setuptools-rust. |
 
@@ -702,27 +702,94 @@ gRPC status mapping mirrors HTTP: `RESOURCE_EXHAUSTED`, `NOT_FOUND`,
 
 ## Multi-GPU topology
 
-`oasr-server` hosts exactly one engine.  To scale horizontally:
+One engine process fills one GPU, and engines that share a process share one
+GIL, so the topology that scales is **one server process per GPU**: two of them
+on two GPUs serve twice what one does at saturation.  `--gpus` makes
+`oasr-server` build that itself:
 
 ```bash
-# GPU 0
-CUDA_VISIBLE_DEVICES=0 oasr-server \
-    --ckpt-dir /path/to/ckpt --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051 &
-
-# GPU 1
-CUDA_VISIBLE_DEVICES=1 oasr-server \
-    --ckpt-dir /path/to/ckpt --http-bind 127.0.0.1:8081 --grpc-bind 127.0.0.1:50052 &
+oasr-server --gpus 0,1 --ckpt-dir /path/to/ckpt --service-mode offline \
+    --http-bind 0.0.0.0:8080 --grpc-bind 0.0.0.0:50051
 ```
 
-Put any L4/L7 load balancer (nginx, envoy, …) in front — sticky routing is
-not required since one process serves a request end-to-end.  Inside a process
-with several `--engine-workers`, a request goes to the least-loaded worker and
-stays there because its handle carries that worker's command sender; there is
-no routing table to keep in step.
+The process becomes a **launcher**.  It never loads a model.  It starts one
+*replica* per listed GPU — the same command, with `CUDA_VISIBLE_DEVICES` set to
+that device — and serves the configured ports by routing to them.
+
+- **What a replica gets.** Every flag except `--gpus`, `--processes-per-gpu`,
+  `--http-bind` and `--grpc-bind`.  Every limit therefore applies per replica:
+  `--max-concurrent-requests`, `--max-batch-size`, `--max-num-blocks`,
+  `--max-inflight-connections`.  N replicas admit N times as much.  Each
+  replica binds loopback ports of its own and reports them back.  The launcher
+  logs them (`replica bound ... http=127.0.0.1:…`), so a replica can still be
+  reached directly for debugging.
+- **`--gpus`** takes either a comma list of device ordinals or `all`.
+  Ordinals are read the way CUDA would read them in the launcher, through an
+  inherited `CUDA_VISIBLE_DEVICES`: `--gpus 0` under `CUDA_VISIBLE_DEVICES=2,3`
+  runs on device 2.  `all` means every visible device; `nvidia-smi` counts them
+  when nothing restricts the list.  A device listed twice is refused, because
+  that is what `--processes-per-gpu` is for.
+- **Routing is per request.** Each HTTP request, gRPC call, gRPC stream and
+  realtime session goes to the ready replica with the fewest open.  Ties are
+  taken in turn.  Routing is per request, not per connection: a gRPC client
+  multiplexes every call over one connection, and an HTTP client keeps its
+  connections alive.  Balancing connections (`SO_REUSEPORT`, an L4 balancer)
+  would therefore land one client's whole load on one GPU.  A stream or
+  session stays on its replica for its whole life.  Bodies stream through in
+  both directions, and the router adds no limit or deadline of its own.
+- **Health.** The launcher answers `/readyz` and `grpc.health.v1.Health`
+  itself.  It is ready while any replica is (the rule an in-process
+  `EnginePool` applies), and not ready from the shutdown signal on.
+  `/healthz` answers for the launcher process.
+- **Metrics.** One scrape of `/metrics` returns the launcher's own series and
+  every replica's, each sample labelled `replica` and `gpu`.  See
+  [Launcher](#launcher) below.
+- **Failures.** A replica that exits is restarted after a backoff: 1 s,
+  doubling to 30 s, and reset once it is ready.  A replica whose `/readyz`
+  keeps failing for a minute after it was ready is stopped and restarted; that
+  is a dispatcher that gave up on a failing engine.  Requests in flight on a
+  replica that dies fail, as they would without the launcher.  So may an HTTP
+  request routed to it in the moment before its exit is seen.  A gRPC call
+  whose replica refuses the connection is sent to another replica instead.  If
+  every replica's first start fails (a bad checkpoint path fails them all
+  alike), the launcher exits non-zero rather than restarting them forever.
+- **Startup.** The launcher binds its ports before any replica starts, so a
+  port already in use fails at once.  Replicas on different GPUs start
+  together.  Replicas sharing a GPU start one after another, because each
+  sizes its pools from the memory the GPU has free when it starts.
+- **Shutdown.** SIGTERM stops readiness, stops the listeners accepting, and
+  sends SIGTERM to every replica.  Each replica then drains as described under
+  [Limits, timeouts and shutdown](#limits-timeouts-and-shutdown).  A replica
+  still running `--shutdown-grace-secs` + 24 s later is killed.  Each replica
+  runs in its own process group, so a terminal's Ctrl-C reaches only the
+  launcher.  A launcher that dies without stopping its replicas takes them
+  with it (`PR_SET_PDEATHSIG`).
+- **Logs.** Replicas' lines come out of the launcher's stdout and stderr,
+  prefixed `[replica 1 gpu 1]`.  With `--log-format json` they gain `"replica"`
+  and `"gpu"` fields instead.
+
+`--engine-workers` is not a substitute.  Its workers are full engines on the
+first visible GPU and share the process's GIL.  Inside one process, a request
+goes to the least-loaded worker and stays there, because its handle carries that
+worker's command sender.
+
+**Without the launcher.** One process per GPU behind a balancer you already
+run still works.  It is also the shape for a fleet that spans hosts:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 oasr-server --ckpt-dir /path/to/ckpt \
+    --http-bind 127.0.0.1:8080 --grpc-bind 127.0.0.1:50051 &
+CUDA_VISIBLE_DEVICES=1 oasr-server --ckpt-dir /path/to/ckpt \
+    --http-bind 127.0.0.1:8081 --grpc-bind 127.0.0.1:50052 &
+```
+
+Sticky routing is not required, because one process serves a request end to
+end.  For gRPC the balancer has to work per call (L7), for the reason above.
 
 ### Processes per GPU is mode-dependent
 
-The right number of `oasr-server` processes **per GPU** differs by service mode:
+The right number of server processes **per GPU** differs by service mode
+(`--processes-per-gpu`, default 1; without `--gpus` it implies `--gpus 0`):
 
 | Mode | Recommended | Why |
 |---|---|---|
@@ -731,8 +798,7 @@ The right number of `oasr-server` processes **per GPU** differs by service mode:
 
 For streaming, enabling **CUDA MPS** (`nvidia-cuda-mps-control -d`) lets the
 processes' kernels run concurrently rather than time-slice, improving the
-multiplier further. Each process is independent — front them with the same
-load balancer.
+multiplier further.
 
 ### Streaming throughput levers
 
@@ -937,7 +1003,7 @@ Available subroutines:
 > reference box. The HTTP `offline` path uses a raw-PCM body (no base64/JSON),
 > which is ~2× a base64-JSON body would be. The remaining gap between gRPC and
 > the raw engine ceiling is GPU-bound + online-padding bound; scale out with
-> **one `oasr-server` process per GPU** to multiply total throughput.
+> **one server process per GPU** (`--gpus`) to multiply total throughput.
 
 Output reports requests `ok` / `rejected` (server backpressure —
 `RESOURCE_EXHAUSTED`) / `fail` (transport errors), wall-clock time, total
@@ -1038,6 +1104,22 @@ loses nothing and a repeated one double-counts nothing.
 | `oasr_engine_metric_samples_dropped_total` | counter | Non-zero means a histogram above is showing a **truncated** distribution — the collector buffered more samples between two drains than it may hold. Exported so the cap is visible instead of passing for a complete one. |
 | `oasr_gpu_{memory_used_bytes,memory_total_bytes}` | gauge | Device memory, sampled once a second. Device-wide, not this process's. |
 | `oasr_gpu_utilization_ratio` | gauge | NVML's fraction of its sampling window in which any kernel was resident — a **saturation hint, not SM occupancy**. A kernel using one SM of 170 reads as `1.0`. |
+
+### Launcher
+
+A launcher's `/metrics` is one exposition for the whole host.  It holds the
+launcher's own series, below, and every replica's series from the tables
+above, fetched at scrape time with labels `replica` (index) and `gpu` (the
+device it runs on) added to each sample.  Each family keeps one `# TYPE` line.
+`sum without (replica, gpu) (…)` is the host's total.  A replica that does not
+answer within 2 s is left out, and a comment line says which.
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `oasr_router_replica_ready{replica,gpu}` | gauge | `1` while the launcher routes to the replica: its `/readyz` answered 200 at the last poll (once a second). |
+| `oasr_router_replica_in_flight{replica,gpu}` | gauge | Requests, streams and realtime sessions the launcher has open on the replica.  This is what it balances on; a request counts until the last byte of its response. |
+| `oasr_router_replica_restarts_total{replica,gpu}` | counter | Restarts after the replica exited or stopped answering `/readyz`.  Any increase is worth a look in the replica's log lines. |
+| `oasr_router_unrouted_total{reason}` | counter | Requests the launcher answered itself: `no_replica` (none ready: `503` / `UNAVAILABLE`), or `replica_error` (the replica chosen failed before answering: `502` / `UNAVAILABLE`). |
 
 > **`stage_host_seconds` is host time, and the name says so.** CUDA is
 > asynchronous: the encoder forward returns while the GPU is still working, and
@@ -1188,10 +1270,11 @@ or is abandoned while the command channel is full, leaves nothing behind either.
 - Watch `oasr_dispatch_tick_seconds` p99. If it is far above your latency budget
   on an AR decode family, lower `--decode-steps-per-tick`.
 - For local development, a single process pinned to one GPU keeps things
-  simple; multi-GPU scale comes from running additional `oasr-server`
-  processes behind a load balancer.
+  simple; multi-GPU scale is `--gpus` (see
+  [Multi-GPU topology](#multi-gpu-topology)).
 - If the engine OOMs or panics mid-step, the process exits non-zero.  Use a
-  process manager (systemd, supervisord, k8s) to restart it.
+  process manager (systemd, supervisord, k8s) to restart it.  Under `--gpus`
+  the launcher restarts the replica itself, and only the launcher needs one.
 
 ## Out of scope (v1)
 

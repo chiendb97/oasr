@@ -217,8 +217,10 @@ See [asrbench.md](asrbench.md) and [benchmarks.md](benchmarks.md).
 
 ## How do I scale OASR across several GPUs?
 
-Run one `oasr-server` process per GPU and put a load balancer in front. Within
-a process, the engine batches concurrent requests dynamically. It serves its
+`oasr-server --gpus 0,1` (or `--gpus all`) runs one server process per GPU
+behind one port: it starts a replica per GPU, sends each request to the least
+loaded, restarts a replica that fails, and merges their metrics. Within a
+process, the engine batches concurrent requests dynamically. It serves its
 own Prometheus `/metrics` endpoint, and the repository includes Grafana
 dashboards. See [serving.md](serving.md).
 

@@ -36,3 +36,15 @@ axum = { workspace = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
 hyper = { workspace = true }
+# The launcher (`--gpus`): router, replica processes, merged metrics.
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tower = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+# A WebSocket client through the router.  Already in the build: axum's `ws`
+# feature is built on it.
+tokio-tungstenite = "0.24"
