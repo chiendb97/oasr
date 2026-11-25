@@ -836,12 +836,17 @@ and the default-off `--use-ctc-cuda-graphs` / `--use-feature-cuda-graphs`
 (**keep them off** — both measured to regress; `.artifacts/engine_perf.md` §1).
 `oasr-server --help` lists them all.
 
-**Audio hand-off.** After the codec, the front-end asks the engine for a
-**page-locked** buffer (`ASREngine.new_audio_buffer`) and decodes into that, so
-the waveform is copied once rather than twice: the engine can then DMA each row
-of a micro-batch straight into the padded device batch instead of packing the
-batch into staging first. Worth **1.13–1.19×** on the engine's offline path
-(`.artifacts/engine_perf.md` §10.7). Page-locked memory is process-global and
+**Audio hand-off.** At admission the dispatcher asks the engine for a
+**page-locked** buffer (`ASREngine.new_audio_buffer`) and copies the decoded
+waveform into it, so the waveform is copied once rather than twice: the engine
+can then DMA each row of a micro-batch straight into the padded device batch
+instead of packing the batch into staging first. Worth **1.13–1.19×** on the
+engine's offline path (`.artifacts/engine_perf.md` §10.7). The copy touches no
+Python object, so it runs off the GIL. Helper threads from the runtime's blocking
+pool start it while the dispatcher builds the admission specs, and the
+dispatcher joins them. A tick that copies 1 MiB or more joins with the GIL
+released, so a VAD or admission-prep thread, or another engine worker, runs
+meanwhile. Page-locked memory is process-global and
 the allocator keeps what it takes, so it is bounded twice:
 - `--max-pinned-audio-seconds` caps one request.
 - `--max-pinned-audio-total-seconds` (default 3600) caps all of them at once.

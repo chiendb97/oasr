@@ -21,6 +21,7 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use thiserror::Error;
 
 use crate::engine_metrics::{EngineLabels, EngineSnapshot};
+use crate::payload_copy::{CopyInFlight, DstPtr, PayloadCopy, RELEASE_GIL_MIN_BYTES};
 
 /// One unit of admission for [`PyEngine::add_requests_batch_locked`].
 ///
@@ -256,11 +257,14 @@ impl PyEngine {
             return Ok(Vec::new());
         }
         // Every offline payload's destination first -- an engine-owned pinned
-        // tensor, or a fresh numpy array -- then all the copies at once, then the
-        // specs.  The copies are the dispatcher's largest admission cost (~27 MB
-        // per 64-request tick at saturation, 4.5 ms single-threaded, all of it
-        // inside the tick that holds the GIL), and none of them touches Python,
-        // so they are spread across threads.
+        // tensor, or a fresh numpy array -- then the copies, then the specs.
+        // The copies are the dispatcher's largest admission cost (~30 MB per
+        // 64-request tick at saturation, ~5 ms on one thread), and none of them
+        // touches Python: they start on helper threads before the specs are
+        // built and are joined with the GIL released (`payload_copy`).
+        //
+        // Declared before the copy, so the destinations outlive it on every
+        // path out of this function, an early `?` included.
         let mut dests: Vec<Option<Bound<'py, PyAny>>> = Vec::with_capacity(specs.len());
         let mut jobs: Vec<PayloadCopy<'_>> = Vec::new();
         for spec in specs {
@@ -277,10 +281,10 @@ impl PyEngine {
                 AdmitSpec::Streaming { .. } => dests.push(None),
             }
         }
-        copy_payloads(&jobs);
+        let copy = CopyInFlight::start(&jobs);
 
         let list = PyList::empty_bound(py);
-        for (spec, dest) in specs.iter().zip(dests) {
+        for (spec, dest) in specs.iter().zip(&dests) {
             let d = PyDict::new_bound(py);
             match spec {
                 AdmitSpec::Offline {
@@ -315,6 +319,14 @@ impl PyEngine {
                 }
             }
             list.append(d)?;
+        }
+        // Every byte lands before the engine can read one.  Joined without the
+        // GIL when the copy is long enough to let another Python thread (a VAD
+        // or admission-prep worker, another engine's dispatcher) run meanwhile.
+        if copy.bytes() >= RELEASE_GIL_MIN_BYTES {
+            py.allow_threads(|| copy.finish());
+        } else {
+            copy.finish();
         }
         let out = bound.call_method1("add_requests_batch_checked", (list,))?;
         let rows: Vec<Bound<'py, PyAny>> = out.extract()?;
@@ -824,7 +836,8 @@ fn offline_audio_to_py<'py>(
 /// The same preference as [`offline_audio_to_py`] -- an engine-owned pinned
 /// tensor (returned as the tensor, so its allocator tracks in-flight copies),
 /// else a fresh numpy array -- split from the copy so a batch can allocate
-/// every destination under the GIL and then fill them all in parallel.
+/// every destination under the GIL and then fill them off it
+/// ([`CopyInFlight`]).
 fn offline_audio_dest<'py>(
     py: Python<'py>,
     engine: &Bound<'py, PyAny>,
@@ -836,8 +849,9 @@ fn offline_audio_dest<'py>(
         let dst = contiguous_f32_ptr(arr, n)?;
         return Ok((buf, dst));
     }
-    // SAFETY: uninitialized only until `copy_payloads` writes all `n` elements,
-    // which happens before the array is handed to Python; f32 has no drop glue.
+    // SAFETY: uninitialized only until the batch's `CopyInFlight` writes all `n`
+    // elements, which finishes before the array is handed to Python; f32 has no
+    // drop glue.
     let arr = unsafe { PyArray1::<f32>::new_bound(py, n, false) };
     let dst = contiguous_f32_ptr(&arr, n)?;
     Ok((arr.into_any(), dst))
@@ -858,55 +872,6 @@ fn contiguous_f32_ptr(arr: &Bound<'_, PyArray1<f32>>, n: usize) -> PyResult<*mut
         )));
     }
     Ok(slice.as_mut_ptr())
-}
-
-/// A destination pointer that may cross into a copy thread.
-#[derive(Clone, Copy)]
-struct DstPtr(*mut f32);
-
-// SAFETY: each pointer addresses a distinct, freshly allocated buffer that only
-// its own copy job writes, and the scoped threads join before the buffers are
-// handed to Python (see `copy_payloads`).
-unsafe impl Send for DstPtr {}
-unsafe impl Sync for DstPtr {}
-
-/// One payload copy: `src` (little-endian f32 bytes) into `dst`, which holds
-/// exactly `src.len() / 4` elements.
-struct PayloadCopy<'a> {
-    dst: DstPtr,
-    src: &'a [u8],
-}
-
-/// Below this many bytes per batch the copies run inline: a scoped thread costs
-/// tens of microseconds to spawn, which a single request's copy does not repay.
-const PARALLEL_COPY_MIN_BYTES: usize = 4 << 20;
-/// Copy threads per batch.  Single-threaded memcpy into pinned memory measured
-/// ~6 GB/s; a handful of threads is enough to reach memory bandwidth.
-const MAX_COPY_THREADS: usize = 8;
-
-fn copy_one(job: &PayloadCopy<'_>) {
-    // SAFETY: `dst` holds `src.len() / 4` f32 elements (checked by
-    // `contiguous_f32_ptr`), `src` is exactly that many elements, and the two are
-    // distinct allocations.  x86 is little-endian, so the bytes are the floats.
-    unsafe {
-        std::ptr::copy_nonoverlapping(job.src.as_ptr(), job.dst.0.cast::<u8>(), job.src.len());
-    }
-}
-
-/// Fill every destination, in parallel when the batch is large enough to repay
-/// the threads.  Returns after every copy has completed.
-fn copy_payloads(jobs: &[PayloadCopy<'_>]) {
-    let total: usize = jobs.iter().map(|j| j.src.len()).sum();
-    let threads = jobs.len().min(MAX_COPY_THREADS);
-    if threads <= 1 || total < PARALLEL_COPY_MIN_BYTES {
-        jobs.iter().for_each(copy_one);
-        return;
-    }
-    std::thread::scope(|scope| {
-        for t in 0..threads {
-            scope.spawn(move || jobs.iter().skip(t).step_by(threads).for_each(copy_one));
-        }
-    });
 }
 
 /// Decode raw little-endian f32 audio bytes into a writable numpy array on
@@ -1122,6 +1087,113 @@ class WithoutBuffers:
             assert_eq!(calls(&declining), 2, "an empty payload is not offered");
             let old = engine(py, "WithoutBuffers", ());
             assert!(pinned_audio_buffer(&old, 16_000).is_none());
+        });
+    }
+
+    /// A stand-in for the bulk admission: hands out buffers the way the engine
+    /// does (a "tensor" written through its `numpy()` view, or `None` for heap
+    /// audio) and records the bytes each spec carries at the moment it is
+    /// admitted.
+    const RECORDER: &str = r#"
+import numpy as np
+
+
+class Pinned:
+    def __init__(self, n):
+        self.arr = np.empty(n, dtype=np.float32)
+
+    def numpy(self):
+        return self.arr
+
+
+class Recorder:
+    def __init__(self, pinned):
+        self.pinned = pinned
+        self.seen = []
+
+    def new_audio_buffer(self, n):
+        return Pinned(n) if self.pinned else None
+
+    def add_requests_batch_checked(self, specs):
+        for s in specs:
+            a = s.get("audio")
+            if isinstance(a, Pinned):
+                a = a.numpy()
+            self.seen.append(None if a is None else a.tobytes())
+        return [{"request_id": s["request_id"]} for s in specs]
+"#;
+
+    /// Every payload reaches the engine whole, in its own buffer, by the time
+    /// the engine is called -- with the copy spread over helpers and joined off
+    /// the GIL, which a batch of several MiB takes.
+    #[test]
+    fn a_batch_reaches_the_engine_copied_whole() {
+        pyo3::prepare_freethreaded_python();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let _rt = rt.enter();
+        // Lengths that cut chunks mid-payload, plus a ragged tail the engine
+        // never sees (`len % 4`), around a streaming open.
+        let lens = [(3 << 20) + 6, 4, 0, 700_001 * 4, (1 << 20) + 2, 8 << 20];
+        let payloads: Vec<Bytes> = lens
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                (0..n)
+                    .map(|k| (k * 13 + i) as u8)
+                    .collect::<Vec<u8>>()
+                    .into()
+            })
+            .collect();
+        let mut specs: Vec<AdmitSpec> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, audio)| AdmitSpec::Offline {
+                rid: format!("r{i}"),
+                audio: audio.clone(),
+                sample_rate: 16_000,
+                priority: 0,
+                decoding: None,
+            })
+            .collect();
+        specs.insert(
+            2,
+            AdmitSpec::Streaming {
+                rid: "s".into(),
+                sample_rate: 16_000,
+                priority: 0,
+                decoding: None,
+            },
+        );
+        let mut want: Vec<Option<Vec<u8>>> = payloads
+            .iter()
+            .map(|p| Some(p[..p.len() / 4 * 4].to_vec()))
+            .collect();
+        want.insert(2, None);
+
+        Python::with_gil(|py| {
+            if py.import_bound("numpy").is_err() {
+                eprintln!("skipped: numpy is not importable from this interpreter");
+                return;
+            }
+            let module = PyModule::from_code_bound(py, RECORDER, "recorder.py", "recorder")
+                .expect("the recorder does not compile");
+            for pinned in [true, false] {
+                let engine = module
+                    .getattr("Recorder")
+                    .unwrap()
+                    .call1((pinned,))
+                    .unwrap();
+                let errors = PyEngine::add_requests_batch_locked(py, &engine, &specs).unwrap();
+                assert!(errors.iter().all(Option::is_none));
+                let seen: Vec<Option<Vec<u8>>> = engine.getattr("seen").unwrap().extract().unwrap();
+                assert_eq!(seen.len(), want.len());
+                for (i, (got, exp)) in seen.iter().zip(&want).enumerate() {
+                    assert!(got == exp, "spec {i} (pinned={pinned}) arrived altered");
+                }
+            }
         });
     }
 }
