@@ -20,6 +20,7 @@ pub mod client;
 pub mod dispatcher;
 pub mod engine_metrics;
 pub mod handle;
+mod payload_copy;
 pub mod pool;
 pub mod pyengine;
 pub mod router;
