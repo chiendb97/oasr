@@ -300,6 +300,7 @@ extension cookbook for each axis.
 | `csrc/alignment/` | The post-decode alignment pass and the beam read-back, in C++ (`_C.alignment`) |
 | `rust/crates/oasr-engine-client/` | The GIL-owning dispatcher thread |
 | `rust/crates/oasr-serve/` | Mode-agnostic serving core shared by binary and extension |
+| `rust/crates/oasr-serve/src/launcher/` | `--gpus`: one replica process per GPU behind the server's ports -- supervisor, per-request router, merged `/metrics` |
 | `rust/crates/oasr-server-http/src/{openai,realtime}.rs` | The OpenAI-compatible routes and the `/v1/realtime` WebSocket |
 | `rust/crates/oasr-asr/src/{codec,encoding}.rs` | Container decoding (symphonia) + the one `encoding=` parser both front-ends share |
 | `rust/crates/oasr-metrics/` | Every metric's name, kind, unit, help and **buckets**, declared once; `install_recorder` is the only place the exporter is built |

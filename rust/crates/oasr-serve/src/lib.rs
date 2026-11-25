@@ -11,14 +11,18 @@
 //!     interpreter (`pyo3/extension-module`) and calls [`run`] under
 //!     `Python::allow_threads`.
 //!
-//! Multi-GPU scaling = launch one front-end per GPU behind a process manager
-//! and set `CUDA_VISIBLE_DEVICES` per launch.
+//! Several GPUs: `--gpus` turns the process into a launcher, which starts one
+//! replica of itself per GPU and routes to them from this process's ports
+//! ([`launcher`]).
 
 mod config;
+mod launcher;
 
 pub use config::Cli;
 
+use std::ffi::OsString;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,12 +57,48 @@ const CUT_GRACE: Duration = Duration::from_secs(2);
 /// exiting, which is the failure this bound exists to avoid.
 const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How to start this program again: what the launcher runs for each replica.
+///
+/// The two front-ends differ.  The binary is its own executable; the extension
+/// module runs inside an interpreter, whose executable is Python, and its
+/// `argv[0]` is a console script that is only sometimes executable
+/// (`python -m oasr._server_cli` gives a `.py` path).
+#[derive(Clone, Debug)]
+pub struct SelfCommand {
+    pub program: OsString,
+    /// Arguments placed before the server's own (`-m oasr._server_cli`).
+    pub prefix_args: Vec<OsString>,
+}
+
+impl SelfCommand {
+    /// This process's executable, for the standalone binary.
+    pub fn current_exe() -> Result<Self> {
+        let exe = std::env::current_exe().context("locate the oasr-server executable")?;
+        Ok(Self {
+            program: exe.into_os_string(),
+            prefix_args: Vec::new(),
+        })
+    }
+
+    /// `python -m oasr._server_cli`, for the extension module.
+    pub fn python_module(python: impl Into<OsString>) -> Self {
+        Self {
+            program: python.into(),
+            prefix_args: vec!["-m".into(), "oasr._server_cli".into()],
+        }
+    }
+}
+
 /// Run the server to completion: build the engine, start the HTTP + gRPC
-/// listeners, and block until a shutdown signal arrives.
+/// listeners, and block until a shutdown signal arrives.  With `--gpus` (or
+/// `--processes-per-gpu` above one) it is the launcher instead: it starts
+/// replicas of itself with `relaunch` and routes to them.  `argv` is the
+/// command line `cli` was parsed from, program name first; the replicas get
+/// it back, less the launcher's own flags.
 ///
 /// Builds its own multi-threaded tokio runtime so it can be driven from a
 /// synchronous entry point (`fn main` or an extension-module function).
-pub fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli, argv: Vec<OsString>, relaunch: SelfCommand) -> Result<()> {
     init_tracing(&cli.log_level, &cli.log_format);
     warn_if_debug_build();
 
@@ -66,6 +106,13 @@ pub fn run(cli: Cli) -> Result<()> {
         .enable_all()
         .build()
         .context("build tokio runtime")?;
+    if cli.launches_replicas() {
+        anyhow::ensure!(
+            cli.report_bound_addrs.is_none(),
+            "a replica started by the launcher cannot launch replicas itself"
+        );
+        return runtime.block_on(launcher::run(cli, argv, relaunch));
+    }
     runtime.block_on(serve(cli))
 }
 
@@ -338,7 +385,20 @@ async fn serve(cli: Cli) -> Result<()> {
     let http_bind = cli.http_bind;
     let http_listener = bind_listener(http_bind, cli.listen_backlog)
         .with_context(|| format!("bind http {http_bind}"))?;
-    info!("HTTP listening on http://{http_bind}");
+    // Bound here rather than in the gRPC task, so that a port in use fails the
+    // start as the HTTP one does (it used to leave an HTTP-only server running
+    // behind an error line), and so both addresses are known below.
+    let grpc_bind = cli.grpc_bind;
+    let grpc_listener = bind_listener(grpc_bind, cli.listen_backlog)
+        .with_context(|| format!("bind grpc {grpc_bind}"))?;
+    let http_addr = http_listener.local_addr().context("http local address")?;
+    let grpc_addr = grpc_listener.local_addr().context("grpc local address")?;
+    info!("HTTP listening on http://{http_addr}");
+    if let Some(path) = &cli.report_bound_addrs {
+        // A replica binds port 0; the launcher learns the ports from this file.
+        write_bound_addrs(path, http_addr, grpc_addr)
+            .with_context(|| format!("report bound addresses to {}", path.display()))?;
+    }
     let http_handle = tokio::spawn(async move {
         // Nagle off, as gRPC already has it: an SSE token or a realtime event is
         // its own small write, and with Nagle on the second of two back-to-back
@@ -355,8 +415,6 @@ async fn serve(cli: Cli) -> Result<()> {
     });
 
     // ---- gRPC server (Speech + standard Health) ----
-    let grpc_bind = cli.grpc_bind;
-    let grpc_backlog = cli.listen_backlog;
     let grpc_pool = Arc::clone(&pool);
     let grpc_idle = cli.stream_idle_timeout();
     let grpc_request_timeout = cli.request_timeout();
@@ -421,7 +479,7 @@ async fn serve(cli: Cli) -> Result<()> {
             .with_inflight_permits(grpc_permits)
             .with_max_audio_samples(grpc_max_audio_samples)
             .with_decode_pool(grpc_decode_pool);
-        info!("gRPC listening on {grpc_bind}");
+        info!("gRPC listening on {grpc_addr}");
         // Both message-size limits are set explicitly.  tonic's default
         // decoding cap is 4 MiB, which silently rejected any unary `Recognize`
         // carrying more than ~2 minutes of 16 kHz PCM while HTTP accepted
@@ -438,19 +496,14 @@ async fn serve(cli: Cli) -> Result<()> {
         let mut builder = tonic::transport::Server::builder();
         // An incoming stream drops the builder's TCP options, so they are
         // restated: `Server::builder()` sets nodelay and no keepalive.
-        let incoming = bind_listener(grpc_bind, grpc_backlog)
-            .map_err(|e| e.to_string())
-            .and_then(|listener| {
-                tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
-                    .map_err(|e| e.to_string())
-            });
-        let incoming = match incoming {
-            Ok(incoming) => incoming,
-            Err(e) => {
-                error!("bind grpc {grpc_bind}: {e}");
-                return;
-            }
-        };
+        let incoming =
+            match tonic::transport::server::TcpIncoming::from_listener(grpc_listener, true, None) {
+                Ok(incoming) => incoming,
+                Err(e) => {
+                    error!("grpc listener {grpc_addr}: {e}");
+                    return;
+                }
+            };
         let serve = builder
             .add_service(speech)
             .add_service(health_service)
@@ -526,6 +579,20 @@ async fn serve(cli: Cli) -> Result<()> {
     }
 
     info!("bye");
+    Ok(())
+}
+
+/// Write this process's bound addresses for the launcher, atomically: a
+/// launcher polling `path` reads either nothing or the whole file.
+fn write_bound_addrs(path: &Path, http: SocketAddr, grpc: SocketAddr) -> Result<()> {
+    let report = launcher::BoundAddrs {
+        pid: std::process::id(),
+        http,
+        grpc,
+    };
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&report)?)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

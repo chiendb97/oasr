@@ -82,6 +82,11 @@ prost = "0.13"
 prost-types = "0.13"
 tonic-build = "0.12"
 hyper = { version = "1", features = ["full"] }
+# The launcher's router (`oasr-serve`, `--gpus`): hyper's pooled client and its
+# graceful server.  All three are already in the build under axum and tonic.
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "server-graceful", "http1", "http2", "tokio", "service"] }
+http = "1"
+http-body-util = "0.1"
 
 # Audio
 hound = "3.5"
@@ -112,6 +117,9 @@ rubato = { version = "0.16", default-features = false }
 # Views a `Vec<f32>` as its bytes without `unsafe`.  Already in the build:
 # symphonia depends on it.
 bytemuck = "1"
+
+# Signals and process groups for the launcher's replicas.
+libc = "0.2"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

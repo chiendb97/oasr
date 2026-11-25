@@ -650,7 +650,8 @@ bottleneck.
 
 **Do not add threads inside one engine to gain throughput** — CPython's GIL means
 it cannot work, and the engine is GPU-bound and already batching. Horizontal
-scale is one process per GPU; see [serving.md](serving.md#multi-gpu-topology).
+scale is one process per GPU, which `oasr-server --gpus` starts and routes to;
+see [serving.md](serving.md#multi-gpu-topology).
 
 Under serving, the PyO3 dispatcher is the only Python caller and runs
 single-threaded; HTTP and gRPC handlers stay on tokio and never touch the GIL.

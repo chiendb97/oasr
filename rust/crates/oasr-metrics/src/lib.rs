@@ -341,6 +341,19 @@ metrics_table! {
     /// SM of 170 reads as 1.0.
     GPU_UTILIZATION = "oasr_gpu_utilization_ratio", Gauge, None, None,
         "NVML GPU utilization over its sampling window, in [0, 1]";
+
+    // -- Launcher (`--gpus`): the router in front of the replicas ------------
+    // All but the last carry {replica, gpu}.  The replicas' own series reach
+    // the launcher's `/metrics` with the same two labels added.
+    ROUTER_REPLICA_READY = "oasr_router_replica_ready", Gauge, None, None,
+        "1 while the launcher routes to this replica: its /readyz answered 200 at the last poll";
+    ROUTER_REPLICA_IN_FLIGHT = "oasr_router_replica_in_flight", Gauge, None, None,
+        "Requests, streams and realtime sessions the launcher has open on this replica (what it balances on)";
+    ROUTER_REPLICA_RESTARTS = "oasr_router_replica_restarts_total", Counter, None, None,
+        "Times the launcher restarted this replica after it exited or stopped answering /readyz";
+    /// `{reason}`: `no_replica` or `replica_error`.
+    ROUTER_UNROUTED = "oasr_router_unrouted_total", Counter, None, None,
+        "Requests the launcher answered itself: no replica was ready, or the one chosen failed";
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +402,10 @@ pub mod label {
     pub const ROUTE: &str = "route";
     pub const STATUS: &str = "status";
     pub const CODE: &str = "code";
+    /// The launcher's replica index, and the device it runs on.
+    pub const REPLICA: &str = "replica";
+    pub const GPU: &str = "gpu";
+    pub const REASON: &str = "reason";
 }
 
 /// The label key an engine-scope series carries *besides* `engine`, if any.

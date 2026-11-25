@@ -283,8 +283,8 @@ See [`docs/quantization.md`](docs/quantization.md) for the recipes, GPU support 
 
 ## Serving
 
-`oasr-server` hosts one in-process `ASREngine` and serves it over HTTP and gRPC. Scale horizontally
-by launching one process per GPU.
+`oasr-server` hosts one in-process `ASREngine` and serves it over HTTP and gRPC. Scale across GPUs
+with `--gpus 0,1` (or `all`): one replica process per GPU behind the same ports.
 
 ```bash
 oasr-server \

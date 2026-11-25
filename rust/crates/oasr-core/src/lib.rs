@@ -24,7 +24,13 @@ fn serve(py: Python<'_>, args: Vec<String>) -> PyResult<()> {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
-    py.allow_threads(|| oasr_serve::run(cli))
+    // A launcher (`--gpus`) starts its replicas as `python -m oasr._server_cli`
+    // with this interpreter: `args[0]` is a console script, or a `.py` path
+    // that is not executable at all.
+    let python: String = py.import_bound("sys")?.getattr("executable")?.extract()?;
+    let relaunch = oasr_serve::SelfCommand::python_module(python);
+    let argv = args.into_iter().map(Into::into).collect();
+    py.allow_threads(|| oasr_serve::run(cli, argv, relaunch))
         .map_err(|e| PyRuntimeError::new_err(format!("{e:#}")))
 }
 

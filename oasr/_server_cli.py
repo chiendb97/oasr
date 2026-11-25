@@ -6,6 +6,9 @@ extension module via setuptools-rust (see ``pyproject.toml``'s
 process ``argv`` into it so ``oasr-server ...`` on the ``PATH`` behaves like the
 old standalone binary — same flags, same HTTP/gRPC servers, just shipped inside
 the wheel instead of a separately-built executable.
+
+``oasr-server --gpus`` starts its replicas as ``python -m oasr._server_cli``
+with this interpreter, so the module must stay runnable that way.
 """
 
 import sys

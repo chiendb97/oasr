@@ -339,8 +339,9 @@ python benchmarks/run.py --family accuracy \
   processes. Clients that reconnect in bursts also need the server's
   `--listen-backlog` (default 4096; it was 128): past the accept queue each new
   connection waits out a 1 s SYN retransmit.
-- `--num-workers > 1` is rejected — `oasr-server` is now one-process-per-GPU.
-  For multi-GPU, launch N `oasr-server` processes manually with distinct
+- `--num-workers > 1` is rejected — `oasr-server` is one process per GPU.
+  For multi-GPU, start the server with `--gpus 0,1` and point the bench at its
+  one port, or launch N `oasr-server` processes with distinct
   `--http-bind`/`--grpc-bind` + `CUDA_VISIBLE_DEVICES`.
 - Wire encoding `i16_le` halves the HTTP/WS bytes vs `f32_le`. Server-side
   decode (`oasr-asr::decode_raw_pcm`) widens i16 back to f32 by dividing by

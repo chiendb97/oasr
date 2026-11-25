@@ -2,10 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! CLI / runtime config.
 //!
-//! After the move to PyO3 in-process engines (one engine per process, one
-//! process per GPU), the supervisor + subprocess-spawning options went away
-//! and the binary now reads engine config like `engine_worker.py` did:
-//! optional JSON file + flag overrides.
+//! One engine per process, one process per GPU: the engine config is read like
+//! `engine_worker.py` did (optional JSON file + flag overrides), and `--gpus`
+//! has this same command line start one replica per GPU (`crate::launcher`).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -339,6 +338,32 @@ pub struct Cli {
     #[arg(long, default_value = "engine")]
     pub engine_label: String,
 
+    // ---- Several GPUs behind one port ----
+    /// Serve from several GPUs behind this server's ports: start one replica
+    /// `oasr-server` per listed GPU (`--processes-per-gpu` for more), each with
+    /// `CUDA_VISIBLE_DEVICES` set to its device and bound to a private loopback
+    /// port, and route every request, stream and realtime session to the ready
+    /// replica with the fewest in flight.  A comma list of device ordinals --
+    /// read the way CUDA would read them in this process, so through an
+    /// inherited `CUDA_VISIBLE_DEVICES` -- or `all`.  Every other flag is passed
+    /// to each replica and applies to it alone (`--max-concurrent-requests`,
+    /// `--max-batch-size`, ...).  A replica that exits, or stops answering
+    /// `/readyz` for a minute, is restarted.  Unset: one engine in this process,
+    /// as before.
+    #[arg(long, value_name = "LIST|all")]
+    pub gpus: Option<String>,
+    /// Replica processes per GPU behind the router; implies `--gpus 0` when
+    /// `--gpus` is unset.  Offline serving wants one (the batched forward fills
+    /// the GPU); streaming is host-bound, and a second process is a second GIL.
+    /// Replicas sharing a GPU start one after another, each sizing its pools
+    /// from what the last left free.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    pub processes_per_gpu: u32,
+    /// Set by the launcher on each replica: write the addresses this process
+    /// bound to this file (JSON), once both listeners are up.
+    #[arg(long, hide = true)]
+    pub report_bound_addrs: Option<PathBuf>,
+
     // ---- Server ----
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub http_bind: SocketAddr,
@@ -470,6 +495,12 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Whether this process is the launcher: it starts replicas and routes to
+    /// them instead of building an engine.
+    pub fn launches_replicas(&self) -> bool {
+        self.gpus.is_some() || self.processes_per_gpu > 1
+    }
+
     /// Largest accepted audio payload in bytes (shared by both front-ends).
     pub fn max_audio_bytes(&self) -> usize {
         self.max_audio_mib.saturating_mul(1024 * 1024)
