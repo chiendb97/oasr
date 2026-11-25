@@ -245,6 +245,22 @@ METRICS: List[MetricDef] = [
     MetricDef("chunk_lag_ms.*", "ms", INFO, "Chunk send time minus its real-time schedule."),
     # -- resources --------------------------------------------------------------
     MetricDef("cpu_pct.*", "%", INFO, "Process CPU utilisation (100 = one core).", telemetry=True),
+    MetricDef(
+        "client_cpu_pct.*",
+        "%",
+        INFO,
+        "CPU of the load generator's busiest process over the window (100 = one core; "
+        "network backends only). Near 100, the client, not the server, set the pace.",
+        telemetry=True,
+    ),
+    MetricDef(
+        "client_loop_lag_ms.*",
+        "ms",
+        INFO,
+        "How late the load generator's event loop ran a 2 ms timer over the window: the "
+        "delay a response waited for the client (network backends only).",
+        telemetry=True,
+    ),
     MetricDef("rss_mb.*", "MiB", LOWER, "Process resident memory.", telemetry=True),
     MetricDef("sys_mem_mb.*", "MiB", INFO, "System memory in use.", telemetry=True),
     MetricDef("gpu_util_pct.*", "%", INFO, "Device utilisation (NVML).", telemetry=True),

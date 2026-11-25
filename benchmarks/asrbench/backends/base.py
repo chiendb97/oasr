@@ -203,6 +203,29 @@ class Backend(ABC):
         """Convert one streaming chunk to the backend's wire form."""
         return chunk
 
+    async def prepared(self) -> None:  # noqa: B027 -- optional hook
+        """Every payload of a benchmark is built; called before any clock starts.
+
+        A backend that has to move payloads somewhere before it can send them
+        (:class:`~benchmarks.asrbench.backends.client_pool.ClientPool`) does it
+        here, so the transfer is never inside a measured window.
+        """
+
+    # -- client processes --------------------------------------------------------
+
+    def client_pids(self) -> List[int]:
+        """The processes generating this backend's load (this one, by default)."""
+        return [os.getpid()]
+
+    def client_options(self) -> Optional[Dict[str, Any]]:
+        """Options that make another instance, in another process, reach the same server.
+
+        ``None`` (the default) means inference runs in this process, so the
+        client cannot be spread over processes (``-o client_procs``).  Called
+        after :meth:`load`, when a spawned server's address is known.
+        """
+        return None
+
     # -- inference (timed) -------------------------------------------------------
 
     @abstractmethod

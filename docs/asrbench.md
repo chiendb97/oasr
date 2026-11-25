@@ -415,6 +415,47 @@ In both transports the first final result ends a streaming session. gRPC
 stubs are compiled from `rust/proto/oasr_speech_v1.proto` when the backend
 loads, which requires `grpcio` and `grpcio-tools`.
 
+**Client processes.** One Python process cannot keep a fast server busy:
+building each upload, parsing each response and the event loop around them
+cost the client about a millisecond of CPU per request, all of it on one
+interpreter.
+`-o client_procs=N` (`oasr_server` and `openai_http`) moves that work into *N*
+worker processes, each with its own connections to the same server. The
+runner, the records and every summary are unchanged. Each request goes to the
+worker with the fewest in flight, and streaming sessions are mirrored event by
+event. Payloads are copied to every worker before any clock starts, so each
+worker holds the whole workload in memory.
+
+Measured against one U2++ `oasr-server` (closed loop, multipart WAV, req/s):
+
+| In flight | 1 client process | 8 client processes | 8-process reference load generator |
+|---|---|---|---|
+| 1 | 252–265 | 231–235 | 257 |
+| 16 | 411 | 1,030–1,169 | 1,039 |
+| 64 | 254–258 | 766–800 | 924 |
+| 256 | 145–190 | 1,474–1,507 | 1,550 |
+
+Give the client a core per process plus one for the main process. With 8
+workers on 8 cores, the 1-in-flight point ran about 8 % below one process;
+with 24 cores it matched.
+
+Workers stamp `t_submit`, `t_done` and stream events themselves on
+`perf_counter`. That is the system-wide monotonic clock, and start-up refuses a
+worker whose clock does not read between two of the main process's. The main
+process still stamps the schedule, so the hand-off to a worker (about 0.1 ms)
+counts as client time and shows in `send_lag_ms`. At low load a request goes
+to the lowest-numbered idle worker, which keeps one worker warm; spreading
+ties round-robin cost about 0.2 ms per request at 1 in flight. `client_procs`
+is a backend option, so `compare` treats two client sizes as two
+configurations. The run records the worker PIDs and the requests each one
+served. [Client capacity](#client-capacity) says when a point needs more
+workers.
+
+```bash
+python -m benchmarks.asrbench run --profile standard --backend oasr_server \
+    -o dtype=float16 -o client_procs=8
+```
+
 **Service overhead.** To quantify the cost of serving, run the same profile
 against `oasr_engine` and `oasr_server` and render both runs in one report.
 
@@ -492,6 +533,27 @@ the shared event loop. Served requests wait for the same step, so the reported
 latency remains correct. Closed-loop latency is service time under *N*
 concurrent clients by construction; use the open loop for latency objectives.
 
+### Client capacity
+
+A closed loop never shows a slow client in `send_lag_ms`: each user schedules
+its next request when it gets to it, so the lag stays near zero while the
+client delivers a fraction of what the server sustains. For a network backend
+the suite measures the load generator itself over every window:
+
+- `client_cpu_pct.max` is the CPU of the busiest client process, as a
+  percentage of one core.
+- `client_loop_lag_ms.*` is how late the main event loop ran a 2 ms timer,
+  which is how long a response waited for the client.
+
+Either one past its threshold (90 %, or 5 ms at p99) adds a warning to the
+point. Measured on U2++ through one client process, healthy points ran
+timers at most 1.3 ms late (p99) at up to 38 % of a core. At 16 in flight the
+client was 10 ms late at only 64 % busy, and delivered 341 req/s where eight
+processes delivered 1,273. One event loop handled each batch of responses, and
+the requests they released, one after another while the server sat idle. At
+256 in flight it was 23 ms late and 98 % busy. With `client_procs`, the
+workers' CPU is included; their event loops are not probed.
+
 ### Failures
 
 Percentiles are computed over successful requests. Timeouts, failures and
@@ -564,6 +626,7 @@ where `.n` is the sample count.
 | `error_rate`, `timeout_rate`, `empty_rate` | ratio | Lower |
 | `requests.*`, `sessions.*` | count | Informational |
 | `send_lag_ms.*`, `offered_rate` | ms, req/s | Informational |
+| `client_cpu_pct.max`, `client_loop_lag_ms.*` (network backends) | %, ms | Informational |
 | `achieved_ratio` | ratio | Higher |
 | `queue_wait_ms.*`, `batch_size_observed.*` | ms, count | Lower / informational |
 | `first_partial_ms.*`, `final_latency_ms.*`, `emission_delay_ms.*`, `late_chunk_pct` | ms, % | Lower |
@@ -782,9 +845,13 @@ python -m benchmarks.asrbench compare main <candidate-run-id> --thresholds ci/th
   warm-up can enumerate. Their capture cost appears in open-loop tail latency,
   as it would in production, until captures saturate. Longer runs amortise
   it.
-- **Single-process client.** One asyncio client generates load. At very high
-  request rates the client can become the bottleneck; `send_lag_ms` and the
-  client-lag warning indicate when this happens.
+- **Client capacity.** By default one asyncio process generates the load, and
+  against a fast server it becomes the bottleneck well before the server
+  does. Network backends take `-o client_procs=N` to spread it
+  ([Benchmarking `oasr-server`](#benchmarking-oasr-server)). `send_lag_ms` and
+  the client-lag warning show when the client set the pace. The in-process
+  backends have no client to spread: their load generator and the engine
+  share one interpreter.
 - **No forced alignment.** Emission delay uses the backend's own word timings
   and is therefore relative to that model's alignment. LibriSpeech provides no
   reference word alignments.

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from benchmarks.asrbench import backends, environment
+from benchmarks.asrbench.backends.client_pool import ClientPool, requested_procs
 from benchmarks.asrbench.metrics import direction, low_sample_percentiles, unit
 from benchmarks.asrbench.monitor import ResourceMonitor, summarize_window
 from benchmarks.asrbench.profiles import Profile
@@ -51,6 +52,11 @@ from benchmarks.asrbench.runners.load import Load
 from benchmarks.asrbench.workloads import Workload, load_audio, resolve
 
 MODES = ("offline", "streaming")
+
+#: A client process this busy over a window (% of one core) is flagged.
+CLIENT_CPU_WARN_PCT = 90.0
+#: ...and so is an event loop that ran its timers this late (p99, ms).
+CLIENT_LOOP_LAG_WARN_MS = 5.0
 
 
 def _log(msg: str) -> None:
@@ -110,6 +116,28 @@ def _measured_nothing(records: List[Any]) -> Optional[str]:
     return f"every measured request failed ({failed} failed, {rejected} rejected)"
 
 
+def _client_limits(ctx: RunContext, summary: Dict[str, float]) -> str:
+    """Record the load generator's own load; say how it may have limited the point.
+
+    Measured on U2++ through one client process: healthy points ran the event
+    loop's timers at most ~1.3 ms late (p99) at up to 38 % of a core; the
+    client-bound 16-in-flight point was 10 ms late at 64 %, the 256-in-flight
+    one 23 ms late at 98 %.
+    """
+    why = []
+    lag = ctx.client_loop_lag_ms
+    if lag is not None:
+        summary.update({f"client_loop_lag_ms.{k}": v for k, v in lag.items()})
+        if lag.get("p99", 0.0) >= CLIENT_LOOP_LAG_WARN_MS:
+            why.append(f"its event loop ran timers {lag['p99']:.0f} ms late (p99)")
+    cpu = ctx.client_cpu_pct
+    if cpu is not None:
+        summary["client_cpu_pct.max"] = cpu
+        if cpu >= CLIENT_CPU_WARN_PCT:
+            why.append(f"a client process was {cpu:.0f} % busy")
+    return " and ".join(why)
+
+
 async def _run_point(
     bench: Benchmark,
     point: Dict[str, Any],
@@ -146,6 +174,12 @@ async def _run_point(
     server = ctx.backend.server_metrics_end()
     result.summary.update({k: v for k, v in server.items() if isinstance(v, (int, float))})
     result.server.update({k: v for k, v in server.items() if not isinstance(v, (int, float))})
+    client = _client_limits(ctx, result.summary)
+    if client:
+        result.warnings.append(
+            f"the load generator may have set this point's pace: {client} "
+            "(-o client_procs=N spreads it)"
+        )
     if monitor is not None and len(result.window) == 2:
         origin = ctx.clock.origin_mono
         result.summary.update(
@@ -167,6 +201,22 @@ async def _run_point(
             f"(e.g. {tails[0]}); add requests or repetitions before reading them"
         )
     return result
+
+
+async def _client_pool(backend: backends.Backend, backend_name: str) -> backends.Backend:
+    """``backend``, or a pool of client processes around it (``-o client_procs=N``).
+
+    Started after the backend loaded, so ``init_s`` stays the server's own
+    start-up and the workers attach to a server that is already up.
+    """
+    procs = requested_procs(backend.options)
+    if procs <= 1:
+        return backend
+    pool = ClientPool(backend, backend_name, procs)
+    _log(f"starting {procs} client processes ...")
+    await pool.start()
+    _log(f"client processes up in {pool.start_s:.2f}s (pids {[h.pid for h in pool.handles]})")
+    return pool
 
 
 async def run_profile(
@@ -272,6 +322,20 @@ async def run_profile(
             write_run_json(run_dir, meta, results)
             await backend.close()
             continue
+        try:
+            backend = await _client_pool(backend, backend_name)
+        except Exception as exc:  # noqa: BLE001 -- a client that cannot start fails its group
+            why = f"client processes failed to start: {type(exc).__name__}: {exc}"
+            _log(why)
+            for b in group:
+                for point in b.points():
+                    r = b.new_result(point)
+                    r.status, r.reason = STATUS_FAILED, why
+                    results.append(r)
+            meta["backend"]["instances"][mode] = {"error": why, "init_s": init_s}
+            write_run_json(run_dir, meta, results)
+            await backend.close()
+            continue
         caps = backend.capabilities()
         meta["backend"]["instances"][mode] = {
             "info": backend.info().to_json(),
@@ -300,6 +364,7 @@ async def run_profile(
                     _log(f"decoding workload {wname} ({len(bench.workload.items)} items) ...")
                     audio_cache[wname] = load_audio(bench.workload.items, sample_rate)
                 bench.prepare(backend, audio_cache[wname])
+                await backend.prepared()
                 if isinstance(bench, Load) and bench.params.get("capacity_from"):
                     bench.capacity_req_s = capacity.get(str(bench.params["capacity_from"]))
                 for point in bench.points():
@@ -317,6 +382,8 @@ async def run_profile(
                 monitor.stop()
                 meta["monitor"].setdefault("files", []).append(monitor.out_path.name)
                 meta["monitor"]["probes"] = monitor.header()
+            if isinstance(backend, ClientPool):  # how the requests were spread
+                meta["backend"]["instances"][mode]["client"] = backend.describe()
             await backend.close()
             del backend
             gc.collect()
