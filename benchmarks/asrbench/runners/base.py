@@ -43,6 +43,9 @@ from benchmarks.asrbench.results import (
 )
 from benchmarks.asrbench.workloads import WorkItem, Workload, bucket_of
 
+#: The event-loop lag probe's period.
+LOOP_PROBE_S = 0.002
+
 
 @dataclass
 class RunContext:
@@ -58,6 +61,15 @@ class RunContext:
     init_s: Optional[float] = None
     #: The measured window of the current point (run clock).
     window: List[float] = field(default_factory=list)
+    #: CPU of the busiest load-generator process over the last window, % of one
+    #: core; ``None`` for an in-process backend, whose client is the engine.
+    client_cpu_pct: Optional[float] = None
+    _client_cpu0: Dict[int, float] = field(default_factory=dict)
+    #: How late the load generator's event loop ran a timer during the last
+    #: window, ms (``n``/``p50``/``p99``/``max``); ``None`` for an in-process backend.
+    client_loop_lag_ms: Optional[Dict[str, float]] = None
+    _lag_probe: Optional["asyncio.Task[None]"] = None
+    _lags: List[float] = field(default_factory=list)
     _requests: List[RequestRecord] = field(default_factory=list)
     _sessions: List[SessionRecord] = field(default_factory=list)
 
@@ -67,11 +79,81 @@ class RunContext:
         """Start the measured phase: reset allocator peaks and server counters."""
         self.backend.reset_peak_memory()
         self.backend.server_metrics_begin()
+        self.client_cpu_pct = None
+        self._client_cpu0 = {} if self.caps.in_process else self._client_cpu()
+        self.client_loop_lag_ms = None
+        if not self.caps.in_process:
+            self._start_lag_probe()
         self.window = [self.clock.now()]
 
     def close_window(self) -> None:
         if len(self.window) == 1:
             self.window.append(self.clock.now())
+            wall = self.window[1] - self.window[0]
+            if self._client_cpu0 and wall > 0:
+                cpu1 = self._client_cpu()
+                busy = [
+                    100.0 * (cpu1[pid] - t0) / wall
+                    for pid, t0 in self._client_cpu0.items()
+                    if pid in cpu1
+                ]
+                self.client_cpu_pct = max(busy) if busy else None
+            if self._lag_probe is not None:
+                self._lag_probe.cancel()
+                self._lag_probe = None
+                if self._lags:
+                    lags = sorted(1e3 * x for x in self._lags)
+                    self.client_loop_lag_ms = {
+                        "n": float(len(lags)),
+                        "p50": lags[len(lags) // 2],
+                        "p99": lags[min(len(lags) - 1, int(round(0.99 * (len(lags) - 1))))],
+                        "max": lags[-1],
+                    }
+
+    def _start_lag_probe(self) -> None:
+        """Time how late the event loop runs a short timer, for the whole window.
+
+        A client can limit a point without being CPU-saturated: one event loop
+        handles a batch of responses (and the requests they release) one after
+        another, so each waits for the loop while the server sits idle.  Measured
+        on U2++ at 16 in flight, one process was 66 % busy and delivered 341 req/s
+        where eight delivered 1,273.  The delay a timer sees is the delay a
+        response sees.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._lags = []
+
+        async def probe() -> None:
+            while True:
+                t = time.perf_counter()
+                await asyncio.sleep(LOOP_PROBE_S)
+                self._lags.append(time.perf_counter() - t - LOOP_PROBE_S)
+
+        self._lag_probe = loop.create_task(probe())
+
+    def _client_cpu(self) -> Dict[int, float]:
+        """CPU seconds (user + system) of each load-generator process.
+
+        A closed loop cannot show a saturated client in ``send_lag_ms``: each
+        user schedules its next request when it gets to it, so the lag stays near
+        zero while one Python process delivers a fraction of what the server
+        sustains.  The client's own CPU can.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return {}
+        out: Dict[int, float] = {}
+        for pid in self.backend.client_pids():
+            try:
+                t = psutil.Process(pid).cpu_times()
+            except psutil.Error:
+                continue
+            out[pid] = t.user + t.system
+        return out
 
     # -- records --------------------------------------------------------------
 

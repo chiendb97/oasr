@@ -146,6 +146,8 @@ class OpenAIHttpBackend(Backend):
         "max_connections": "HTTP connection pool size (1024)",
         "trust_env": "honour HTTP(S)_PROXY for the server URL (false)",
         "server_pid": "PID of the server process, for resource monitoring",
+        "client_procs": "client processes sending the requests (1); one Python process "
+        "saturates near 16 in flight against a fast server",
     }
 
     def __init__(self, options: Optional[Dict[str, Any]] = None, mode: str = "offline") -> None:
@@ -312,6 +314,11 @@ class OpenAIHttpBackend(Backend):
         stream = _WsStream(ws)
         stream.start()
         return stream
+
+    # -- client processes ---------------------------------------------------------
+
+    def client_options(self) -> Optional[Dict[str, Any]]:
+        return {**self.options, "base_url": self.base_url}
 
     # -- observability ---------------------------------------------------------------
 
@@ -605,6 +612,14 @@ class OasrServerBackend(OpenAIHttpBackend):
                     raise RuntimeError(f"realtime handshake refused: {msg.get('error')}")
         finally:
             await ws.close()
+
+    def client_options(self) -> Optional[Dict[str, Any]]:
+        # Workers attach to this instance's server, spawned or attached; they
+        # never start one of their own.
+        opts = {**self.options, "base_url": self.base_url}
+        if self.grpc_addr:
+            opts["grpc_addr"] = self.grpc_addr
+        return opts
 
     def _served_model(self) -> Dict[str, Any]:
         """``/v1/models``'s first row (id + the engine's model info), for provenance."""
